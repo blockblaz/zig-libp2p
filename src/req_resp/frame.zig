@@ -1,5 +1,6 @@
-//! Length-prefixed req/resp framing (varint + payload) matching Zeam
-//! `pkgs/network/src/ethlibp2p.zig` (snappy payload is layered outside).
+//! Length-prefixed req/resp framing: varint-declared payload on requests,
+//! single-byte response code then the same length prefix on responses.
+//! Compression (for example snappy) is applied outside this layer.
 
 const std = @import("std");
 const varint = @import("../varint.zig");
