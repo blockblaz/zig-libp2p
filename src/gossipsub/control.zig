@@ -391,6 +391,71 @@ pub fn deinitPruneView(allocator: std.mem.Allocator, p: *PruneView) void {
     p.* = undefined;
 }
 
+/// Subset of `ControlExtensions` from [rpc.proto](https://github.com/libp2p/go-libp2p-pubsub/blob/master/pb/rpc.proto):
+/// `optional bool partialMessages = 10` only. Experimental fields (e.g. 6492434) are skipped on decode.
+pub const ControlExtensionsView = struct {
+    partial_messages: ?bool = null,
+};
+
+/// Encode `ControlExtensions` protobuf bytes (field 10 when set).
+pub fn encodeControlExtensions(allocator: std.mem.Allocator, view: ControlExtensionsView) (Error || std.mem.Allocator.Error)![]u8 {
+    var inner = std.ArrayList(u8).empty;
+    defer inner.deinit(allocator);
+    if (view.partial_messages) |b| {
+        try w.appendFieldKey(&inner, allocator, 10, .varint);
+        try w.appendVarUInt64(&inner, allocator, if (b) 1 else 0);
+    }
+    return try inner.toOwnedSlice(allocator);
+}
+
+/// Encode a `ControlMessage` containing only `optional ControlExtensions extensions = 6`.
+pub fn encodeControlMessageExtensionsOnly(allocator: std.mem.Allocator, view: ControlExtensionsView) (Error || std.mem.Allocator.Error)![]u8 {
+    const payload = try encodeControlExtensions(allocator, view);
+    defer allocator.free(payload);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try w.appendLengthDelimited(&out, allocator, 6, payload);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// First `extensions` entry in a `ControlMessage` wire blob, or null.
+pub fn decodeFirstControlExtensions(control: []const u8) Error!?ControlExtensionsView {
+    var off: usize = 0;
+    while (off < control.len) {
+        const key = try w.decodeFieldKey(control[off..]);
+        off += key.len;
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(control[off..], key.wire_type, lim.max_control_extensions_blob_bytes)
+        else
+            try w.nextFieldValue(control[off..], key.wire_type);
+        off += nv.total;
+
+        if (key.field_number != 6 or key.wire_type != .length_delimited) continue;
+
+        var view = ControlExtensionsView{};
+        var io: usize = 0;
+        while (io < nv.value.len) {
+            const ik = try w.decodeFieldKey(nv.value[io..]);
+            io += ik.len;
+            const iv = if (ik.wire_type == .length_delimited)
+                try w.nextFieldValueLimited(nv.value[io..], ik.wire_type, lim.max_control_extensions_blob_bytes)
+            else
+                try w.nextFieldValue(nv.value[io..], ik.wire_type);
+            io += iv.total;
+            switch (ik.field_number) {
+                10 => {
+                    if (ik.wire_type != .varint) return error.UnsupportedWireType;
+                    const vv = try w.decodeVarUInt64(iv.value);
+                    view.partial_messages = vv.value != 0;
+                },
+                else => {},
+            }
+        }
+        return view;
+    }
+    return null;
+}
+
 test "ihave topic and message ids round trip" {
     const a = std.testing.allocator;
     const mids: []const []const u8 = &.{ "id-a", "id-b" };
@@ -521,4 +586,30 @@ test "iwant rejects oversized message id" {
     try w.appendLengthDelimited(&ctl, a, 2, inner.items);
 
     try std.testing.expectError(error.LengthDelimitedTooLong, decodeFirstIWant(a, ctl.items));
+}
+
+test "control extensions partialMessages round trip" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |b| {
+        const wire = try encodeControlMessageExtensionsOnly(a, .{ .partial_messages = b });
+        defer a.free(wire);
+        const got = (try decodeFirstControlExtensions(wire)).?;
+        try std.testing.expectEqual(@as(?bool, b), got.partial_messages);
+    }
+}
+
+test "control extensions empty message" {
+    const a = std.testing.allocator;
+    const wire = try encodeControlMessageExtensionsOnly(a, .{});
+    defer a.free(wire);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x32, 0x00 }, wire);
+    const got = (try decodeFirstControlExtensions(wire)).?;
+    try std.testing.expectEqual(@as(?bool, null), got.partial_messages);
+}
+
+test "control extensions wire matches manual key for field 10 true" {
+    const a = std.testing.allocator;
+    const wire = try encodeControlMessageExtensionsOnly(a, .{ .partial_messages = true });
+    defer a.free(wire);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x32, 0x02, 0x50, 0x01 }, wire);
 }
