@@ -25,7 +25,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Req/resp behaviour | Not started | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) |
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Not started | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) |
-| Typed error sets (layers) | Partial | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — codec layers + **TCP** + **stream multistream** + **zquic** mappers (`fromZquicWireTransport`, `fromZquicOpenLocalStream`, `fromZquicIoSetup`) in `transport.transport_error`; full QUIC event-loop typing still embedder-owned |
+| Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
 | Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
 
 **Still heavy lift for embedders:** full swarm, connection manager, mesh, and **full** TLS `SignedKey` verification (today: parse + PeerId only in [`security.libp2p_tls`](#security)). QUIC listen/dial lifecycle remains primarily [zquic](https://github.com/ch4r10t33r/zquic) + [`transport.quic_v1`](#transport) presets.
@@ -64,16 +64,17 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 | Module | Role |
 |--------|------|
-| `errors` | Layered errors: `ReqRespError`, `GossipsubError`, `TransportError` (#45) |
+| `errors` | Layered errors: `ReqRespError`, `GossipsubError`, `TransportError`; `setLastErrorMessage` / `lastErrorMessage` / `clearLastErrorMessage` (#45) |
+| `layer_events` | Event carriers: `ReqRespFailure`, `GossipsubFailure`, `TransportFailure` (each has a `kind:` field for `switch`) (#45) |
 | `protocol` | Lean req/resp protocol id strings; `LeanSupportedProtocol` enum with `protocolId`, `fromInt`, `fromSlice` |
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
-| `addr_list` | Multiaddr CSV: `parseCsv`, `freeList` (uses bundled `multiaddr`) |
+| `addr_list` | Multiaddr CSV: `parseCsv` (`ParseCsvError`), `freeList` (uses bundled `multiaddr`) |
 | `multistream` | Multistream-select 1.0.0 line I/O: `multistream_1_0_0`, `max_protocol_id_body_bytes`, `writeProtocolLine`, `writeProtocolLineWithMax`, `ProtocolLineError`, `trimNegotiationLine` |
-| `ping` | Ping 1.0.0: `protocol_line`, wire helpers, `Ping` / `PingConfig` timer policy, `handleInbound`, `initiatorRoundTripMs` |
-| `identify` | Identify 1.0.0: `protocol_line`, `MessageView` / `MessageOwned`, `encode` / `decodeOwned`, `Identify` (`handleInbound`, `onConnectionEstablished`) |
+| `ping` | Ping 1.0.0: `WireError` = `errors.ReqRespError`, `handleInbound`, `initiatorRoundTripMs`, `Ping` / `PingConfig` |
+| `identify` | Identify 1.0.0: oversized wire uses global `PayloadTooLarge` (same tag as other codecs); `encode` / `decodeOwned`, `Identify` helpers |
 | `peer_id` | Re-export of `peer-id` package |
 | `identity` | `PeerId`, `ParseError` aliases |
-| `keypair` | PEM → `KeyPair` (Ed25519, secp256k1) + `peerIdFromKeyPair` |
+| `keypair` | PEM → `KeyPair`; `peerIdFromKeyPair` (`PeerIdFromKeyPairError`) |
 | `snappyz` | Re-export of `zig_snappy` (block Snappy) |
 | `snappyframesz` | Re-export of Snappy framing for libp2p streams |
 | `zquic` | Full **zquic** library (QUIC/TLS); use for transport integration |
@@ -112,7 +113,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 |-----------|------|
 | `transport.quic_v1` | QUIC v1 labels + zquic wiring: `multistream_protocol_id`, `tls_alpn`, `libp2pZquicServerConfig` / `libp2pZquicClientConfig` (ALPN `libp2p`, `raw_application_streams`), `appendFirstBidiStreamInitiatorHandshake` |
 | `transport.quic` | QUIC transport entrypoint: re-exports `quic_v1` + `stream_multistream`, `parseQuicV1Endpoint` from multiaddrs with `/udp/.../quic-v1` (and optional `/p2p`) |
-| `transport.transport_error` | Maps `std.Io.net` connect/listen/accept, multistream handshake I/O, `security.libp2p_tls` parse failures, and **zquic** (`types.TransportError` wire codes, `OpenLocalStreamError`, lossy `fromZquicIoSetup` for `Server`/`Client` init + client run) into `TransportError` |
+| `transport.transport_error` | Maps `std.Io.net`, multistream I/O, `security.libp2p_tls`, and **zquic** (`fromZquicWireTransport`, `fromZquicOpenLocalStream`, typed `fromZquicIoSetup` / `fromZquicRun` on `ZquicIoSetupError` / `ZquicRunError`) into `TransportError` |
 | `transport.stream_multistream` | Per-stream multistream-select on `std.Io.Reader` / `Writer`: `StreamHandshakeError` = `errors.TransportError` \|\| `Allocator.Error`; `appendFirstStreamInitiatorHandshake` still uses `NegotiateError` for buffer-only builds |
 | `transport.tcp` | TCP over `std.Io.net`: `listen` / `dial` / `acceptTuned` surface `TransportError` (plus `SocketTuningFailed` where tuning runs), `multistream_protocol_id`, thin wrappers around `stream_multistream` |
 | `transport.multistream_negotiate` | **Bounded** multistream-select 1.0.0 on a byte cursor: `default_max_body_len`, `readNegotiationLine`, `validateProtocolId`, initiator/responder steps (`initiatorSendMultistreamHeader`, `responderReadProtocolOffer`, `responderReplyProtocol`, …), `NegotiateError` |

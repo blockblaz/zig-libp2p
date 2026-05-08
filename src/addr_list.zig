@@ -1,9 +1,12 @@
 //! Parse comma-separated multiaddr strings (trimmed entries, empty chunks skipped).
 
 const std = @import("std");
-const Multiaddr = @import("multiaddr").Multiaddr;
+const multiaddr_mod = @import("multiaddr");
+const Multiaddr = multiaddr_mod.Multiaddr;
 
-pub fn parseCsv(allocator: std.mem.Allocator, csv: []const u8) ![]Multiaddr {
+pub const ParseCsvError = multiaddr_mod.multiaddr.Error || std.mem.Allocator.Error;
+
+pub fn parseCsv(allocator: std.mem.Allocator, csv: []const u8) ParseCsvError![]Multiaddr {
     var out = std.ArrayList(Multiaddr).empty;
     errdefer {
         for (out.items) |m| m.deinit();

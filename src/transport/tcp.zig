@@ -144,11 +144,13 @@ test "tcp listen dial multistream round trip" {
     defer server.deinit(io);
     const port = server.socket.address.getPort();
 
+    const ServerThreadErr = errors.TransportError || ApplyStreamSocketTuningError || sm.StreamHandshakeError;
+
     const ServerCtx = struct {
         server: *net.Server,
         io: Io,
         tuning: StreamSocketTuning,
-        err: ?anyerror = null,
+        err: ?ServerThreadErr = null,
 
         fn run(ctx: *@This()) void {
             const st = acceptTuned(ctx.server, ctx.io, ctx.tuning) catch |e| {

@@ -16,7 +16,8 @@ const pid = @import("peer_id");
 pub const protocol_line: []const u8 = "/ipfs/id/1.0.0\n";
 
 pub const Error = proto.Error || error{
-    WireLimitExceeded,
+    /// Same global tag as [`errors.GossipsubError.PayloadTooLarge`] / [`errors.ReqRespError.PayloadTooLarge`] (#45).
+    PayloadTooLarge,
     TooManyListenAddrs,
     TooManyProtocols,
     IdentifyMessageTooLarge,
@@ -119,7 +120,7 @@ fn maxForField(field: u32, limits: Limits) usize {
 
 /// Decode `Identify` from wire bytes (untrusted).
 pub fn decodeOwned(allocator: std.mem.Allocator, wire: []const u8, limits: Limits) (Error || std.mem.Allocator.Error)!MessageOwned {
-    if (wire.len > limits.max_message_bytes) return error.WireLimitExceeded;
+    if (wire.len > limits.max_message_bytes) return error.PayloadTooLarge;
 
     var out: MessageOwned = .{};
     errdefer out.deinit(allocator);

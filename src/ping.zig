@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const errors = @import("errors.zig");
 
 /// Multistream negotiation line including newline.
 pub const protocol_line: []const u8 = "/ipfs/ping/1.0.0\n";
@@ -9,7 +10,21 @@ pub const protocol_line: []const u8 = "/ipfs/ping/1.0.0\n";
 /// Payload size for each ping or pong datagram on the stream.
 pub const payload_len: usize = 32;
 
-pub const WireError = Io.Reader.Error || Io.Writer.Error || error{PayloadMismatch};
+/// Ping stream failures use the same layer as req/resp stream I/O (#45).
+pub const WireError = errors.ReqRespError;
+
+fn mapReaderErr(err: Io.Reader.Error) errors.ReqRespError {
+    return switch (err) {
+        error.ReadFailed => error.IoError,
+        error.EndOfStream => error.IncompleteStream,
+    };
+}
+
+fn mapWriterErr(err: Io.Writer.Error) errors.ReqRespError {
+    return switch (err) {
+        error.WriteFailed => error.IoError,
+    };
+}
 
 /// Fill `payload` with random bytes suitable for a ping datagram.
 pub fn randomPayload(payload: *[payload_len]u8) void {
@@ -17,22 +32,21 @@ pub fn randomPayload(payload: *[payload_len]u8) void {
 }
 
 /// Write one ping/pong payload and flush.
-pub fn writePayload(w: *Io.Writer, payload: *const [payload_len]u8) Io.Writer.Error!void {
-    try Io.Writer.writeAll(w, payload);
-    try Io.Writer.flush(w);
+pub fn writePayload(w: *Io.Writer, payload: *const [payload_len]u8) WireError!void {
+    Io.Writer.writeAll(w, payload) catch |e| return mapWriterErr(e);
+    Io.Writer.flush(w) catch |e| return mapWriterErr(e);
 }
 
 /// Read exactly one payload from the stream.
-pub fn readPayload(r: *Io.Reader, payload_out: *[payload_len]u8) Io.Reader.Error!void {
-    try Io.Reader.readSliceAll(r, payload_out);
+pub fn readPayload(r: *Io.Reader, payload_out: *[payload_len]u8) WireError!void {
+    Io.Reader.readSliceAll(r, payload_out) catch |e| return mapReaderErr(e);
 }
 
 /// Responder: read one payload and write it back (echo).
 pub fn handleInbound(r: *Io.Reader, w: *Io.Writer) WireError!void {
     var buf: [payload_len]u8 = undefined;
-    try Io.Reader.readSliceAll(r, &buf);
-    try Io.Writer.writeAll(w, &buf);
-    try Io.Writer.flush(w);
+    try readPayload(r, &buf);
+    try writePayload(w, &buf);
 }
 
 /// Initiator: send `payload`, read echo, ensure it matches. Returns wall-clock RTT in milliseconds.
@@ -43,7 +57,7 @@ pub fn initiatorRoundTripMs(r: *Io.Reader, w: *Io.Writer, payload: *[payload_len
     var echo: [payload_len]u8 = undefined;
     try readPayload(r, &echo);
     const t1: u64 = @intCast(std.time.milliTimestamp());
-    if (!std.mem.eql(u8, payload, &echo)) return error.PayloadMismatch;
+    if (!std.mem.eql(u8, payload, &echo)) return error.InvalidData;
     return t1 - t0;
 }
 
