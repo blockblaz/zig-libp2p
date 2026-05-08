@@ -2,15 +2,28 @@
 //!
 //! Specification: https://github.com/libp2p/specs/blob/master/tls/tls.md
 //!
-//! zquic runs QUIC TLS 1.3; set ALPN to `transport.quic_v1.tls_alpn` for libp2p-on-QUIC.
+//! ## Profiles (issue #16)
+//!
+//! * **QUIC + TLS 1.3 (libp2p-on-QUIC):** After the QUIC handshake, TLS uses application-layer
+//!   protocol [`quic_application_layer_protocol`] (value `libp2p`). [`transport.quic_v1`] presets
+//!   (`libp2pZquicServerConfig` / `libp2pZquicClientConfig`) set this via `tls_alpn`, which aliases
+//!   the constant below—keep them in sync.
+//! * **TCP (or other) via multistream-select:** negotiate [`multistream_protocol_id`] (`/tls/1.0.0`)
+//!   before the TLS layer, per the TLS spec multistream path.
+//! * **Noise XX** for devnets that require it is **not** implemented here; track [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36).
+//!
 //! This module parses the libp2p Public Key extension (IANA enterprise OID) from a leaf
 //! certificate and derives a PeerId from the embedded protobuf public key (spec test vectors).
 //!
-//! Signature verification over `handshake_signature_prefix` || SubjectPublicKeyInfo is not
-//! implemented here; callers must not treat PeerId match alone as authenticated until that lands.
+//! **Authentication gap:** signature verification over `handshake_signature_prefix` ||
+//! SubjectPublicKeyInfo is not implemented; callers must not treat PeerId derivation alone as a
+//! fully authenticated remote peer until verification lands (see #16).
 
 const std = @import("std");
 const peer_id = @import("peer_id");
+
+/// TLS ALPN identifier for libp2p over QUIC (TLS 1.3). Same bytes as `transport.quic_v1.tls_alpn`.
+pub const quic_application_layer_protocol: []const u8 = "libp2p";
 
 /// Multistream protocol id when TLS is negotiated via multistream-select (not QUIC ALPN).
 pub const multistream_protocol_id: []const u8 = "/tls/1.0.0";
@@ -145,4 +158,8 @@ test "libp2p TLS spec vector 3 (secp256k1) peer id" {
 test "missing extension" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.MissingLibp2pExtension, peerIdFromCertificate(a, &[_]u8{ 0x30, 0x00 }));
+}
+
+test "QUIC TLS ALPN matches libp2p TLS spec string" {
+    try std.testing.expectEqualStrings("libp2p", quic_application_layer_protocol);
 }
