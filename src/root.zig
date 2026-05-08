@@ -7,6 +7,11 @@ pub const protocol = @import("protocol.zig");
 pub const varint = @import("varint.zig");
 pub const addr_list = @import("addr_list.zig");
 pub const multistream = @import("multistream.zig");
+pub const ping = @import("ping.zig");
+
+pub const gossip = struct {
+    pub const topic = @import("gossip/topic.zig");
+};
 
 /// Block Snappy (`zig_snappy`), same module name as in Zeam.
 pub const snappyz = @import("snappyz");
