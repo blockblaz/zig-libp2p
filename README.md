@@ -22,7 +22,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Noise XX | Partial | [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36) — [`security.noise`](#security): use [`security.noise.stream_upgrade`](./src/security/noise/stream_upgrade.zig) for multistream `/noise` + handshake on a stream; interop tests can live in Zeam. |
 | Connection manager | Partial | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) — `connection_manager` + `peer_events`; embedder must call `tick` / `onDialFailure` / `onConnectionEstablished` / `onConnectionClosed` from transport |
 | Gossipsub mesh runtime | Partial | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) — `gossipsub.runtime`: per-topic mesh, inbound GRAFT/PRUNE, heartbeat GRAFT/PRUNE toward `mesh_n` / `mesh_n_low` / `mesh_n_high`, publish forwarding + `OutDelivery` outbox; IHave/IWant, scoring, bounded per-peer queues still TBD |
-| Req/resp behaviour | Not started | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) |
+| Req/resp behaviour | Partial | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40): `req_resp.runtime` — `request_id`, outbound timeout, inbound idle timeout, swarm command helpers |
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Not started | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) |
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
@@ -113,6 +113,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `req_resp.frame` | Length-prefixed framing: `max_rpc_message_size`, `parseRequestHeader`, `parseResponseHeader`, `appendRequestPrefix`, `appendResponsePrefix`; `FrameError` = `errors.ReqRespError` |
 | `req_resp.stream` | Incremental scan: `peekRpcUnaryRequest` / `peekRpcUnaryResponse`, `scanCompleteRequest` / `scanCompleteResponse`, `consumePrefix`, `InboundBuffer` |
 | `req_resp.snappy_wire` | Snappy + framing for `ssz_snappy`: `compressBlock`, `decompressBlock`, `compressFramed`, `decompressFramed`, `buildRequestWire`, `buildResponseWire`, `decodeRequestSsz`, `decodeResponseSsz` |
+| `req_resp.runtime` | `ReqResp` / `ReqRespConfig`: monotonic `request_id`, outbound request timeout (default 15s), inbound response idle timeout (default 5m), `tick`, `completeOutbound`, `onInboundRpcRequest`, response commands (#40) |
 
 ### `transport`
 
