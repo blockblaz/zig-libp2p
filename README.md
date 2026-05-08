@@ -95,8 +95,8 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `gossipsub.config` | Zeam gossipsub constants: `mesh_n` / `mesh_n_low` / `mesh_n_high`, `gossip_lazy`, `heartbeat_interval_ms`, `duplicate_cache_ttl_ms`, `history_length`, `max_transmit_size_bytes` (#39) |
 | `gossipsub.message_id` | Wire message ID: `writeMessageId(topic, data, snappy_decompressed_ok, out20)` — SHA256 domain + topic len + topic + data, truncated to 20 bytes (#39) |
 | `gossipsub.duplicate_cache` | TTL map `(topic, id)` → expiry; `prune`, `checkDuplicate` (#39) |
-| `gossipsub.runtime` | `Gossipsub` + `GossipsubConfig` (`local_peer_id`, mesh knobs): mesh maintenance, `popOutboxDelivery` (`OutDelivery`: `wire` + optional `to` peer), subscribe/publish use `to=null` broadcast (#39) |
-| `gossipsub.rpc` | RPC envelope: `encodeEmptyControlRpc`, `encodeControlOnlyRpc`, `encodeSubscribe` / `decodeFirstSubscribe`, `deinitSubscribeView`, `decodeControlPayload`, `encodePublish` / `decodeFirstPublish`, `decodePublishes` / `freePublishBlobs` |
+| `gossipsub.runtime` | `Gossipsub` + `GossipsubConfig.validate` (`InitConfigError`), `meshPeerCountForTopic`, inbound `subscriptions` for GRAFT candidate narrowing, `popOutboxDelivery` (#39) |
+| `gossipsub.rpc` | RPC envelope: `encodeEmptyControlRpc`, `encodeControlOnlyRpc`, `encodeSubscribe` / `decodeFirstSubscribe` / `decodeSubscribes` / `freeSubscribeViews`, `deinitSubscribeView`, `decodeControlPayload`, `encodePublish` / `decodeFirstPublish`, `decodePublishes` / `freePublishBlobs` |
 | `gossipsub.control` | Control message fragments: **IHave** / **IWant** / **IDontWant** / **graft** / **prune**; **ControlExtensions** (`partialMessages`): `encodeControlExtensions`, `encodeControlMessageExtensionsOnly`, `decodeFirstControlExtensions`, `ControlExtensionsView` |
 | `gossipsub.message` | `Message` protobuf: `MessageView`, `MessageOwned`, `encode`, `decode`, `MessageOwned.deinit` |
 

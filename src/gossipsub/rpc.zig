@@ -110,6 +110,78 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
     return null;
 }
 
+/// Every `subscriptions` entry (`1`, length-delimited `SubOpts`). Caller frees with [`freeSubscribeViews`].
+pub fn decodeSubscribes(allocator: std.mem.Allocator, rpc_wire: []const u8) (Error || std.mem.Allocator.Error)![]SubscribeView {
+    var out = std.ArrayList(SubscribeView).init(allocator);
+    errdefer {
+        for (0..out.items.len) |i| {
+            deinitSubscribeView(allocator, &out.items[i]);
+        }
+        out.deinit(allocator);
+    }
+    var off: usize = 0;
+    while (off < rpc_wire.len) {
+        const key = try w.decodeFieldKey(rpc_wire[off..]);
+        off += key.len;
+        const val_buf = rpc_wire[off..];
+        const ld_cap_top: usize = switch (key.field_number) {
+            1 => lim.max_subopts_blob_bytes,
+            else => lim.max_rpc_length_delimited_bytes,
+        };
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(val_buf, key.wire_type, ld_cap_top)
+        else
+            try w.nextFieldValue(val_buf, key.wire_type);
+        const v = nv.value;
+        off += nv.total;
+
+        if (key.field_number != 1 or key.wire_type != .length_delimited) continue;
+
+        var sub_off: usize = 0;
+        var subscribe: ?bool = null;
+        var topic: ?[]const u8 = null;
+        while (sub_off < v.len) {
+            const sk = try w.decodeFieldKey(v[sub_off..]);
+            sub_off += sk.len;
+            const inner = v[sub_off..];
+            const ld_cap_inner: usize = switch (sk.field_number) {
+                2 => lim.max_topic_str_bytes,
+                else => lim.max_subopts_blob_bytes,
+            };
+            const iv = if (sk.wire_type == .length_delimited)
+                try w.nextFieldValueLimited(inner, sk.wire_type, ld_cap_inner)
+            else
+                try w.nextFieldValue(inner, sk.wire_type);
+            const chunk = iv.value;
+            sub_off += iv.total;
+
+            switch (sk.field_number) {
+                1 => {
+                    if (sk.wire_type != .varint) return error.UnsupportedWireType;
+                    const vv = try w.decodeVarUInt64(chunk);
+                    subscribe = vv.value != 0;
+                },
+                2 => {
+                    if (sk.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    topic = chunk;
+                },
+                else => return error.UnsupportedWireType,
+            }
+        }
+        const sub = subscribe orelse return error.MissingSubscribeFields;
+        const top = topic orelse return error.MissingSubscribeFields;
+        try out.append(.{ .subscribe = sub, .topic = try allocator.dupe(u8, top) });
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn freeSubscribeViews(allocator: std.mem.Allocator, views: []SubscribeView) void {
+    for (0..views.len) |i| {
+        deinitSubscribeView(allocator, &views[i]);
+    }
+    allocator.free(views);
+}
+
 /// Returns an owned copy of the raw `ControlMessage` bytes for field `3`, or null.
 pub fn decodeControlPayload(allocator: std.mem.Allocator, rpc: []const u8) (Error || std.mem.Allocator.Error)!?[]u8 {
     var off: usize = 0;
@@ -194,6 +266,15 @@ pub fn freePublishBlobs(allocator: std.mem.Allocator, blobs: [][]u8) void {
     allocator.free(blobs);
 }
 
+fn encodeSubOptsPayload(allocator: std.mem.Allocator, subscribe: bool, topic: []const u8) (Error || std.mem.Allocator.Error)![]u8 {
+    var sub = std.ArrayList(u8).empty;
+    defer sub.deinit(allocator);
+    try w.appendFieldKey(&sub, allocator, 1, .varint);
+    try w.appendVarUInt64(&sub, allocator, if (subscribe) 1 else 0);
+    try w.appendLengthDelimited(&sub, allocator, 2, topic);
+    return try sub.toOwnedSlice(allocator);
+}
+
 test "encodeEmptyControlRpc matches two-byte empty submessage" {
     const a = std.testing.allocator;
     const buf = try encodeEmptyControlRpc(a);
@@ -203,6 +284,39 @@ test "encodeEmptyControlRpc matches two-byte empty submessage" {
     defer if (ctl) |c| a.free(c);
     try std.testing.expect(ctl != null);
     try std.testing.expectEqual(@as(usize, 0), ctl.?.len);
+}
+
+test "encodeControlOnlyRpc round trips decodeControlPayload" {
+    const a = std.testing.allocator;
+    const ctl_mod = @import("control.zig");
+    const inner = try ctl_mod.encodeGraft(a, "/mesh/x");
+    defer a.free(inner);
+    const rpc_wire = try encodeControlOnlyRpc(a, inner);
+    defer a.free(rpc_wire);
+    const got = (try decodeControlPayload(a, rpc_wire)).?;
+    defer a.free(got);
+    try std.testing.expectEqualSlices(u8, inner, got);
+}
+
+test "decodeSubscribes reads every subscription entry" {
+    const a = std.testing.allocator;
+
+    const o1 = try encodeSubOptsPayload(a, true, "alpha");
+    defer a.free(o1);
+    const o2 = try encodeSubOptsPayload(a, false, "beta");
+    defer a.free(o2);
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try w.appendLengthDelimited(&list, a, 1, o1);
+    try w.appendLengthDelimited(&list, a, 1, o2);
+
+    const views = try decodeSubscribes(a, list.items);
+    defer freeSubscribeViews(a, views);
+    try std.testing.expectEqual(@as(usize, 2), views.len);
+    try std.testing.expect(views[0].subscribe);
+    try std.testing.expectEqualStrings("alpha", views[0].topic);
+    try std.testing.expect(!views[1].subscribe);
+    try std.testing.expectEqualStrings("beta", views[1].topic);
 }
 
 test "subscribe round trip" {

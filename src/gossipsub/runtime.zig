@@ -1,6 +1,10 @@
 //! Gossipsub mesh runtime (incremental, #39): subscriptions, peer presence, per-topic mesh,
 //! heartbeat GRAFT/PRUNE toward Zeam `mesh_n` / `mesh_n_low` / `mesh_n_high`, inbound control,
 //! publish forwarding, duplicate cache, and a targeted outbox.
+//!
+//! Inbound `subscriptions` RPC entries record remote interest per topic. When at least one peer
+//! has advertised interest for a topic, GRAFT candidates are restricted to those peers; if none
+//! have, the implementation falls back to all connected peers (flood-style bootstrap).
 
 const std = @import("std");
 const identity = @import("../identity.zig");
@@ -18,7 +22,14 @@ pub const GossipsubConfig = struct {
     mesh_n_low: u8 = gs_cfg.mesh_n_low,
     mesh_n: u8 = gs_cfg.mesh_n,
     mesh_n_high: u8 = gs_cfg.mesh_n_high,
+
+    pub fn validate(c: GossipsubConfig) InitConfigError!void {
+        if (c.mesh_n_low > c.mesh_n) return error.InvalidMeshKnobs;
+        if (c.mesh_n > c.mesh_n_high) return error.InvalidMeshKnobs;
+    }
 };
+
+pub const InitConfigError = error{InvalidMeshKnobs};
 
 pub const OutDelivery = struct {
     wire: []u8,
@@ -44,13 +55,16 @@ pub const Gossipsub = struct {
     dup: duplicate_cache.DuplicateCache,
     subs: std.StringHashMap(void),
     mesh: std.StringHashMap(TopicMesh),
+    /// Peers that sent a SUBSCRIBE RPC for a topic (used to narrow GRAFT targets).
+    remote_interest: std.StringHashMap(TopicMesh),
     connected: std.HashMap(identity.PeerId, void, connection_manager.PeerIdContext, std.hash_map.default_max_load_percentage),
     clock_ms: i64,
     outbox: std.ArrayList(OutDelivery),
     inbound_delivered: u64,
     scratch_peers: std.ArrayList(identity.PeerId),
 
-    pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) std.mem.Allocator.Error!*Gossipsub {
+    pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
+        try config.validate();
         const p = try allocator.create(Gossipsub);
         errdefer allocator.destroy(p);
         p.* = .{
@@ -59,6 +73,7 @@ pub const Gossipsub = struct {
             .dup = duplicate_cache.DuplicateCache.init(allocator),
             .subs = std.StringHashMap(void).init(allocator),
             .mesh = std.StringHashMap(TopicMesh).init(allocator),
+            .remote_interest = std.StringHashMap(TopicMesh).init(allocator),
             .connected = .init(allocator),
             .clock_ms = 0,
             .outbox = .init(allocator),
@@ -76,6 +91,11 @@ pub const Gossipsub = struct {
             e.value_ptr.deinit(self.allocator);
         }
         self.mesh.deinit(self.allocator);
+        var rit = self.remote_interest.iterator();
+        while (rit.next()) |e| {
+            e.value_ptr.deinit(self.allocator);
+        }
+        self.remote_interest.deinit(self.allocator);
         for (self.outbox.items) |d| self.allocator.free(d.wire);
         self.outbox.deinit(self.allocator);
         self.connected.deinit(self.allocator);
@@ -99,6 +119,25 @@ pub const Gossipsub = struct {
         }
     }
 
+    fn ensureRemoteInterestTable(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error!void {
+        const gop = try self.remote_interest.getOrPut(topic);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = TopicMesh.init(self.allocator);
+        }
+    }
+
+    fn noteRemoteSubscription(self: *Gossipsub, sender: identity.PeerId, topic: []const u8, want: bool) std.mem.Allocator.Error!void {
+        if (want) {
+            try self.ensureRemoteInterestTable(topic);
+            const rp = self.remote_interest.getPtr(topic).?;
+            try rp.peers.put(sender, {});
+        } else {
+            if (self.remote_interest.getPtr(topic)) |rp| {
+                _ = rp.peers.remove(sender);
+            }
+        }
+    }
+
     pub fn subscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || std.mem.Allocator.Error)!void {
         if (self.subs.contains(topic)) return;
         try self.subs.put(topic, {});
@@ -112,6 +151,10 @@ pub const Gossipsub = struct {
     pub fn unsubscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || std.mem.Allocator.Error)!void {
         if (self.subs.fetchRemove(topic)) |_| {
             if (self.mesh.fetchRemove(topic)) |kv| {
+                var tm = kv.value;
+                tm.deinit(self.allocator);
+            }
+            if (self.remote_interest.fetchRemove(topic)) |kv| {
                 var tm = kv.value;
                 tm.deinit(self.allocator);
             }
@@ -139,6 +182,10 @@ pub const Gossipsub = struct {
         while (mit.next()) |e| {
             _ = e.value_ptr.peers.remove(peer);
         }
+        var rit = self.remote_interest.iterator();
+        while (rit.next()) |e| {
+            _ = e.value_ptr.peers.remove(peer);
+        }
     }
 
     fn sortPeersByBytes(peers: []identity.PeerId) void {
@@ -157,11 +204,20 @@ pub const Gossipsub = struct {
     fn candidatesOutsideMesh(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error![]identity.PeerId {
         self.scratch_peers.clearRetainingCapacity();
         const mp = self.mesh.getPtr(topic) orelse return &[_]identity.PeerId{};
+        const interest = self.remote_interest.getPtr(topic);
+        const restrict = blk: {
+            const ip = interest orelse break :blk false;
+            break :blk ip.peers.count() > 0;
+        };
         var cit = self.connected.keyIterator();
         while (cit.next()) |kp| {
             const p = kp.*;
             if (p.eql(&self.cfg.local_peer_id)) continue;
             if (mp.peers.contains(p)) continue;
+            if (restrict) {
+                const ip = interest.?;
+                if (!ip.peers.contains(p)) continue;
+            }
             try self.scratch_peers.append(p);
         }
         sortPeersByBytes(self.scratch_peers.items);
@@ -223,6 +279,12 @@ pub const Gossipsub = struct {
     }
 
     pub fn handleInboundRpc(self: *Gossipsub, sender: identity.PeerId, frame: []const u8) (rpc.Error || msg_mod.Error || control.Error || std.mem.Allocator.Error)!void {
+        const sub_views = try rpc.decodeSubscribes(self.allocator, frame);
+        defer rpc.freeSubscribeViews(self.allocator, sub_views);
+        for (sub_views) |sv| {
+            try self.noteRemoteSubscription(sender, sv.topic, sv.subscribe);
+        }
+
         if (try rpc.decodeControlPayload(self.allocator, frame)) |ctl| {
             defer self.allocator.free(ctl);
             try self.handleInboundControl(sender, ctl);
@@ -283,6 +345,12 @@ pub const Gossipsub = struct {
         return sum;
     }
 
+    /// Mesh size for `topic`, or `null` if we have no mesh row for that topic string.
+    pub fn meshPeerCountForTopic(self: *const Gossipsub, topic: []const u8) ?usize {
+        const mp = self.mesh.getPtr(topic) orelse return null;
+        return mp.peers.count();
+    }
+
     pub fn inboundDeliveredCount(self: *const Gossipsub) u64 {
         return self.inbound_delivered;
     }
@@ -318,6 +386,7 @@ test "gossipsub subscribe, graft mesh, dedup, forward" {
     defer a.free(graft_rpc);
     try g.handleInboundRpc(p1, graft_rpc);
     try std.testing.expectEqual(@as(u64, 1), g.meshPeers());
+    try std.testing.expectEqual(@as(?usize, 1), g.meshPeerCountForTopic("blocks"));
 
     const inner = try msg_mod.encode(a, .{ .topic = "blocks", .data = "hello" });
     defer a.free(inner);
@@ -371,4 +440,159 @@ test "mesh forward targets non-sender peer" {
     }
     try std.testing.expect(saw_pb);
     try std.testing.expect(!saw_pa);
+}
+
+test "Gossipsub init rejects invalid mesh knobs" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    try std.testing.expectError(
+        error.InvalidMeshKnobs,
+        Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 9, .mesh_n = 8, .mesh_n_high = 12 }),
+    );
+    try std.testing.expectError(
+        error.InvalidMeshKnobs,
+        Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 6, .mesh_n = 12, .mesh_n_high = 8 }),
+    );
+}
+
+test "heartbeat emits GRAFT when mesh below mesh_n_low" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const remote = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 2, .mesh_n = 2, .mesh_n_high = 12 });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    const sub_d = g.popOutboxDelivery().?;
+    defer a.free(sub_d.wire);
+
+    g.onPeerConnected(remote);
+    try g.heartbeat();
+
+    var saw_graft = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        if (d.to != null and d.to.?.eql(&remote)) {
+            const ctl = (try rpc.decodeControlPayload(a, d.wire)).?;
+            defer a.free(ctl);
+            const graft_topic = (try control.decodeFirstGraftTopic(a, ctl)).?;
+            defer a.free(graft_topic);
+            try std.testing.expectEqualStrings("t", graft_topic);
+            saw_graft = true;
+        }
+    }
+    try std.testing.expect(saw_graft);
+}
+
+test "heartbeat prunes mesh above mesh_n_high down to mesh_n" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 2, .mesh_n_high = 3 });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    const sub_d = g.popOutboxDelivery().?;
+    defer a.free(sub_d.wire);
+
+    var peers: [4]identity.PeerId = undefined;
+    for (&peers) |*p| p.* = try identity.PeerId.random();
+
+    const graft_ctl = try control.encodeGraft(a, "t");
+    defer a.free(graft_ctl);
+    const graft_full = try rpc.encodeControlOnlyRpc(a, graft_ctl);
+    defer a.free(graft_full);
+
+    for (peers) |p| {
+        g.onPeerConnected(p);
+        try g.handleInboundRpc(p, graft_full);
+    }
+    try std.testing.expectEqual(@as(u64, 4), g.meshPeers());
+
+    try g.heartbeat();
+
+    var prune_count: u32 = 0;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if (try control.decodeFirstPrune(a, ctl)) |pv| {
+            var pvv = pv;
+            defer control.deinitPruneView(a, &pvv);
+            prune_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 2), prune_count);
+    try std.testing.expectEqual(@as(?usize, 2), g.meshPeerCountForTopic("t"));
+}
+
+test "two nodes exchange graft then deliver publish forward" {
+    const a = std.testing.allocator;
+    const pa = try identity.PeerId.random();
+    const pb = try identity.PeerId.random();
+
+    var ga = try Gossipsub.init(a, .{ .local_peer_id = pa, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 12 });
+    defer ga.deinit();
+    var gb = try Gossipsub.init(a, .{ .local_peer_id = pb, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 12 });
+    defer gb.deinit();
+
+    try ga.subscribe("t");
+    try gb.subscribe("t");
+    const ga_sub = ga.popOutboxDelivery().?;
+    defer a.free(ga_sub.wire);
+    const gb_sub = gb.popOutboxDelivery().?;
+    defer a.free(gb_sub.wire);
+
+    ga.onPeerConnected(pb);
+    gb.onPeerConnected(pa);
+
+    try ga.heartbeat();
+    const graft_a = ga.popOutboxDelivery().?;
+    defer a.free(graft_a.wire);
+    try std.testing.expect(graft_a.to != null and graft_a.to.?.eql(&pb));
+    try gb.handleInboundRpc(pa, graft_a.wire);
+
+    try gb.heartbeat();
+    const graft_b = gb.popOutboxDelivery().?;
+    defer a.free(graft_b.wire);
+    try std.testing.expect(graft_b.to != null and graft_b.to.?.eql(&pa));
+    try ga.handleInboundRpc(pb, graft_b.wire);
+
+    try std.testing.expectEqual(@as(?usize, 1), ga.meshPeerCountForTopic("t"));
+    try std.testing.expectEqual(@as(?usize, 1), gb.meshPeerCountForTopic("t"));
+
+    const inner = try msg_mod.encode(a, .{ .topic = "t", .data = "payload" });
+    defer a.free(inner);
+    const pubw = try rpc.encodePublish(a, inner);
+    defer a.free(pubw);
+
+    try ga.handleInboundRpc(pb, pubw);
+    const fwd = ga.popOutboxDelivery().?;
+    defer a.free(fwd.wire);
+    try std.testing.expect(fwd.to != null and fwd.to.?.eql(&pb));
+}
+
+test "remote subscription narrows GRAFT candidates" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const pa = try identity.PeerId.random();
+    const pb = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 12 });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    const sub_d = g.popOutboxDelivery().?;
+    defer a.free(sub_d.wire);
+
+    g.onPeerConnected(pa);
+    g.onPeerConnected(pb);
+
+    const pa_sub = try rpc.encodeSubscribe(a, "t", true);
+    defer a.free(pa_sub);
+    try g.handleInboundRpc(pa, pa_sub);
+
+    try g.heartbeat();
+    const d = g.popOutboxDelivery().?;
+    defer a.free(d.wire);
+    try std.testing.expect(d.to != null and d.to.?.eql(&pa));
 }
