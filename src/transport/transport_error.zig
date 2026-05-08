@@ -66,6 +66,10 @@ pub fn fromLibp2pTls(_: libp2p_tls.Error) errors.TransportError {
     return error.SecurityUpgradeFailed;
 }
 
+pub fn fromLibp2pTlsVerify(_: libp2p_tls.VerifyPeerCertificateError) errors.TransportError {
+    return error.SecurityUpgradeFailed;
+}
+
 // ── zquic (RFC 9000 wire codes, stream limits, demo I/O setup) ─────────────
 
 /// Opening a local stream past the peer's `MAX_STREAMS` limit (`rawAllocateNextLocalBidiStream`, etc.).
