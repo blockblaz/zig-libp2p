@@ -2,15 +2,35 @@
 
 const std = @import("std");
 const w = @import("../protobuf/wire.zig");
+const lim = @import("wire_limits.zig");
 
-pub const Error = w.Error || error{ MissingPruneTopic, MissingIHaveTopic };
+pub const Error = w.Error || error{
+    MissingPruneTopic,
+    MissingIHaveTopic,
+    WireLimitExceeded,
+};
+
+fn checkControlEntryLen(len: usize) Error!void {
+    if (len > lim.max_control_entry_bytes) return error.WireLimitExceeded;
+}
+
+fn checkTopicLen(len: usize) Error!void {
+    if (len > lim.max_topic_str_bytes) return error.WireLimitExceeded;
+}
+
+fn checkMessageIdLen(len: usize) Error!void {
+    if (len > lim.max_message_id_bytes) return error.WireLimitExceeded;
+}
 
 /// `repeated ControlIHave ihave = 1` with one entry: topic plus optional message id list.
-pub fn encodeIHave(allocator: std.mem.Allocator, topic_id: []const u8, message_ids: []const []const u8) std.mem.Allocator.Error![]u8 {
+pub fn encodeIHave(allocator: std.mem.Allocator, topic_id: []const u8, message_ids: []const []const u8) (Error || std.mem.Allocator.Error)![]u8 {
+    try checkTopicLen(topic_id.len);
+    if (message_ids.len > lim.max_message_ids_per_entry) return error.WireLimitExceeded;
     var inner = std.ArrayList(u8).empty;
     defer inner.deinit(allocator);
     try w.appendLengthDelimited(&inner, allocator, 1, topic_id);
     for (message_ids) |mid| {
+        try checkMessageIdLen(mid.len);
         try w.appendLengthDelimited(&inner, allocator, 2, mid);
     }
 
@@ -36,6 +56,8 @@ pub fn decodeFirstIHave(allocator: std.mem.Allocator, control: []const u8) (Erro
 
         if (key.field_number != 1 or key.wire_type != .length_delimited) continue;
 
+        try checkControlEntryLen(nv.value.len);
+
         var topic: ?[]const u8 = null;
         var ids = std.ArrayList([]u8).empty;
         defer {
@@ -52,10 +74,13 @@ pub fn decodeFirstIHave(allocator: std.mem.Allocator, control: []const u8) (Erro
             switch (ik.field_number) {
                 1 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    try checkTopicLen(iv.value.len);
                     topic = iv.value;
                 },
                 2 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    try checkMessageIdLen(iv.value.len);
+                    if (ids.items.len >= lim.max_message_ids_per_entry) return error.WireLimitExceeded;
                     {
                         const copy = try allocator.dupe(u8, iv.value);
                         errdefer allocator.free(copy);
@@ -85,10 +110,12 @@ pub fn deinitIHaveOwned(allocator: std.mem.Allocator, v: *IHaveOwned) void {
 }
 
 /// `repeated ControlIWant iwant = 2` with one entry holding the given message ids.
-pub fn encodeIWant(allocator: std.mem.Allocator, message_ids: []const []const u8) std.mem.Allocator.Error![]u8 {
+pub fn encodeIWant(allocator: std.mem.Allocator, message_ids: []const []const u8) (Error || std.mem.Allocator.Error)![]u8 {
+    if (message_ids.len > lim.max_message_ids_per_entry) return error.WireLimitExceeded;
     var inner = std.ArrayList(u8).empty;
     defer inner.deinit(allocator);
     for (message_ids) |mid| {
+        try checkMessageIdLen(mid.len);
         try w.appendLengthDelimited(&inner, allocator, 1, mid);
     }
 
@@ -113,6 +140,8 @@ pub fn decodeFirstIWant(allocator: std.mem.Allocator, control: []const u8) (Erro
 
         if (key.field_number != 2 or key.wire_type != .length_delimited) continue;
 
+        try checkControlEntryLen(nv.value.len);
+
         var ids = std.ArrayList([]u8).empty;
         defer {
             for (ids.items) |m| allocator.free(m);
@@ -128,6 +157,8 @@ pub fn decodeFirstIWant(allocator: std.mem.Allocator, control: []const u8) (Erro
             switch (ik.field_number) {
                 1 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    try checkMessageIdLen(iv.value.len);
+                    if (ids.items.len >= lim.max_message_ids_per_entry) return error.WireLimitExceeded;
                     {
                         const copy = try allocator.dupe(u8, iv.value);
                         errdefer allocator.free(copy);
@@ -157,10 +188,12 @@ pub fn deinitIDontWantOwned(allocator: std.mem.Allocator, v: *IDontWantOwned) vo
 }
 
 /// `repeated ControlIDontWant idontwant = 5` with one entry listing the given message ids.
-pub fn encodeIDontWant(allocator: std.mem.Allocator, message_ids: []const []const u8) std.mem.Allocator.Error![]u8 {
+pub fn encodeIDontWant(allocator: std.mem.Allocator, message_ids: []const []const u8) (Error || std.mem.Allocator.Error)![]u8 {
+    if (message_ids.len > lim.max_message_ids_per_entry) return error.WireLimitExceeded;
     var inner = std.ArrayList(u8).empty;
     defer inner.deinit(allocator);
     for (message_ids) |mid| {
+        try checkMessageIdLen(mid.len);
         try w.appendLengthDelimited(&inner, allocator, 1, mid);
     }
 
@@ -181,6 +214,8 @@ pub fn decodeFirstIDontWant(allocator: std.mem.Allocator, control: []const u8) (
 
         if (key.field_number != 5 or key.wire_type != .length_delimited) continue;
 
+        try checkControlEntryLen(nv.value.len);
+
         var ids = std.ArrayList([]u8).empty;
         defer {
             for (ids.items) |m| allocator.free(m);
@@ -196,6 +231,8 @@ pub fn decodeFirstIDontWant(allocator: std.mem.Allocator, control: []const u8) (
             switch (ik.field_number) {
                 1 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    try checkMessageIdLen(iv.value.len);
+                    if (ids.items.len >= lim.max_message_ids_per_entry) return error.WireLimitExceeded;
                     {
                         const copy = try allocator.dupe(u8, iv.value);
                         errdefer allocator.free(copy);
@@ -212,7 +249,8 @@ pub fn decodeFirstIDontWant(allocator: std.mem.Allocator, control: []const u8) (
 }
 
 /// `repeated ControlGraft graft = 3` with a single graft for `topicID`.
-pub fn encodeGraft(allocator: std.mem.Allocator, topic_id: []const u8) std.mem.Allocator.Error![]u8 {
+pub fn encodeGraft(allocator: std.mem.Allocator, topic_id: []const u8) (Error || std.mem.Allocator.Error)![]u8 {
+    try checkTopicLen(topic_id.len);
     var graft = std.ArrayList(u8).empty;
     defer graft.deinit(allocator);
     try w.appendLengthDelimited(&graft, allocator, 1, topic_id);
@@ -224,7 +262,8 @@ pub fn encodeGraft(allocator: std.mem.Allocator, topic_id: []const u8) std.mem.A
 }
 
 /// `repeated ControlPrune prune = 4` with topic and optional backoff (seconds).
-pub fn encodePrune(allocator: std.mem.Allocator, topic_id: []const u8, backoff_seconds: ?u64) std.mem.Allocator.Error![]u8 {
+pub fn encodePrune(allocator: std.mem.Allocator, topic_id: []const u8, backoff_seconds: ?u64) (Error || std.mem.Allocator.Error)![]u8 {
+    try checkTopicLen(topic_id.len);
     var prune = std.ArrayList(u8).empty;
     defer prune.deinit(allocator);
     try w.appendLengthDelimited(&prune, allocator, 1, topic_id);
@@ -250,6 +289,8 @@ pub fn decodeFirstGraftTopic(allocator: std.mem.Allocator, control: []const u8) 
 
         if (key.field_number != 3 or key.wire_type != .length_delimited) continue;
 
+        try checkControlEntryLen(nv.value.len);
+
         var go: usize = 0;
         while (go < nv.value.len) {
             const gk = try w.decodeFieldKey(nv.value[go..]);
@@ -257,6 +298,7 @@ pub fn decodeFirstGraftTopic(allocator: std.mem.Allocator, control: []const u8) 
             const gv = try w.nextFieldValue(nv.value[go..], gk.wire_type);
             go += gv.total;
             if (gk.field_number == 1 and gk.wire_type == .length_delimited) {
+                try checkTopicLen(gv.value.len);
                 return try allocator.dupe(u8, gv.value);
             }
         }
@@ -280,6 +322,8 @@ pub fn decodeFirstPrune(allocator: std.mem.Allocator, control: []const u8) (Erro
 
         if (key.field_number != 4 or key.wire_type != .length_delimited) continue;
 
+        try checkControlEntryLen(nv.value.len);
+
         var topic: ?[]const u8 = null;
         var backoff: ?u64 = null;
         var po: usize = 0;
@@ -291,6 +335,7 @@ pub fn decodeFirstPrune(allocator: std.mem.Allocator, control: []const u8) (Erro
             switch (pk.field_number) {
                 1 => {
                     if (pk.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    try checkTopicLen(pv.value.len);
                     topic = pv.value;
                 },
                 3 => {
@@ -397,4 +442,52 @@ test "prune topic and backoff round trip" {
     defer deinitPruneView(a, &got);
     try std.testing.expectEqualStrings("prune-topic", got.topic);
     try std.testing.expectEqual(@as(?u64, 60), got.backoff_seconds);
+}
+
+test "ihave rejects oversized topic" {
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, lim.max_topic_str_bytes + 1);
+    defer a.free(big);
+    @memset(big, 'z');
+
+    var inner = std.ArrayList(u8).empty;
+    defer inner.deinit(a);
+    try w.appendLengthDelimited(&inner, a, 1, big);
+    var ctl = std.ArrayList(u8).empty;
+    defer ctl.deinit(a);
+    try w.appendLengthDelimited(&ctl, a, 1, inner.items);
+
+    try std.testing.expectError(error.WireLimitExceeded, decodeFirstIHave(a, ctl.items));
+}
+
+test "ihave rejects excess message id count" {
+    const a = std.testing.allocator;
+    var inner = std.ArrayList(u8).empty;
+    defer inner.deinit(a);
+    try w.appendLengthDelimited(&inner, a, 1, "t");
+    var i: usize = 0;
+    while (i < lim.max_message_ids_per_entry + 1) : (i += 1) {
+        try w.appendLengthDelimited(&inner, a, 2, "");
+    }
+    var ctl = std.ArrayList(u8).empty;
+    defer ctl.deinit(a);
+    try w.appendLengthDelimited(&ctl, a, 1, inner.items);
+
+    try std.testing.expectError(error.WireLimitExceeded, decodeFirstIHave(a, ctl.items));
+}
+
+test "iwant rejects oversized message id" {
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, lim.max_message_id_bytes + 1);
+    defer a.free(big);
+    @memset(big, 0);
+
+    var inner = std.ArrayList(u8).empty;
+    defer inner.deinit(a);
+    try w.appendLengthDelimited(&inner, a, 1, big);
+    var ctl = std.ArrayList(u8).empty;
+    defer ctl.deinit(a);
+    try w.appendLengthDelimited(&ctl, a, 2, inner.items);
+
+    try std.testing.expectError(error.WireLimitExceeded, decodeFirstIWant(a, ctl.items));
 }

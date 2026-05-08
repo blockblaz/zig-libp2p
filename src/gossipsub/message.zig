@@ -2,8 +2,9 @@
 
 const std = @import("std");
 const w = @import("../protobuf/wire.zig");
+const lim = @import("wire_limits.zig");
 
-pub const Error = w.Error;
+pub const Error = w.Error || error{WireLimitExceeded};
 
 pub const MessageView = struct {
     from: ?[]const u8 = null,
@@ -39,7 +40,19 @@ fn appendOptBytes(list: *std.ArrayList(u8), allocator: std.mem.Allocator, field:
     }
 }
 
-pub fn encode(allocator: std.mem.Allocator, msg: MessageView) std.mem.Allocator.Error![]u8 {
+fn checkOpt(max: usize, slice: ?[]const u8) Error!void {
+    if (slice) |s| {
+        if (s.len > max) return error.WireLimitExceeded;
+    }
+}
+
+pub fn encode(allocator: std.mem.Allocator, msg: MessageView) (Error || std.mem.Allocator.Error)![]u8 {
+    try checkOpt(lim.max_gossip_message_from_bytes, msg.from);
+    try checkOpt(lim.max_gossip_message_data_bytes, msg.data);
+    try checkOpt(lim.max_gossip_message_seqno_bytes, msg.seqno);
+    try checkOpt(lim.max_gossip_message_topic_bytes, msg.topic);
+    try checkOpt(lim.max_gossip_message_signature_bytes, msg.signature);
+    try checkOpt(lim.max_gossip_message_key_bytes, msg.key);
     var list = std.ArrayList(u8).empty;
     defer list.deinit(allocator);
     try appendOptBytes(&list, allocator, 1, msg.from);
@@ -52,6 +65,8 @@ pub fn encode(allocator: std.mem.Allocator, msg: MessageView) std.mem.Allocator.
 }
 
 pub fn decode(allocator: std.mem.Allocator, wire: []const u8) (Error || std.mem.Allocator.Error)!MessageOwned {
+    if (wire.len > lim.max_gossip_message_wire_bytes) return error.WireLimitExceeded;
+
     var out: MessageOwned = .{};
     errdefer out.deinit(allocator);
 
@@ -63,6 +78,18 @@ pub fn decode(allocator: std.mem.Allocator, wire: []const u8) (Error || std.mem.
         off += nv.total;
 
         if (key.wire_type != .length_delimited) return error.UnsupportedWireType;
+
+        const max_for_field: usize = switch (key.field_number) {
+            1 => lim.max_gossip_message_from_bytes,
+            2 => lim.max_gossip_message_data_bytes,
+            3 => lim.max_gossip_message_seqno_bytes,
+            4 => lim.max_gossip_message_topic_bytes,
+            5 => lim.max_gossip_message_signature_bytes,
+            6 => lim.max_gossip_message_key_bytes,
+            else => return error.UnsupportedWireType,
+        };
+        if (nv.value.len > max_for_field) return error.WireLimitExceeded;
+
         const duped = try allocator.dupe(u8, nv.value);
         errdefer allocator.free(duped);
 
@@ -111,4 +138,14 @@ test "message topic and data round trip" {
     defer got.deinit(a);
     try std.testing.expectEqualStrings("blocks", got.topic.?);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, got.data.?);
+}
+
+test "decode rejects oversized data field" {
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, lim.max_gossip_message_data_bytes + 1);
+    defer a.free(big);
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try w.appendLengthDelimited(&list, a, 2, big);
+    try std.testing.expectError(error.WireLimitExceeded, decode(a, list.items));
 }
