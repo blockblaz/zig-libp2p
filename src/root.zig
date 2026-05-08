@@ -27,6 +27,7 @@ pub const protobuf = struct {
 /// Libp2p peer IDs (`blockblaz/peer-id`), same pin as `multiaddr-zig`.
 pub const peer_id = @import("peer_id");
 pub const identity = @import("identity.zig");
+pub const keypair = @import("keypair.zig");
 
 /// Block Snappy (`zig_snappy`), same module name as in Zeam.
 pub const snappyz = @import("snappyz");
