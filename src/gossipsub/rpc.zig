@@ -3,8 +3,12 @@
 
 const std = @import("std");
 const w = @import("../protobuf/wire.zig");
+const lim = @import("wire_limits.zig");
 
-pub const Error = w.Error || error{MissingSubscribeFields};
+pub const Error = w.Error || error{
+    MissingSubscribeFields,
+    WireLimitExceeded,
+};
 
 /// `optional ControlMessage control = 3` with an empty nested message.
 pub fn encodeEmptyControlRpc(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
@@ -15,7 +19,8 @@ pub fn encodeEmptyControlRpc(allocator: std.mem.Allocator) std.mem.Allocator.Err
 }
 
 /// One `SubOpts` in `repeated SubOpts subscriptions = 1` (subscribe + topic id).
-pub fn encodeSubscribe(allocator: std.mem.Allocator, topic: []const u8, subscribe: bool) std.mem.Allocator.Error![]u8 {
+pub fn encodeSubscribe(allocator: std.mem.Allocator, topic: []const u8, subscribe: bool) (Error || std.mem.Allocator.Error)![]u8 {
+    if (topic.len > lim.max_topic_str_bytes) return error.WireLimitExceeded;
     var sub = std.ArrayList(u8).empty;
     defer sub.deinit(allocator);
     try w.appendFieldKey(&sub, allocator, 1, .varint);
@@ -50,6 +55,8 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
         if (key.field_number != 1) continue;
         if (key.wire_type != .length_delimited) return error.UnsupportedWireType;
 
+        if (v.len > lim.max_subopts_blob_bytes) return error.WireLimitExceeded;
+
         var sub_off: usize = 0;
         var subscribe: ?bool = null;
         var topic: ?[]const u8 = null;
@@ -69,6 +76,7 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
                 },
                 2 => {
                     if (sk.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    if (chunk.len > lim.max_topic_str_bytes) return error.WireLimitExceeded;
                     topic = chunk;
                 },
                 else => return error.UnsupportedWireType,
@@ -96,6 +104,7 @@ pub fn decodeControlPayload(allocator: std.mem.Allocator, rpc: []const u8) (Erro
         off += nv.total;
 
         if (key.field_number == 3 and key.wire_type == .length_delimited) {
+            if (v.len > lim.max_rpc_length_delimited_bytes) return error.WireLimitExceeded;
             return try allocator.dupe(u8, v);
         }
     }
@@ -108,7 +117,8 @@ pub fn deinitSubscribeView(allocator: std.mem.Allocator, s: *SubscribeView) void
 }
 
 /// `repeated Message publish = 2` with a single encoded `Message` wire blob.
-pub fn encodePublish(allocator: std.mem.Allocator, message_wire: []const u8) std.mem.Allocator.Error![]u8 {
+pub fn encodePublish(allocator: std.mem.Allocator, message_wire: []const u8) (Error || std.mem.Allocator.Error)![]u8 {
+    if (message_wire.len > lim.max_rpc_length_delimited_bytes) return error.WireLimitExceeded;
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
     try w.appendLengthDelimited(&out, allocator, 2, message_wire);
@@ -124,6 +134,7 @@ pub fn decodeFirstPublish(allocator: std.mem.Allocator, rpc: []const u8) (Error 
         const nv = try w.nextFieldValue(rpc[off..], key.wire_type);
         off += nv.total;
         if (key.field_number == 2 and key.wire_type == .length_delimited) {
+            if (nv.value.len > lim.max_rpc_length_delimited_bytes) return error.WireLimitExceeded;
             return try allocator.dupe(u8, nv.value);
         }
     }
@@ -171,4 +182,14 @@ test "publish wraps message wire" {
     defer decoded.deinit(a);
     try std.testing.expectEqualStrings("t", decoded.topic.?);
     try std.testing.expectEqualStrings("payload", decoded.data.?);
+}
+
+test "decodeControlPayload rejects oversized field" {
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, lim.max_rpc_length_delimited_bytes + 1);
+    defer a.free(big);
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try w.appendLengthDelimited(&list, a, 3, big);
+    try std.testing.expectError(error.WireLimitExceeded, decodeControlPayload(a, list.items));
 }
