@@ -48,6 +48,7 @@ pub const transport = struct {
     pub const stream_multistream = @import("transport/stream_multistream.zig");
     pub const tcp = @import("transport/tcp.zig");
     pub const multistream_negotiate = @import("transport/multistream_negotiate.zig");
+    pub const transport_error = @import("transport/transport_error.zig");
 };
 
 pub const security = struct {

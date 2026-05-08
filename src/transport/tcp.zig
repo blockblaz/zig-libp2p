@@ -7,7 +7,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const net = Io.net;
+const errors = @import("../errors.zig");
 const sm = @import("stream_multistream.zig");
+const terr = @import("transport_error.zig");
 const posix = std.posix;
 const c = std.c;
 
@@ -52,25 +54,25 @@ pub const ConnectOptions = struct {
     tuning: StreamSocketTuning = .{},
 };
 
-pub fn listen(address: *const net.IpAddress, io: Io, options: ListenOptions) net.IpAddress.ListenError!net.Server {
+pub fn listen(address: *const net.IpAddress, io: Io, options: ListenOptions) errors.TransportError!net.Server {
     return net.IpAddress.listen(address, io, .{
         .kernel_backlog = options.kernel_backlog,
         .reuse_address = options.reuse_address,
         .mode = .stream,
         .protocol = .tcp,
-    });
+    }) catch |e| return terr.fromIpListen(e);
 }
 
 pub fn dial(
     address: *const net.IpAddress,
     io: Io,
     options: ConnectOptions,
-) (net.IpAddress.ConnectError || ApplyStreamSocketTuningError)!net.Stream {
-    var stream = try net.IpAddress.connect(address, io, .{
+) (errors.TransportError || ApplyStreamSocketTuningError)!net.Stream {
+    var stream = net.IpAddress.connect(address, io, .{
         .mode = .stream,
         .protocol = .tcp,
         .timeout = options.timeout,
-    });
+    }) catch |e| return terr.fromIpConnect(e);
     applyStreamSocketTuning(stream.socket.handle, options.tuning) catch |err| {
         stream.close(io);
         return err;
@@ -82,8 +84,8 @@ pub fn acceptTuned(
     server: *net.Server,
     io: Io,
     tuning: StreamSocketTuning,
-) (net.Server.AcceptError || ApplyStreamSocketTuningError)!net.Stream {
-    var stream = try server.accept(io);
+) (errors.TransportError || ApplyStreamSocketTuningError)!net.Stream {
+    var stream = server.accept(io) catch |e| return terr.fromServerAccept(e);
     applyStreamSocketTuning(stream.socket.handle, tuning) catch |err| {
         stream.close(io);
         return err;
