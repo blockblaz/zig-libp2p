@@ -24,7 +24,7 @@ const zig_libp2p = @import("zig_libp2p");
 // zig_libp2p.protocol, zig_libp2p.varint, zig_libp2p.addr_list, zig_libp2p.req_resp.frame
 ```
 
-Run this repo’s tests: `zig build test`.
+Run this repo’s tests locally: `zig build test`. On push and pull request, GitHub Actions runs `zig fmt --check .`, `zig build test`, and `zig build` (see `.github/workflows/ci.yml`).
 
 ## Suggested review-sized PRs (historical)
 
