@@ -7,7 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const net = Io.net;
-const neg = @import("multistream_negotiate.zig");
+const sm = @import("stream_multistream.zig");
 const posix = std.posix;
 const c = std.c;
 
@@ -92,32 +92,9 @@ pub fn acceptTuned(
 }
 
 /// First multistream-select messages on a new TCP stream: `/multistream/1.0.0\n` then `protocol_id\n`.
-pub fn appendFirstStreamInitiatorHandshake(
-    write: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    protocol_id: []const u8,
-) (neg.NegotiateError || std.mem.Allocator.Error)!void {
-    try neg.initiatorSendMultistreamHeader(write, allocator);
-    try neg.initiatorSendProtocol(write, allocator, protocol_id);
-}
+pub const appendFirstStreamInitiatorHandshake = sm.appendFirstStreamInitiatorHandshake;
 
-pub const StreamHandshakeError = neg.NegotiateError || Io.Writer.Error || Io.Reader.ShortError || std.mem.Allocator.Error;
-
-const handshake_accum_cap = 1024;
-
-fn compactConsumed(acc: *std.ArrayList(u8), allocator: std.mem.Allocator, rem: []const u8) std.mem.Allocator.Error!void {
-    const consumed = acc.items.len - rem.len;
-    try acc.replaceRange(allocator, 0, consumed, &.{});
-}
-
-fn readMoreHandshake(acc: *std.ArrayList(u8), r: *Io.Reader, allocator: std.mem.Allocator) StreamHandshakeError!void {
-    if (acc.items.len >= handshake_accum_cap) return error.LineTooLong;
-    var chunk: [512]u8 = undefined;
-    const n = try r.readSliceShort(&chunk);
-    if (n == 0) return error.MissingNewline;
-    try acc.appendSlice(allocator, chunk[0..n]);
-    if (acc.items.len > handshake_accum_cap) return error.LineTooLong;
-}
+pub const StreamHandshakeError = sm.StreamHandshakeError;
 
 /// Run the initiator side of multistream-select 1.0.0 for `protocol_id` on a connected TCP stream.
 pub fn initiatorHandshakeMultistream(
@@ -128,39 +105,9 @@ pub fn initiatorHandshakeMultistream(
     scratch_w: []u8,
     allocator: std.mem.Allocator,
 ) StreamHandshakeError!void {
-    var acc = std.ArrayList(u8).empty;
-    defer acc.deinit(allocator);
-
     var r = net.Stream.reader(stream, io, scratch_r);
     var w = net.Stream.writer(stream, io, scratch_w);
-
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-    try appendFirstStreamInitiatorHandshake(&out, allocator, protocol_id);
-    try Io.Writer.writeAll(&w.interface, out.items);
-    try Io.Writer.flush(&w.interface);
-
-    while (true) {
-        var rem: []const u8 = acc.items;
-        if (neg.initiatorReadPeerMultistream(&rem, neg.default_max_body_len)) |_| {
-            try compactConsumed(&acc, allocator, rem);
-            break;
-        } else |err| switch (err) {
-            error.MissingNewline => try readMoreHandshake(&acc, &r.interface, allocator),
-            else => return err,
-        }
-    }
-
-    while (true) {
-        var rem: []const u8 = acc.items;
-        if (neg.initiatorReadProtocolAck(&rem, protocol_id, neg.default_max_body_len)) |_| {
-            try compactConsumed(&acc, allocator, rem);
-            return;
-        } else |err| switch (err) {
-            error.MissingNewline => try readMoreHandshake(&acc, &r.interface, allocator),
-            else => return err,
-        }
-    }
+    return sm.initiatorHandshakeMultistream(&r.interface, &w.interface, protocol_id, allocator);
 }
 
 /// Run the responder side: accept multistream, echo header, accept one protocol offer, reply if supported.
@@ -172,45 +119,9 @@ pub fn responderHandshakeMultistream(
     scratch_w: []u8,
     allocator: std.mem.Allocator,
 ) StreamHandshakeError!void {
-    var acc = std.ArrayList(u8).empty;
-    defer acc.deinit(allocator);
-
     var r = net.Stream.reader(stream, io, scratch_r);
     var w = net.Stream.writer(stream, io, scratch_w);
-
-    while (true) {
-        var rem: []const u8 = acc.items;
-        if (neg.responderReadMultistreamOffer(&rem, neg.default_max_body_len)) |_| {
-            try compactConsumed(&acc, allocator, rem);
-            break;
-        } else |err| switch (err) {
-            error.MissingNewline => try readMoreHandshake(&acc, &r.interface, allocator),
-            else => return err,
-        }
-    }
-
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-    try neg.responderSendMultistreamHeader(&out, allocator);
-    try Io.Writer.writeAll(&w.interface, out.items);
-    try Io.Writer.flush(&w.interface);
-
-    while (true) {
-        var rem: []const u8 = acc.items;
-        const offered = neg.responderReadProtocolOffer(&rem, neg.default_max_body_len) catch |err| switch (err) {
-            error.MissingNewline => {
-                try readMoreHandshake(&acc, &r.interface, allocator);
-                continue;
-            },
-            else => return err,
-        };
-        try compactConsumed(&acc, allocator, rem);
-        out.clearRetainingCapacity();
-        try neg.responderReplyProtocol(&out, allocator, offered, supported_protocol_id);
-        try Io.Writer.writeAll(&w.interface, out.items);
-        try Io.Writer.flush(&w.interface);
-        return;
-    }
+    return sm.responderHandshakeMultistream(&r.interface, &w.interface, supported_protocol_id, allocator);
 }
 
 test "tcp identifiers" {
