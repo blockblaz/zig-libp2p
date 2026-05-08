@@ -24,7 +24,7 @@ const zig_libp2p = @import("zig_libp2p");
 // zig_libp2p.protocol, zig_libp2p.varint, zig_libp2p.addr_list, zig_libp2p.req_resp.frame
 ```
 
-Run this repo’s tests locally: `zig build test`. On push and pull request, GitHub Actions runs `zig fmt --check .`, `zig build test`, and `zig build` (see `.github/workflows/ci.yml`).
+Run this repo’s tests locally: `zig build test`. CI matches [Zeam’s workflow pattern](https://github.com/blockblaz/zeam/blob/main/.github/workflows/ci.yml) for Zig: `mlugg/setup-zig@v2.0.5` at **0.16.0**, `actions/cache` on `~/.cache/zig`, `zig build --fetch` with retries, then `zig fmt --check .`, `zig build test --summary all`, and `zig build` (each with the same retry style where applicable). See `.github/workflows/ci.yml`.
 
 ## Suggested review-sized PRs (historical)
 
