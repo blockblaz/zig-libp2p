@@ -113,7 +113,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `req_resp.frame` | Length-prefixed framing: `max_rpc_message_size`, `parseRequestHeader`, `parseResponseHeader`, `appendRequestPrefix`, `appendResponsePrefix`; `FrameError` = `errors.ReqRespError` |
 | `req_resp.stream` | Incremental scan: `peekRpcUnaryRequest` / `peekRpcUnaryResponse`, `scanCompleteRequest` / `scanCompleteResponse`, `consumePrefix`, `InboundBuffer` |
 | `req_resp.snappy_wire` | Snappy + framing for `ssz_snappy`: `compressBlock`, `decompressBlock`, `compressFramed`, `decompressFramed`, `buildRequestWire`, `buildResponseWire`, `decodeRequestSsz`, `decodeResponseSsz` |
-| `req_resp.runtime` | `ReqResp` / `ReqRespConfig`: outbound `request_id`, inbound `channel_id` via `registerInboundChannel` (wire `request_id` + `RpcRequest.channel_id`), `sendResponseChunk`/`finishResponseStream`/`sendErrorResponse(channel_id,…)`, `create`/`destroy`, `shutdown`, timeouts (#40) |
+| `req_resp.runtime` | `ReqResp` / `ReqRespConfig`: outbound `request_id`, inbound `channel_id`, `onPeerDisconnected` → `Disconnected`, `sendResponseChunk` / `finishResponseStream` / `sendErrorResponse`, `create`/`destroy`, `shutdown`, timeouts (#40) |
 
 ### `transport`
 

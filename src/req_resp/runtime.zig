@@ -6,6 +6,9 @@
 //! [`registerInboundChannel`] before queuing [`swarm.Event.rpc_request`] with the returned
 //! `channel_id`, then respond with [`sendResponseChunk`], [`finishResponseStream`], or
 //! [`sendErrorResponse`] using that `channel_id`.
+//!
+//! When the transport drops the last session to a peer, call [`onPeerDisconnected`] so pending
+//! outbound work and open inbound response channels emit [`errors.ReqRespError.Disconnected`] (#40).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -210,6 +213,55 @@ pub const ReqResp = struct {
                 .peer = ent.value.peer,
                 .request_id = ent.value.stream_request_id,
                 .kind = error.StreamTimedOut,
+            } });
+        }
+    }
+
+    /// Call when the peer has no remaining connection (transport callback). Cancels pending outbound
+    /// requests and open inbound response channels, emitting [`errors.ReqRespError.Disconnected`].
+    pub fn onPeerDisconnected(self: *ReqResp, peer: identity.PeerId) std.mem.Allocator.Error!void {
+        var drop_out = std.ArrayList(u64).init(self.allocator);
+        defer drop_out.deinit(self.allocator);
+        {
+            var it = self.pending_out.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.peer.eql(&peer)) {
+                    try drop_out.append(e.key_ptr.*);
+                }
+            }
+        }
+        for (drop_out.items) |rid| {
+            _ = self.pending_out.remove(rid);
+            try self.swarm.queueEvent(.{ .rpc_error_response = .{
+                .peer = peer,
+                .request_id = rid,
+                .kind = error.Disconnected,
+            } });
+        }
+
+        const InboundDrop = struct {
+            channel_id: u64,
+            stream_request_id: u64,
+        };
+        var drop_in = std.ArrayList(InboundDrop).init(self.allocator);
+        defer drop_in.deinit(self.allocator);
+        {
+            var it = self.inbound.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.peer.eql(&peer)) {
+                    try drop_in.append(.{
+                        .channel_id = e.key_ptr.*,
+                        .stream_request_id = e.value_ptr.stream_request_id,
+                    });
+                }
+            }
+        }
+        for (drop_in.items) |d| {
+            _ = self.inbound.remove(d.channel_id);
+            try self.swarm.queueEvent(.{ .rpc_error_response = .{
+                .peer = peer,
+                .request_id = d.stream_request_id,
+                .kind = error.Disconnected,
             } });
         }
     }
@@ -446,6 +498,187 @@ test "req_resp create destroy and shutdown clears maps" {
     rr.shutdown();
     try std.testing.expectEqual(@as(u32, 0), rr.pending_out.count());
     try std.testing.expectEqual(@as(u32, 0), rr.inbound.count());
+
+    swarm.shutdown();
+    while (true) {
+        var ev = swarm.nextEvent(5000) catch break;
+        defer ev.deinit(a);
+        if (std.meta.activeTag(ev) == .swarm_closed) break;
+    }
+}
+
+test "req_resp onPeerDisconnected emits Disconnected for pending outbound" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var rr = ReqResp.init(a, &swarm, .{ .request_timeout_ms = 60_000, .response_idle_timeout_ms = 60_000 });
+    defer rr.deinit();
+
+    const peer = try identity.PeerId.random();
+    const rid = try rr.sendRequest(peer, .status, "x", 0);
+
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_request, std.meta.activeTag(ev));
+    }
+
+    try rr.onPeerDisconnected(peer);
+
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_error_response, std.meta.activeTag(ev));
+        try std.testing.expectEqual(error.Disconnected, ev.rpc_error_response.kind);
+        try std.testing.expectEqual(rid, ev.rpc_error_response.request_id);
+        try std.testing.expect(ev.rpc_error_response.peer.eql(&peer));
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), rr.pending_out.count());
+
+    swarm.shutdown();
+    while (true) {
+        var ev = swarm.nextEvent(5000) catch break;
+        defer ev.deinit(a);
+        if (std.meta.activeTag(ev) == .swarm_closed) break;
+    }
+}
+
+test "req_resp onPeerDisconnected clears inbound channels" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var rr = ReqResp.init(a, &swarm, .{});
+    defer rr.deinit();
+
+    const peer = try identity.PeerId.random();
+    const stream_rid: u64 = 404;
+    const cid = try rr.registerInboundChannel(peer, .blocks_by_range, stream_rid, 0);
+    try queueInboundRpcRequest(a, &swarm, peer, .blocks_by_range, stream_rid, cid, "");
+
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_request, std.meta.activeTag(ev));
+    }
+
+    try rr.onPeerDisconnected(peer);
+
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_error_response, std.meta.activeTag(ev));
+        try std.testing.expectEqual(error.Disconnected, ev.rpc_error_response.kind);
+        try std.testing.expectEqual(stream_rid, ev.rpc_error_response.request_id);
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), rr.inbound.count());
+    try std.testing.expectError(error.UnknownInboundChannel, rr.sendResponseChunk(cid, "nope", 0));
+
+    swarm.shutdown();
+    while (true) {
+        var ev = swarm.nextEvent(5000) catch break;
+        defer ev.deinit(a);
+        if (std.meta.activeTag(ev) == .swarm_closed) break;
+    }
+}
+
+test "req_resp single response chunk then end of stream" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var rr = ReqResp.init(a, &swarm, .{});
+    defer rr.deinit();
+
+    const peer = try identity.PeerId.random();
+    const stream_rid: u64 = 1;
+    const cid = try rr.registerInboundChannel(peer, .status, stream_rid, 0);
+    try queueInboundRpcRequest(a, &swarm, peer, .status, stream_rid, cid, "req");
+
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_request, std.meta.activeTag(ev));
+    }
+
+    try rr.sendResponseChunk(cid, "status-bytes", 0);
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_response_chunk, std.meta.activeTag(ev));
+        try std.testing.expectEqualStrings("status-bytes", ev.rpc_response_chunk.chunk);
+    }
+
+    try rr.finishResponseStream(cid);
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_response_end, std.meta.activeTag(ev));
+        try std.testing.expect(ev.rpc_response_end.peer.eql(&peer));
+        try std.testing.expectEqual(stream_rid, ev.rpc_response_end.request_id);
+    }
+
+    swarm.shutdown();
+    while (true) {
+        var ev = swarm.nextEvent(5000) catch break;
+        defer ev.deinit(a);
+        if (std.meta.activeTag(ev) == .swarm_closed) break;
+    }
+}
+
+test "req_resp multiple response chunks then end of stream" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var rr = ReqResp.init(a, &swarm, .{});
+    defer rr.deinit();
+
+    const peer = try identity.PeerId.random();
+    const stream_rid: u64 = 2;
+    const cid = try rr.registerInboundChannel(peer, .blocks_by_range, stream_rid, 0);
+    try queueInboundRpcRequest(a, &swarm, peer, .blocks_by_range, stream_rid, cid, "range-req");
+
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_request, std.meta.activeTag(ev));
+    }
+
+    for ([_][]const u8{ "blk_a", "blk_b", "blk_c" }) |part| {
+        try rr.sendResponseChunk(cid, part, 0);
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_response_chunk, std.meta.activeTag(ev));
+        try std.testing.expectEqualStrings(part, ev.rpc_response_chunk.chunk);
+    }
+
+    try rr.finishResponseStream(cid);
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_response_end, std.meta.activeTag(ev));
+        try std.testing.expectEqual(stream_rid, ev.rpc_response_end.request_id);
+    }
 
     swarm.shutdown();
     while (true) {

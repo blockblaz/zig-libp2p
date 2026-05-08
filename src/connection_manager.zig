@@ -3,6 +3,9 @@
 //! Embedders call [`ConnectionManager.tick`] with a monotonic clock and forward transport
 //! callbacks into [`onConnectionEstablished`], [`onConnectionClosed`], and [`onDialFailure`].
 //! Dial commands use multiaddrs with `/p2p` stripped so the transport dials by address only.
+//!
+//! If you use `req_resp.runtime.ReqResp`, call `onPeerDisconnected` when the peer has no remaining
+//! connection (for example after [`onConnectionClosed`] when the last session to that peer ends).
 
 const std = @import("std");
 const multiaddr = @import("multiaddr");
