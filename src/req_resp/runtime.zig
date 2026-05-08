@@ -1,11 +1,11 @@
-//! Req/resp runtime helpers: outbound `request_id` tracking, request timeouts, inbound response
-//! channel idle timeouts, and [`swarm.SwarmCommand`] wiring (#40).
+//! Req/resp runtime helpers (#40): outbound `request_id` tracking, per-inbound `channel_id`,
+//! request/idle timeouts, and [`swarm.SwarmCommand`] wiring.
 //!
-//! Embedders must call [`ReqResp.tick`] periodically with a monotonic millisecond clock. After
-//! [`ReqResp.sendRequest`], drain or handle swarm events as usual; when a matching response stream
-//! ends (success or peer error), call [`ReqResp.completeOutbound`] so the pending slot is cleared.
-//! When serving inbound RPC, call [`ReqResp.onInboundRpcRequest`] so idle timeouts apply, then use
-//! [`sendResponseChunk`], [`finishResponseStream`], or [`sendErrorResponse`].
+//! Call [`ReqResp.tick`] with a monotonic millisecond clock. After [`sendRequest`], call
+//! [`completeOutbound`] when the response stream ends. For inbound RPC, call
+//! [`registerInboundChannel`] before queuing [`swarm.Event.rpc_request`] with the returned
+//! `channel_id`, then respond with [`sendResponseChunk`], [`finishResponseStream`], or
+//! [`sendErrorResponse`] using that `channel_id`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,30 +24,20 @@ pub const ReqRespConfig = struct {
     response_idle_timeout_ms: i64 = 5 * 60 * 1000,
 };
 
-pub const ChannelKey = struct {
-    peer: identity.PeerId,
-    request_id: u64,
-
-    pub const Context = struct {
-        pub fn hash(_: Context, k: ChannelKey) u64 {
-            var buf: [128]u8 = undefined;
-            const b = k.peer.toBytes(&buf) catch return k.request_id;
-            const h = std.hash.Wyhash.hash(0, b);
-            return h ^ std.hash.Wyhash.hash(0, std.mem.asBytes(&k.request_id));
-        }
-        pub fn eql(_: Context, a: ChannelKey, b: ChannelKey, _: usize) bool {
-            return a.request_id == b.request_id and a.peer.eql(&b.peer);
-        }
-    };
-};
-
 const PendingOutbound = struct {
     peer: identity.PeerId,
     deadline_ms: i64,
 };
 
 const InboundChannel = struct {
+    peer: identity.PeerId,
+    protocol: protocol.LeanSupportedProtocol,
+    stream_request_id: u64,
     last_activity_ms: i64,
+};
+
+pub const Error = error{
+    UnknownInboundChannel,
 };
 
 pub const ReqResp = struct {
@@ -55,8 +45,9 @@ pub const ReqResp = struct {
     swarm: *swarm_mod.Swarm,
     cfg: ReqRespConfig,
     next_request_id: u64 = 1,
+    next_channel_id: u64 = 1,
     pending_out: std.AutoHashMap(u64, PendingOutbound),
-    inbound: std.HashMap(ChannelKey, InboundChannel, ChannelKey.Context, std.hash_map.default_max_load_percentage),
+    inbound: std.AutoHashMap(u64, InboundChannel),
 
     pub fn init(allocator: std.mem.Allocator, s: *swarm_mod.Swarm, cfg: ReqRespConfig) ReqResp {
         return .{
@@ -68,9 +59,28 @@ pub const ReqResp = struct {
         };
     }
 
+    pub fn create(allocator: std.mem.Allocator, s: *swarm_mod.Swarm, cfg: ReqRespConfig) std.mem.Allocator.Error!*ReqResp {
+        const p = try allocator.create(ReqResp);
+        errdefer allocator.destroy(p);
+        p.* = ReqResp.init(allocator, s, cfg);
+        return p;
+    }
+
+    pub fn destroy(self: *ReqResp) void {
+        const a = self.allocator;
+        self.deinit();
+        a.destroy(self);
+    }
+
     pub fn deinit(self: *ReqResp) void {
         self.pending_out.deinit(self.allocator);
         self.inbound.deinit(self.allocator);
+    }
+
+    /// Clears outbound and inbound state without emitting events (does not stop the swarm).
+    pub fn shutdown(self: *ReqResp) void {
+        self.pending_out.clearRetainingCapacity();
+        self.inbound.clearRetainingCapacity();
     }
 
     /// Allocates a monotonic `request_id`, records a deadline, and submits [`SwarmCommand.send_request`].
@@ -90,12 +100,12 @@ pub const ReqResp = struct {
             .peer = peer,
             .protocol = proto,
             .request_id = id,
+            .channel_id = 0,
             .payload = payload,
         } });
         return id;
     }
 
-    /// Drops the outbound deadline without emitting an event (does not cancel transport I/O).
     pub fn cancelRequest(self: *ReqResp, request_id: u64) void {
         _ = self.pending_out.remove(request_id);
     }
@@ -106,50 +116,56 @@ pub const ReqResp = struct {
         _ = self.pending_out.remove(request_id);
     }
 
-    /// Register an inbound RPC so [`tick`] can enforce [`ReqRespConfig.response_idle_timeout_ms`].
-    pub fn onInboundRpcRequest(self: *ReqResp, r: swarm_mod.RpcRequest, now_ms: i64) std.mem.Allocator.Error!void {
-        const key = ChannelKey{ .peer = r.peer, .request_id = r.request_id };
-        try self.inbound.put(key, .{ .last_activity_ms = now_ms });
+    /// Returns `channel_id` for [`swarm.RpcRequest.channel_id`]. `request_id` is the stream
+    /// correlation for response commands (`send_response_chunk`, `rpc_response_chunk`, …).
+    pub fn registerInboundChannel(
+        self: *ReqResp,
+        peer: identity.PeerId,
+        proto: protocol.LeanSupportedProtocol,
+        request_id: u64,
+        now_ms: i64,
+    ) std.mem.Allocator.Error!u64 {
+        const ch = self.next_channel_id;
+        self.next_channel_id += 1;
+        try self.inbound.put(ch, .{
+            .peer = peer,
+            .protocol = proto,
+            .stream_request_id = request_id,
+            .last_activity_ms = now_ms,
+        });
+        return ch;
     }
 
     pub fn sendResponseChunk(
         self: *ReqResp,
-        peer: identity.PeerId,
-        request_id: u64,
+        channel_id: u64,
         payload: []const u8,
         now_ms: i64,
-    ) swarm_mod.SubmitError!void {
-        const key = ChannelKey{ .peer = peer, .request_id = request_id };
-        if (self.inbound.getPtr(key)) |ch| {
-            ch.last_activity_ms = now_ms;
-        }
+    ) (Error || swarm_mod.SubmitError)!void {
+        const ent = self.inbound.getPtr(channel_id) orelse return error.UnknownInboundChannel;
+        ent.last_activity_ms = now_ms;
         try self.swarm.submit(.{ .send_response_chunk = .{
-            .peer = peer,
-            .request_id = request_id,
+            .peer = ent.peer,
+            .request_id = ent.stream_request_id,
             .chunk = payload,
         } });
     }
 
-    pub fn finishResponseStream(self: *ReqResp, peer: identity.PeerId, request_id: u64) swarm_mod.SubmitError!void {
-        _ = self.inbound.remove(.{ .peer = peer, .request_id = request_id });
+    pub fn finishResponseStream(self: *ReqResp, channel_id: u64) (Error || swarm_mod.SubmitError)!void {
+        const ent = self.inbound.fetchRemove(channel_id) orelse return error.UnknownInboundChannel;
         try self.swarm.submit(.{ .send_end_of_stream = .{
-            .peer = peer,
-            .request_id = request_id,
+            .peer = ent.value.peer,
+            .request_id = ent.value.stream_request_id,
         } });
     }
 
     /// UTF-8 diagnostic is stored via [`errors.setLastErrorMessage`] for this thread (`RawError` + #45).
-    pub fn sendErrorResponse(
-        self: *ReqResp,
-        peer: identity.PeerId,
-        request_id: u64,
-        message: []const u8,
-    ) swarm_mod.SubmitError!void {
-        _ = self.inbound.remove(.{ .peer = peer, .request_id = request_id });
+    pub fn sendErrorResponse(self: *ReqResp, channel_id: u64, message: []const u8) (Error || swarm_mod.SubmitError)!void {
+        const ent = self.inbound.fetchRemove(channel_id) orelse return error.UnknownInboundChannel;
         errors.setLastErrorMessage(message);
         try self.swarm.submit(.{ .send_error_response = .{
-            .peer = peer,
-            .request_id = request_id,
+            .peer = ent.value.peer,
+            .request_id = ent.value.stream_request_id,
             .kind = error.RawError,
         } });
     }
@@ -176,28 +192,48 @@ pub const ReqResp = struct {
             } });
         }
 
-        var idle_in = std.ArrayList(ChannelKey).init(self.allocator);
-        defer idle_in.deinit(self.allocator);
+        var idle_ch = std.ArrayList(u64).init(self.allocator);
+        defer idle_ch.deinit(self.allocator);
         const idle_ms = self.cfg.response_idle_timeout_ms;
         {
             var it = self.inbound.iterator();
             while (it.next()) |e| {
                 const elapsed = now_ms - e.value_ptr.last_activity_ms;
                 if (elapsed >= idle_ms) {
-                    try idle_in.append(e.key_ptr.*);
+                    try idle_ch.append(e.key_ptr.*);
                 }
             }
         }
-        for (idle_in.items) |k| {
-            _ = self.inbound.remove(k);
+        for (idle_ch.items) |cid| {
+            const ent = self.inbound.fetchRemove(cid) orelse continue;
             try self.swarm.queueEvent(.{ .rpc_error_response = .{
-                .peer = k.peer,
-                .request_id = k.request_id,
+                .peer = ent.value.peer,
+                .request_id = ent.value.stream_request_id,
                 .kind = error.StreamTimedOut,
             } });
         }
     }
 };
+
+fn queueInboundRpcRequest(
+    a: std.mem.Allocator,
+    swarm_ptr: *swarm_mod.Swarm,
+    peer: identity.PeerId,
+    proto: protocol.LeanSupportedProtocol,
+    request_id: u64,
+    channel_id: u64,
+    payload: []const u8,
+) std.mem.Allocator.Error!void {
+    const owned = try a.dupe(u8, payload);
+    errdefer a.free(owned);
+    try swarm_ptr.queueEvent(.{ .rpc_request = .{
+        .peer = peer,
+        .protocol = proto,
+        .request_id = request_id,
+        .channel_id = channel_id,
+        .payload = owned,
+    } });
+}
 
 test "req_resp outbound timeout emits rpc_error_response" {
     if (builtin.single_threaded) return error.SkipZigTest;
@@ -219,6 +255,7 @@ test "req_resp outbound timeout emits rpc_error_response" {
         defer ev.deinit(a);
         try std.testing.expectEqual(.rpc_request, std.meta.activeTag(ev));
         try std.testing.expectEqual(rid, ev.rpc_request.request_id);
+        try std.testing.expectEqual(@as(u64, 0), ev.rpc_request.channel_id);
     }
 
     try rr.tick(1_100);
@@ -286,15 +323,16 @@ test "req_resp inbound idle timeout" {
     defer rr.deinit();
 
     const peer = try identity.PeerId.random();
-    try rr.onInboundRpcRequest(.{
-        .peer = peer,
-        .protocol = .status,
-        .request_id = 99,
-        .payload = "",
-    }, 500);
+    const cid = try rr.registerInboundChannel(peer, .status, 99, 500);
+    try queueInboundRpcRequest(a, &swarm, peer, .status, 99, cid, "");
 
     try rr.tick(530);
 
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_request, std.meta.activeTag(ev));
+    }
     {
         var ev = try swarm.nextEvent(5000);
         defer ev.deinit(a);
@@ -324,17 +362,19 @@ test "req_resp sendResponseChunk extends inbound idle window" {
     defer rr.deinit();
 
     const peer = try identity.PeerId.random();
-    try rr.onInboundRpcRequest(.{
-        .peer = peer,
-        .protocol = .status,
-        .request_id = 7,
-        .payload = "",
-    }, 0);
+    const cid = try rr.registerInboundChannel(peer, .status, 7, 0);
+    try queueInboundRpcRequest(a, &swarm, peer, .status, 7, cid, "");
+
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_request, std.meta.activeTag(ev));
+    }
 
     try rr.tick(45);
     try std.testing.expectError(error.Timeout, swarm.nextEvent(0));
 
-    try rr.sendResponseChunk(peer, 7, "a", 50);
+    try rr.sendResponseChunk(cid, "a", 50);
     {
         var ev = try swarm.nextEvent(5000);
         defer ev.deinit(a);
@@ -350,6 +390,62 @@ test "req_resp sendResponseChunk extends inbound idle window" {
         defer ev.deinit(a);
         try std.testing.expectEqual(.rpc_error_response, std.meta.activeTag(ev));
     }
+
+    swarm.shutdown();
+    while (true) {
+        var ev = swarm.nextEvent(5000) catch break;
+        defer ev.deinit(a);
+        if (std.meta.activeTag(ev) == .swarm_closed) break;
+    }
+}
+
+test "req_resp unknown inbound channel returns error" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var rr = ReqResp.init(a, &swarm, .{});
+    defer rr.deinit();
+
+    try std.testing.expectError(error.UnknownInboundChannel, rr.sendResponseChunk(999, "x", 0));
+
+    swarm.shutdown();
+    while (true) {
+        var ev = swarm.nextEvent(5000) catch break;
+        defer ev.deinit(a);
+        if (std.meta.activeTag(ev) == .swarm_closed) break;
+    }
+}
+
+test "req_resp create destroy and shutdown clears maps" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    const rr = try ReqResp.create(a, &swarm, .{ .request_timeout_ms = 60_000, .response_idle_timeout_ms = 60_000 });
+    defer rr.destroy();
+
+    const peer = try identity.PeerId.random();
+    _ = try rr.sendRequest(peer, .status, "q", 0);
+    _ = try rr.registerInboundChannel(peer, .status, 1, 0);
+
+    {
+        var ev = try swarm.nextEvent(5000);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.rpc_request, std.meta.activeTag(ev));
+    }
+
+    rr.shutdown();
+    try std.testing.expectEqual(@as(u32, 0), rr.pending_out.count());
+    try std.testing.expectEqual(@as(u32, 0), rr.inbound.count());
 
     swarm.shutdown();
     while (true) {

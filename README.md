@@ -68,7 +68,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `layer_events` | Event carriers: `ReqRespFailure`, `GossipsubFailure`, `TransportFailure` (each has a `kind:` field for `switch`) (#45) |
 | `peer_events` | Peer connection payloads: `Direction`, `DisconnectReason`, `ConnectionFailureResult`, connected / disconnected / failed event structs (#38) |
 | `connection_manager` | Known-peer dial scheduling (multiaddr without `/p2p`), reconnect backoff, refcount + peer events (#38) |
-| `swarm` | Threaded runtime: bounded `submit` / `nextEvent`, `queueEvent`, `run` / `startBackground`, `shutdown` (#34); stubs until real I/O |
+| `swarm` | Threaded runtime: bounded `submit` / `nextEvent`, `queueEvent`, `run` / `startBackground`, `shutdown` (#34); `RpcRequest.channel_id` for inbound req/resp (#40); stubs until real I/O |
 | `protocol` | Lean req/resp protocol id strings; `LeanSupportedProtocol` enum with `protocolId`, `fromInt`, `fromSlice` |
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
 | `addr_list` | Multiaddr CSV: `parseCsv` (`ParseCsvError`), `freeList` (uses bundled `multiaddr`) |
@@ -113,7 +113,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `req_resp.frame` | Length-prefixed framing: `max_rpc_message_size`, `parseRequestHeader`, `parseResponseHeader`, `appendRequestPrefix`, `appendResponsePrefix`; `FrameError` = `errors.ReqRespError` |
 | `req_resp.stream` | Incremental scan: `peekRpcUnaryRequest` / `peekRpcUnaryResponse`, `scanCompleteRequest` / `scanCompleteResponse`, `consumePrefix`, `InboundBuffer` |
 | `req_resp.snappy_wire` | Snappy + framing for `ssz_snappy`: `compressBlock`, `decompressBlock`, `compressFramed`, `decompressFramed`, `buildRequestWire`, `buildResponseWire`, `decodeRequestSsz`, `decodeResponseSsz` |
-| `req_resp.runtime` | `ReqResp` / `ReqRespConfig`: monotonic `request_id`, outbound request timeout (default 15s), inbound response idle timeout (default 5m), `tick`, `completeOutbound`, `onInboundRpcRequest`, response commands (#40) |
+| `req_resp.runtime` | `ReqResp` / `ReqRespConfig`: outbound `request_id`, inbound `channel_id` via `registerInboundChannel` (wire `request_id` + `RpcRequest.channel_id`), `sendResponseChunk`/`finishResponseStream`/`sendErrorResponse(channel_id,…)`, `create`/`destroy`, `shutdown`, timeouts (#40) |
 
 ### `transport`
 
