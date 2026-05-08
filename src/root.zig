@@ -5,6 +5,7 @@
 
 pub const errors = @import("errors.zig");
 pub const layer_events = @import("layer_events.zig");
+pub const swarm = @import("swarm.zig");
 pub const protocol = @import("protocol.zig");
 pub const varint = @import("varint.zig");
 pub const addr_list = @import("addr_list.zig");
