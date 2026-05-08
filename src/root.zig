@@ -1,7 +1,7 @@
-//! Pure-Zig libp2p stack for Lean Ethereum clients (Zeam integration).
+//! Pure-Zig libp2p-oriented networking helpers for Lean Ethereum clients.
 //!
-//! The exported C ABI for the Zeam host is rooted at `static_lib_entry.zig`
-//! (see `build.zig`); this module is the dependency-friendly API surface.
+//! Add this package in `build.zig.zon`, then `b.dependency("zig_libp2p", …)`
+//! and `dep.module("zig_libp2p")` on your executable or library module.
 
 pub const protocol = @import("protocol.zig");
 pub const varint = @import("varint.zig");

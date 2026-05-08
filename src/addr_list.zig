@@ -1,5 +1,4 @@
-//! Parse comma-separated multiaddr strings in the same shape Zeam passes across
-//! the FFI boundary (`EthLibp2p` / `multiaddrsToString`).
+//! Parse comma-separated multiaddr strings (trimmed entries, empty chunks skipped).
 
 const std = @import("std");
 const Multiaddr = @import("multiaddr").Multiaddr;
