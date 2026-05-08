@@ -5,10 +5,26 @@ const std = @import("std");
 /// Multistream protocol id including the mandatory newline terminator.
 pub const multistream_1_0_0: []const u8 = "/multistream/1.0.0\n";
 
-/// Writes a protocol id followed by `\n` (multistream-select negotiation line).
-pub fn writeProtocolLine(protocol_id: []const u8, writer: anytype) @TypeOf(writer).Error!void {
+/// Default maximum length of the protocol id **body** (bytes before `\n`) for `writeProtocolLine`.
+/// Matches `transport.multistream_negotiate.default_max_body_len` and typical libp2p stacks.
+pub const max_protocol_id_body_bytes: usize = 1024;
+
+pub const ProtocolLineError = error{ProtocolIdTooLong};
+
+/// Writes `protocol_id` and `\n`, rejecting ids longer than `max_body_len` (DoS-safe for untrusted strings).
+pub fn writeProtocolLineWithMax(
+    protocol_id: []const u8,
+    max_body_len: usize,
+    writer: anytype,
+) (ProtocolLineError || @TypeOf(writer).Error)!void {
+    if (protocol_id.len > max_body_len) return error.ProtocolIdTooLong;
     try writer.writeAll(protocol_id);
     try writer.writeByte('\n');
+}
+
+/// Writes a protocol id followed by `\n` using `max_protocol_id_body_bytes`.
+pub fn writeProtocolLine(protocol_id: []const u8, writer: anytype) (ProtocolLineError || @TypeOf(writer).Error)!void {
+    return writeProtocolLineWithMax(protocol_id, max_protocol_id_body_bytes, writer);
 }
 
 /// Strips ASCII whitespace and CR around a received negotiation line.
@@ -27,4 +43,26 @@ test "writeProtocolLine and trim" {
     try writeProtocolLine("/foo/bar", list.writer(std.testing.allocator));
     try std.testing.expectEqualStrings("/foo/bar\n", list.items);
     try std.testing.expectEqualStrings("/foo/bar", trimNegotiationLine(list.items));
+}
+
+test "writeProtocolLine rejects oversized protocol id" {
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(std.testing.allocator);
+    const big = try std.testing.allocator.alloc(u8, max_protocol_id_body_bytes + 1);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'a');
+    try std.testing.expectError(
+        error.ProtocolIdTooLong,
+        writeProtocolLine(big, list.writer(std.testing.allocator)),
+    );
+}
+
+test "writeProtocolLineWithMax allows custom cap" {
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(std.testing.allocator);
+    const s = try std.testing.allocator.alloc(u8, 8);
+    defer std.testing.allocator.free(s);
+    @memset(s, 'b');
+    try writeProtocolLineWithMax(s, 8, list.writer(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 9), list.items.len);
 }
