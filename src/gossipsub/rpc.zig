@@ -154,6 +154,37 @@ pub fn decodeFirstPublish(allocator: std.mem.Allocator, rpc: []const u8) (Error 
     return null;
 }
 
+/// Every `publish` field (`2`, length-delimited) as owned `Message` wire blobs. Caller frees with [`freePublishBlobs`].
+pub fn decodePublishes(allocator: std.mem.Allocator, rpc_wire: []const u8) (Error || std.mem.Allocator.Error)![][]u8 {
+    var out = std.ArrayList([]u8).init(allocator);
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+    var off: usize = 0;
+    while (off < rpc_wire.len) {
+        const key = try w.decodeFieldKey(rpc_wire[off..]);
+        off += key.len;
+        const val_buf = rpc_wire[off..];
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(val_buf, key.wire_type, lim.max_rpc_length_delimited_bytes)
+        else
+            try w.nextFieldValue(val_buf, key.wire_type);
+        off += nv.total;
+        if (key.field_number == 2 and key.wire_type == .length_delimited) {
+            const blob = try allocator.dupe(u8, nv.value);
+            errdefer allocator.free(blob);
+            try out.append(blob);
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn freePublishBlobs(allocator: std.mem.Allocator, blobs: [][]u8) void {
+    for (blobs) |b| allocator.free(b);
+    allocator.free(blobs);
+}
+
 test "encodeEmptyControlRpc matches two-byte empty submessage" {
     const a = std.testing.allocator;
     const buf = try encodeEmptyControlRpc(a);
@@ -180,6 +211,28 @@ test "decodeFirstSubscribe returns null on control-only rpc" {
     const wire = try encodeEmptyControlRpc(a);
     defer a.free(wire);
     try std.testing.expectEqual(@as(?SubscribeView, null), try decodeFirstSubscribe(a, wire));
+}
+
+test "decodePublishes returns all publish entries" {
+    const a = std.testing.allocator;
+    const msg = @import("message.zig");
+    const inner1 = try msg.encode(a, .{ .topic = "a", .data = "1" });
+    defer a.free(inner1);
+    const inner2 = try msg.encode(a, .{ .topic = "b", .data = "2" });
+    defer a.free(inner2);
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try w.appendLengthDelimited(&list, a, 2, inner1);
+    try w.appendLengthDelimited(&list, a, 2, inner2);
+    const blobs = try decodePublishes(a, list.items);
+    defer freePublishBlobs(a, blobs);
+    try std.testing.expectEqual(@as(usize, 2), blobs.len);
+    var d1 = try msg.decode(a, blobs[0]);
+    defer d1.deinit(a);
+    var d2 = try msg.decode(a, blobs[1]);
+    defer d2.deinit(a);
+    try std.testing.expectEqualStrings("a", d1.topic.?);
+    try std.testing.expectEqualStrings("b", d2.topic.?);
 }
 
 test "publish wraps message wire" {
