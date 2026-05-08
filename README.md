@@ -2,7 +2,7 @@
 
 Pure-Zig helpers for **libp2p-flavored** networking in Lean Ethereum clients: length-prefixed req/resp, gossipsub protobuf, multistream-select, QUIC-related constants, and shared dependencies (`peer_id`, `multiaddr`, Snappy) aligned with Zeam pins.
 
-**Not in scope yet:** full gossipsub mesh runtime, high-level QUIC listen/dial wrappers (embedders use [zquic](https://github.com/ch4r10t33r/zquic) directly with [`transport.quic_v1`](#transport) presets), and libp2p security/session upgrades beyond zquic TLS + ALPN. See [Roadmap](#roadmap).
+**Not in scope yet:** full gossipsub mesh runtime, high-level QUIC listen/dial wrappers (embedders use [zquic](https://github.com/ch4r10t33r/zquic) with [`transport.quic_v1`](#transport) presets), and **full** libp2p TLS verification (see [`security.libp2p_tls`](#security) for PeerId-from-cert parsing + roadmap). See [Roadmap](#roadmap).
 
 | Requirement | Version / note |
 |-------------|----------------|
@@ -84,11 +84,17 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `transport.quic_v1` | QUIC v1 labels + zquic wiring: `multistream_protocol_id`, `tls_alpn`, `libp2pZquicServerConfig` / `libp2pZquicClientConfig` (ALPN `libp2p`, `raw_application_streams`), `appendFirstBidiStreamInitiatorHandshake` |
 | `transport.multistream_negotiate` | **Bounded** multistream-select 1.0.0 on a byte cursor: `default_max_body_len`, `readNegotiationLine`, `validateProtocolId`, initiator/responder steps (`initiatorSendMultistreamHeader`, `responderReadProtocolOffer`, `responderReplyProtocol`, …), `NegotiateError` |
 
+### `security`
+
+| Submodule | Role |
+|-----------|------|
+| `security.libp2p_tls` | libp2p TLS spec constants (`multistream_protocol_id`, `handshake_signature_prefix`, extension OID), `findLibp2pExtensionExtValue`, `parseSignedKey`, `peerIdFromCertificate` (spec test vectors; **no** signature verify yet) |
+
 ---
 
 ## Roadmap
 
-- Finish `/quic-v1` **endpoint** ergonomics (listen/dial helpers, stream lifecycle) on zquic; presets and multistream stream open are in `transport.quic_v1`. Add libp2p security/session layer (Noise or dedicated TLS identity) as needed for devnets.
+- Finish `/quic-v1` **endpoint** ergonomics (listen/dial helpers, stream lifecycle) on zquic; presets and multistream stream open are in `transport.quic_v1`. Extend `security.libp2p_tls` with mandatory `SignedKey` transcript verification; Noise or other profiles only if devnets require them.
 - Gossipsub mesh scoring and backpressure; optional **ControlExtensions** on the wire.
 
 ---
