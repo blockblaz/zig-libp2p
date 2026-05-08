@@ -13,7 +13,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 const errors = @import("errors.zig");
-const layer_events = @import("layer_events.zig");
+const peer_events = @import("peer_events.zig");
 const protocol = @import("protocol.zig");
 const identity = @import("identity.zig");
 
@@ -53,10 +53,6 @@ pub const RpcError = struct {
     kind: errors.ReqRespError,
 };
 
-pub const PeerIdPayload = struct {
-    peer: identity.PeerId,
-};
-
 /// Application → swarm control plane. Slices are copied by [`Swarm.submit`].
 pub const SwarmCommand = union(enum) {
     publish: struct {
@@ -89,9 +85,9 @@ pub const Event = union(enum) {
         request_id: u64,
     },
     rpc_error_response: RpcError,
-    peer_connected: PeerIdPayload,
-    peer_disconnected: PeerIdPayload,
-    peer_connection_failed: layer_events.TransportFailure,
+    peer_connected: peer_events.PeerConnectedPayload,
+    peer_disconnected: peer_events.PeerDisconnectedPayload,
+    peer_connection_failed: peer_events.PeerConnectionFailedPayload,
     log: struct {
         level: LogLevel,
         message: []const u8,
@@ -383,7 +379,11 @@ pub const Swarm = struct {
                 self.pushEvent(.{ .rpc_error_response = e }) catch {};
             },
             .dial => |d| {
-                self.pushEvent(.{ .peer_connection_failed = .{ .kind = error.DialFailed } }) catch {
+                self.pushEvent(.{ .peer_connection_failed = .{
+                    .peer = null,
+                    .direction = .outbound,
+                    .result = .{ .err = error.DialFailed },
+                } }) catch {
                     destroyCommand(self.gpa, .{ .dial = d });
                     return;
                 };
@@ -391,6 +391,12 @@ pub const Swarm = struct {
             },
             .shutdown => unreachable,
         }
+    }
+
+    /// Enqueue a swarm event from the embedder (for example the connection manager). Same capacity
+    /// and lifetime rules as events produced inside [`run`].
+    pub fn queueEvent(self: *Swarm, ev: Event) std.mem.Allocator.Error!void {
+        return self.pushEvent(ev);
     }
 
     fn pushEvent(self: *Swarm, ev: OwnedEvent) std.mem.Allocator.Error!void {
