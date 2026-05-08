@@ -9,6 +9,7 @@ A minimal **pure-Zig** library you add with `build.zig.zon` + `std.Build.depende
 - **multistream-select 1.0.0** negotiation line helpers
 - **Snappy**: same pins as Zeam — [`zig_snappy`](https://github.com/blockblaz/zig-snappy) (`snappyz`) and [`snappyframesz`](https://github.com/blockblaz/snappyframesz) for block + framed stream compression
 - **Lean gossip mesh topics** (`/leanconsensus/<fork>/<name>/ssz_snappy`) and **libp2p ping** constants
+- **Peer IDs** via [`peer-id`](https://github.com/blockblaz/peer-id) (same pin as `multiaddr-zig`), re-exported and wrapped in `identity`
 
 Gossipsub RPC protobuf, transport, and security handshakes are not implemented yet.
 
@@ -33,6 +34,7 @@ In application code:
 const zig_libp2p = @import("zig_libp2p");
 // zig_libp2p.protocol, zig_libp2p.varint, zig_libp2p.addr_list,
 // zig_libp2p.multistream, zig_libp2p.ping, zig_libp2p.gossip.topic,
+// zig_libp2p.peer_id, zig_libp2p.identity,
 // zig_libp2p.snappyz, zig_libp2p.snappyframesz,
 // zig_libp2p.req_resp.frame, zig_libp2p.req_resp.stream, zig_libp2p.req_resp.snappy_wire
 ```
@@ -46,6 +48,7 @@ Run this repo’s tests locally: `zig build test`. CI matches [Zeam’s workflow
 3. **PR3 — Streaming + multistream**: `req_resp/stream`, `multistream`.
 4. **PR4 — Snappy + ssz_snappy wire**: `zig_snappy`, `snappyframesz`, `req_resp/snappy_wire`, RPC unary `peekRpcUnary*`.
 5. **PR5 — Gossip topic + ping**: `gossip/topic` (Zeam-compatible `LeanNetworkTopic`), `ping`.
+6. **PR6 — Peer ID**: `peer_id` dependency, `identity` helpers + tests.
 
 ## Done so far
 
@@ -59,11 +62,12 @@ Run this repo’s tests locally: `zig build test`. CI matches [Zeam’s workflow
 - [x] **`ssz_snappy` unary wire**: `buildRequestWire` / `buildResponseWire`, `decodeRequestSsz` / `decodeResponseSsz`, `peekRpcUnaryRequest` / `peekRpcUnaryResponse`.
 - [x] **Lean gossip mesh topic** encode/decode (`gossip.topic.LeanNetworkTopic`, same layout as Zeam `interface.zig`).
 - [x] **Ping** multistream line + 32-byte payload size (`ping`).
+- [x] **Peer ID** package (`peer_id` / `identity`): parse and encode libp2p peer IDs (bytes, base58, `fromString` vector).
 
 ## Next
 
 - [ ] Wire [zquic](https://github.com/ch4r10t33r/zquic) on Zig 0.16; `/quic-v1` transport and libp2p security handshake.
-- [ ] Peer identity and handshake suitable for Lean devnets.
+- [ ] Security handshake (Noise or TLS) suitable for Lean devnets.
 - [ ] Gossipsub v1.1 RPC (protobuf), mesh, subscriptions, backpressure.
 
 ## Remote

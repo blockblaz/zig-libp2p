@@ -19,6 +19,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("snappyframesz.zig");
 
+    const peer_id_mod = b.dependency("peer_id", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("peer-id");
+
     const mod = b.addModule("zig_libp2p", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -27,6 +32,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("multiaddr", multiaddr_dep.module("multiaddr"));
     mod.addImport("snappyz", snappyz);
     mod.addImport("snappyframesz", snappyframesz);
+    mod.addImport("peer_id", peer_id_mod);
 
     const unit_tests = b.addTest(.{
         .root_module = mod,
