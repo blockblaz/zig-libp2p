@@ -13,6 +13,14 @@ pub const gossip = struct {
     pub const topic = @import("gossip/topic.zig");
 };
 
+pub const gossipsub = struct {
+    pub const rpc = @import("gossipsub/rpc.zig");
+};
+
+pub const protobuf = struct {
+    pub const wire = @import("protobuf/wire.zig");
+};
+
 /// Libp2p peer IDs (`blockblaz/peer-id`), same pin as `multiaddr-zig`.
 pub const peer_id = @import("peer_id");
 pub const identity = @import("identity.zig");
