@@ -49,6 +49,7 @@ pub const req_resp = struct {
     pub const stream = @import("req_resp/stream.zig");
     pub const snappy_wire = @import("req_resp/snappy_wire.zig");
     pub const runtime = @import("req_resp/runtime.zig");
+    pub const wire_tcp = @import("req_resp/wire_tcp.zig");
 };
 
 pub const transport = struct {
