@@ -4,7 +4,7 @@ Minimal **pure-Zig** helpers for libp2p-oriented Lean Ethereum clients: multiadd
 
 Full gossipsub mesh behaviour, transports, and security handshakes are not implemented yet.
 
-**Zig 0.16.0** (`build.zig.zon` `minimum_zig_version`). [zquic](https://github.com/ch4r10t33r/zquic) **v1.6.x** is a pinned dependency and re-exported as `zig_libp2p.zquic` (see `src/root.zig`). `transport.quic_v1` exposes multistream and TLS ALPN constants; `transport.multistream_negotiate` runs bounded multistream-select 1.0.0 on a byte cursor (for the first QUIC stream). zquic I/O presets and full connection lifecycle glue are follow-up work (see GitHub #15).
+**Zig 0.16.0** (`build.zig.zon` `minimum_zig_version`). [zquic](https://github.com/ch4r10t33r/zquic) **v1.6.x** is a pinned dependency and re-exported as `zig_libp2p.zquic` (see `src/root.zig`). `transport.quic_v1` exposes multistream and TLS ALPN constants; `transport.multistream_negotiate` runs bounded multistream-select 1.0.0 on a byte cursor (for the first QUIC stream); `transport.zquic_io_config` builds zquic `ServerConfig` / `ClientConfig` with libp2p ALPN and raw application streams. Full UDP event-loop integration remains embedder-owned (see #15).
 
 ## Usage (Zig dependency)
 
