@@ -1,6 +1,10 @@
-//! Length-prefixed req/resp framing: varint-declared payload on requests,
-//! single-byte response code then the same length prefix on responses.
-//! Compression (for example snappy) is applied outside this layer.
+//! Length-prefixed req/resp framing: varint length field on requests,
+//! single-byte response code then the same length field on responses.
+//!
+//! On Lean consensus libp2p streams (`…/ssz_snappy`), the varint is the
+//! **uncompressed SSZ size**; the bytes after the header are snappy-framed
+//! payload whose wire length may differ. For fixed-size raw bodies, see
+//! `req_resp.stream.scanCompleteRequest`.
 
 const std = @import("std");
 const varint = @import("../varint.zig");

@@ -1,7 +1,10 @@
-//! Incremental length-prefixed req/resp frames over a byte stream.
+//! Incremental req/resp parsing over a byte stream.
 //!
-//! `scanComplete*` inspects a buffer without consuming. Slices in the result
-//! alias the input until you remove processed bytes with `consumePrefix`.
+//! `scanComplete*` treats the varint as the **wire length** of the body
+//! (length-delimited messages). For Ethereum-style `ssz_snappy` unary
+//! messages where the buffer holds one full RPC blob, use `peekRpcUnary*`.
+//!
+//! Slices from `scanComplete*` alias the input until you call `consumePrefix`.
 
 const std = @import("std");
 const frame = @import("frame.zig");
@@ -22,6 +25,52 @@ pub const PoppedResponse = struct {
     declared_len: usize,
     body: []const u8,
 };
+
+/// One unary RPC request buffer: varint is **uncompressed** SSZ length;
+/// `framed_payload` is the entire snappy-framed suffix (wire length may differ).
+pub const RpcUnaryRequest = struct {
+    total_len: usize,
+    declared_uncompressed_len: usize,
+    framed_payload: []const u8,
+};
+
+/// One unary RPC response buffer (same length semantics as `RpcUnaryRequest`).
+pub const RpcUnaryResponse = struct {
+    total_len: usize,
+    code: u8,
+    declared_uncompressed_len: usize,
+    framed_payload: []const u8,
+};
+
+/// Returns `null` when the varint header is incomplete (`Truncated`).
+pub fn peekRpcUnaryRequest(buf: []const u8) FrameError!?RpcUnaryRequest {
+    if (buf.len == 0) return null;
+    const h = frame.parseRequestHeader(buf) catch |err| switch (err) {
+        error.Truncated => return null,
+        else => |e| return e,
+    };
+    return .{
+        .total_len = buf.len,
+        .declared_uncompressed_len = h.declared_len,
+        .framed_payload = h.payload,
+    };
+}
+
+/// Returns `null` when the header (code + varint) is incomplete.
+pub fn peekRpcUnaryResponse(buf: []const u8) FrameError!?RpcUnaryResponse {
+    if (buf.len == 0) return null;
+    const h = frame.parseResponseHeader(buf) catch |err| switch (err) {
+        error.Truncated => return null,
+        error.Incomplete => return null,
+        else => |e| return e,
+    };
+    return .{
+        .total_len = buf.len,
+        .code = h.code,
+        .declared_uncompressed_len = h.declared_len,
+        .framed_payload = h.payload,
+    };
+}
 
 /// Returns `null` if fewer than one full frame is present.
 pub fn scanCompleteRequest(buf: []const u8) FrameError!?PoppedRequest {
@@ -88,6 +137,14 @@ pub const InboundBuffer = struct {
         return scanCompleteResponse(self.raw.items);
     }
 
+    pub fn peekRpcUnaryRequestFromBuffer(self: *const InboundBuffer) FrameError!?RpcUnaryRequest {
+        return peekRpcUnaryRequest(self.raw.items);
+    }
+
+    pub fn peekRpcUnaryResponseFromBuffer(self: *const InboundBuffer) FrameError!?RpcUnaryResponse {
+        return peekRpcUnaryResponse(self.raw.items);
+    }
+
     pub fn consume(self: *InboundBuffer, n: usize) !void {
         try consumePrefix(&self.raw, n);
     }
@@ -151,4 +208,21 @@ test "InboundBuffer feed rejects over cap" {
     var inbound = InboundBuffer.init(4);
     defer inbound.deinit(a);
     try std.testing.expectError(error.BufferCapExceeded, inbound.feed(a, "hello"));
+}
+
+test "peekRpcUnaryRequest incomplete varint" {
+    const buf = [_]u8{0x80};
+    try std.testing.expect((try peekRpcUnaryRequest(&buf)) == null);
+}
+
+test "peekRpcUnaryRequest treats suffix as framed blob" {
+    const a = std.testing.allocator;
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try frame.appendRequestPrefix(&list, a, 5);
+    try list.appendSlice(a, "payload-longer-than-five");
+    const r = (try peekRpcUnaryRequest(list.items)).?;
+    try std.testing.expectEqual(@as(usize, 5), r.declared_uncompressed_len);
+    try std.testing.expectEqualStrings("payload-longer-than-five", r.framed_payload);
+    try std.testing.expectEqual(list.items.len, r.total_len);
 }
