@@ -2,26 +2,26 @@
 
 const std = @import("std");
 const w = @import("../protobuf/wire.zig");
+const errors = @import("../errors.zig");
 const lim = @import("wire_limits.zig");
 
-pub const Error = w.Error || error{
+pub const Error = errors.GossipsubError || w.Error || error{
     MissingPruneTopic,
     MissingIHaveTopic,
-    WireLimitExceeded,
 };
 
 fn checkTopicLen(len: usize) Error!void {
-    if (len > lim.max_topic_str_bytes) return error.WireLimitExceeded;
+    if (len > lim.max_topic_str_bytes) return error.PayloadTooLarge;
 }
 
 fn checkMessageIdLen(len: usize) Error!void {
-    if (len > lim.max_message_id_bytes) return error.WireLimitExceeded;
+    if (len > lim.max_message_id_bytes) return error.PayloadTooLarge;
 }
 
 /// `repeated ControlIHave ihave = 1` with one entry: topic plus optional message id list.
 pub fn encodeIHave(allocator: std.mem.Allocator, topic_id: []const u8, message_ids: []const []const u8) (Error || std.mem.Allocator.Error)![]u8 {
     try checkTopicLen(topic_id.len);
-    if (message_ids.len > lim.max_message_ids_per_entry) return error.WireLimitExceeded;
+    if (message_ids.len > lim.max_message_ids_per_entry) return error.PayloadTooLarge;
     var inner = std.ArrayList(u8).empty;
     defer inner.deinit(allocator);
     try w.appendLengthDelimited(&inner, allocator, 1, topic_id);
@@ -83,7 +83,7 @@ pub fn decodeFirstIHave(allocator: std.mem.Allocator, control: []const u8) (Erro
                 },
                 2 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
-                    if (ids.items.len >= lim.max_message_ids_per_entry) return error.WireLimitExceeded;
+                    if (ids.items.len >= lim.max_message_ids_per_entry) return error.PayloadTooLarge;
                     {
                         const copy = try allocator.dupe(u8, iv.value);
                         errdefer allocator.free(copy);
@@ -114,7 +114,7 @@ pub fn deinitIHaveOwned(allocator: std.mem.Allocator, v: *IHaveOwned) void {
 
 /// `repeated ControlIWant iwant = 2` with one entry holding the given message ids.
 pub fn encodeIWant(allocator: std.mem.Allocator, message_ids: []const []const u8) (Error || std.mem.Allocator.Error)![]u8 {
-    if (message_ids.len > lim.max_message_ids_per_entry) return error.WireLimitExceeded;
+    if (message_ids.len > lim.max_message_ids_per_entry) return error.PayloadTooLarge;
     var inner = std.ArrayList(u8).empty;
     defer inner.deinit(allocator);
     for (message_ids) |mid| {
@@ -168,7 +168,7 @@ pub fn decodeFirstIWant(allocator: std.mem.Allocator, control: []const u8) (Erro
             switch (ik.field_number) {
                 1 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
-                    if (ids.items.len >= lim.max_message_ids_per_entry) return error.WireLimitExceeded;
+                    if (ids.items.len >= lim.max_message_ids_per_entry) return error.PayloadTooLarge;
                     {
                         const copy = try allocator.dupe(u8, iv.value);
                         errdefer allocator.free(copy);
@@ -199,7 +199,7 @@ pub fn deinitIDontWantOwned(allocator: std.mem.Allocator, v: *IDontWantOwned) vo
 
 /// `repeated ControlIDontWant idontwant = 5` with one entry listing the given message ids.
 pub fn encodeIDontWant(allocator: std.mem.Allocator, message_ids: []const []const u8) (Error || std.mem.Allocator.Error)![]u8 {
-    if (message_ids.len > lim.max_message_ids_per_entry) return error.WireLimitExceeded;
+    if (message_ids.len > lim.max_message_ids_per_entry) return error.PayloadTooLarge;
     var inner = std.ArrayList(u8).empty;
     defer inner.deinit(allocator);
     for (message_ids) |mid| {
@@ -249,7 +249,7 @@ pub fn decodeFirstIDontWant(allocator: std.mem.Allocator, control: []const u8) (
             switch (ik.field_number) {
                 1 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
-                    if (ids.items.len >= lim.max_message_ids_per_entry) return error.WireLimitExceeded;
+                    if (ids.items.len >= lim.max_message_ids_per_entry) return error.PayloadTooLarge;
                     {
                         const copy = try allocator.dupe(u8, iv.value);
                         errdefer allocator.free(copy);
@@ -569,7 +569,7 @@ test "ihave rejects excess message id count" {
     defer ctl.deinit(a);
     try w.appendLengthDelimited(&ctl, a, 1, inner.items);
 
-    try std.testing.expectError(error.WireLimitExceeded, decodeFirstIHave(a, ctl.items));
+    try std.testing.expectError(error.PayloadTooLarge, decodeFirstIHave(a, ctl.items));
 }
 
 test "iwant rejects oversized message id" {

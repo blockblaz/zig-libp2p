@@ -25,7 +25,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Req/resp behaviour | Not started | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) |
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Not started | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) |
-| Typed error sets (layers) | Partial | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) |
+| Typed error sets (layers) | Partial | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors.ReqRespError` / `GossipsubError` / `TransportError`; req/resp + gossipsub codec wired |
 | Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
 
 **Still heavy lift for embedders:** full swarm, connection manager, mesh, and **full** TLS `SignedKey` verification (today: parse + PeerId only in [`security.libp2p_tls`](#security)). QUIC listen/dial lifecycle remains primarily [zquic](https://github.com/ch4r10t33r/zquic) + [`transport.quic_v1`](#transport) presets.
@@ -64,6 +64,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 | Module | Role |
 |--------|------|
+| `errors` | Layered errors: `ReqRespError`, `GossipsubError`, `TransportError` (#45) |
 | `protocol` | Lean req/resp protocol id strings; `LeanSupportedProtocol` enum with `protocolId`, `fromInt`, `fromSlice` |
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
 | `addr_list` | Multiaddr CSV: `parseCsv`, `freeList` (uses bundled `multiaddr`) |
@@ -101,7 +102,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 | Submodule | Role |
 |-----------|------|
-| `req_resp.frame` | Length-prefixed framing: `max_rpc_message_size`, `parseRequestHeader`, `parseResponseHeader`, `appendRequestPrefix`, `appendResponsePrefix` |
+| `req_resp.frame` | Length-prefixed framing: `max_rpc_message_size`, `parseRequestHeader`, `parseResponseHeader`, `appendRequestPrefix`, `appendResponsePrefix`; `FrameError` = `errors.ReqRespError` |
 | `req_resp.stream` | Incremental scan: `peekRpcUnaryRequest` / `peekRpcUnaryResponse`, `scanCompleteRequest` / `scanCompleteResponse`, `consumePrefix`, `InboundBuffer` |
 | `req_resp.snappy_wire` | Snappy + framing for `ssz_snappy`: `compressBlock`, `decompressBlock`, `compressFramed`, `decompressFramed`, `buildRequestWire`, `buildResponseWire`, `decodeRequestSsz`, `decodeResponseSsz` |
 

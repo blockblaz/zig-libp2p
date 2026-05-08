@@ -4,35 +4,47 @@
 
 const std = @import("std");
 const frame = @import("frame.zig");
+const errors = @import("../errors.zig");
 const snappyz = @import("snappyz");
 const snappyframesz = @import("snappyframesz");
 const stream = @import("stream.zig");
 
 pub const FrameError = frame.FrameError;
+pub const ReqRespError = errors.ReqRespError;
 
-pub const WireError = error{
-    LengthMismatch,
-    IncompleteHeader,
-};
+/// Back-compat: length/header issues are [`ReqRespError`] values.
+pub const WireError = ReqRespError;
 
-pub fn compressBlock(allocator: std.mem.Allocator, plain: []const u8) ![]u8 {
-    return snappyz.encode(allocator, plain);
+pub fn compressBlock(allocator: std.mem.Allocator, plain: []const u8) (ReqRespError || std.mem.Allocator.Error)![]u8 {
+    return snappyz.encode(allocator, plain) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidData,
+    };
 }
 
-pub fn decompressBlock(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
-    return snappyz.decode(allocator, compressed);
+pub fn decompressBlock(allocator: std.mem.Allocator, compressed: []const u8) (ReqRespError || std.mem.Allocator.Error)![]u8 {
+    return snappyz.decode(allocator, compressed) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidData,
+    };
 }
 
-pub fn compressFramed(allocator: std.mem.Allocator, plain: []const u8) ![]u8 {
-    return snappyframesz.encode(allocator, plain);
+pub fn compressFramed(allocator: std.mem.Allocator, plain: []const u8) (ReqRespError || std.mem.Allocator.Error)![]u8 {
+    return snappyframesz.encode(allocator, plain) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidData,
+    };
 }
 
-pub fn decompressFramed(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    return snappyframesz.decode(allocator, data);
+pub fn decompressFramed(allocator: std.mem.Allocator, data: []const u8) (ReqRespError || std.mem.Allocator.Error)![]u8 {
+    return snappyframesz.decode(allocator, data) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidData,
+    };
 }
 
 /// Varint (uncompressed length) + snappy-framed SSZ payload.
-pub fn buildRequestWire(allocator: std.mem.Allocator, uncompressed_ssz: []const u8) ![]u8 {
+pub fn buildRequestWire(allocator: std.mem.Allocator, uncompressed_ssz: []const u8) (ReqRespError || std.mem.Allocator.Error)![]u8 {
     const framed = try compressFramed(allocator, uncompressed_ssz);
     defer allocator.free(framed);
     var out = std.ArrayList(u8).empty;
@@ -43,7 +55,7 @@ pub fn buildRequestWire(allocator: std.mem.Allocator, uncompressed_ssz: []const 
 }
 
 /// Response code + varint (uncompressed length) + snappy-framed SSZ payload.
-pub fn buildResponseWire(allocator: std.mem.Allocator, code: u8, uncompressed_ssz: []const u8) ![]u8 {
+pub fn buildResponseWire(allocator: std.mem.Allocator, code: u8, uncompressed_ssz: []const u8) (ReqRespError || std.mem.Allocator.Error)![]u8 {
     const framed = try compressFramed(allocator, uncompressed_ssz);
     defer allocator.free(framed);
     var out = std.ArrayList(u8).empty;
@@ -54,7 +66,7 @@ pub fn buildResponseWire(allocator: std.mem.Allocator, code: u8, uncompressed_ss
 }
 
 /// Parse one unary request buffer and decompress SSZ; checks uncompressed length.
-pub fn decodeRequestSsz(allocator: std.mem.Allocator, wire: []const u8) ![]u8 {
+pub fn decodeRequestSsz(allocator: std.mem.Allocator, wire: []const u8) (ReqRespError || std.mem.Allocator.Error)![]u8 {
     const msg = (try stream.peekRpcUnaryRequest(wire)) orelse return error.IncompleteHeader;
     const plain = try decompressFramed(allocator, msg.framed_payload);
     errdefer allocator.free(plain);
@@ -63,7 +75,7 @@ pub fn decodeRequestSsz(allocator: std.mem.Allocator, wire: []const u8) ![]u8 {
 }
 
 /// Parse one unary response buffer and decompress SSZ; checks uncompressed length.
-pub fn decodeResponseSsz(allocator: std.mem.Allocator, wire: []const u8) !struct { code: u8, ssz: []u8 } {
+pub fn decodeResponseSsz(allocator: std.mem.Allocator, wire: []const u8) (ReqRespError || std.mem.Allocator.Error)!struct { code: u8, ssz: []u8 } {
     const msg = (try stream.peekRpcUnaryResponse(wire)) orelse return error.IncompleteHeader;
     const plain = try decompressFramed(allocator, msg.framed_payload);
     errdefer allocator.free(plain);
