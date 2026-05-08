@@ -10,6 +10,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const glue_mod = b.createModule(.{
+        .root_source_file = b.path("src/zeam_glue_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zig_libp2p", .module = mod },
+        },
+    });
+
+    const lib = b.addLibrary(.{
+        .name = "zig-libp2p",
+        .linkage = .static,
+        .root_module = glue_mod,
+    });
+    lib.root_module.link_libc = true;
+    b.installArtifact(lib);
+
     const unit_tests = b.addTest(.{
         .root_module = mod,
     });
