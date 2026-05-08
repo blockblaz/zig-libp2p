@@ -8,6 +8,14 @@
             .url = "git+https://github.com/zen-eth/multiaddr-zig#568b5dd7c125973994222a34bc05679ab2f7b545",
             .hash = "multiaddr-0.1.0-Cjaydr-zAAARdtYgb09TsxD3JXF-Y1x6OM2Ow40o-G80",
         },
+        .zig_snappy = .{
+            .url = "git+https://github.com/blockblaz/zig-snappy#5058ae298101e409af9d35cf7eeddc2650477164",
+            .hash = "zig_snappy-0.0.3-bDFzXmBjAAAd1yTK5LQvRJ-srdnJbhkHZajl0KcXVJDx",
+        },
+        .snappyframesz = .{
+            .url = "git+https://github.com/blockblaz/snappyframesz#df262c69ca24f072dd71b26c70972649458b6659",
+            .hash = "snappyframesz-0.0.2-COCLy-AQBAAvfJT4M4AK1AqYfMzhvdbsQhsfAJPGTgpc",
+        },
     },
     .paths = .{
         "build.zig",
