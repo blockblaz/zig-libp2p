@@ -16,6 +16,15 @@ pub fn encodeEmptyControlRpc(allocator: std.mem.Allocator) std.mem.Allocator.Err
     return try list.toOwnedSlice(allocator);
 }
 
+/// Top-level `RPC` with only `control = 3` set to a `ControlMessage` wire blob (e.g. from `gossipsub.control.encodeGraft`).
+pub fn encodeControlOnlyRpc(allocator: std.mem.Allocator, control_wire: []const u8) (Error || std.mem.Allocator.Error)![]u8 {
+    if (control_wire.len > lim.max_rpc_length_delimited_bytes) return error.PayloadTooLarge;
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(allocator);
+    try w.appendLengthDelimited(&list, allocator, 3, control_wire);
+    return try list.toOwnedSlice(allocator);
+}
+
 /// One `SubOpts` in `repeated SubOpts subscriptions = 1` (subscribe + topic id).
 pub fn encodeSubscribe(allocator: std.mem.Allocator, topic: []const u8, subscribe: bool) (Error || std.mem.Allocator.Error)![]u8 {
     if (topic.len > lim.max_topic_str_bytes) return error.PayloadTooLarge;
