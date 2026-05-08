@@ -8,6 +8,7 @@ pub const varint = @import("varint.zig");
 pub const addr_list = @import("addr_list.zig");
 pub const multistream = @import("multistream.zig");
 pub const ping = @import("ping.zig");
+pub const identify = @import("identify.zig");
 
 pub const gossip = struct {
     pub const topic = @import("gossip/topic.zig");
