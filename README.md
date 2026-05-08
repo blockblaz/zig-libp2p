@@ -15,11 +15,11 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Snappy framing | Done | — |
 | TCP transport | Done | [#35](https://github.com/ch4r10t33r/zig-libp2p/issues/35) |
 | QUIC multiaddr + per-stream negotiate | Partial | [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) |
-| libp2p TLS on QUIC (ALPN, peer auth) | Partial | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — [`security.libp2p_tls`](#security) implements cert + SignedKey verification (`peerIdFromVerifiedCertificate`); embedders must invoke it on the peer leaf cert after TLS. **Noise** remains [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36). |
+| libp2p TLS on QUIC (ALPN, peer auth) | Partial | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — [`security.libp2p_tls`](#security) implements cert + SignedKey verification (`peerIdFromVerifiedCertificate`); embedders must invoke it on the peer leaf cert after TLS. |
 | Ping behaviour (`/ipfs/ping/1.0.0`) | Done | [#42](https://github.com/ch4r10t33r/zig-libp2p/issues/42) |
 | KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
 | Swarm / network runtime | Partial | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — threaded command/event runtime; transport integration still embedder-owned |
-| Noise XX | Not started | [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36) |
+| Noise XX | Partial | [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36) — [`security.noise`](#security): use [`security.noise.stream_upgrade`](./src/security/noise/stream_upgrade.zig) for multistream `/noise` + handshake on a stream; interop tests can live in Zeam. |
 | Connection manager | Not started | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) |
 | Gossipsub mesh runtime | Not started | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) |
 | Req/resp behaviour | Not started | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) |
@@ -114,7 +114,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 |-----------|------|
 | `transport.quic_v1` | QUIC v1 labels + zquic wiring: `multistream_protocol_id`, `tls_alpn` (alias of `security.libp2p_tls.quic_application_layer_protocol`), `libp2pZquicServerConfig` / `libp2pZquicClientConfig` (`raw_application_streams`), `appendFirstBidiStreamInitiatorHandshake` |
 | `transport.quic` | QUIC transport entrypoint: re-exports `quic_v1` + `stream_multistream`, `parseQuicV1Endpoint` from multiaddrs with `/udp/.../quic-v1` (and optional `/p2p`) |
-| `transport.transport_error` | Maps `std.Io.net`, multistream I/O, `security.libp2p_tls`, and **zquic** (`fromZquicWireTransport`, `fromZquicOpenLocalStream`, typed `fromZquicIoSetup` / `fromZquicRun` on `ZquicIoSetupError` / `ZquicRunError`) into `TransportError` |
+| `transport.transport_error` | Maps `std.Io.net`, multistream I/O, `security.libp2p_tls`, `security.noise.libp2p` (`fromLibp2pNoise`), and **zquic** (`fromZquicWireTransport`, `fromZquicOpenLocalStream`, typed `fromZquicIoSetup` / `fromZquicRun` on `ZquicIoSetupError` / `ZquicRunError`) into `TransportError` |
 | `transport.stream_multistream` | Per-stream multistream-select on `std.Io.Reader` / `Writer`: `StreamHandshakeError` = `errors.TransportError` \|\| `Allocator.Error`; `appendFirstStreamInitiatorHandshake` still uses `NegotiateError` for buffer-only builds |
 | `transport.tcp` | TCP over `std.Io.net`: `listen` / `dial` / `acceptTuned` surface `TransportError` (plus `SocketTuningFailed` where tuning runs), `multistream_protocol_id`, thin wrappers around `stream_multistream` |
 | `transport.multistream_negotiate` | **Bounded** multistream-select 1.0.0 on a byte cursor: `default_max_body_len`, `readNegotiationLine`, `validateProtocolId`, initiator/responder steps (`initiatorSendMultistreamHeader`, `responderReadProtocolOffer`, `responderReplyProtocol`, …), `NegotiateError` |
@@ -124,6 +124,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | Submodule | Role |
 |-----------|------|
 | `security.libp2p_tls` | libp2p TLS 1.3 profile (#16): ALPN / multistream ids, extension OID, `peerIdFromCertificate` (parse only), `peerIdFromVerifiedCertificate` (self-signed X.509 + `SignedKey` over SPKI), spec vectors 1–4 |
+| `security.noise` | Noise XX + libp2p framing (#36): `protocol` (handshake + transport keys), `payload` / `identity` (protobuf + static-key signing), `libp2p` (`/noise`, `readNoiseFrame` / `writeNoiseFrame`, `handshakeInitiator` / `handshakeResponder`, `SecureChannel`), `stream_upgrade` (`negotiateInitiator` / `negotiateResponder`, `toTransportError`) for multistream-then-Noise on one stream |
 
 ---
 

@@ -55,6 +55,13 @@ pub const transport = struct {
 
 pub const security = struct {
     pub const libp2p_tls = @import("security/libp2p_tls.zig");
+    pub const noise = struct {
+        pub const protocol = @import("security/noise/protocol.zig");
+        pub const payload = @import("security/noise/payload.zig");
+        pub const identity = @import("security/noise/identity.zig");
+        pub const libp2p = @import("security/noise/libp2p_noise.zig");
+        pub const stream_upgrade = @import("security/noise/stream_upgrade.zig");
+    };
 };
 
 /// Pure-Zig QUIC/TLS stack ([zquic](https://github.com/ch4r10t33r/zquic)), Zig 0.16–pinned in `build.zig.zon`.
