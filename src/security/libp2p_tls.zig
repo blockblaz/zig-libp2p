@@ -7,7 +7,10 @@
 //! * **QUIC + TLS 1.3 (libp2p-on-QUIC):** After the QUIC handshake, TLS uses application-layer
 //!   protocol [`quic_application_layer_protocol`] (value `libp2p`). [`transport.quic_v1`] presets
 //!   (`libp2pZquicServerConfig` / `libp2pZquicClientConfig`) set this via `tls_alpn`, which aliases
-//!   the constant below—keep them in sync.
+//!   the constant below—keep them in sync. The pinned zquic stack does not yet expose the peer leaf
+//!   certificate on [`zquic.transport.io.ConnState`]; use [`leafCertificateDerFromTls13HandshakeCertificateMessage`]
+//!   on captured TLS Certificate handshake bytes, then [`peerIdFromVerifiedCertificate`] or
+//!   [`verifiedPeerIdFromQuicLeafCertificate`].
 //! * **TCP (or other) via multistream-select:** negotiate [`multistream_protocol_id`] (`/tls/1.0.0`)
 //!   before the TLS layer, per the TLS spec multistream path.
 //! * **Noise XX** for devnets that require it is **not** implemented here; track [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36).
@@ -39,6 +42,12 @@ pub const extension_oid_contents: [10]u8 = .{ 0x2B, 0x06, 0x01, 0x04, 0x01, 0x83
 
 /// Full DER `OBJECT IDENTIFIER` TLV for [`extension_oid_contents`].
 pub const extension_oid_tlv: [12]u8 = .{ 0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xA2, 0x5A, 0x01, 0x01 };
+
+pub const TlsHandshakeCertificateMessageError = error{
+    MalformedTlsHandshakeCertificateMessage,
+};
+
+pub const QuicPeerIdentityError = VerifyPeerCertificateError || error{PeerIdMismatch};
 
 pub const Error = error{
     MissingLibp2pExtension,
@@ -219,6 +228,50 @@ pub fn peerIdFromVerifiedCertificate(
 }
 
 /// Derive [`PeerId`] from a **single** leaf certificate’s libp2p extension (Ed25519, ECDSA, Secp256k1, … per protobuf).
+fn readTlsHandshakeU24(buf: []const u8, pos: usize) TlsHandshakeCertificateMessageError!struct { v: u32, next: usize } {
+    if (pos + 3 > buf.len) return error.MalformedTlsHandshakeCertificateMessage;
+    const v = (@as(u32, buf[pos]) << 16) | (@as(u32, buf[pos + 1]) << 8) | @as(u32, buf[pos + 2]);
+    return .{ .v = v, .next = pos + 3 };
+}
+
+/// Parse a TLS 1.3 `Certificate` handshake message (type `0x0b`) and return the first entry’s DER.
+/// `message` is the full record: 1-byte type, 3-byte length, then body (RFC 8446 §4.4.2).
+pub fn leafCertificateDerFromTls13HandshakeCertificateMessage(message: []const u8) TlsHandshakeCertificateMessageError![]const u8 {
+    if (message.len < 4) return error.MalformedTlsHandshakeCertificateMessage;
+    if (message[0] != 0x0b) return error.MalformedTlsHandshakeCertificateMessage;
+    const lh = try readTlsHandshakeU24(message, 1);
+    const body_end = lh.next + lh.v;
+    if (body_end > message.len) return error.MalformedTlsHandshakeCertificateMessage;
+    const body = message[lh.next..body_end];
+    if (body.len < 1) return error.MalformedTlsHandshakeCertificateMessage;
+    const ctx_len = body[0];
+    const after_ctx = 1 + ctx_len;
+    if (after_ctx > body.len) return error.MalformedTlsHandshakeCertificateMessage;
+    const list_h = try readTlsHandshakeU24(body, after_ctx);
+    const list_end = list_h.next + list_h.v;
+    if (list_end > body.len) return error.MalformedTlsHandshakeCertificateMessage;
+    const list = body[list_h.next..list_end];
+    if (list.len < 3) return error.MalformedTlsHandshakeCertificateMessage;
+    const cert_len_h = try readTlsHandshakeU24(list, 0);
+    const cert_end = cert_len_h.next + cert_len_h.v;
+    if (cert_end > list.len) return error.MalformedTlsHandshakeCertificateMessage;
+    return list[cert_len_h.next..cert_end];
+}
+
+/// Full libp2p identity verification on a QUIC peer leaf cert, optionally matching `/p2p` from the dial multiaddr.
+pub fn verifiedPeerIdFromQuicLeafCertificate(
+    allocator: std.mem.Allocator,
+    cert_der: []const u8,
+    expected_peer: ?peer_id.PeerId,
+    now_sec: i64,
+) QuicPeerIdentityError!peer_id.PeerId {
+    const id = try peerIdFromVerifiedCertificate(allocator, cert_der, now_sec);
+    if (expected_peer) |exp| {
+        if (!std.meta.eql(id, exp)) return error.PeerIdMismatch;
+    }
+    return id;
+}
+
 pub fn peerIdFromCertificate(allocator: std.mem.Allocator, cert_der: []const u8) Error!peer_id.PeerId {
     const ext = try findLibp2pExtensionExtValue(cert_der);
     const sk = try parseSignedKey(ext);
@@ -322,4 +375,24 @@ test "missing extension" {
 
 test "QUIC TLS ALPN matches libp2p TLS spec string" {
     try std.testing.expectEqualStrings("libp2p", quic_application_layer_protocol);
+}
+
+test "parse synthetic TLS 1.3 Certificate handshake (first leaf)" {
+    // certificate_request_context = empty, list = one entry: u24 len + cert + u16 ext = 3+1+2
+    const body = [_]u8{
+        0x00, // ctx len
+        0x00, 0x00, 0x06, // list length = 6
+        0x00, 0x00, 0x01, // cert octet string length = 1
+        0xab,
+        0x00, 0x00, // certificate extensions length = 0
+    };
+    var msg: [4 + body.len]u8 = undefined;
+    msg[0] = 0x0b;
+    msg[1] = 0x00;
+    msg[2] = 0x00;
+    msg[3] = @intCast(body.len);
+    @memcpy(msg[4..], &body);
+    const leaf = try leafCertificateDerFromTls13HandshakeCertificateMessage(&msg);
+    try std.testing.expectEqual(@as(usize, 1), leaf.len);
+    try std.testing.expectEqual(@as(u8, 0xab), leaf[0]);
 }
