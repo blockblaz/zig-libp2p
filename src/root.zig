@@ -6,7 +6,9 @@
 pub const protocol = @import("protocol.zig");
 pub const varint = @import("varint.zig");
 pub const addr_list = @import("addr_list.zig");
+pub const multistream = @import("multistream.zig");
 
 pub const req_resp = struct {
     pub const frame = @import("req_resp/frame.zig");
+    pub const stream = @import("req_resp/stream.zig");
 };
