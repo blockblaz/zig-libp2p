@@ -38,5 +38,9 @@ pub const req_resp = struct {
     pub const snappy_wire = @import("req_resp/snappy_wire.zig");
 };
 
+pub const transport = struct {
+    pub const quic_v1 = @import("transport/quic_v1.zig");
+};
+
 /// Pure-Zig QUIC/TLS stack ([zquic](https://github.com/ch4r10t33r/zquic)), Zig 0.16–pinned in `build.zig.zon`.
 pub const zquic = @import("zquic");

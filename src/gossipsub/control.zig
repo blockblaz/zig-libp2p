@@ -149,6 +149,68 @@ pub fn deinitIWantOwned(allocator: std.mem.Allocator, v: *IWantOwned) void {
     v.* = undefined;
 }
 
+/// Payload shape matches `ControlIDontWant` (repeated `messageIDs` only, same as `ControlIWant`).
+pub const IDontWantOwned = IWantOwned;
+
+pub fn deinitIDontWantOwned(allocator: std.mem.Allocator, v: *IDontWantOwned) void {
+    deinitIWantOwned(allocator, v);
+}
+
+/// `repeated ControlIDontWant idontwant = 5` with one entry listing the given message ids.
+pub fn encodeIDontWant(allocator: std.mem.Allocator, message_ids: []const []const u8) std.mem.Allocator.Error![]u8 {
+    var inner = std.ArrayList(u8).empty;
+    defer inner.deinit(allocator);
+    for (message_ids) |mid| {
+        try w.appendLengthDelimited(&inner, allocator, 1, mid);
+    }
+
+    var ctl = std.ArrayList(u8).empty;
+    defer ctl.deinit(allocator);
+    try w.appendLengthDelimited(&ctl, allocator, 5, inner.items);
+    return try ctl.toOwnedSlice(allocator);
+}
+
+/// First `ControlIDontWant` in a `ControlMessage` wire blob, or null.
+pub fn decodeFirstIDontWant(allocator: std.mem.Allocator, control: []const u8) (Error || std.mem.Allocator.Error)!?IDontWantOwned {
+    var off: usize = 0;
+    while (off < control.len) {
+        const key = try w.decodeFieldKey(control[off..]);
+        off += key.len;
+        const nv = try w.nextFieldValue(control[off..], key.wire_type);
+        off += nv.total;
+
+        if (key.field_number != 5 or key.wire_type != .length_delimited) continue;
+
+        var ids = std.ArrayList([]u8).empty;
+        defer {
+            for (ids.items) |m| allocator.free(m);
+            ids.deinit(allocator);
+        }
+
+        var io: usize = 0;
+        while (io < nv.value.len) {
+            const ik = try w.decodeFieldKey(nv.value[io..]);
+            io += ik.len;
+            const iv = try w.nextFieldValue(nv.value[io..], ik.wire_type);
+            io += iv.total;
+            switch (ik.field_number) {
+                1 => {
+                    if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    {
+                        const copy = try allocator.dupe(u8, iv.value);
+                        errdefer allocator.free(copy);
+                        try ids.append(allocator, copy);
+                    }
+                },
+                else => {},
+            }
+        }
+        const owned_ids = try ids.toOwnedSlice(allocator);
+        return IDontWantOwned{ .message_ids = owned_ids };
+    }
+    return null;
+}
+
 /// `repeated ControlGraft graft = 3` with a single graft for `topicID`.
 pub fn encodeGraft(allocator: std.mem.Allocator, topic_id: []const u8) std.mem.Allocator.Error![]u8 {
     var graft = std.ArrayList(u8).empty;
@@ -294,6 +356,27 @@ test "iwant empty" {
     defer a.free(wire);
     var got = (try decodeFirstIWant(a, wire)).?;
     defer deinitIWantOwned(a, &got);
+    try std.testing.expectEqual(@as(usize, 0), got.message_ids.len);
+}
+
+test "idontwant message ids round trip" {
+    const a = std.testing.allocator;
+    const mids: []const []const u8 = &.{ "a", "\xff\x00" };
+    const wire = try encodeIDontWant(a, mids);
+    defer a.free(wire);
+    var got = (try decodeFirstIDontWant(a, wire)).?;
+    defer deinitIDontWantOwned(a, &got);
+    try std.testing.expectEqual(@as(usize, 2), got.message_ids.len);
+    try std.testing.expectEqualStrings("a", got.message_ids[0]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xff, 0 }, got.message_ids[1]);
+}
+
+test "idontwant empty" {
+    const a = std.testing.allocator;
+    const wire = try encodeIDontWant(a, &[_][]const u8{});
+    defer a.free(wire);
+    var got = (try decodeFirstIDontWant(a, wire)).?;
+    defer deinitIDontWantOwned(a, &got);
     try std.testing.expectEqual(@as(usize, 0), got.message_ids.len);
 }
 
