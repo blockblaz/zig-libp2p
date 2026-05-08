@@ -41,7 +41,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `protocol` | Lean req/resp protocol id strings; `LeanSupportedProtocol` enum with `protocolId`, `fromInt`, `fromSlice` |
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
 | `addr_list` | Multiaddr CSV: `parseCsv`, `freeList` (uses bundled `multiaddr`) |
-| `multistream` | Multistream-select 1.0.0 line I/O: `multistream_1_0_0`, `writeProtocolLine`, `trimNegotiationLine` |
+| `multistream` | Multistream-select 1.0.0 line I/O: `multistream_1_0_0`, `max_protocol_id_body_bytes`, `writeProtocolLine`, `writeProtocolLineWithMax`, `ProtocolLineError`, `trimNegotiationLine` |
 | `ping` | Ping 1.0.0: `protocol_line`, `payload_len` |
 | `peer_id` | Re-export of `peer-id` package |
 | `identity` | `PeerId`, `ParseError` aliases |

@@ -6,8 +6,8 @@
 const std = @import("std");
 const ms = @import("../multistream.zig");
 
-/// Default maximum negotiation line body length (bytes before `\n`). Matches common libp2p stacks.
-pub const default_max_body_len: usize = 1024;
+/// Default maximum negotiation line body length (bytes before `\n`). Same as `multistream.max_protocol_id_body_bytes`.
+pub const default_max_body_len: usize = ms.max_protocol_id_body_bytes;
 
 pub const NegotiateError = error{
     LineTooLong,
@@ -52,7 +52,8 @@ fn appendMultistreamHeader(write: *std.ArrayList(u8), allocator: std.mem.Allocat
 
 fn appendProtocolLine(write: *std.ArrayList(u8), allocator: std.mem.Allocator, protocol_id: []const u8) (NegotiateError || std.mem.Allocator.Error)!void {
     try validateProtocolId(protocol_id);
-    try ms.writeProtocolLine(protocol_id, write.writer(allocator));
+    try write.appendSlice(allocator, protocol_id);
+    try write.append(allocator, '\n');
 }
 
 /// Append the initiator's first message: `/multistream/1.0.0\n`.
