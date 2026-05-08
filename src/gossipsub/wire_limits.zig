@@ -16,6 +16,9 @@ pub const max_message_id_bytes: usize = 256;
 /// Repeated message ids inside a single `IHave` / `IWant` / `IDontWant` entry.
 pub const max_message_ids_per_entry: usize = 8192;
 
+/// Nested `ControlExtensions` message (`ControlMessage.extensions`, field 6).
+pub const max_control_extensions_blob_bytes: usize = 4096;
+
 /// One `SubOpts` nested message inside `subscriptions`.
 pub const max_subopts_blob_bytes: usize = 64 * 1024;
 

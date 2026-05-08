@@ -60,7 +60,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | Submodule | Role |
 |-----------|------|
 | `gossipsub.rpc` | RPC envelope: `encodeEmptyControlRpc`, `encodeSubscribe` / `decodeFirstSubscribe`, `deinitSubscribeView`, `decodeControlPayload`, `encodePublish` / `decodeFirstPublish` |
-| `gossipsub.control` | Control message fragments: **IHave** / **IWant** / **IDontWant** / **graft** / **prune** — `encode*` / `decodeFirst*` / `deinit*` helpers |
+| `gossipsub.control` | Control message fragments: **IHave** / **IWant** / **IDontWant** / **graft** / **prune**; **ControlExtensions** (`partialMessages`): `encodeControlExtensions`, `encodeControlMessageExtensionsOnly`, `decodeFirstControlExtensions`, `ControlExtensionsView` |
 | `gossipsub.message` | `Message` protobuf: `MessageView`, `MessageOwned`, `encode`, `decode`, `MessageOwned.deinit` |
 
 ### `protobuf`
@@ -95,7 +95,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 ## Roadmap
 
 - Finish `/quic-v1` **endpoint** ergonomics (listen/dial helpers, stream lifecycle) on zquic; presets and multistream stream open are in `transport.quic_v1`. Extend `security.libp2p_tls` with mandatory `SignedKey` transcript verification; Noise or other profiles only if devnets require them.
-- Gossipsub mesh scoring and backpressure; optional **ControlExtensions** on the wire.
+- Gossipsub mesh scoring and backpressure; **ControlExtensions.partialMessages** wire helpers are in `gossipsub.control` (experimental proto fields still ignored).
 
 ---
 
