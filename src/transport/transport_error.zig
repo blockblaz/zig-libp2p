@@ -4,6 +4,7 @@ const std = @import("std");
 const errors = @import("../errors.zig");
 const neg = @import("multistream_negotiate.zig");
 const libp2p_tls = @import("../security/libp2p_tls.zig");
+const libp2p_noise = @import("../security/noise/libp2p_noise.zig");
 const zquic = @import("zquic");
 const net = std.Io.net;
 const Io = std.Io;
@@ -67,6 +68,10 @@ pub fn fromLibp2pTls(_: libp2p_tls.Error) errors.TransportError {
 }
 
 pub fn fromLibp2pTlsVerify(_: libp2p_tls.VerifyPeerCertificateError) errors.TransportError {
+    return error.SecurityUpgradeFailed;
+}
+
+pub fn fromLibp2pNoise(_: libp2p_noise.Error) errors.TransportError {
     return error.SecurityUpgradeFailed;
 }
 
