@@ -1,5 +1,5 @@
-//! Parse comma-separated multiaddr strings as produced for the Rust bridge
-//! (`EthLibp2p` → `multiaddrsToString` in Zeam).
+//! Parse comma-separated multiaddr strings in the same shape Zeam passes across
+//! the FFI boundary (`EthLibp2p` / `multiaddrsToString`).
 
 const std = @import("std");
 const Multiaddr = @import("multiaddr").Multiaddr;

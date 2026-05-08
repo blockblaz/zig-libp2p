@@ -1,15 +1,21 @@
-//! C ABI matching Zeam `pkgs/network/src/ethlibp2p.zig` and `rust/libp2p-glue`.
+//! Zeam host interop: `extern "C"` entry points and types matching
+//! `pkgs/network/src/ethlibp2p.zig` (`CreateNetworkParams`, `create_and_run_network`, …).
 //!
-//! Current behaviour is a **lifecycle stub**: parameters are released, readiness
-//! is signalled, and the bridge thread blocks until `stop_network`, so Zeam can
-//! join the thread. Gossip, RPC, and transports are not implemented yet.
+//! C link names are unchanged so the Zeam executable can swap this static archive
+//! for the previous native dependency without relinking the host.
+//!
+//! Current behaviour is a **lifecycle stub**: startup parameters are validated,
+//! host-owned buffers are released via `releaseStartNetworkParams`, readiness is
+//! signalled, and this thread blocks until `stop_network` so the host can join.
+//! Gossip, RPC, and transports are not implemented yet.
 
 const std = @import("std");
 const c = std.c;
+const addr_list = @import("zig_libp2p").addr_list;
 const protocol = @import("zig_libp2p").protocol;
 
 comptime {
-    _ = protocol; // keep protocol linked for upcoming stack wiring
+    _ = protocol;
 }
 
 fn monotonicNs() i128 {
@@ -58,6 +64,15 @@ extern fn releaseStartNetworkParams(
     connect_addresses: [*c]const u8,
 ) callconv(.c) void;
 
+fn releaseParams(p: CreateNetworkParams) void {
+    releaseStartNetworkParams(
+        p.zig_handler,
+        p.local_private_key,
+        p.listen_addresses,
+        p.connect_addresses,
+    );
+}
+
 export fn create_and_run_network(params: *const CreateNetworkParams) callconv(.c) void {
     if (@intFromPtr(params) == 0) return;
     const p = params.*;
@@ -72,12 +87,34 @@ export fn create_and_run_network(params: *const CreateNetworkParams) callconv(.c
     }
 
     g_shutdown[@intCast(nid)].store(false, .release);
-    releaseStartNetworkParams(
-        p.zig_handler,
-        p.local_private_key,
-        p.listen_addresses,
-        p.connect_addresses,
-    );
+
+    const listen_span = std.mem.span(p.listen_addresses);
+    const connect_span = std.mem.span(p.connect_addresses);
+
+    {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const al = arena.allocator();
+
+        const listen_ma = addr_list.parseCsv(al, listen_span) catch {
+            releaseParams(p);
+            return;
+        };
+        defer addr_list.freeList(al, listen_ma);
+
+        if (listen_ma.len == 0) {
+            releaseParams(p);
+            return;
+        }
+
+        const connect_ma = addr_list.parseCsv(al, connect_span) catch {
+            releaseParams(p);
+            return;
+        };
+        defer addr_list.freeList(al, connect_ma);
+    }
+
+    releaseParams(p);
 
     g_ready[@intCast(nid)].store(true, .release);
 
@@ -103,6 +140,8 @@ export fn stop_network(network_id: u32) callconv(.c) void {
     if (network_id >= max_networks) return;
     g_shutdown[@intCast(network_id)].store(true, .release);
 }
+
+// C link names below are stable for the Zeam host (`ethlibp2p.zig` `extern fn`).
 
 export fn publish_msg_to_rust_bridge(
     network_id: u32,
