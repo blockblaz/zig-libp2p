@@ -2,7 +2,7 @@
 
 Pure-Zig helpers for **libp2p-flavored** networking in Lean Ethereum clients: length-prefixed req/resp, gossipsub protobuf, multistream-select, QUIC-related constants, and shared dependencies (`peer_id`, `multiaddr`, Snappy) aligned with Zeam pins.
 
-**Not in scope yet:** full gossipsub mesh runtime, complete QUIC transport / event-loop integration, and libp2p security handshakes beyond what [zquic](https://github.com/ch4r10t33r/zquic) provides at the TLS layer. See [Roadmap](#roadmap).
+**Not in scope yet:** full gossipsub mesh runtime, high-level QUIC listen/dial wrappers (embedders use [zquic](https://github.com/ch4r10t33r/zquic) directly with [`transport.quic_v1`](#transport) presets), and libp2p security/session upgrades beyond zquic TLS + ALPN. See [Roadmap](#roadmap).
 
 | Requirement | Version / note |
 |-------------|----------------|
@@ -81,14 +81,14 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 | Submodule | Role |
 |-----------|------|
-| `transport.quic_v1` | Constants: `multistream_protocol_id` (`/quic-v1`), `tls_alpn` (`libp2p`) |
+| `transport.quic_v1` | QUIC v1 labels + zquic wiring: `multistream_protocol_id`, `tls_alpn`, `libp2pZquicServerConfig` / `libp2pZquicClientConfig` (ALPN `libp2p`, `raw_application_streams`), `appendFirstBidiStreamInitiatorHandshake` |
 | `transport.multistream_negotiate` | **Bounded** multistream-select 1.0.0 on a byte cursor: `default_max_body_len`, `readNegotiationLine`, `validateProtocolId`, initiator/responder steps (`initiatorSendMultistreamHeader`, `responderReadProtocolOffer`, `responderReplyProtocol`, …), `NegotiateError` |
 
 ---
 
 ## Roadmap
 
-- Build `/quic-v1` transport and libp2p security handshake (Noise or TLS) on top of the bundled zquic stack for devnets.
+- Finish `/quic-v1` **endpoint** ergonomics (listen/dial helpers, stream lifecycle) on zquic; presets and multistream stream open are in `transport.quic_v1`. Add libp2p security/session layer (Noise or dedicated TLS identity) as needed for devnets.
 - Gossipsub mesh scoring and backpressure; optional **ControlExtensions** on the wire.
 
 ---
