@@ -8,11 +8,19 @@ const zquic = @import("zquic");
 const net = std.Io.net;
 const Io = std.Io;
 
-comptime {
-    // Ensure zquic `io` PEM helpers' error names are in the global error set so `fromZquicIoSetup` can switch on them.
-    _ = @typeInfo(@typeInfo(@TypeOf(zquic.transport.io.loadCertDer)).@"fn".return_type.?);
-    _ = @typeInfo(@typeInfo(@TypeOf(zquic.transport.io.loadPrivateKey)).@"fn".return_type.?);
-}
+/// Errors from [`zquic.transport.io.Server.init`] / [`zquic.transport.io.Client.init`].
+pub const ZquicIoSetupError = @typeInfo(
+    @typeInfo(@TypeOf(zquic.transport.io.Server.init)).@"fn".return_type.?,
+).error_union.error_set || @typeInfo(
+    @typeInfo(@TypeOf(zquic.transport.io.Client.init)).@"fn".return_type.?,
+).error_union.error_set;
+
+/// Errors from [`zquic.transport.io.Server.run`] / [`zquic.transport.io.Client.run`].
+pub const ZquicRunError = @typeInfo(
+    @typeInfo(@TypeOf(zquic.transport.io.Server.run)).@"fn".return_type.?,
+).error_union.error_set || @typeInfo(
+    @typeInfo(@TypeOf(zquic.transport.io.Client.run)).@"fn".return_type.?,
+).error_union.error_set;
 
 pub fn fromIpConnect(err: net.IpAddress.ConnectError) errors.TransportError {
     return switch (err) {
@@ -96,11 +104,9 @@ pub fn fromZquicWireTransport(code: zquic.types.TransportError) errors.Transport
     };
 }
 
-/// Lossy mapping for zquic `transport.io` setup and client run helpers (`Server.init`, `Client.init`,
-/// `run` handshake timeout, `resolveAddress`, cert PEM load, POSIX socket/bind).
-///
-/// **OOM** is passed through; everything else collapses to [`errors.TransportError`].
-pub fn fromZquicIoSetup(err: anyerror) (errors.TransportError || std.mem.Allocator.Error) {
+/// Lossy mapping for [`zquic.transport.io.Server.init`] / [`zquic.transport.io.Client.init`].
+/// **OOM** is passed through.
+pub fn fromZquicIoSetup(err: ZquicIoSetupError) (errors.TransportError || std.mem.Allocator.Error) {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.CertReadFailed,
@@ -108,6 +114,20 @@ pub fn fromZquicIoSetup(err: anyerror) (errors.TransportError || std.mem.Allocat
         error.NoCertEnd,
         error.MissingEndMarker,
         => error.SecurityUpgradeFailed,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        => error.Unreachable,
+        error.AddressNotAvailable => error.Unreachable,
+        error.ConnectionRefused => error.DialFailed,
+        error.Timeout => error.DialFailed,
+        else => error.DialFailed,
+    };
+}
+
+/// Lossy mapping for [`zquic.transport.io.Server.run`] / [`zquic.transport.io.Client.run`].
+pub fn fromZquicRun(err: ZquicRunError) (errors.TransportError || std.mem.Allocator.Error) {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
         error.HandshakeTimeout => error.SecurityUpgradeFailed,
         error.HostNotFound => error.DialFailed,
         error.NetworkUnreachable,
@@ -126,4 +146,8 @@ test "fromZquicWireTransport maps connection_refused" {
 
 test "fromZquicOpenLocalStream maps stream limit" {
     try std.testing.expect(fromZquicOpenLocalStream(error.StreamLimitExceeded) == error.ProtocolNegotiationFailed);
+}
+
+test "fromZquicIoSetup typed cert failure" {
+    try std.testing.expect(fromZquicIoSetup(error.CertReadFailed) == error.SecurityUpgradeFailed);
 }

@@ -121,8 +121,13 @@ pub fn keyPairFromPem(allocator: std.mem.Allocator, pem: []const u8) PemError!Ke
     return keyPairFromDer(der[0..n]);
 }
 
+/// Errors from [`peer_id.PeerId.fromPublicKey`] (identity / SHA2-256 multihash path).
+pub const PeerIdFromKeyPairError = @typeInfo(
+    @typeInfo(@TypeOf(pid.PeerId.fromPublicKey)).@"fn".return_type.?,
+).error_union.error_set;
+
 /// Derive a libp2p PeerId from a loaded key pair (protobuf public key encoding).
-pub fn peerIdFromKeyPair(allocator: std.mem.Allocator, kp: KeyPair) !pid.PeerId {
+pub fn peerIdFromKeyPair(allocator: std.mem.Allocator, kp: KeyPair) PeerIdFromKeyPairError!pid.PeerId {
     switch (kp) {
         .ed25519 => |k| {
             const b = k.public_key.toBytes();
