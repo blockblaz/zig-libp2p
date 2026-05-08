@@ -10,7 +10,7 @@ A minimal **pure-Zig** library you add with `build.zig.zon` + `std.Build.depende
 - **Snappy**: same pins as Zeam — [`zig_snappy`](https://github.com/blockblaz/zig-snappy) (`snappyz`) and [`snappyframesz`](https://github.com/blockblaz/snappyframesz) for block + framed stream compression
 - **Lean gossip mesh topics** (`/leanconsensus/<fork>/<name>/ssz_snappy`) and **libp2p ping** constants
 - **Peer IDs** via [`peer-id`](https://github.com/blockblaz/peer-id) (same pin as `multiaddr-zig`), re-exported and wrapped in `identity`
-- **Protobuf wire** (`protobuf.wire`) and **gossipsub** helpers: `RPC` (subscribe, publish, empty control), **control** graft/prune, **`Message`** encode/decode (`gossipsub.rpc`, `gossipsub.control`, `gossipsub.message`)
+- **Protobuf wire** (`protobuf.wire`) and **gossipsub** helpers: `RPC` (subscribe, publish, empty control), **control** IHAVE/IWANT/graft/prune, **`Message`** encode/decode (`gossipsub.rpc`, `gossipsub.control`, `gossipsub.message`)
 
 Full gossipsub mesh behaviour, transport, and security handshakes are not implemented yet.
 
@@ -69,13 +69,13 @@ Run this repo’s tests locally: `zig build test`. CI matches [Zeam’s workflow
 - [x] **Peer ID** package (`peer_id` / `identity`): parse and encode libp2p peer IDs (bytes, base58, `fromString` vector).
 - [x] **Protobuf wire** varints + length-delimited fields (`protobuf.wire`).
 - [x] **Gossipsub `RPC`** (proto2): empty `ControlMessage`, first `SubOpts` subscribe encode/decode (`gossipsub.rpc`).
-- [x] **Gossipsub control** (graft/prune wire + decode helpers) and **`Message`** encode/decode; first `publish` on `RPC` (`gossipsub.control`, `gossipsub.message`).
+- [x] **Gossipsub control** (IHAVE/IWANT/graft/prune wire + decode helpers) and **`Message`** encode/decode; first `publish` on `RPC` (`gossipsub.control`, `gossipsub.message`).
 
 ## Next
 
 - [ ] Wire [zquic](https://github.com/ch4r10t33r/zquic) on Zig 0.16; `/quic-v1` transport and libp2p security handshake.
 - [ ] Security handshake (Noise or TLS) suitable for Lean devnets.
-- [ ] Gossipsub control messages (IHAVE, IWANT), mesh scoring, backpressure.
+- [ ] Gossipsub mesh scoring, backpressure; optional **IDONTWANT** / **ControlExtensions** wire.
 
 ## Remote
 
