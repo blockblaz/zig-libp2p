@@ -2,7 +2,33 @@
 
 Pure-Zig helpers for **libp2p-flavored** networking in Lean Ethereum clients: length-prefixed req/resp, gossipsub protobuf, multistream-select, QUIC-related constants, and shared dependencies (`peer_id`, `multiaddr`, Snappy) aligned with Zeam pins.
 
-**Not in scope yet:** full gossipsub mesh runtime, high-level QUIC listen/dial wrappers (embedders use [zquic](https://github.com/ch4r10t33r/zquic) with [`transport.quic_v1`](#transport) presets), and **full** libp2p TLS verification (see [`security.libp2p_tls`](#security) for PeerId-from-cert parsing + roadmap). See [Roadmap](#roadmap).
+Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31).
+
+## Zeam parity
+
+| Surface | Status | Issue |
+|---------|--------|-------|
+| Multistream-select | Done | — |
+| Varint / protobuf wire | Done | — |
+| Lean req/resp codec | Done | — |
+| Gossipsub codec | Done | — |
+| Snappy framing | Done | — |
+| TCP transport | Done | [#35](https://github.com/ch4r10t33r/zig-libp2p/issues/35) |
+| QUIC multiaddr + per-stream negotiate | Partial | [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) |
+| libp2p TLS (PeerId from cert) | Partial | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) |
+| Ping behaviour (`/ipfs/ping/1.0.0`) | Done | [#42](https://github.com/ch4r10t33r/zig-libp2p/issues/42) |
+| KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
+| Swarm / network runtime | Not started | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) |
+| Noise XX | Not started | [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36) |
+| Connection manager | Not started | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) |
+| Gossipsub mesh runtime | Not started | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) |
+| Req/resp behaviour | Not started | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) |
+| Identify | Not started | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
+| Metrics (Prometheus-style) | Not started | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) |
+| Typed error sets (layers) | Partial | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) |
+| Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
+
+**Still heavy lift for embedders:** full swarm, connection manager, mesh, and **full** TLS `SignedKey` verification (today: parse + PeerId only in [`security.libp2p_tls`](#security)). QUIC listen/dial lifecycle remains primarily [zquic](https://github.com/ch4r10t33r/zquic) + [`transport.quic_v1`](#transport) presets.
 
 | Requirement | Version / note |
 |-------------|----------------|
@@ -42,9 +68,10 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
 | `addr_list` | Multiaddr CSV: `parseCsv`, `freeList` (uses bundled `multiaddr`) |
 | `multistream` | Multistream-select 1.0.0 line I/O: `multistream_1_0_0`, `max_protocol_id_body_bytes`, `writeProtocolLine`, `writeProtocolLineWithMax`, `ProtocolLineError`, `trimNegotiationLine` |
-| `ping` | Ping 1.0.0: `protocol_line`, `payload_len` |
+| `ping` | Ping 1.0.0: `protocol_line`, wire helpers, `Ping` / `PingConfig` timer policy, `handleInbound`, `initiatorRoundTripMs` |
 | `peer_id` | Re-export of `peer-id` package |
 | `identity` | `PeerId`, `ParseError` aliases |
+| `keypair` | PEM → `KeyPair` (Ed25519, secp256k1) + `peerIdFromKeyPair` |
 | `snappyz` | Re-export of `zig_snappy` (block Snappy) |
 | `snappyframesz` | Re-export of Snappy framing for libp2p streams |
 | `zquic` | Full **zquic** library (QUIC/TLS); use for transport integration |
@@ -97,8 +124,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 ## Roadmap
 
-- Finish `/quic-v1` **endpoint** ergonomics (typed listen/dial, Rust interop, lifecycle hooks) on zquic; use `transport.quic` / `transport.stream_multistream` for multiaddr + per-stream negotiation. Plain TCP listen/dial is in `transport.tcp`. Extend `security.libp2p_tls` with mandatory `SignedKey` transcript verification; Noise or other profiles only if devnets require them.
-- Gossipsub mesh scoring and backpressure; **ControlExtensions.partialMessages** wire helpers are in `gossipsub.control` (experimental proto fields still ignored).
+Priorities follow the [parity table](#zeam-parity) (open issues linked there). Near term: [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) QUIC ergonomics, [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) Identify, [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) swarm. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
 
 ---
 
