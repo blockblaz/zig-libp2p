@@ -15,7 +15,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Snappy framing | Done | — |
 | TCP transport | Done | [#35](https://github.com/ch4r10t33r/zig-libp2p/issues/35) |
 | QUIC multiaddr + per-stream negotiate | Partial | [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) |
-| libp2p TLS on QUIC (ALPN, PeerId from cert) | Partial | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — ALPN centralized in [`security.libp2p_tls`](#security); SignedKey / SPKI signature verification still out of scope here |
+| libp2p TLS on QUIC (ALPN, peer auth) | Partial | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — [`security.libp2p_tls`](#security) implements cert + SignedKey verification (`peerIdFromVerifiedCertificate`); embedders must invoke it on the peer leaf cert after TLS. **Noise** remains [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36). |
 | Ping behaviour (`/ipfs/ping/1.0.0`) | Done | [#42](https://github.com/ch4r10t33r/zig-libp2p/issues/42) |
 | KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
 | Swarm / network runtime | Partial | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — threaded command/event runtime; transport integration still embedder-owned |
@@ -28,7 +28,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
 | Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
 
-**Still heavy lift for embedders:** connection manager, gossipsub mesh runtime, req/resp behaviour, and **full** TLS peer authentication (`SignedKey` / SPKI signature verification—today: parse + PeerId only in [`security.libp2p_tls`](#security)). QUIC listen/dial lifecycle remains primarily [zquic](https://github.com/ch4r10t33r/zquic) + [`transport.quic_v1`](#transport) presets.
+**Still heavy lift for embedders:** connection manager, gossipsub mesh runtime, req/resp behaviour, and wiring [`peerIdFromVerifiedCertificate`](./src/security/libp2p_tls.zig) into the TLS peer-cert path (library provides verification; transport must call it). QUIC listen/dial lifecycle remains primarily [zquic](https://github.com/ch4r10t33r/zquic) + [`transport.quic_v1`](#transport) presets.
 
 | Requirement | Version / note |
 |-------------|----------------|
@@ -123,7 +123,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 | Submodule | Role |
 |-----------|------|
-| `security.libp2p_tls` | libp2p TLS 1.3 profile docs (#16), `quic_application_layer_protocol` / `multistream_protocol_id`, `handshake_signature_prefix`, extension OID, `findLibp2pExtensionExtValue`, `parseSignedKey`, `peerIdFromCertificate` (spec vectors; **no** `SignedKey` signature verify yet) |
+| `security.libp2p_tls` | libp2p TLS 1.3 profile (#16): ALPN / multistream ids, extension OID, `peerIdFromCertificate` (parse only), `peerIdFromVerifiedCertificate` (self-signed X.509 + `SignedKey` over SPKI), spec vectors 1–4 |
 
 ---
 

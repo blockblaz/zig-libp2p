@@ -15,12 +15,15 @@
 //! This module parses the libp2p Public Key extension (IANA enterprise OID) from a leaf
 //! certificate and derives a PeerId from the embedded protobuf public key (spec test vectors).
 //!
-//! **Authentication gap:** signature verification over `handshake_signature_prefix` ||
-//! SubjectPublicKeyInfo is not implemented; callers must not treat PeerId derivation alone as a
-//! fully authenticated remote peer until verification lands (see #16).
+//! For authenticated handshakes, use [`peerIdFromVerifiedCertificate`]: it enforces a single
+//! certificate, self-signature and validity window (`std.crypto.Certificate.verify`), and verifies
+//! the host key signature over `handshake_signature_prefix` || SubjectPublicKeyInfo (TLS spec).
+//! [`peerIdFromCertificate`] only parses the extension and derives a PeerId (no crypto proof).
 
 const std = @import("std");
 const peer_id = @import("peer_id");
+
+const X509 = std.crypto.Certificate;
 
 /// TLS ALPN identifier for libp2p over QUIC (TLS 1.3). Same bytes as `transport.quic_v1.tls_alpn`.
 pub const quic_application_layer_protocol: []const u8 = "libp2p";
@@ -43,7 +46,16 @@ pub const Error = error{
     MalformedSignedKey,
     InvalidPublicKeyProtobuf,
     UnsupportedAsn1Length,
+    CertificateTrailingData,
+    MalformedSubjectPublicKeyInfo,
+    HandshakeMessageTooLong,
+    SignedKeySignatureInvalid,
+    InvalidHostPublicKeyEncoding,
+    UnsupportedHostPublicKeyType,
 };
+
+/// Full TLS identity verification (certificate + SignedKey), per the libp2p TLS spec.
+pub const VerifyPeerCertificateError = Error || X509.ParseError || X509.Parsed.VerifyError;
 
 fn readShortDerLength(buf: []const u8, pos: usize) Error!struct { len: usize, header: usize } {
     if (pos >= buf.len) return error.MalformedExtension;
@@ -96,6 +108,116 @@ pub fn parseSignedKey(signed_key_der: []const u8) Error!struct { public_key_pb: 
     return .{ .public_key_pb = pk.payload, .signature = sig.payload };
 }
 
+/// SubjectPublicKeyInfo DER of the certificate’s ephemeral key (RFC 5280), as signed in the TLS handshake.
+fn subjectPublicKeyInfoTlv(cert_der: []const u8) (Error || X509.ParseError)![]const u8 {
+    const b = cert_der;
+    const certificate = try X509.der.Element.parse(b, 0);
+    const tbs_certificate = try X509.der.Element.parse(b, certificate.slice.start);
+    const version_elem = try X509.der.Element.parse(b, tbs_certificate.slice.start);
+    const serial_number = if (@as(u8, @bitCast(version_elem.identifier)) == 0xa0)
+        try X509.der.Element.parse(b, version_elem.slice.end)
+    else
+        version_elem;
+    const tbs_signature = try X509.der.Element.parse(b, serial_number.slice.end);
+    const issuer = try X509.der.Element.parse(b, tbs_signature.slice.end);
+    const validity = try X509.der.Element.parse(b, issuer.slice.end);
+    const subject = try X509.der.Element.parse(b, validity.slice.end);
+    const spki_start: u32 = subject.slice.end;
+    const pub_key_info = try X509.der.Element.parse(b, spki_start);
+    return b[spki_start..pub_key_info.slice.end];
+}
+
+fn sec1FromSubjectPublicKeyInfoPkix(spki: []const u8) Error![]const u8 {
+    const seq = try readConstructedTLV(spki, 0, 0x30);
+    if (seq.next != spki.len) return error.MalformedSubjectPublicKeyInfo;
+    var pos: usize = 0;
+    const algo = try readConstructedTLV(seq.payload, pos, 0x30);
+    pos = algo.next;
+    const bitstr = try readConstructedTLV(seq.payload, pos, 0x03);
+    if (bitstr.payload.len < 2) return error.MalformedSubjectPublicKeyInfo;
+    if (bitstr.payload[0] != 0) return error.MalformedSubjectPublicKeyInfo;
+    return bitstr.payload[1..];
+}
+
+fn verifyHostKeySignature(
+    key_type: peer_id.KeyType,
+    pubkey_data: []const u8,
+    signature: []const u8,
+    message: []const u8,
+) Error!void {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const ecdsa = std.crypto.ecdsa;
+    switch (key_type) {
+        .ED25519 => {
+            if (pubkey_data.len != Ed25519.PublicKey.encoded_length) return error.InvalidHostPublicKeyEncoding;
+            if (signature.len != Ed25519.Signature.encoded_length) return error.SignedKeySignatureInvalid;
+            const pk = Ed25519.PublicKey.fromBytes(pubkey_data[0..Ed25519.PublicKey.encoded_length].*) catch
+                return error.InvalidHostPublicKeyEncoding;
+            const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
+            sig.verify(message, pk) catch return error.SignedKeySignatureInvalid;
+        },
+        .Secp256k1 => {
+            if (pubkey_data.len != 33) return error.InvalidHostPublicKeyEncoding;
+            const pk = ecdsa.EcdsaSecp256k1Sha256.PublicKey.fromSec1(pubkey_data) catch
+                return error.InvalidHostPublicKeyEncoding;
+            const sig = ecdsa.EcdsaSecp256k1Sha256.Signature.fromDer(signature) catch
+                return error.SignedKeySignatureInvalid;
+            sig.verify(message, pk) catch return error.SignedKeySignatureInvalid;
+        },
+        .ECDSA => {
+            const sec1 = sec1FromSubjectPublicKeyInfoPkix(pubkey_data) catch
+                return error.InvalidHostPublicKeyEncoding;
+            const pk = ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(sec1) catch
+                return error.InvalidHostPublicKeyEncoding;
+            const sig = ecdsa.EcdsaP256Sha256.Signature.fromDer(signature) catch
+                return error.SignedKeySignatureInvalid;
+            sig.verify(message, pk) catch return error.SignedKeySignatureInvalid;
+        },
+        .RSA, .CURVE25519 => return error.UnsupportedHostPublicKeyType,
+    }
+}
+
+/// Verify libp2p TLS identity: single self-signed cert (time range), libp2p extension, and host signature.
+pub fn peerIdFromVerifiedCertificate(
+    allocator: std.mem.Allocator,
+    cert_der: []const u8,
+    now_sec: i64,
+) VerifyPeerCertificateError!peer_id.PeerId {
+    if (cert_der.len > std.math.maxInt(u32)) return error.CertificateFieldHasInvalidLength;
+
+    const cert_el = try X509.der.Element.parse(cert_der, 0);
+    if (@as(usize, @intCast(cert_el.slice.end)) != cert_der.len)
+        return error.CertificateTrailingData;
+
+    const x509 = X509{ .buffer = cert_der, .index = 0 };
+    try X509.verify(x509, x509, now_sec);
+
+    const spki = try subjectPublicKeyInfoTlv(cert_der);
+    const msg_len = handshake_signature_prefix.len + spki.len;
+    if (msg_len > 512) return error.HandshakeMessageTooLong;
+    var msg_buf: [512]u8 = undefined;
+    @memcpy(msg_buf[0..handshake_signature_prefix.len], handshake_signature_prefix);
+    @memcpy(msg_buf[handshake_signature_prefix.len..][0..spki.len], spki);
+    const message = msg_buf[0..msg_len];
+
+    const ext = try findLibp2pExtensionExtValue(cert_der);
+    const sk = try parseSignedKey(ext);
+    const reader = peer_id.PublicKeyReader.init(sk.public_key_pb) catch return error.InvalidPublicKeyProtobuf;
+    const pk_data = reader.getData();
+    if (pk_data.len == 0) return error.InvalidPublicKeyProtobuf;
+
+    try verifyHostKeySignature(reader.getType(), pk_data, sk.signature, message);
+
+    const owned = try allocator.dupe(u8, pk_data);
+    defer allocator.free(owned);
+
+    var pk = peer_id.PublicKey{
+        .type = reader.getType(),
+        .data = owned,
+    };
+    return peer_id.PeerId.fromPublicKey(allocator, &pk) catch return error.InvalidPublicKeyProtobuf;
+}
+
 /// Derive [`PeerId`] from a **single** leaf certificate’s libp2p extension (Ed25519, ECDSA, Secp256k1, … per protobuf).
 pub fn peerIdFromCertificate(allocator: std.mem.Allocator, cert_der: []const u8) Error!peer_id.PeerId {
     const ext = try findLibp2pExtensionExtValue(cert_der);
@@ -114,6 +236,12 @@ pub fn peerIdFromCertificate(allocator: std.mem.Allocator, cert_der: []const u8)
     return peer_id.PeerId.fromPublicKey(allocator, &pk) catch return error.InvalidPublicKeyProtobuf;
 }
 
+fn tlsVectorValidityMidpointSec(cert_der: []const u8) X509.ParseError!i64 {
+    const c = X509{ .buffer = cert_der, .index = 0 };
+    const p = try c.parse();
+    return @intCast((p.validity.not_before + p.validity.not_after) / 2);
+}
+
 test "libp2p TLS spec vector 1 (Ed25519) peer id" {
     const a = std.testing.allocator;
     const hex =
@@ -127,6 +255,12 @@ test "libp2p TLS spec vector 1 (Ed25519) peer id" {
     var b58: [128]u8 = undefined;
     const s = try id.toBase58(&b58);
     try std.testing.expectEqualStrings("12D3KooWM6CgA9iBFZmcYAHA6A2qvbAxqfkmrYiRQuz3XEsk4Ksv", s);
+
+    const now = try tlsVectorValidityMidpointSec(cert);
+    const id_v = try peerIdFromVerifiedCertificate(a, cert, now);
+    var b58_v: [128]u8 = undefined;
+    const s_v = try id_v.toBase58(&b58_v);
+    try std.testing.expectEqualStrings("12D3KooWM6CgA9iBFZmcYAHA6A2qvbAxqfkmrYiRQuz3XEsk4Ksv", s_v);
 }
 
 test "libp2p TLS spec vector 2 (ECDSA) peer id" {
@@ -136,10 +270,17 @@ test "libp2p TLS spec vector 2 (ECDSA) peer id" {
     ;
     var buf: [512]u8 = undefined;
     const n = try std.fmt.hexToBytes(&buf, hex);
-    const id = try peerIdFromCertificate(a, buf[0..n]);
+    const cert = buf[0..n];
+    const id = try peerIdFromCertificate(a, cert);
     var b58: [128]u8 = undefined;
     const s = try id.toBase58(&b58);
     try std.testing.expectEqualStrings("QmfXbAwNjJLXfesgztEHe8HwgVDCMMpZ9Eax1HYq6hn9uE", s);
+
+    const now = try tlsVectorValidityMidpointSec(cert);
+    const id_v = try peerIdFromVerifiedCertificate(a, cert, now);
+    var b58_v: [128]u8 = undefined;
+    const s_v = try id_v.toBase58(&b58_v);
+    try std.testing.expectEqualStrings("QmfXbAwNjJLXfesgztEHe8HwgVDCMMpZ9Eax1HYq6hn9uE", s_v);
 }
 
 test "libp2p TLS spec vector 3 (secp256k1) peer id" {
@@ -149,10 +290,29 @@ test "libp2p TLS spec vector 3 (secp256k1) peer id" {
     ;
     var buf: [512]u8 = undefined;
     const n = try std.fmt.hexToBytes(&buf, hex);
-    const id = try peerIdFromCertificate(a, buf[0..n]);
+    const cert = buf[0..n];
+    const id = try peerIdFromCertificate(a, cert);
     var b58: [128]u8 = undefined;
     const s = try id.toBase58(&b58);
     try std.testing.expectEqualStrings("16Uiu2HAkutTMoTzDw1tCvSRtu6YoixJwS46S1ZFxW8hSx9fWHiPs", s);
+
+    const now = try tlsVectorValidityMidpointSec(cert);
+    const id_v = try peerIdFromVerifiedCertificate(a, cert, now);
+    var b58_v: [128]u8 = undefined;
+    const s_v = try id_v.toBase58(&b58_v);
+    try std.testing.expectEqualStrings("16Uiu2HAkutTMoTzDw1tCvSRtu6YoixJwS46S1ZFxW8hSx9fWHiPs", s_v);
+}
+
+test "libp2p TLS spec vector 4 (invalid) rejected after verify" {
+    const a = std.testing.allocator;
+    const hex =
+        \\308201f73082019da0030201020204499602d2300a06082a8648ce3d040302302031123010060355040a13096c69627032702e696f310a300806035504051301313020170d3735303130313133303030305a180f34303936303130313133303030305a302031123010060355040a13096c69627032702e696f310a300806035504051301313059301306072a8648ce3d020106082a8648ce3d030107034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569ea381c23081bf3081bc060a2b0601040183a25a01010481ad3081aa045f0803125b3059301306072a8648ce3d020106082a8648ce3d03010703420004bf30511f909414ebdd3242178fd290f093a551cf75c973155de0bb5a96fedf6cb5d52da7563e794b512f66e60c7f55ba8a3acf3dd72a801980d205e8a1ad29f204473045022100bb6e03577b7cc7a3cd1558df0da2b117dfdcc0399bc2504ebe7de6f65cade72802206de96e2a5be9b6202adba24ee0362e490641ac45c240db71fe955f2c5cf8df6e300a06082a8648ce3d0403020348003045022100e847f267f43717358f850355bdcabbefb2cfbf8a3c043b203a14788a092fe8db022027c1d04a2d41fd6b57a7e8b3989e470325de4406e52e084e34a3fd56eef0d0df
+    ;
+    var buf: [512]u8 = undefined;
+    const n = try std.fmt.hexToBytes(&buf, hex);
+    const cert = buf[0..n];
+    const now = try tlsVectorValidityMidpointSec(cert);
+    try std.testing.expectError(error.SignedKeySignatureInvalid, peerIdFromVerifiedCertificate(a, cert, now));
 }
 
 test "missing extension" {
