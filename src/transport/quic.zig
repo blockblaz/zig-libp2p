@@ -1,20 +1,27 @@
 //! QUIC transport helpers for libp2p (tracking issue #37).
 //!
-//! zquic listen/dial loops and connection types are still embedder-owned: use
-//! [`quic_v1.libp2pZquicServerConfig`] / [`quic_v1.libp2pZquicClientConfig`] with
-//! `zquic.transport.io.Server` / `Client`, then run [`stream_multistream`] on each new
-//! raw application bidirectional stream.
+//! Typical flow:
+//! 1. [`parseQuicV1Endpoint`] from a dial multiaddr, or the same for listen.
+//! 2. [`initLibp2pQuicServerFromMultiaddr`] or bind with [`bindUdpSocket`] + `zquic.transport.io.Server.initFromSocket`.
+//! 3. [`initLibp2pQuicClientFromEndpoint`] for an IPv4 dial target (zquic client socket is IPv4 today).
+//! 4. After QUIC + TLS, open raw app bidi streams (`zquic.transport.io.rawAllocateNextLocalBidiStream`, …).
+//! 5. Run [`stream_multistream.initiatorHandshakeMultistream`] / [`responderHandshakeMultistream`] on each stream
+//!    using [`quic_raw_stream_io.RawAppBidiClient`] or [`RawAppBidiServer`] I/O adapters (see module [`quic_raw_stream_io`]).
 //!
-//! This module adds multiaddr parsing for typical `/udp/.../quic-v1` dial targets.
+//! This module adds multiaddr parsing for typical `/udp/.../quic-v1` dial and listen addresses.
 
 const std = @import("std");
 const multiaddr = @import("multiaddr");
 const peer_id_mod = @import("peer_id");
+const zquic = @import("zquic");
 
 pub const quic_v1 = @import("quic_v1.zig");
 pub const stream_multistream = @import("stream_multistream.zig");
+pub const quic_raw_stream_io = @import("quic_raw_stream_io.zig");
 
 const net = std.Io.net;
+const posix = std.posix;
+const ZIo = zquic.transport.io;
 
 /// IP + UDP port + optional `/p2p` expectation after `/quic-v1`.
 pub const QuicV1Endpoint = struct {
@@ -27,6 +34,11 @@ pub const ParseQuicV1EndpointError = error{
     MissingUdpPort,
     MissingQuicV1Component,
 } || multiaddr.multiaddr.Error;
+
+/// zquic `Client.init` / event loop is IPv4 UDP only in the current pin; use IPv6 once zquic grows an IPv6 client socket path.
+pub const Libp2pQuicClientDialError = error{ZquicClientIpv4Only};
+
+pub const BindUdpSocketError = posix.SocketError || posix.BindError;
 
 /// Extract host/port and optional PeerId from a multiaddr that includes `/udp/.../quic-v1`.
 /// Ignores unrelated components (for example `/p2p-circuit`) except those matched above.
@@ -66,6 +78,91 @@ pub fn parseQuicV1Endpoint(ma: multiaddr.Multiaddr) ParseQuicV1EndpointError!Qui
     return .{ .address = address, .expected_peer = peer };
 }
 
+/// Format the IP portion of `address` for `zquic` `ClientConfig.host` (dotted quad for IPv4).
+pub fn formatZquicDialHost(address: net.IpAddress, buf: []u8) (Libp2pQuicClientDialError || std.fmt.BufPrintError)![]const u8 {
+    return switch (address) {
+        .ip4 => |v| try std.fmt.bufPrint(buf, "{}.{}.{}.{}", .{
+            v.bytes[0], v.bytes[1], v.bytes[2], v.bytes[3],
+        }),
+        .ip6 => error.ZquicClientIpv4Only,
+    };
+}
+
+/// Create a datagram socket bound to `address` (IPv4 or IPv6). Caller usually passes it to [`ZIo.Server.initFromSocket`].
+pub fn bindUdpSocket(address: net.IpAddress) BindUdpSocketError!posix.socket_t {
+    return switch (address) {
+        .ip4 => |v| {
+            const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+            errdefer posix.close(sock);
+            var sa: posix.sockaddr.in = .{
+                .family = posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, v.port),
+                .addr = @bitCast(v.bytes),
+                .padding = undefined,
+            };
+            try posix.bind(sock, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+            return sock;
+        },
+        .ip6 => |v| {
+            const sock = try posix.socket(posix.AF.INET6, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+            errdefer posix.close(sock);
+            var sa: posix.sockaddr.in6 = .{
+                .family = posix.AF.INET6,
+                .port = std.mem.nativeToBig(u16, v.port),
+                .flowinfo = v.flow,
+                .addr = v.bytes,
+                .scope_id = v.interface.index,
+            };
+            try posix.bind(sock, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+            return sock;
+        },
+    };
+}
+
+/// `Server.initFromSocket` with [`quic_v1.libp2pZquicServerConfig`], binding from multiaddr `/udp/.../quic-v1`.
+/// `Libp2pZquicServerOptions.port` is overwritten by the UDP port in the multiaddr.
+pub fn initLibp2pQuicServerFromMultiaddr(
+    allocator: std.mem.Allocator,
+    ma: multiaddr.Multiaddr,
+    options: quic_v1.Libp2pZquicServerOptions,
+) !*ZIo.Server {
+    const ep = try parseQuicV1Endpoint(ma);
+    const sock = try bindUdpSocket(ep.address);
+    errdefer posix.close(sock);
+
+    var cfg_opts = options;
+    cfg_opts.port = ep.address.getPort();
+    const cfg = quic_v1.libp2pZquicServerConfig(cfg_opts);
+    return ZIo.Server.initFromSocket(allocator, cfg, sock, true);
+}
+
+/// Options shared with [`quic_v1.Libp2pZquicClientOptions`] except `host` / `port` (taken from the endpoint).
+pub const Libp2pZquicClientDialOptions = struct {
+    keylog_path: ?[]const u8 = null,
+    qlog_dir: ?[]const u8 = null,
+    cubic: bool = false,
+    v2: bool = false,
+};
+
+/// Build a [`ZIo.Client`] for an IPv4 [`QuicV1Endpoint`] using the libp2p QUIC presets.
+pub fn initLibp2pQuicClientFromEndpoint(
+    allocator: std.mem.Allocator,
+    ep: QuicV1Endpoint,
+    dial_options: Libp2pZquicClientDialOptions,
+) !ZIo.Client {
+    var host_buf: [15]u8 = undefined;
+    const host = try formatZquicDialHost(ep.address, &host_buf);
+    const cfg = quic_v1.libp2pZquicClientConfig(.{
+        .host = host,
+        .port = ep.address.getPort(),
+        .keylog_path = dial_options.keylog_path,
+        .qlog_dir = dial_options.qlog_dir,
+        .cubic = dial_options.cubic,
+        .v2 = dial_options.v2,
+    });
+    return ZIo.Client.init(allocator, cfg);
+}
+
 test "parse quic-v1 ipv4 multiaddr" {
     const a = std.testing.allocator;
     var ma = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/4001/quic-v1");
@@ -94,4 +191,21 @@ test "parse quic-v1 rejects missing ip" {
     defer ma.deinit();
 
     try std.testing.expectError(error.MissingIp, parseQuicV1Endpoint(ma));
+}
+
+test "format zquic dial host ipv4" {
+    var buf: [15]u8 = undefined;
+    const s = try formatZquicDialHost(.{ .ip4 = .{
+        .bytes = .{ 10, 0, 0, 1 },
+        .port = 4001,
+    } }, &buf);
+    try std.testing.expectEqualStrings("10.0.0.1", s);
+}
+
+test "bindUdpSocket ipv4 loopback" {
+    const sock = try bindUdpSocket(.{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = 0,
+    } });
+    defer posix.close(sock);
 }

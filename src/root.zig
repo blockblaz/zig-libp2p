@@ -47,6 +47,7 @@ pub const req_resp = struct {
 pub const transport = struct {
     pub const quic_v1 = @import("transport/quic_v1.zig");
     pub const quic = @import("transport/quic.zig");
+    pub const quic_raw_stream_io = @import("transport/quic_raw_stream_io.zig");
     pub const stream_multistream = @import("transport/stream_multistream.zig");
     pub const tcp = @import("transport/tcp.zig");
     pub const multistream_negotiate = @import("transport/multistream_negotiate.zig");

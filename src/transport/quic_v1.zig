@@ -1,8 +1,9 @@
 //! Libp2p QUIC v1 transport labels and **zquic** integration helpers.
 //!
-//! Full endpoint listen/dial APIs are still owned by embedders (see roadmap issue #15);
-//! this module centralizes ALPN, raw-stream mode, and the multistream-select bytes for
-//! the first application bidirectional stream after QUIC + TLS complete.
+//! Multiaddr listen/dial helpers live in [`transport.quic`]. This module centralizes ALPN,
+//! raw-stream presets, and multistream byte helpers. After TLS, tie peer identity to
+//! `/p2p` using [`security.libp2p_tls.verifiedPeerIdFromQuicLeafCertificate`] once you have
+//! the peer leaf DER (from captured Certificate handshake bytes or future zquic hooks).
 
 const std = @import("std");
 const zquic = @import("zquic");
