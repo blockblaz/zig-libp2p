@@ -23,6 +23,7 @@ pub const gossipsub = struct {
     pub const config = @import("gossipsub/config.zig");
     pub const message_id = @import("gossipsub/message_id.zig");
     pub const duplicate_cache = @import("gossipsub/duplicate_cache.zig");
+    pub const runtime = @import("gossipsub/runtime.zig");
     pub const rpc = @import("gossipsub/rpc.zig");
     pub const control = @import("gossipsub/control.zig");
     pub const message = @import("gossipsub/message.zig");
