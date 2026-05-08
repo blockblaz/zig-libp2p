@@ -82,6 +82,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | Submodule | Role |
 |-----------|------|
 | `transport.quic_v1` | QUIC v1 labels + zquic wiring: `multistream_protocol_id`, `tls_alpn`, `libp2pZquicServerConfig` / `libp2pZquicClientConfig` (ALPN `libp2p`, `raw_application_streams`), `appendFirstBidiStreamInitiatorHandshake` |
+| `transport.tcp` | TCP over `std.Io.net`: `listen`, `dial`, `acceptTuned` (socket tuning on accept/connect), `StreamSocketTuning` (`TCP_NODELAY`, `SO_SNDBUF` / `SO_RCVBUF` on POSIX; skipped on Windows), `multistream_protocol_id`, `appendFirstStreamInitiatorHandshake`, `initiatorHandshakeMultistream` / `responderHandshakeMultistream` |
 | `transport.multistream_negotiate` | **Bounded** multistream-select 1.0.0 on a byte cursor: `default_max_body_len`, `readNegotiationLine`, `validateProtocolId`, initiator/responder steps (`initiatorSendMultistreamHeader`, `responderReadProtocolOffer`, `responderReplyProtocol`, …), `NegotiateError` |
 
 ### `security`
@@ -94,7 +95,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 ## Roadmap
 
-- Finish `/quic-v1` **endpoint** ergonomics (listen/dial helpers, stream lifecycle) on zquic; presets and multistream stream open are in `transport.quic_v1`. Extend `security.libp2p_tls` with mandatory `SignedKey` transcript verification; Noise or other profiles only if devnets require them.
+- Finish `/quic-v1` **endpoint** ergonomics (listen/dial helpers, stream lifecycle) on zquic; presets and multistream stream open are in `transport.quic_v1`. Plain TCP listen/dial helpers live in `transport.tcp` (no TLS). Extend `security.libp2p_tls` with mandatory `SignedKey` transcript verification; Noise or other profiles only if devnets require them.
 - Gossipsub mesh scoring and backpressure; **ControlExtensions.partialMessages** wire helpers are in `gossipsub.control` (experimental proto fields still ignored).
 
 ---
