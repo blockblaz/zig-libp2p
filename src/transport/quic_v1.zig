@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const zquic = @import("zquic");
+const libp2p_tls = @import("../security/libp2p_tls.zig");
 const neg = @import("multistream_negotiate.zig");
 const sm = @import("stream_multistream.zig");
 
@@ -14,8 +15,8 @@ const Io = zquic.transport.io;
 /// Multistream protocol id for the QUIC v1 transport.
 pub const multistream_protocol_id: []const u8 = "/quic-v1";
 
-/// TLS ALPN identifier for libp2p over QUIC after the QUIC handshake.
-pub const tls_alpn: []const u8 = "libp2p";
+/// TLS ALPN identifier for libp2p over QUIC after the QUIC handshake (see `security.libp2p_tls`).
+pub const tls_alpn: []const u8 = libp2p_tls.quic_application_layer_protocol;
 
 /// Options for [`libp2pZquicServerConfig`].
 pub const Libp2pZquicServerOptions = struct {
