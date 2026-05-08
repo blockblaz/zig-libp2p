@@ -10,10 +10,6 @@ pub const Error = w.Error || error{
     WireLimitExceeded,
 };
 
-fn checkControlEntryLen(len: usize) Error!void {
-    if (len > lim.max_control_entry_bytes) return error.WireLimitExceeded;
-}
-
 fn checkTopicLen(len: usize) Error!void {
     if (len > lim.max_topic_str_bytes) return error.WireLimitExceeded;
 }
@@ -51,12 +47,13 @@ pub fn decodeFirstIHave(allocator: std.mem.Allocator, control: []const u8) (Erro
     while (off < control.len) {
         const key = try w.decodeFieldKey(control[off..]);
         off += key.len;
-        const nv = try w.nextFieldValue(control[off..], key.wire_type);
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(control[off..], key.wire_type, lim.max_control_entry_bytes)
+        else
+            try w.nextFieldValue(control[off..], key.wire_type);
         off += nv.total;
 
         if (key.field_number != 1 or key.wire_type != .length_delimited) continue;
-
-        try checkControlEntryLen(nv.value.len);
 
         var topic: ?[]const u8 = null;
         var ids = std.ArrayList([]u8).empty;
@@ -69,17 +66,23 @@ pub fn decodeFirstIHave(allocator: std.mem.Allocator, control: []const u8) (Erro
         while (io < nv.value.len) {
             const ik = try w.decodeFieldKey(nv.value[io..]);
             io += ik.len;
-            const iv = try w.nextFieldValue(nv.value[io..], ik.wire_type);
+            const ld_cap: usize = switch (ik.field_number) {
+                1 => lim.max_topic_str_bytes,
+                2 => lim.max_message_id_bytes,
+                else => lim.max_control_entry_bytes,
+            };
+            const iv = if (ik.wire_type == .length_delimited)
+                try w.nextFieldValueLimited(nv.value[io..], ik.wire_type, ld_cap)
+            else
+                try w.nextFieldValue(nv.value[io..], ik.wire_type);
             io += iv.total;
             switch (ik.field_number) {
                 1 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
-                    try checkTopicLen(iv.value.len);
                     topic = iv.value;
                 },
                 2 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
-                    try checkMessageIdLen(iv.value.len);
                     if (ids.items.len >= lim.max_message_ids_per_entry) return error.WireLimitExceeded;
                     {
                         const copy = try allocator.dupe(u8, iv.value);
@@ -135,12 +138,13 @@ pub fn decodeFirstIWant(allocator: std.mem.Allocator, control: []const u8) (Erro
     while (off < control.len) {
         const key = try w.decodeFieldKey(control[off..]);
         off += key.len;
-        const nv = try w.nextFieldValue(control[off..], key.wire_type);
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(control[off..], key.wire_type, lim.max_control_entry_bytes)
+        else
+            try w.nextFieldValue(control[off..], key.wire_type);
         off += nv.total;
 
         if (key.field_number != 2 or key.wire_type != .length_delimited) continue;
-
-        try checkControlEntryLen(nv.value.len);
 
         var ids = std.ArrayList([]u8).empty;
         defer {
@@ -152,12 +156,18 @@ pub fn decodeFirstIWant(allocator: std.mem.Allocator, control: []const u8) (Erro
         while (io < nv.value.len) {
             const ik = try w.decodeFieldKey(nv.value[io..]);
             io += ik.len;
-            const iv = try w.nextFieldValue(nv.value[io..], ik.wire_type);
+            const ld_cap: usize = switch (ik.field_number) {
+                1 => lim.max_message_id_bytes,
+                else => lim.max_control_entry_bytes,
+            };
+            const iv = if (ik.wire_type == .length_delimited)
+                try w.nextFieldValueLimited(nv.value[io..], ik.wire_type, ld_cap)
+            else
+                try w.nextFieldValue(nv.value[io..], ik.wire_type);
             io += iv.total;
             switch (ik.field_number) {
                 1 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
-                    try checkMessageIdLen(iv.value.len);
                     if (ids.items.len >= lim.max_message_ids_per_entry) return error.WireLimitExceeded;
                     {
                         const copy = try allocator.dupe(u8, iv.value);
@@ -209,12 +219,13 @@ pub fn decodeFirstIDontWant(allocator: std.mem.Allocator, control: []const u8) (
     while (off < control.len) {
         const key = try w.decodeFieldKey(control[off..]);
         off += key.len;
-        const nv = try w.nextFieldValue(control[off..], key.wire_type);
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(control[off..], key.wire_type, lim.max_control_entry_bytes)
+        else
+            try w.nextFieldValue(control[off..], key.wire_type);
         off += nv.total;
 
         if (key.field_number != 5 or key.wire_type != .length_delimited) continue;
-
-        try checkControlEntryLen(nv.value.len);
 
         var ids = std.ArrayList([]u8).empty;
         defer {
@@ -226,12 +237,18 @@ pub fn decodeFirstIDontWant(allocator: std.mem.Allocator, control: []const u8) (
         while (io < nv.value.len) {
             const ik = try w.decodeFieldKey(nv.value[io..]);
             io += ik.len;
-            const iv = try w.nextFieldValue(nv.value[io..], ik.wire_type);
+            const ld_cap: usize = switch (ik.field_number) {
+                1 => lim.max_message_id_bytes,
+                else => lim.max_control_entry_bytes,
+            };
+            const iv = if (ik.wire_type == .length_delimited)
+                try w.nextFieldValueLimited(nv.value[io..], ik.wire_type, ld_cap)
+            else
+                try w.nextFieldValue(nv.value[io..], ik.wire_type);
             io += iv.total;
             switch (ik.field_number) {
                 1 => {
                     if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
-                    try checkMessageIdLen(iv.value.len);
                     if (ids.items.len >= lim.max_message_ids_per_entry) return error.WireLimitExceeded;
                     {
                         const copy = try allocator.dupe(u8, iv.value);
@@ -284,21 +301,28 @@ pub fn decodeFirstGraftTopic(allocator: std.mem.Allocator, control: []const u8) 
     while (off < control.len) {
         const key = try w.decodeFieldKey(control[off..]);
         off += key.len;
-        const nv = try w.nextFieldValue(control[off..], key.wire_type);
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(control[off..], key.wire_type, lim.max_control_entry_bytes)
+        else
+            try w.nextFieldValue(control[off..], key.wire_type);
         off += nv.total;
 
         if (key.field_number != 3 or key.wire_type != .length_delimited) continue;
-
-        try checkControlEntryLen(nv.value.len);
 
         var go: usize = 0;
         while (go < nv.value.len) {
             const gk = try w.decodeFieldKey(nv.value[go..]);
             go += gk.len;
-            const gv = try w.nextFieldValue(nv.value[go..], gk.wire_type);
+            const ld_cap: usize = switch (gk.field_number) {
+                1 => lim.max_topic_str_bytes,
+                else => lim.max_control_entry_bytes,
+            };
+            const gv = if (gk.wire_type == .length_delimited)
+                try w.nextFieldValueLimited(nv.value[go..], gk.wire_type, ld_cap)
+            else
+                try w.nextFieldValue(nv.value[go..], gk.wire_type);
             go += gv.total;
             if (gk.field_number == 1 and gk.wire_type == .length_delimited) {
-                try checkTopicLen(gv.value.len);
                 return try allocator.dupe(u8, gv.value);
             }
         }
@@ -317,12 +341,13 @@ pub fn decodeFirstPrune(allocator: std.mem.Allocator, control: []const u8) (Erro
     while (off < control.len) {
         const key = try w.decodeFieldKey(control[off..]);
         off += key.len;
-        const nv = try w.nextFieldValue(control[off..], key.wire_type);
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(control[off..], key.wire_type, lim.max_control_entry_bytes)
+        else
+            try w.nextFieldValue(control[off..], key.wire_type);
         off += nv.total;
 
         if (key.field_number != 4 or key.wire_type != .length_delimited) continue;
-
-        try checkControlEntryLen(nv.value.len);
 
         var topic: ?[]const u8 = null;
         var backoff: ?u64 = null;
@@ -330,12 +355,18 @@ pub fn decodeFirstPrune(allocator: std.mem.Allocator, control: []const u8) (Erro
         while (po < nv.value.len) {
             const pk = try w.decodeFieldKey(nv.value[po..]);
             po += pk.len;
-            const pv = try w.nextFieldValue(nv.value[po..], pk.wire_type);
+            const ld_cap: usize = switch (pk.field_number) {
+                1 => lim.max_topic_str_bytes,
+                else => lim.max_control_entry_bytes,
+            };
+            const pv = if (pk.wire_type == .length_delimited)
+                try w.nextFieldValueLimited(nv.value[po..], pk.wire_type, ld_cap)
+            else
+                try w.nextFieldValue(nv.value[po..], pk.wire_type);
             po += pv.total;
             switch (pk.field_number) {
                 1 => {
                     if (pk.wire_type != .length_delimited) return error.UnsupportedWireType;
-                    try checkTopicLen(pv.value.len);
                     topic = pv.value;
                 },
                 3 => {
@@ -457,7 +488,7 @@ test "ihave rejects oversized topic" {
     defer ctl.deinit(a);
     try w.appendLengthDelimited(&ctl, a, 1, inner.items);
 
-    try std.testing.expectError(error.WireLimitExceeded, decodeFirstIHave(a, ctl.items));
+    try std.testing.expectError(error.LengthDelimitedTooLong, decodeFirstIHave(a, ctl.items));
 }
 
 test "ihave rejects excess message id count" {
@@ -489,5 +520,5 @@ test "iwant rejects oversized message id" {
     defer ctl.deinit(a);
     try w.appendLengthDelimited(&ctl, a, 2, inner.items);
 
-    try std.testing.expectError(error.WireLimitExceeded, decodeFirstIWant(a, ctl.items));
+    try std.testing.expectError(error.LengthDelimitedTooLong, decodeFirstIWant(a, ctl.items));
 }

@@ -24,6 +24,8 @@ pub const max_gossip_message_wire_bytes: usize = 4 * 1024 * 1024;
 
 pub const max_gossip_message_data_bytes: usize = 4 * 1024 * 1024;
 pub const max_gossip_message_from_bytes: usize = 128;
+/// `Message.topic` (field 4); same bound as subscription / graft topics.
+pub const max_gossip_message_topic_bytes: usize = max_topic_str_bytes;
 pub const max_gossip_message_seqno_bytes: usize = 128;
 pub const max_gossip_message_signature_bytes: usize = 8192;
 pub const max_gossip_message_key_bytes: usize = 8192;
