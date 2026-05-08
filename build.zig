@@ -4,11 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const multiaddr_dep = b.dependency("multiaddr", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("zig_libp2p", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    mod.addImport("multiaddr", multiaddr_dep.module("multiaddr"));
 
     const glue_mod = b.createModule(.{
         .root_source_file = b.path("src/zeam_glue_root.zig"),

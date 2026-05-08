@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x6e2dd2ac84762996,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .multiaddr = .{
+            .url = "git+https://github.com/zen-eth/multiaddr-zig#568b5dd7c125973994222a34bc05679ab2f7b545",
+            .hash = "multiaddr-0.1.0-Cjaydr-zAAARdtYgb09TsxD3JXF-Y1x6OM2Ow40o-G80",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
