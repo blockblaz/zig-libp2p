@@ -1,9 +1,153 @@
-//! `ControlMessage` protobuf fragments (graft / prune) for gossipsub v1.1.
+//! `ControlMessage` protobuf fragments (IHAVE / IWANT / graft / prune) for gossipsub v1.1.
 
 const std = @import("std");
 const w = @import("../protobuf/wire.zig");
 
-pub const Error = w.Error || error{MissingPruneTopic};
+pub const Error = w.Error || error{ MissingPruneTopic, MissingIHaveTopic };
+
+/// `repeated ControlIHave ihave = 1` with one entry: topic plus optional message id list.
+pub fn encodeIHave(allocator: std.mem.Allocator, topic_id: []const u8, message_ids: []const []const u8) std.mem.Allocator.Error![]u8 {
+    var inner = std.ArrayList(u8).empty;
+    defer inner.deinit(allocator);
+    try w.appendLengthDelimited(&inner, allocator, 1, topic_id);
+    for (message_ids) |mid| {
+        try w.appendLengthDelimited(&inner, allocator, 2, mid);
+    }
+
+    var ctl = std.ArrayList(u8).empty;
+    defer ctl.deinit(allocator);
+    try w.appendLengthDelimited(&ctl, allocator, 1, inner.items);
+    return try ctl.toOwnedSlice(allocator);
+}
+
+pub const IHaveOwned = struct {
+    topic: []u8,
+    message_ids: [][]u8,
+};
+
+/// First `ControlIHave` in a `ControlMessage` wire blob, or null.
+pub fn decodeFirstIHave(allocator: std.mem.Allocator, control: []const u8) (Error || std.mem.Allocator.Error)!?IHaveOwned {
+    var off: usize = 0;
+    while (off < control.len) {
+        const key = try w.decodeFieldKey(control[off..]);
+        off += key.len;
+        const nv = try w.nextFieldValue(control[off..], key.wire_type);
+        off += nv.total;
+
+        if (key.field_number != 1 or key.wire_type != .length_delimited) continue;
+
+        var topic: ?[]const u8 = null;
+        var ids = std.ArrayList([]u8).empty;
+        defer {
+            for (ids.items) |m| allocator.free(m);
+            ids.deinit(allocator);
+        }
+
+        var io: usize = 0;
+        while (io < nv.value.len) {
+            const ik = try w.decodeFieldKey(nv.value[io..]);
+            io += ik.len;
+            const iv = try w.nextFieldValue(nv.value[io..], ik.wire_type);
+            io += iv.total;
+            switch (ik.field_number) {
+                1 => {
+                    if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    topic = iv.value;
+                },
+                2 => {
+                    if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    {
+                        const copy = try allocator.dupe(u8, iv.value);
+                        errdefer allocator.free(copy);
+                        try ids.append(allocator, copy);
+                    }
+                },
+                else => {},
+            }
+        }
+        const top = topic orelse return error.MissingIHaveTopic;
+        const owned_ids = try ids.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_ids) |m| allocator.free(m);
+            allocator.free(owned_ids);
+        }
+        const topic_dup = try allocator.dupe(u8, top);
+        return IHaveOwned{ .topic = topic_dup, .message_ids = owned_ids };
+    }
+    return null;
+}
+
+pub fn deinitIHaveOwned(allocator: std.mem.Allocator, v: *IHaveOwned) void {
+    allocator.free(v.topic);
+    for (v.message_ids) |m| allocator.free(m);
+    allocator.free(v.message_ids);
+    v.* = undefined;
+}
+
+/// `repeated ControlIWant iwant = 2` with one entry holding the given message ids.
+pub fn encodeIWant(allocator: std.mem.Allocator, message_ids: []const []const u8) std.mem.Allocator.Error![]u8 {
+    var inner = std.ArrayList(u8).empty;
+    defer inner.deinit(allocator);
+    for (message_ids) |mid| {
+        try w.appendLengthDelimited(&inner, allocator, 1, mid);
+    }
+
+    var ctl = std.ArrayList(u8).empty;
+    defer ctl.deinit(allocator);
+    try w.appendLengthDelimited(&ctl, allocator, 2, inner.items);
+    return try ctl.toOwnedSlice(allocator);
+}
+
+pub const IWantOwned = struct {
+    message_ids: [][]u8,
+};
+
+/// First `ControlIWant` in a `ControlMessage` wire blob, or null.
+pub fn decodeFirstIWant(allocator: std.mem.Allocator, control: []const u8) (Error || std.mem.Allocator.Error)!?IWantOwned {
+    var off: usize = 0;
+    while (off < control.len) {
+        const key = try w.decodeFieldKey(control[off..]);
+        off += key.len;
+        const nv = try w.nextFieldValue(control[off..], key.wire_type);
+        off += nv.total;
+
+        if (key.field_number != 2 or key.wire_type != .length_delimited) continue;
+
+        var ids = std.ArrayList([]u8).empty;
+        defer {
+            for (ids.items) |m| allocator.free(m);
+            ids.deinit(allocator);
+        }
+
+        var io: usize = 0;
+        while (io < nv.value.len) {
+            const ik = try w.decodeFieldKey(nv.value[io..]);
+            io += ik.len;
+            const iv = try w.nextFieldValue(nv.value[io..], ik.wire_type);
+            io += iv.total;
+            switch (ik.field_number) {
+                1 => {
+                    if (ik.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    {
+                        const copy = try allocator.dupe(u8, iv.value);
+                        errdefer allocator.free(copy);
+                        try ids.append(allocator, copy);
+                    }
+                },
+                else => {},
+            }
+        }
+        const owned_ids = try ids.toOwnedSlice(allocator);
+        return IWantOwned{ .message_ids = owned_ids };
+    }
+    return null;
+}
+
+pub fn deinitIWantOwned(allocator: std.mem.Allocator, v: *IWantOwned) void {
+    for (v.message_ids) |m| allocator.free(m);
+    allocator.free(v.message_ids);
+    v.* = undefined;
+}
 
 /// `repeated ControlGraft graft = 3` with a single graft for `topicID`.
 pub fn encodeGraft(allocator: std.mem.Allocator, topic_id: []const u8) std.mem.Allocator.Error![]u8 {
@@ -107,6 +251,50 @@ pub fn decodeFirstPrune(allocator: std.mem.Allocator, control: []const u8) (Erro
 pub fn deinitPruneView(allocator: std.mem.Allocator, p: *PruneView) void {
     allocator.free(p.topic);
     p.* = undefined;
+}
+
+test "ihave topic and message ids round trip" {
+    const a = std.testing.allocator;
+    const mids: []const []const u8 = &.{ "id-a", "id-b" };
+    const wire = try encodeIHave(a, "/t/have", mids);
+    defer a.free(wire);
+    var got = (try decodeFirstIHave(a, wire)).?;
+    defer deinitIHaveOwned(a, &got);
+    try std.testing.expectEqualStrings("/t/have", got.topic);
+    try std.testing.expectEqual(@as(usize, 2), got.message_ids.len);
+    try std.testing.expectEqualStrings("id-a", got.message_ids[0]);
+    try std.testing.expectEqualStrings("id-b", got.message_ids[1]);
+}
+
+test "ihave empty message id list" {
+    const a = std.testing.allocator;
+    const wire = try encodeIHave(a, "topic-only", &[_][]const u8{});
+    defer a.free(wire);
+    var got = (try decodeFirstIHave(a, wire)).?;
+    defer deinitIHaveOwned(a, &got);
+    try std.testing.expectEqualStrings("topic-only", got.topic);
+    try std.testing.expectEqual(@as(usize, 0), got.message_ids.len);
+}
+
+test "iwant message ids round trip" {
+    const a = std.testing.allocator;
+    const mids: []const []const u8 = &.{ "\x00\x01", "want-b" };
+    const wire = try encodeIWant(a, mids);
+    defer a.free(wire);
+    var got = (try decodeFirstIWant(a, wire)).?;
+    defer deinitIWantOwned(a, &got);
+    try std.testing.expectEqual(@as(usize, 2), got.message_ids.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1 }, got.message_ids[0]);
+    try std.testing.expectEqualStrings("want-b", got.message_ids[1]);
+}
+
+test "iwant empty" {
+    const a = std.testing.allocator;
+    const wire = try encodeIWant(a, &[_][]const u8{});
+    defer a.free(wire);
+    var got = (try decodeFirstIWant(a, wire)).?;
+    defer deinitIWantOwned(a, &got);
+    try std.testing.expectEqual(@as(usize, 0), got.message_ids.len);
 }
 
 test "graft topic round trip" {
