@@ -48,14 +48,19 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
         const key = try w.decodeFieldKey(rpc[off..]);
         off += key.len;
         const val_buf = rpc[off..];
-        const nv = try w.nextFieldValue(val_buf, key.wire_type);
+        const ld_cap_top: usize = switch (key.field_number) {
+            1 => lim.max_subopts_blob_bytes,
+            else => lim.max_rpc_length_delimited_bytes,
+        };
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(val_buf, key.wire_type, ld_cap_top)
+        else
+            try w.nextFieldValue(val_buf, key.wire_type);
         const v = nv.value;
         off += nv.total;
 
         if (key.field_number != 1) continue;
         if (key.wire_type != .length_delimited) return error.UnsupportedWireType;
-
-        if (v.len > lim.max_subopts_blob_bytes) return error.WireLimitExceeded;
 
         var sub_off: usize = 0;
         var subscribe: ?bool = null;
@@ -64,7 +69,14 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
             const sk = try w.decodeFieldKey(v[sub_off..]);
             sub_off += sk.len;
             const inner = v[sub_off..];
-            const iv = try w.nextFieldValue(inner, sk.wire_type);
+            const ld_cap_inner: usize = switch (sk.field_number) {
+                2 => lim.max_topic_str_bytes,
+                else => lim.max_subopts_blob_bytes,
+            };
+            const iv = if (sk.wire_type == .length_delimited)
+                try w.nextFieldValueLimited(inner, sk.wire_type, ld_cap_inner)
+            else
+                try w.nextFieldValue(inner, sk.wire_type);
             const chunk = iv.value;
             sub_off += iv.total;
 
@@ -76,7 +88,6 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
                 },
                 2 => {
                     if (sk.wire_type != .length_delimited) return error.UnsupportedWireType;
-                    if (chunk.len > lim.max_topic_str_bytes) return error.WireLimitExceeded;
                     topic = chunk;
                 },
                 else => return error.UnsupportedWireType,
@@ -99,12 +110,14 @@ pub fn decodeControlPayload(allocator: std.mem.Allocator, rpc: []const u8) (Erro
         const key = try w.decodeFieldKey(rpc[off..]);
         off += key.len;
         const val_buf = rpc[off..];
-        const nv = try w.nextFieldValue(val_buf, key.wire_type);
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(val_buf, key.wire_type, lim.max_rpc_length_delimited_bytes)
+        else
+            try w.nextFieldValue(val_buf, key.wire_type);
         const v = nv.value;
         off += nv.total;
 
         if (key.field_number == 3 and key.wire_type == .length_delimited) {
-            if (v.len > lim.max_rpc_length_delimited_bytes) return error.WireLimitExceeded;
             return try allocator.dupe(u8, v);
         }
     }
@@ -131,10 +144,12 @@ pub fn decodeFirstPublish(allocator: std.mem.Allocator, rpc: []const u8) (Error 
     while (off < rpc.len) {
         const key = try w.decodeFieldKey(rpc[off..]);
         off += key.len;
-        const nv = try w.nextFieldValue(rpc[off..], key.wire_type);
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(rpc[off..], key.wire_type, lim.max_rpc_length_delimited_bytes)
+        else
+            try w.nextFieldValue(rpc[off..], key.wire_type);
         off += nv.total;
         if (key.field_number == 2 and key.wire_type == .length_delimited) {
-            if (nv.value.len > lim.max_rpc_length_delimited_bytes) return error.WireLimitExceeded;
             return try allocator.dupe(u8, nv.value);
         }
     }
@@ -191,5 +206,5 @@ test "decodeControlPayload rejects oversized field" {
     var list = std.ArrayList(u8).empty;
     defer list.deinit(a);
     try w.appendLengthDelimited(&list, a, 3, big);
-    try std.testing.expectError(error.WireLimitExceeded, decodeControlPayload(a, list.items));
+    try std.testing.expectError(error.LengthDelimitedTooLong, decodeControlPayload(a, list.items));
 }

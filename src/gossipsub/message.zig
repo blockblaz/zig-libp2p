@@ -74,10 +74,6 @@ pub fn decode(allocator: std.mem.Allocator, wire: []const u8) (Error || std.mem.
     while (off < wire.len) {
         const key = try w.decodeFieldKey(wire[off..]);
         off += key.len;
-        const nv = try w.nextFieldValue(wire[off..], key.wire_type);
-        off += nv.total;
-
-        if (key.wire_type != .length_delimited) return error.UnsupportedWireType;
 
         const max_for_field: usize = switch (key.field_number) {
             1 => lim.max_gossip_message_from_bytes,
@@ -88,7 +84,10 @@ pub fn decode(allocator: std.mem.Allocator, wire: []const u8) (Error || std.mem.
             6 => lim.max_gossip_message_key_bytes,
             else => return error.UnsupportedWireType,
         };
-        if (nv.value.len > max_for_field) return error.WireLimitExceeded;
+        if (key.wire_type != .length_delimited) return error.UnsupportedWireType;
+
+        const nv = try w.nextFieldValueLimited(wire[off..], key.wire_type, max_for_field);
+        off += nv.total;
 
         const duped = try allocator.dupe(u8, nv.value);
         errdefer allocator.free(duped);
@@ -147,5 +146,5 @@ test "decode rejects oversized data field" {
     var list = std.ArrayList(u8).empty;
     defer list.deinit(a);
     try w.appendLengthDelimited(&list, a, 2, big);
-    try std.testing.expectError(error.WireLimitExceeded, decode(a, list.items));
+    try std.testing.expectError(error.LengthDelimitedTooLong, decode(a, list.items));
 }

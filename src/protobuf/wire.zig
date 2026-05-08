@@ -8,6 +8,10 @@ pub const Error = error{
     InvalidVarint,
     UnsupportedWireType,
     InvalidFieldNumber,
+    /// Declared length-delimited payload is larger than the caller-supplied policy cap.
+    LengthDelimitedTooLong,
+    /// Declared length does not fit in `usize`, or `prefix + length` overflows `usize`.
+    LengthDelimitedOverflow,
 };
 
 pub const WireType = enum(u3) {
@@ -57,7 +61,18 @@ pub fn appendLengthDelimited(list: *std.ArrayList(u8), allocator: std.mem.Alloca
 
 /// After a field key, `buf` starts at the value wire bytes. Returns the value
 /// slice and total bytes consumed from `buf` (including length prefixes).
+///
+/// For `length_delimited`, only lengths representable as `usize` and a non-overflowing
+/// end offset are accepted. Callers allocating from `value` should still enforce an
+/// application-specific maximum via [`nextFieldValueLimited`].
 pub fn nextFieldValue(buf: []const u8, wire_type: WireType) Error!struct { value: []const u8, total: usize } {
+    return nextFieldValueLimited(buf, wire_type, std.math.maxInt(usize));
+}
+
+/// Like [`nextFieldValue`], but rejects `length_delimited` payloads whose declared
+/// length is greater than `max_length_delimited` before indexing the buffer.
+/// Other wire types ignore `max_length_delimited`.
+pub fn nextFieldValueLimited(buf: []const u8, wire_type: WireType, max_length_delimited: usize) Error!struct { value: []const u8, total: usize } {
     return switch (wire_type) {
         .varint => blk: {
             const d = try decodeVarUInt64(buf);
@@ -67,8 +82,10 @@ pub fn nextFieldValue(buf: []const u8, wire_type: WireType) Error!struct { value
         .fixed32 => if (buf.len < 4) error.Truncated else .{ .value = buf[0..4], .total = 4 },
         .length_delimited => blk: {
             const ln = try decodeVarUInt64(buf);
-            const n: usize = @intCast(ln.value);
-            const end = ln.len + n;
+            const len_u64 = ln.value;
+            const n = std.math.cast(usize, len_u64) orelse return error.LengthDelimitedOverflow;
+            if (n > max_length_delimited) return error.LengthDelimitedTooLong;
+            const end = std.math.add(usize, ln.len, n) catch return error.LengthDelimitedOverflow;
             if (buf.len < end) return error.Truncated;
             break :blk .{ .value = buf[ln.len..end], .total = end };
         },
@@ -101,4 +118,24 @@ test "varUInt64 round trip small values" {
         try std.testing.expectEqual(v, dec.value);
         try std.testing.expectEqual(list.items.len, dec.len);
     }
+}
+
+test "nextFieldValueLimited length_delimited within cap" {
+    const a = std.testing.allocator;
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try appendVarUInt64(&list, a, 4);
+    try list.appendSlice(a, "abcd");
+    const nv = try nextFieldValueLimited(list.items, .length_delimited, 16);
+    try std.testing.expectEqualStrings("abcd", nv.value);
+    try std.testing.expectEqual(@as(usize, 5), nv.total);
+}
+
+test "nextFieldValueLimited length_delimited rejects over cap" {
+    const a = std.testing.allocator;
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try appendVarUInt64(&list, a, 10);
+    try list.appendSlice(a, &[_]u8{0} ** 10);
+    try std.testing.expectError(error.LengthDelimitedTooLong, nextFieldValueLimited(list.items, .length_delimited, 5));
 }
