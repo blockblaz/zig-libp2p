@@ -23,7 +23,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Connection manager | Not started | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) |
 | Gossipsub mesh runtime | Not started | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) |
 | Req/resp behaviour | Not started | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) |
-| Identify | Not started | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
+| Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Not started | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) |
 | Typed error sets (layers) | Partial | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) |
 | Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
@@ -69,6 +69,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `addr_list` | Multiaddr CSV: `parseCsv`, `freeList` (uses bundled `multiaddr`) |
 | `multistream` | Multistream-select 1.0.0 line I/O: `multistream_1_0_0`, `max_protocol_id_body_bytes`, `writeProtocolLine`, `writeProtocolLineWithMax`, `ProtocolLineError`, `trimNegotiationLine` |
 | `ping` | Ping 1.0.0: `protocol_line`, wire helpers, `Ping` / `PingConfig` timer policy, `handleInbound`, `initiatorRoundTripMs` |
+| `identify` | Identify 1.0.0: `protocol_line`, `MessageView` / `MessageOwned`, `encode` / `decodeOwned`, `Identify` (`handleInbound`, `onConnectionEstablished`) |
 | `peer_id` | Re-export of `peer-id` package |
 | `identity` | `PeerId`, `ParseError` aliases |
 | `keypair` | PEM → `KeyPair` (Ed25519, secp256k1) + `peerIdFromKeyPair` |
@@ -124,7 +125,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 ## Roadmap
 
-Priorities follow the [parity table](#zeam-parity) (open issues linked there). Near term: [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) QUIC ergonomics, [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) Identify, [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) swarm. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
+Priorities follow the [parity table](#zeam-parity) (open issues linked there). Near term: [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) QUIC ergonomics, [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) swarm. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
 
 ---
 
