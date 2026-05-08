@@ -1,6 +1,5 @@
-//! Wire protocol identifiers shared with Zeam and the former Rust glue.
-//! Values must stay aligned with `pkgs/network/src/interface.zig` and
-//! `rust/libp2p-glue/src/req_resp/protocol_id.rs`.
+//! Lean consensus req/resp protocol id strings and numeric wire tags.
+//! Discriminants stay stable for interoperability with other Lean clients.
 
 const std = @import("std");
 
@@ -38,7 +37,7 @@ pub const LeanSupportedProtocol = enum(u32) {
     }
 };
 
-test "discriminants match rust glue" {
+test "discriminants stable wire tags" {
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LeanSupportedProtocol.blocks_by_root));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LeanSupportedProtocol.status));
     try std.testing.expectEqual(@as(u32, 2), @intFromEnum(LeanSupportedProtocol.blocks_by_range));
