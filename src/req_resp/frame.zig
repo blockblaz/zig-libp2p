@@ -8,18 +8,19 @@
 
 const std = @import("std");
 const varint = @import("../varint.zig");
+const errors = @import("../errors.zig");
 
 pub const max_rpc_message_size: usize = 4 * 1024 * 1024;
 
-pub const FrameError = error{
-    EmptyFrame,
-    PayloadTooLarge,
-    Incomplete,
-} || varint.DecodeError;
+/// Back-compat alias; use [`errors.ReqRespError`] in new code.
+pub const FrameError = errors.ReqRespError;
 
 pub fn parseRequestHeader(bytes: []const u8) FrameError!struct { declared_len: usize, payload: []const u8 } {
     if (bytes.len == 0) return error.EmptyFrame;
-    const dec = try varint.decode(bytes);
+    const dec = varint.decode(bytes) catch |err| switch (err) {
+        error.Truncated => return error.IncompleteStream,
+        error.Overflow => return error.VarintOverflow,
+    };
     if (dec.value > max_rpc_message_size) return error.PayloadTooLarge;
     return .{
         .declared_len = dec.value,
@@ -29,9 +30,12 @@ pub fn parseRequestHeader(bytes: []const u8) FrameError!struct { declared_len: u
 
 pub fn parseResponseHeader(bytes: []const u8) FrameError!struct { code: u8, declared_len: usize, payload: []const u8 } {
     if (bytes.len == 0) return error.EmptyFrame;
-    if (bytes.len == 1) return error.Incomplete;
+    if (bytes.len == 1) return error.IncompleteStream;
     const code = bytes[0];
-    const dec = try varint.decode(bytes[1..]);
+    const dec = varint.decode(bytes[1..]) catch |err| switch (err) {
+        error.Truncated => return error.IncompleteStream,
+        error.Overflow => return error.VarintOverflow,
+    };
     if (dec.value > max_rpc_message_size) return error.PayloadTooLarge;
     return .{
         .code = code,
@@ -40,14 +44,14 @@ pub fn parseResponseHeader(bytes: []const u8) FrameError!struct { code: u8, decl
     };
 }
 
-pub fn appendRequestPrefix(list: *std.ArrayList(u8), allocator: std.mem.Allocator, uncompressed_len: usize) !void {
+pub fn appendRequestPrefix(list: *std.ArrayList(u8), allocator: std.mem.Allocator, uncompressed_len: usize) (FrameError || std.mem.Allocator.Error)!void {
     if (uncompressed_len > max_rpc_message_size) return error.PayloadTooLarge;
     var scratch: [varint.max_encoding_bytes]u8 = undefined;
     const enc = varint.encodeToScratch(&scratch, uncompressed_len);
     try list.appendSlice(allocator, enc);
 }
 
-pub fn appendResponsePrefix(list: *std.ArrayList(u8), allocator: std.mem.Allocator, code: u8, uncompressed_len: usize) !void {
+pub fn appendResponsePrefix(list: *std.ArrayList(u8), allocator: std.mem.Allocator, code: u8, uncompressed_len: usize) (FrameError || std.mem.Allocator.Error)!void {
     if (uncompressed_len > max_rpc_message_size) return error.PayloadTooLarge;
     try list.append(allocator, code);
     var scratch: [varint.max_encoding_bytes]u8 = undefined;

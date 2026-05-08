@@ -11,8 +11,6 @@ const frame = @import("frame.zig");
 
 pub const FrameError = frame.FrameError;
 
-pub const BufferCapExceeded = error{BufferCapExceeded};
-
 pub const PoppedRequest = struct {
     total_len: usize,
     declared_len: usize,
@@ -46,7 +44,7 @@ pub const RpcUnaryResponse = struct {
 pub fn peekRpcUnaryRequest(buf: []const u8) FrameError!?RpcUnaryRequest {
     if (buf.len == 0) return null;
     const h = frame.parseRequestHeader(buf) catch |err| switch (err) {
-        error.Truncated => return null,
+        error.IncompleteStream => return null,
         else => |e| return e,
     };
     return .{
@@ -60,8 +58,7 @@ pub fn peekRpcUnaryRequest(buf: []const u8) FrameError!?RpcUnaryRequest {
 pub fn peekRpcUnaryResponse(buf: []const u8) FrameError!?RpcUnaryResponse {
     if (buf.len == 0) return null;
     const h = frame.parseResponseHeader(buf) catch |err| switch (err) {
-        error.Truncated => return null,
-        error.Incomplete => return null,
+        error.IncompleteStream => return null,
         else => |e| return e,
     };
     return .{
@@ -100,7 +97,7 @@ pub fn scanCompleteResponse(buf: []const u8) FrameError!?PoppedResponse {
 }
 
 /// Removes the first `n` bytes from the front of `list`.
-pub fn consumePrefix(list: *std.ArrayList(u8), n: usize) !void {
+pub fn consumePrefix(list: *std.ArrayList(u8), n: usize) std.mem.Allocator.Error!void {
     try list.replaceRange(0, n, &.{});
 }
 
@@ -123,7 +120,7 @@ pub const InboundBuffer = struct {
         self.raw.deinit(allocator);
     }
 
-    pub fn feed(self: *InboundBuffer, allocator: std.mem.Allocator, chunk: []const u8) (BufferCapExceeded || std.mem.Allocator.Error)!void {
+    pub fn feed(self: *InboundBuffer, allocator: std.mem.Allocator, chunk: []const u8) (FrameError || std.mem.Allocator.Error)!void {
         const new_len = self.raw.items.len + chunk.len;
         if (new_len > self.max_capacity) return error.BufferCapExceeded;
         try self.raw.appendSlice(allocator, chunk);
@@ -145,7 +142,7 @@ pub const InboundBuffer = struct {
         return peekRpcUnaryResponse(self.raw.items);
     }
 
-    pub fn consume(self: *InboundBuffer, n: usize) !void {
+    pub fn consume(self: *InboundBuffer, n: usize) std.mem.Allocator.Error!void {
         try consumePrefix(&self.raw, n);
     }
 };

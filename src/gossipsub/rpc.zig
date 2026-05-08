@@ -3,12 +3,10 @@
 
 const std = @import("std");
 const w = @import("../protobuf/wire.zig");
+const errors = @import("../errors.zig");
 const lim = @import("wire_limits.zig");
 
-pub const Error = w.Error || error{
-    MissingSubscribeFields,
-    WireLimitExceeded,
-};
+pub const Error = errors.GossipsubError || w.Error || error{MissingSubscribeFields};
 
 /// `optional ControlMessage control = 3` with an empty nested message.
 pub fn encodeEmptyControlRpc(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
@@ -20,7 +18,7 @@ pub fn encodeEmptyControlRpc(allocator: std.mem.Allocator) std.mem.Allocator.Err
 
 /// One `SubOpts` in `repeated SubOpts subscriptions = 1` (subscribe + topic id).
 pub fn encodeSubscribe(allocator: std.mem.Allocator, topic: []const u8, subscribe: bool) (Error || std.mem.Allocator.Error)![]u8 {
-    if (topic.len > lim.max_topic_str_bytes) return error.WireLimitExceeded;
+    if (topic.len > lim.max_topic_str_bytes) return error.PayloadTooLarge;
     var sub = std.ArrayList(u8).empty;
     defer sub.deinit(allocator);
     try w.appendFieldKey(&sub, allocator, 1, .varint);
@@ -131,7 +129,7 @@ pub fn deinitSubscribeView(allocator: std.mem.Allocator, s: *SubscribeView) void
 
 /// `repeated Message publish = 2` with a single encoded `Message` wire blob.
 pub fn encodePublish(allocator: std.mem.Allocator, message_wire: []const u8) (Error || std.mem.Allocator.Error)![]u8 {
-    if (message_wire.len > lim.max_rpc_length_delimited_bytes) return error.WireLimitExceeded;
+    if (message_wire.len > lim.max_rpc_length_delimited_bytes) return error.PayloadTooLarge;
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
     try w.appendLengthDelimited(&out, allocator, 2, message_wire);

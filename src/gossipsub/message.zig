@@ -2,9 +2,10 @@
 
 const std = @import("std");
 const w = @import("../protobuf/wire.zig");
+const errors = @import("../errors.zig");
 const lim = @import("wire_limits.zig");
 
-pub const Error = w.Error || error{WireLimitExceeded};
+pub const Error = errors.GossipsubError || w.Error;
 
 pub const MessageView = struct {
     from: ?[]const u8 = null,
@@ -42,7 +43,7 @@ fn appendOptBytes(list: *std.ArrayList(u8), allocator: std.mem.Allocator, field:
 
 fn checkOpt(max: usize, slice: ?[]const u8) Error!void {
     if (slice) |s| {
-        if (s.len > max) return error.WireLimitExceeded;
+        if (s.len > max) return error.PayloadTooLarge;
     }
 }
 
@@ -65,7 +66,7 @@ pub fn encode(allocator: std.mem.Allocator, msg: MessageView) (Error || std.mem.
 }
 
 pub fn decode(allocator: std.mem.Allocator, wire: []const u8) (Error || std.mem.Allocator.Error)!MessageOwned {
-    if (wire.len > lim.max_gossip_message_wire_bytes) return error.WireLimitExceeded;
+    if (wire.len > lim.max_gossip_message_wire_bytes) return error.PayloadTooLarge;
 
     var out: MessageOwned = .{};
     errdefer out.deinit(allocator);
@@ -82,9 +83,9 @@ pub fn decode(allocator: std.mem.Allocator, wire: []const u8) (Error || std.mem.
             4 => lim.max_gossip_message_topic_bytes,
             5 => lim.max_gossip_message_signature_bytes,
             6 => lim.max_gossip_message_key_bytes,
-            else => return error.UnsupportedWireType,
+            else => return error.InvalidFrame,
         };
-        if (key.wire_type != .length_delimited) return error.UnsupportedWireType;
+        if (key.wire_type != .length_delimited) return error.InvalidFrame;
 
         const nv = try w.nextFieldValueLimited(wire[off..], key.wire_type, max_for_field);
         off += nv.total;
@@ -94,32 +95,32 @@ pub fn decode(allocator: std.mem.Allocator, wire: []const u8) (Error || std.mem.
 
         switch (key.field_number) {
             1 => {
-                if (out.from != null) return error.UnsupportedWireType;
+                if (out.from != null) return error.InvalidFrame;
                 out.from = duped;
             },
             2 => {
-                if (out.data != null) return error.UnsupportedWireType;
+                if (out.data != null) return error.InvalidFrame;
                 out.data = duped;
             },
             3 => {
-                if (out.seqno != null) return error.UnsupportedWireType;
+                if (out.seqno != null) return error.InvalidFrame;
                 out.seqno = duped;
             },
             4 => {
-                if (out.topic != null) return error.UnsupportedWireType;
+                if (out.topic != null) return error.InvalidFrame;
                 out.topic = duped;
             },
             5 => {
-                if (out.signature != null) return error.UnsupportedWireType;
+                if (out.signature != null) return error.InvalidFrame;
                 out.signature = duped;
             },
             6 => {
-                if (out.key != null) return error.UnsupportedWireType;
+                if (out.key != null) return error.InvalidFrame;
                 out.key = duped;
             },
             else => {
                 allocator.free(duped);
-                return error.UnsupportedWireType;
+                return error.InvalidFrame;
             },
         }
     }
