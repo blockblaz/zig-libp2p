@@ -20,15 +20,15 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
 | Swarm / network runtime | Partial | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — threaded command/event runtime; transport integration still embedder-owned |
 | Noise XX | Partial | [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36) — [`security.noise`](#security): use [`security.noise.stream_upgrade`](./src/security/noise/stream_upgrade.zig) for multistream `/noise` + handshake on a stream; interop tests can live in Zeam. |
-| Connection manager | Not started | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) |
-| Gossipsub mesh runtime | Not started | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) |
+| Connection manager | Partial | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) — `connection_manager` + `peer_events`; embedder must call `tick` / `onDialFailure` / `onConnectionEstablished` / `onConnectionClosed` from transport |
+| Gossipsub mesh runtime | Partial | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) — `gossipsub.config` (Zeam knobs), `gossipsub.message_id` (wire ID), `gossipsub.duplicate_cache`; mesh, heartbeat, graft/prune, IHave routing still TBD |
 | Req/resp behaviour | Not started | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) |
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Not started | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) |
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
 | Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
 
-**Still heavy lift for embedders:** connection manager, gossipsub mesh runtime, req/resp behaviour, and wiring [`peerIdFromVerifiedCertificate`](./src/security/libp2p_tls.zig) into the TLS peer-cert path (library provides verification; transport must call it). QUIC listen/dial lifecycle remains primarily [zquic](https://github.com/ch4r10t33r/zquic) + [`transport.quic_v1`](#transport) presets.
+**Still heavy lift for embedders:** gossipsub mesh control plane (beyond config / message ID / duplicate cache), req/resp behaviour, wiring [`peerIdFromVerifiedCertificate`](./src/security/libp2p_tls.zig) into the TLS peer-cert path (library provides verification; transport must call it), and forwarding transport events into [`connection_manager`](./src/connection_manager.zig). QUIC listen/dial lifecycle remains primarily [zquic](https://github.com/ch4r10t33r/zquic) + [`transport.quic_v1`](#transport) presets.
 
 | Requirement | Version / note |
 |-------------|----------------|
@@ -66,7 +66,9 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 |--------|------|
 | `errors` | Layered errors: `ReqRespError`, `GossipsubError`, `TransportError`; `setLastErrorMessage` / `lastErrorMessage` / `clearLastErrorMessage` (#45) |
 | `layer_events` | Event carriers: `ReqRespFailure`, `GossipsubFailure`, `TransportFailure` (each has a `kind:` field for `switch`) (#45) |
-| `swarm` | Threaded runtime: bounded `submit` / `nextEvent`, `run` / `startBackground`, `shutdown` (#34); stubs until real I/O |
+| `peer_events` | Peer connection payloads: `Direction`, `DisconnectReason`, `ConnectionFailureResult`, connected / disconnected / failed event structs (#38) |
+| `connection_manager` | Known-peer dial scheduling (multiaddr without `/p2p`), reconnect backoff, refcount + peer events (#38) |
+| `swarm` | Threaded runtime: bounded `submit` / `nextEvent`, `queueEvent`, `run` / `startBackground`, `shutdown` (#34); stubs until real I/O |
 | `protocol` | Lean req/resp protocol id strings; `LeanSupportedProtocol` enum with `protocolId`, `fromInt`, `fromSlice` |
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
 | `addr_list` | Multiaddr CSV: `parseCsv` (`ParseCsvError`), `freeList` (uses bundled `multiaddr`) |
@@ -90,6 +92,9 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 | Submodule | Role |
 |-----------|------|
+| `gossipsub.config` | Zeam gossipsub constants: `mesh_n` / `mesh_n_low` / `mesh_n_high`, `gossip_lazy`, `heartbeat_interval_ms`, `duplicate_cache_ttl_ms`, `history_length`, `max_transmit_size_bytes` (#39) |
+| `gossipsub.message_id` | Wire message ID: `writeMessageId(topic, data, snappy_decompressed_ok, out20)` — SHA256 domain + topic len + topic + data, truncated to 20 bytes (#39) |
+| `gossipsub.duplicate_cache` | TTL map `(topic, id)` → expiry; `prune`, `checkDuplicate` (#39) |
 | `gossipsub.rpc` | RPC envelope: `encodeEmptyControlRpc`, `encodeSubscribe` / `decodeFirstSubscribe`, `deinitSubscribeView`, `decodeControlPayload`, `encodePublish` / `decodeFirstPublish` |
 | `gossipsub.control` | Control message fragments: **IHave** / **IWant** / **IDontWant** / **graft** / **prune**; **ControlExtensions** (`partialMessages`): `encodeControlExtensions`, `encodeControlMessageExtensionsOnly`, `decodeFirstControlExtensions`, `ControlExtensionsView` |
 | `gossipsub.message` | `Message` protobuf: `MessageView`, `MessageOwned`, `encode`, `decode`, `MessageOwned.deinit` |
@@ -130,7 +135,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 ## Roadmap
 
-Priorities follow the [parity table](#zeam-parity) and [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31). Near term: [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) QUIC ergonomics, [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) TLS verification, [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) connection manager. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
+Priorities follow the [parity table](#zeam-parity) and [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31). Near term: [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) gossipsub mesh + heartbeat, [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) req/resp behaviour, [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) / [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) QUIC + TLS verification ergonomics. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
 
 ---
 
