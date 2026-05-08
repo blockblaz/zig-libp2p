@@ -7,6 +7,7 @@
 const std = @import("std");
 const zquic = @import("zquic");
 const neg = @import("multistream_negotiate.zig");
+const sm = @import("stream_multistream.zig");
 
 const Io = zquic.transport.io;
 
@@ -78,8 +79,7 @@ pub fn appendFirstBidiStreamInitiatorHandshake(
     allocator: std.mem.Allocator,
     protocol_id: []const u8,
 ) (neg.NegotiateError || std.mem.Allocator.Error)!void {
-    try neg.initiatorSendMultistreamHeader(write, allocator);
-    try neg.initiatorSendProtocol(write, allocator, protocol_id);
+    return sm.appendFirstStreamInitiatorHandshake(write, allocator, protocol_id);
 }
 
 test "quic-v1 identifiers" {
