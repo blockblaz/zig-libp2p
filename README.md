@@ -1,6 +1,6 @@
 # zig-libp2p
 
-Minimal **pure-Zig** helpers for libp2p-oriented Lean Ethereum clients: multiaddr CSV and unsigned varints, Lean req/resp protocol ids, length-prefixed req/resp frames, streaming scan/consumption for length-delimited bodies, multistream-select 1.0.0, Snappy stack (`snappyz`, `snappyframesz`, Zeam-aligned pins), `ssz_snappy` unary RPC peek/decode, Lean gossip mesh topics (`gossip.topic`), libp2p ping, peer IDs (`peer_id`, `identity`), protobuf wire, and gossipsub `RPC` plus control (IHAVE, IWANT, graft, prune) and `Message` encode/decode (`gossipsub.rpc`, `gossipsub.control`, `gossipsub.message`).
+Minimal **pure-Zig** helpers for libp2p-oriented Lean Ethereum clients: multiaddr CSV and unsigned varints, Lean req/resp protocol ids, length-prefixed req/resp frames, streaming scan/consumption for length-delimited bodies, multistream-select 1.0.0, Snappy stack (`snappyz`, `snappyframesz`, Zeam-aligned pins), `ssz_snappy` unary RPC peek/decode, Lean gossip mesh topics (`gossip.topic`), libp2p ping, peer IDs (`peer_id`, `identity`), protobuf wire, and gossipsub `RPC` plus control (IHAVE, IWANT, IDONTWANT, graft, prune) and `Message` encode/decode (`gossipsub.rpc`, `gossipsub.control`, `gossipsub.message`).
 
 Full gossipsub mesh behaviour, transports, and security handshakes are not implemented yet.
 
@@ -27,7 +27,7 @@ In application code, `@import("zig_libp2p")` and use the exports from `src/root.
 ## Roadmap
 
 - Build `/quic-v1` transport and libp2p security handshake (Noise or TLS) on top of the bundled zquic stack for devnets.
-- Gossipsub mesh scoring and backpressure; optional **IDONTWANT** / **ControlExtensions** on the wire.
+- Gossipsub mesh scoring and backpressure; optional **ControlExtensions** on the wire.
 
 ## Repository
 
