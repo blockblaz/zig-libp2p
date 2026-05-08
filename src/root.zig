@@ -15,6 +15,8 @@ pub const gossip = struct {
 
 pub const gossipsub = struct {
     pub const rpc = @import("gossipsub/rpc.zig");
+    pub const control = @import("gossipsub/control.zig");
+    pub const message = @import("gossipsub/message.zig");
 };
 
 pub const protobuf = struct {

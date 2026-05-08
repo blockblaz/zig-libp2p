@@ -55,6 +55,26 @@ pub fn appendLengthDelimited(list: *std.ArrayList(u8), allocator: std.mem.Alloca
     try list.appendSlice(allocator, payload);
 }
 
+/// After a field key, `buf` starts at the value wire bytes. Returns the value
+/// slice and total bytes consumed from `buf` (including length prefixes).
+pub fn nextFieldValue(buf: []const u8, wire_type: WireType) Error!struct { value: []const u8, total: usize } {
+    return switch (wire_type) {
+        .varint => blk: {
+            const d = try decodeVarUInt64(buf);
+            break :blk .{ .value = buf[0..d.len], .total = d.len };
+        },
+        .fixed64 => if (buf.len < 8) error.Truncated else .{ .value = buf[0..8], .total = 8 },
+        .fixed32 => if (buf.len < 4) error.Truncated else .{ .value = buf[0..4], .total = 4 },
+        .length_delimited => blk: {
+            const ln = try decodeVarUInt64(buf);
+            const n: usize = @intCast(ln.value);
+            const end = ln.len + n;
+            if (buf.len < end) return error.Truncated;
+            break :blk .{ .value = buf[ln.len..end], .total = end };
+        },
+    };
+}
+
 pub fn decodeFieldKey(buf: []const u8) Error!struct { field_number: u32, wire_type: WireType, len: usize } {
     const dec = try decodeVarUInt64(buf);
     if (dec.value == 0) return error.InvalidFieldNumber;

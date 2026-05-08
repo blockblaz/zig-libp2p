@@ -6,35 +6,6 @@ const w = @import("../protobuf/wire.zig");
 
 pub const Error = w.Error || error{MissingSubscribeFields};
 
-fn consumeFieldValue(buf: []const u8, wire_type: w.WireType) Error![]const u8 {
-    return switch (wire_type) {
-        .varint => buf[0..(try w.decodeVarUInt64(buf)).len],
-        .fixed64 => if (buf.len < 8) error.Truncated else buf[0..8],
-        .fixed32 => if (buf.len < 4) error.Truncated else buf[0..4],
-        .length_delimited => blk: {
-            const ln = try w.decodeVarUInt64(buf);
-            const n: usize = @intCast(ln.value);
-            const end = ln.len + n;
-            if (buf.len < end) return error.Truncated;
-            break :blk buf[ln.len..end];
-        },
-    };
-}
-
-fn fieldTotalLen(buf: []const u8, wire_type: w.WireType) Error!usize {
-    return switch (wire_type) {
-        .varint => (try w.decodeVarUInt64(buf)).len,
-        .fixed64 => 8,
-        .fixed32 => 4,
-        .length_delimited => blk: {
-            const ln = try w.decodeVarUInt64(buf);
-            const n: usize = @intCast(ln.value);
-            if (buf.len < ln.len + n) return error.Truncated;
-            break :blk ln.len + n;
-        },
-    };
-}
-
 /// `optional ControlMessage control = 3` with an empty nested message.
 pub fn encodeEmptyControlRpc(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
     var list = std.ArrayList(u8).empty;
@@ -72,9 +43,9 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
         const key = try w.decodeFieldKey(rpc[off..]);
         off += key.len;
         const val_buf = rpc[off..];
-        const v = try consumeFieldValue(val_buf, key.wire_type);
-        const total = try fieldTotalLen(val_buf, key.wire_type);
-        off += total;
+        const nv = try w.nextFieldValue(val_buf, key.wire_type);
+        const v = nv.value;
+        off += nv.total;
 
         if (key.field_number != 1) continue;
         if (key.wire_type != .length_delimited) return error.UnsupportedWireType;
@@ -86,9 +57,9 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
             const sk = try w.decodeFieldKey(v[sub_off..]);
             sub_off += sk.len;
             const inner = v[sub_off..];
-            const chunk = try consumeFieldValue(inner, sk.wire_type);
-            const inner_total = try fieldTotalLen(inner, sk.wire_type);
-            sub_off += inner_total;
+            const iv = try w.nextFieldValue(inner, sk.wire_type);
+            const chunk = iv.value;
+            sub_off += iv.total;
 
             switch (sk.field_number) {
                 1 => {
@@ -120,9 +91,9 @@ pub fn decodeControlPayload(allocator: std.mem.Allocator, rpc: []const u8) (Erro
         const key = try w.decodeFieldKey(rpc[off..]);
         off += key.len;
         const val_buf = rpc[off..];
-        const v = try consumeFieldValue(val_buf, key.wire_type);
-        const total = try fieldTotalLen(val_buf, key.wire_type);
-        off += total;
+        const nv = try w.nextFieldValue(val_buf, key.wire_type);
+        const v = nv.value;
+        off += nv.total;
 
         if (key.field_number == 3 and key.wire_type == .length_delimited) {
             return try allocator.dupe(u8, v);
@@ -134,6 +105,29 @@ pub fn decodeControlPayload(allocator: std.mem.Allocator, rpc: []const u8) (Erro
 pub fn deinitSubscribeView(allocator: std.mem.Allocator, s: *SubscribeView) void {
     allocator.free(s.topic);
     s.* = undefined;
+}
+
+/// `repeated Message publish = 2` with a single encoded `Message` wire blob.
+pub fn encodePublish(allocator: std.mem.Allocator, message_wire: []const u8) std.mem.Allocator.Error![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try w.appendLengthDelimited(&out, allocator, 2, message_wire);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// First `publish` entry (raw `Message` bytes), or null.
+pub fn decodeFirstPublish(allocator: std.mem.Allocator, rpc: []const u8) (Error || std.mem.Allocator.Error)!?[]u8 {
+    var off: usize = 0;
+    while (off < rpc.len) {
+        const key = try w.decodeFieldKey(rpc[off..]);
+        off += key.len;
+        const nv = try w.nextFieldValue(rpc[off..], key.wire_type);
+        off += nv.total;
+        if (key.field_number == 2 and key.wire_type == .length_delimited) {
+            return try allocator.dupe(u8, nv.value);
+        }
+    }
+    return null;
 }
 
 test "encodeEmptyControlRpc matches two-byte empty submessage" {
@@ -162,4 +156,19 @@ test "decodeFirstSubscribe returns null on control-only rpc" {
     const wire = try encodeEmptyControlRpc(a);
     defer a.free(wire);
     try std.testing.expectEqual(@as(?SubscribeView, null), try decodeFirstSubscribe(a, wire));
+}
+
+test "publish wraps message wire" {
+    const a = std.testing.allocator;
+    const msg = @import("message.zig");
+    const inner = try msg.encode(a, .{ .topic = "t", .data = "payload" });
+    defer a.free(inner);
+    const rpc = try encodePublish(a, inner);
+    defer a.free(rpc);
+    const got = (try decodeFirstPublish(a, rpc)).?;
+    defer a.free(got);
+    var decoded = try msg.decode(a, got);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings("t", decoded.topic.?);
+    try std.testing.expectEqualStrings("payload", decoded.data.?);
 }
