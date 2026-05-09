@@ -21,6 +21,12 @@ pub const WireType = enum(u3) {
     fixed32 = 5,
 };
 
+/// Payload slice and total bytes consumed from the input buffer after a field key.
+pub const FieldValue = struct {
+    value: []const u8,
+    total: usize,
+};
+
 pub fn appendVarUInt64(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u64) std.mem.Allocator.Error!void {
     var v = value;
     while (v >= 0x80) {
@@ -65,14 +71,14 @@ pub fn appendLengthDelimited(list: *std.ArrayList(u8), allocator: std.mem.Alloca
 /// For `length_delimited`, only lengths representable as `usize` and a non-overflowing
 /// end offset are accepted. Callers allocating from `value` should still enforce an
 /// application-specific maximum via [`nextFieldValueLimited`].
-pub fn nextFieldValue(buf: []const u8, wire_type: WireType) Error!struct { value: []const u8, total: usize } {
+pub fn nextFieldValue(buf: []const u8, wire_type: WireType) Error!FieldValue {
     return nextFieldValueLimited(buf, wire_type, std.math.maxInt(usize));
 }
 
 /// Like [`nextFieldValue`], but rejects `length_delimited` payloads whose declared
 /// length is greater than `max_length_delimited` before indexing the buffer.
 /// Other wire types ignore `max_length_delimited`.
-pub fn nextFieldValueLimited(buf: []const u8, wire_type: WireType, max_length_delimited: usize) Error!struct { value: []const u8, total: usize } {
+pub fn nextFieldValueLimited(buf: []const u8, wire_type: WireType, max_length_delimited: usize) Error!FieldValue {
     return switch (wire_type) {
         .varint => blk: {
             const d = try decodeVarUInt64(buf);

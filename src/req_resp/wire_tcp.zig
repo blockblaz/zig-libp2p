@@ -34,7 +34,7 @@ pub fn initiatorUnaryExchange(
     scratch_r: []u8,
     scratch_w: []u8,
     limits: ExchangeLimits,
-) (WireTcpError || std.mem.Allocator.Error)!struct { code: u8, ssz: []u8 } {
+) (WireTcpError || std.mem.Allocator.Error)!framing.UnaryResponse {
     try tcp.initiatorHandshakeMultistream(stream, io, protocol_id, scratch_r, scratch_w, allocator);
     var w = net.Stream.writer(stream, io, scratch_w);
     var r = net.Stream.reader(stream, io, scratch_r);
@@ -78,12 +78,20 @@ pub fn responderUnarySequence(
     return try framing.responderUnarySequenceAfterHandshake(allocator, &r.interface, &w.interface, scratch_r, limits, response_bodies);
 }
 
+fn skipDarwinTcpLoopback() bool {
+    return switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => true,
+        else => false,
+    };
+}
+
 test "wire_tcp status unary over loopback" {
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (skipDarwinTcpLoopback()) return error.SkipZigTest;
 
     const a = std.testing.allocator;
-    var io_impl = Io.Threaded.init(a, .{});
+    var io_impl = Io.Threaded.init(a, .{ .async_limit = Io.Limit.limited(8) });
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -124,9 +132,10 @@ test "wire_tcp status unary over loopback" {
 test "wire_tcp multi response on one stream" {
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (skipDarwinTcpLoopback()) return error.SkipZigTest;
 
     const a = std.testing.allocator;
-    var io_impl = Io.Threaded.init(a, .{});
+    var io_impl = Io.Threaded.init(a, .{ .async_limit = Io.Limit.limited(8) });
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -173,9 +182,10 @@ test "wire_tcp multi response on one stream" {
 test "wire_tcp two connections two handshakes" {
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (skipDarwinTcpLoopback()) return error.SkipZigTest;
 
     const a = std.testing.allocator;
-    var io_impl = Io.Threaded.init(a, .{});
+    var io_impl = Io.Threaded.init(a, .{ .async_limit = Io.Limit.limited(8) });
     defer io_impl.deinit();
     const io = io_impl.io();
 

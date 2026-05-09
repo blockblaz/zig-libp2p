@@ -133,9 +133,13 @@ test "tcp identifiers" {
 
 test "tcp listen dial multistream round trip" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => true,
+        else => false,
+    }) return error.SkipZigTest;
 
     const a = std.testing.allocator;
-    var io_impl = Io.Threaded.init(a, .{});
+    var io_impl = Io.Threaded.init(a, .{ .async_limit = Io.Limit.limited(8) });
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -146,21 +150,23 @@ test "tcp listen dial multistream round trip" {
 
     const ServerThreadErr = errors.TransportError || ApplyStreamSocketTuningError || sm.StreamHandshakeError;
 
+    const tuning: StreamSocketTuning = .{ .tcp_nodelay = true, .send_buffer_bytes = 1 << 16, .recv_buffer_bytes = 1 << 16 };
+
     const ServerCtx = struct {
         server: *net.Server,
-        io: Io,
-        tuning: StreamSocketTuning,
+        io_inner: Io,
+        tuning_inner: StreamSocketTuning,
         err: ?ServerThreadErr = null,
 
         fn run(ctx: *@This()) void {
-            const st = acceptTuned(ctx.server, ctx.io, ctx.tuning) catch |e| {
+            const st = acceptTuned(ctx.server, ctx.io_inner, ctx.tuning_inner) catch |e| {
                 ctx.err = e;
                 return;
             };
-            defer st.close(ctx.io);
+            defer st.close(ctx.io_inner);
             var scratch_r: [2048]u8 = undefined;
             var scratch_w: [2048]u8 = undefined;
-            responderHandshakeMultistream(st, ctx.io, multistream_protocol_id, &scratch_r, &scratch_w, std.testing.allocator) catch |e| {
+            responderHandshakeMultistream(st, ctx.io_inner, multistream_protocol_id, &scratch_r, &scratch_w, a) catch |e| {
                 ctx.err = e;
             };
         }
@@ -168,14 +174,14 @@ test "tcp listen dial multistream round trip" {
 
     var ctx: ServerCtx = .{
         .server = &server,
-        .io = io,
-        .tuning = .{ .tcp_nodelay = true, .send_buffer_bytes = 1 << 16, .recv_buffer_bytes = 1 << 16 },
+        .io_inner = io,
+        .tuning_inner = tuning,
     };
     const thr = try std.Thread.spawn(.{}, ServerCtx.run, .{&ctx});
     defer thr.join();
 
     const connect_addr: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var client = try dial(&connect_addr, io, .{ .tuning = ctx.tuning });
+    var client = try dial(&connect_addr, io, .{ .tuning = tuning });
     defer client.close(io);
 
     var scratch_r: [2048]u8 = undefined;

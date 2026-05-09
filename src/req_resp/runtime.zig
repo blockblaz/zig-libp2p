@@ -76,8 +76,8 @@ pub const ReqResp = struct {
     }
 
     pub fn deinit(self: *ReqResp) void {
-        self.pending_out.deinit(self.allocator);
-        self.inbound.deinit(self.allocator);
+        self.pending_out.deinit();
+        self.inbound.deinit();
     }
 
     /// Clears outbound and inbound state without emitting events (does not stop the swarm).
@@ -176,13 +176,13 @@ pub const ReqResp = struct {
     /// Expire outbound requests and idle inbound channels; emits [`swarm.Event.rpc_error_response`]
     /// through [`swarm.Swarm.queueEvent`].
     pub fn tick(self: *ReqResp, now_ms: i64) std.mem.Allocator.Error!void {
-        var expired_out = std.ArrayList(u64).init(self.allocator);
+        var expired_out: std.ArrayList(u64) = .empty;
         defer expired_out.deinit(self.allocator);
         {
             var it = self.pending_out.iterator();
             while (it.next()) |e| {
                 if (e.value_ptr.deadline_ms <= now_ms) {
-                    try expired_out.append(e.key_ptr.*);
+                    try expired_out.append(self.allocator, e.key_ptr.*);
                 }
             }
         }
@@ -195,7 +195,7 @@ pub const ReqResp = struct {
             } });
         }
 
-        var idle_ch = std.ArrayList(u64).init(self.allocator);
+        var idle_ch: std.ArrayList(u64) = .empty;
         defer idle_ch.deinit(self.allocator);
         const idle_ms = self.cfg.response_idle_timeout_ms;
         {
@@ -203,7 +203,7 @@ pub const ReqResp = struct {
             while (it.next()) |e| {
                 const elapsed = now_ms - e.value_ptr.last_activity_ms;
                 if (elapsed >= idle_ms) {
-                    try idle_ch.append(e.key_ptr.*);
+                    try idle_ch.append(self.allocator, e.key_ptr.*);
                 }
             }
         }
@@ -220,13 +220,13 @@ pub const ReqResp = struct {
     /// Call when the peer has no remaining connection (transport callback). Cancels pending outbound
     /// requests and open inbound response channels, emitting [`errors.ReqRespError.Disconnected`].
     pub fn onPeerDisconnected(self: *ReqResp, peer: identity.PeerId) std.mem.Allocator.Error!void {
-        var drop_out = std.ArrayList(u64).init(self.allocator);
+        var drop_out: std.ArrayList(u64) = .empty;
         defer drop_out.deinit(self.allocator);
         {
             var it = self.pending_out.iterator();
             while (it.next()) |e| {
                 if (e.value_ptr.peer.eql(&peer)) {
-                    try drop_out.append(e.key_ptr.*);
+                    try drop_out.append(self.allocator, e.key_ptr.*);
                 }
             }
         }
@@ -243,13 +243,13 @@ pub const ReqResp = struct {
             channel_id: u64,
             stream_request_id: u64,
         };
-        var drop_in = std.ArrayList(InboundDrop).init(self.allocator);
+        var drop_in: std.ArrayList(InboundDrop) = .empty;
         defer drop_in.deinit(self.allocator);
         {
             var it = self.inbound.iterator();
             while (it.next()) |e| {
                 if (e.value_ptr.peer.eql(&peer)) {
-                    try drop_in.append(.{
+                    try drop_in.append(self.allocator, .{
                         .channel_id = e.key_ptr.*,
                         .stream_request_id = e.value_ptr.stream_request_id,
                     });

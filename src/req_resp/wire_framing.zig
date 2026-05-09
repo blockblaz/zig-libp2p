@@ -15,6 +15,12 @@ pub const ExchangeLimits = struct {
 
 pub const FramingError = errors.ReqRespError;
 
+/// One unary RPC response after decompression (`code` is the RPC status byte).
+pub const UnaryResponse = struct {
+    code: u8,
+    ssz: []u8,
+};
+
 fn firstUnaryResponseWireLen(allocator: std.mem.Allocator, wire: []const u8) (FramingError || std.mem.Allocator.Error)!usize {
     const h = try frame.parseResponseHeader(wire);
     const hdr_len = wire.len - h.payload.len;
@@ -71,7 +77,7 @@ pub fn readOneUnaryResponse(
     r: *Io.Reader,
     scratch: []u8,
     limits: ExchangeLimits,
-) (FramingError || std.mem.Allocator.Error)!struct { code: u8, ssz: []u8 } {
+) (FramingError || std.mem.Allocator.Error)!UnaryResponse {
     var acc = std.ArrayList(u8).empty;
     defer acc.deinit(allocator);
     while (true) {
@@ -80,7 +86,8 @@ pub fn readOneUnaryResponse(
             error.IncompleteStream => continue,
             else => |e| return e,
         };
-        return try snappy_wire.decodeResponseSsz(allocator, acc.items[0..frame_len]);
+        const decoded = try snappy_wire.decodeResponseSsz(allocator, acc.items[0..frame_len]);
+        return UnaryResponse{ .code = decoded.code, .ssz = decoded.ssz };
     }
 }
 
@@ -91,8 +98,8 @@ pub fn writeUnaryRequestFlush(
 ) (FramingError || std.mem.Allocator.Error)!void {
     const wire_req = try snappy_wire.buildRequestWire(allocator, uncompressed_request);
     defer allocator.free(wire_req);
-    try Io.Writer.writeAll(w, wire_req);
-    try Io.Writer.flush(w);
+    Io.Writer.writeAll(w, wire_req) catch return error.IoError;
+    Io.Writer.flush(w) catch return error.IoError;
 }
 
 /// After multistream handshake on `r`/`w`, send one unary request and read one unary response.
@@ -103,7 +110,7 @@ pub fn initiatorUnaryAfterHandshake(
     scratch_r: []u8,
     uncompressed_request: []const u8,
     limits: ExchangeLimits,
-) (FramingError || std.mem.Allocator.Error)!struct { code: u8, ssz: []u8 } {
+) (FramingError || std.mem.Allocator.Error)!UnaryResponse {
     try writeUnaryRequestFlush(allocator, w, uncompressed_request);
     return try readOneUnaryResponse(allocator, r, scratch_r, limits);
 }
@@ -152,8 +159,8 @@ pub fn responderUnarySequenceAfterHandshake(
     for (response_bodies) |body| {
         const wire = try snappy_wire.buildResponseWire(allocator, 0, body);
         defer allocator.free(wire);
-        try Io.Writer.writeAll(w, wire);
+        Io.Writer.writeAll(w, wire) catch return error.IoError;
     }
-    try Io.Writer.flush(w);
+    Io.Writer.flush(w) catch return error.IoError;
     return req_ssz;
 }

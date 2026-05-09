@@ -25,7 +25,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig', 'examples/**') }}
         restore-keys: |
           ${{ runner.os }}-zig-
 
@@ -46,7 +46,7 @@ jobs:
     - name: Lint
       run: zig fmt --check .
 
-    - name: Run unit tests
+    - name: Run unit tests and example checks (TCP status compile-only)
       run: |
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do
@@ -58,6 +58,20 @@ jobs:
           sleep 5
         done
         echo "All unit test attempts failed"
+        exit 1
+
+    - name: Build example executables
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build examples; then
+            echo "Successfully built examples on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All example build attempts failed"
         exit 1
 
     - name: build

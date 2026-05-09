@@ -29,7 +29,7 @@ pub const PeerIdContext = struct {
         const b = key.toBytes(&buf) catch return 0;
         return std.hash.Wyhash.hash(0, b);
     }
-    pub fn eql(_: PeerIdContext, a: identity.PeerId, b: identity.PeerId, _: usize) bool {
+    pub fn eql(_: PeerIdContext, a: identity.PeerId, b: identity.PeerId) bool {
         return a.eql(&b);
     }
 };
@@ -73,9 +73,9 @@ pub const ConnectionManager = struct {
         while (it.next()) |e| {
             self.allocator.free(e.value_ptr.dial_str);
         }
-        self.known.deinit(self.allocator);
-        self.conns.deinit(self.allocator);
-        self.peer_active.deinit(self.allocator);
+        self.known.deinit();
+        self.conns.deinit();
+        self.peer_active.deinit();
     }
 
     pub fn setReqResp(self: *ConnectionManager, rr: ?*req_resp_runtime.ReqResp) void {
@@ -109,7 +109,7 @@ pub const ConnectionManager = struct {
         const dial_str = try multiaddrDialString(self.allocator, ma);
         errdefer self.allocator.free(dial_str);
 
-        const gop = try self.known.getOrPut(self.allocator, effective);
+        const gop = try self.known.getOrPut(effective);
         if (gop.found_existing) {
             self.allocator.free(gop.value_ptr.dial_str);
         }
@@ -183,7 +183,7 @@ pub const ConnectionManager = struct {
 
         try self.conns.put(conn_id, .{ .peer = peer, .direction = direction });
 
-        const gop = try self.peer_active.getOrPut(self.allocator, peer);
+        const gop = try self.peer_active.getOrPut(peer);
         const prev = if (gop.found_existing) gop.value_ptr.* else 0;
         gop.value_ptr.* = prev + 1;
         if (prev == 0) {
@@ -208,7 +208,7 @@ pub const ConnectionManager = struct {
         pr.* -= 1;
         const count = pr.*;
         if (count == 0) {
-            _ = self.peer_active.remove(self.allocator, peer);
+            _ = self.peer_active.remove(peer);
             try self.swarm.queueEvent(.{ .peer_disconnected = .{
                 .peer = peer,
                 .direction = direction,
