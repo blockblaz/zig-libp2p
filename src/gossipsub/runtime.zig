@@ -20,6 +20,35 @@ const message_id = @import("message_id.zig");
 const msg_mod = @import("message.zig");
 const rpc = @import("rpc.zig");
 
+/// `arc4random_buf` is missing from `std.c` on Linux with older glibc (see `std.c.arc4random_buf`),
+/// which breaks CI. Prefer the `getrandom` syscall on Linux; otherwise libc where linked.
+fn gossipsubPrngSeed() u64 {
+    if (builtin.is_test) return 0x1111_2222_3333_4444;
+    var s: u64 = undefined;
+    const bytes = std.mem.asBytes(&s);
+
+    var filled = false;
+    switch (builtin.os.tag) {
+        .linux => {
+            const n = std.os.linux.getrandom(bytes.ptr, bytes.len, 0);
+            filled = (n == bytes.len);
+        },
+        else => {
+            if (@TypeOf(std.c.arc4random_buf) != void) {
+                std.c.arc4random_buf(bytes.ptr, bytes.len);
+                filled = true;
+            }
+        },
+    }
+
+    if (!filled) {
+        const addr: usize = @intFromPtr(bytes.ptr);
+        s = std.hash.Wyhash.hash(0, std.mem.asBytes(&addr));
+    }
+    if (s == 0) s = 0xa5a5_a5a5_a5a5_a5a5;
+    return s;
+}
+
 const SeenMsg = struct {
     topic: []u8,
     id: [20]u8,
@@ -111,12 +140,7 @@ pub const Gossipsub = struct {
         try config.validate();
         const p = try allocator.create(Gossipsub);
         errdefer allocator.destroy(p);
-        const seed: u64 = if (builtin.is_test) 0x1111_2222_3333_4444 else seed: {
-            var s: u64 = undefined;
-            const bytes = std.mem.asBytes(&s);
-            std.c.arc4random_buf(bytes.ptr, bytes.len);
-            break :seed if (s == 0) 0xa5a5_a5a5_a5a5_a5a5 else s;
-        };
+        const seed = gossipsubPrngSeed();
         p.* = .{
             .allocator = allocator,
             .cfg = config,
