@@ -16,6 +16,7 @@ const connection_manager = @import("../connection_manager.zig");
 const errors = @import("../errors.zig");
 const control = @import("control.zig");
 const duplicate_cache = @import("duplicate_cache.zig");
+const metrics_mod = @import("../metrics.zig");
 const gs_cfg = @import("config.zig");
 const lim = @import("wire_limits.zig");
 const message_id = @import("message_id.zig");
@@ -84,6 +85,8 @@ pub const GossipsubConfig = struct {
     max_outbox_entries: usize = 4096,
     /// Per-peer cap on directed outbox entries; overflow drops oldest `lazy_ihave` to that peer first (#39).
     max_queued_per_peer: usize = 256,
+    /// When set, [`Gossipsub`] updates `lean_gossip_mesh_peers` from [`meshPeers`] on membership changes and heartbeat (#43).
+    metrics: ?*metrics_mod.Metrics = null,
 
     pub fn validate(c: GossipsubConfig) InitConfigError!void {
         if (c.mesh_n_low > c.mesh_n) return error.InvalidMeshKnobs;
@@ -216,6 +219,12 @@ pub const Gossipsub = struct {
 
     fn historyWindowMs(self: *const Gossipsub) i64 {
         return @as(i64, self.cfg.history_length) * self.cfg.heartbeat_interval_ms;
+    }
+
+    fn syncMeshPeers(self: *Gossipsub) void {
+        if (self.cfg.metrics) |m| {
+            m.setMeshPeers(self.meshPeers());
+        }
     }
 
     fn pruneRecentSeen(self: *Gossipsub) void {
@@ -437,6 +446,7 @@ pub const Gossipsub = struct {
         const w = try rpc.encodeSubscribe(self.allocator, topic, true);
         errdefer self.allocator.free(w);
         try self.appendOut(w, null);
+        self.syncMeshPeers();
     }
 
     pub fn unsubscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
@@ -452,6 +462,7 @@ pub const Gossipsub = struct {
             const w = try rpc.encodeSubscribe(self.allocator, topic, false);
             errdefer self.allocator.free(w);
             try self.appendOut(w, null);
+            self.syncMeshPeers();
         }
     }
 
@@ -485,6 +496,7 @@ pub const Gossipsub = struct {
         while (rit.next()) |e| {
             _ = e.value_ptr.peers.remove(peer);
         }
+        self.syncMeshPeers();
     }
 
     pub fn peerBehaviourScore(self: *const Gossipsub, peer: identity.PeerId) i32 {
@@ -593,6 +605,7 @@ pub const Gossipsub = struct {
                 self.control_i_want_fulfilled += 1;
             }
         }
+        self.syncMeshPeers();
     }
 
     fn forwardPublish(self: *Gossipsub, sender: identity.PeerId, topic: []const u8, data: []const u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
@@ -692,6 +705,7 @@ pub const Gossipsub = struct {
         }
 
         try self.emitLazyIHAVE();
+        self.syncMeshPeers();
     }
 
     /// Sum of per-topic mesh sizes (a peer in multiple topics is counted multiple times).
@@ -723,8 +737,11 @@ pub const Gossipsub = struct {
 test "gossipsub subscribe, graft mesh, dedup, forward" {
     const a = std.testing.allocator;
     const me = try identity.PeerId.random();
-    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    var reg = metrics_mod.Metrics{ .network_id = "testnet" };
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .metrics = &reg });
     defer g.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), reg.meshPeers());
 
     try g.subscribe("blocks");
     const sub_d = g.popOutboxDelivery().?;
@@ -745,6 +762,7 @@ test "gossipsub subscribe, graft mesh, dedup, forward" {
     defer a.free(graft_rpc);
     try g.handleInboundRpc(p1, graft_rpc);
     try std.testing.expectEqual(@as(u64, 1), g.meshPeers());
+    try std.testing.expectEqual(@as(u64, 1), reg.meshPeers());
     try std.testing.expectEqual(@as(?usize, 1), g.meshPeerCountForTopic("blocks"));
 
     const inner = try msg_mod.encode(a, .{ .topic = "blocks", .data = "hello" });

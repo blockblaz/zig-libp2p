@@ -23,6 +23,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 const errors = @import("errors.zig");
+const metrics = @import("metrics.zig");
 const peer_events = @import("peer_events.zig");
 const protocol = @import("protocol.zig");
 const identity = @import("identity.zig");
@@ -244,12 +245,19 @@ pub const Swarm = struct {
     shutdown_requested: std.atomic.Value(bool) = .init(false),
     cmd_closed: std.atomic.Value(bool) = .init(false),
 
+    /// When non-null, failed [`submit`] calls record [`metrics.SwarmDropReason`] on this registry.
+    metrics: ?*metrics.Metrics = null,
+
     runner: ?std.Thread = null,
 
     pub const SwarmConfig = struct {
         event_capacity: usize = default_event_capacity,
         /// When `null`, a random [`identity.PeerId`] is generated at init.
         local_peer: ?identity.PeerId = null,
+        /// Overrides [`command_capacity`] for the command ring. `0` means use the default capacity.
+        command_ring_capacity: usize = 0,
+        /// Same pointer stored on [`Swarm.metrics`].
+        metrics: ?*metrics.Metrics = null,
     };
 
     pub fn init(gpa: std.mem.Allocator, event_capacity: usize) InitError!Swarm {
@@ -263,7 +271,8 @@ pub const Swarm = struct {
         });
         const io = threaded.io();
 
-        const cmd_buf = try gpa.alloc(OwnedCommand, command_capacity);
+        const cmd_ring_cap = if (config.command_ring_capacity == 0) command_capacity else config.command_ring_capacity;
+        const cmd_buf = try gpa.alloc(OwnedCommand, cmd_ring_cap);
         errdefer gpa.free(cmd_buf);
         @memset(std.mem.sliceAsBytes(cmd_buf), 0);
 
@@ -278,6 +287,7 @@ pub const Swarm = struct {
             .threaded = threaded,
             .io = io,
             .local_peer = lp,
+            .metrics = config.metrics,
             .cmd_buf = cmd_buf,
             .evt_buf = evt_buf,
             .evt_cap = config.event_capacity,
@@ -309,6 +319,10 @@ pub const Swarm = struct {
         self.gpa.free(self.evt_buf);
         self.threaded.deinit();
         self.* = undefined;
+    }
+
+    pub fn metricsRegistry(self: *const Swarm) ?*const metrics.Metrics {
+        return self.metrics;
     }
 
     /// Starts [`run`] on a new OS thread. Idempotent if already started.
@@ -484,15 +498,24 @@ pub const Swarm = struct {
     }
 
     pub fn submit(self: *Swarm, cmd: SwarmCommand) SubmitError!void {
-        if (self.cmd_closed.load(.acquire)) return error.QueueClosed;
+        if (self.cmd_closed.load(.acquire)) {
+            if (self.metrics) |m| m.recordSwarmCommandDropped(.closed);
+            return error.QueueClosed;
+        }
         const owned = try cloneCommand(self.gpa, cmd);
         errdefer destroyCommand(self.gpa, owned);
 
         const io = self.io;
         self.cmd_mutex.lockUncancelable(io);
         defer self.cmd_mutex.unlock(io);
-        if (self.cmd_closed.load(.acquire)) return error.QueueClosed;
-        if (self.cmd_len == self.cmd_buf.len) return error.QueueFull;
+        if (self.cmd_closed.load(.acquire)) {
+            if (self.metrics) |m| m.recordSwarmCommandDropped(.closed);
+            return error.QueueClosed;
+        }
+        if (self.cmd_len == self.cmd_buf.len) {
+            if (self.metrics) |m| m.recordSwarmCommandDropped(.full);
+            return error.QueueFull;
+        }
 
         const slot = (self.cmd_head + self.cmd_len) % self.cmd_buf.len;
         self.cmd_buf[slot] = owned;
@@ -642,7 +665,8 @@ test "swarm submit returns QueueClosed after shutdown" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const a = std.testing.allocator;
-    var swarm = try Swarm.init(a, default_event_capacity);
+    var reg = metrics.Metrics{};
+    var swarm = try Swarm.initWithConfig(a, .{ .metrics = &reg });
     defer swarm.deinit();
     try swarm.startBackground();
 
@@ -653,4 +677,34 @@ test "swarm submit returns QueueClosed after shutdown" {
         if (std.meta.activeTag(ev) == .swarm_closed) break;
     }
     try std.testing.expectError(error.QueueClosed, swarm.submit(.{ .subscribe = .{ .topic = "x" } }));
+    try std.testing.expectEqual(@as(u64, 1), reg.swarmCommandDropped(.closed));
+}
+
+test "swarm submit QueueFull increments metrics" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var reg = metrics.Metrics{};
+    var swarm = try Swarm.initWithConfig(a, .{
+        .event_capacity = 32,
+        .command_ring_capacity = 1,
+        .metrics = &reg,
+    });
+    defer swarm.deinit();
+
+    try swarm.submit(.{ .publish = .{ .topic = "/t", .payload = "one" } });
+    try std.testing.expectError(error.QueueFull, swarm.submit(.{ .publish = .{ .topic = "/t", .payload = "two" } }));
+    try std.testing.expectEqual(@as(u64, 1), reg.swarmCommandDropped(.full));
+
+    swarm.tick(commands_per_tick);
+    var ev = try swarm.nextEvent(1000);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(.gossip_message, std.meta.activeTag(ev));
+
+    swarm.shutdown();
+    swarm.tick(commands_per_tick);
+    var closed = try swarm.nextEvent(1000);
+    defer closed.deinit(a);
+    try std.testing.expectEqual(.swarm_closed, std.meta.activeTag(closed));
 }
