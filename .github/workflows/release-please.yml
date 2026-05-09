@@ -1,30 +1,36 @@
-# release-please opens/updates release PRs. If CI fails with
-# "GitHub Actions is not permitted to create or approve pull requests", either:
+# Release flow (not on every push to main):
+#   1. Actions → release-please → Run workflow (workflow_dispatch) to open/update the release PR.
+#   2. Merge that PR when ready; this job runs again on pull_request closed and publishes the GitHub release.
+#
+# If CI fails with "GitHub Actions is not permitted to create or approve pull requests", either:
 #   Settings → Actions → General → Workflow permissions → enable
 #   "Allow GitHub Actions to create and approve pull requests", or
 #   add repo secret RELEASE_PLEASE_TOKEN (fine-grained PAT: Contents + Pull requests write).
-on:
-  push:
-    branches:
-      - main
-
 name: release-please
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [closed]
+    branches: [main]
 
 jobs:
   release-please:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       startsWith(github.event.pull_request.head.ref, 'release-please--branches--'))
     runs-on: ubuntu-latest
-    # Explicit job permissions so the default branch token can open release PRs.
     permissions:
       contents: write
       issues: write
       pull-requests: write
     env:
-      # googleapis/release-please-action still targets Node 20; opt into Node 24 on the runner.
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - uses: googleapis/release-please-action@v4
         with:
-          # Prefer a PAT when the repo disallows GITHUB_TOKEN from creating PRs.
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
