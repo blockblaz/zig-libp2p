@@ -47,6 +47,13 @@ const ConnEntry = struct {
     direction: peer_events.Direction,
 };
 
+/// Snapshot of dial scheduling state for a known peer (tests and diagnostics, #38).
+pub const KnownPeerDialStatus = struct {
+    failure_count: u8,
+    next_dial_deadline_ms: i64,
+    dial_inflight: bool,
+};
+
 pub const ConnectionManager = struct {
     allocator: std.mem.Allocator,
     swarm: *swarm_mod.Swarm,
@@ -126,6 +133,15 @@ pub const ConnectionManager = struct {
 
     /// Submits [`swarm_mod.SwarmCommand.dial`] for due peers. `now_ms` must be comparable
     /// deadlines from [`onDialFailure`] / [`onConnectionClosed`].
+    pub fn knownPeerStatus(self: *const ConnectionManager, peer: identity.PeerId) ?KnownPeerDialStatus {
+        const st = self.known.get(peer) orelse return null;
+        return .{
+            .failure_count = st.failure_count,
+            .next_dial_deadline_ms = st.next_dial_deadline_ms,
+            .dial_inflight = st.dial_inflight,
+        };
+    }
+
     pub fn tick(self: *ConnectionManager, now_ms: i64) swarm_mod.SubmitError!void {
         var it = self.known.iterator();
         while (it.next()) |e| {
@@ -303,6 +319,90 @@ test "connection manager emits single peer_connected for two conns" {
     try std.testing.expectEqual(@as(std.meta.Tag(swarm_mod.Event), .peer_disconnected), std.meta.activeTag(ev2));
     try std.testing.expect(ev2.peer_disconnected.peer.eql(&peer));
     try std.testing.expectEqual(@as(peer_events.Direction, .inbound), ev2.peer_disconnected.direction);
+}
+
+test "tick submits dial after remote close backoff" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    var ma = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA");
+    defer ma.deinit();
+    try cm.registerKnownPeer(&ma, null);
+    const peer = peerIdFromMultiaddr(&ma).?;
+
+    try cm.onConnectionEstablished(1, peer, .outbound);
+    try cm.onConnectionClosed(10_000, 1, .remote_close);
+
+    var evd = try swarm.nextEvent(100);
+    defer evd.deinit(a);
+    try std.testing.expectEqual(.peer_disconnected, std.meta.activeTag(evd));
+
+    const st_before = cm.knownPeerStatus(peer).?;
+    try std.testing.expectEqual(@as(u8, 1), st_before.failure_count);
+    try std.testing.expectEqual(@as(i64, 15_000), st_before.next_dial_deadline_ms);
+    try std.testing.expect(!st_before.dial_inflight);
+
+    try cm.tick(14_999);
+    try std.testing.expect(!cm.knownPeerStatus(peer).?.dial_inflight);
+
+    try cm.tick(15_000);
+    try std.testing.expect(cm.knownPeerStatus(peer).?.dial_inflight);
+}
+
+test "local close does not set reconnect backoff" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    var ma = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA");
+    defer ma.deinit();
+    try cm.registerKnownPeer(&ma, null);
+    const peer = peerIdFromMultiaddr(&ma).?;
+
+    try cm.onConnectionEstablished(1, peer, .outbound);
+    _ = try swarm.nextEvent(100);
+    try cm.onConnectionClosed(5_000, 1, .local_close);
+    _ = try swarm.nextEvent(100);
+
+    const st = cm.knownPeerStatus(peer).?;
+    try std.testing.expectEqual(@as(u8, 0), st.failure_count);
+    try std.testing.expectEqual(std.math.maxInt(i64), st.next_dial_deadline_ms);
+}
+
+test "onDialFailure with null peer emits swarm event only" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    try cm.onDialFailure(0, 0, null, .unknown, .timeout);
+
+    var ev = try swarm.nextEvent(100);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(.peer_connection_failed, std.meta.activeTag(ev));
+    try std.testing.expect(ev.peer_connection_failed.peer == null);
+    try std.testing.expectEqual(@as(peer_events.Direction, .unknown), ev.peer_connection_failed.direction);
 }
 
 test "connection manager notifies ReqResp on last disconnect" {
