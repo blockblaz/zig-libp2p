@@ -43,6 +43,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("zquic");
 
+    const zig_varint_mod = b.dependency("zig_varint", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zig_varint");
+
     const mod = b.addModule("zig_libp2p", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -53,6 +58,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("snappyframesz", snappyframesz);
     mod.addImport("peer_id", peer_id_mod);
     mod.addImport("zquic", zquic_mod);
+    mod.addImport("zig_varint", zig_varint_mod);
 
     const unit_tests = b.addTest(.{
         .root_module = mod,
