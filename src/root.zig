@@ -4,6 +4,7 @@
 //! and `dep.module("zig_libp2p")` on your executable or library module.
 
 pub const errors = @import("errors.zig");
+pub const metrics = @import("metrics.zig");
 pub const layer_events = @import("layer_events.zig");
 pub const peer_events = @import("peer_events.zig");
 pub const connection_manager = @import("connection_manager.zig");

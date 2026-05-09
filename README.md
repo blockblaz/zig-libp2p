@@ -25,7 +25,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Gossipsub mesh runtime | Done | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) — `gossipsub.runtime`: mesh + heartbeat, lazy IHAVE (`gossip_lazy`, `OutDeliveryKind.lazy_ihave`), IWANT → pull cache, `max_transmit_size_bytes`, global + per-peer outbox caps (drop oldest lazy first), `setPeerBehaviourScore` / `peerBehaviourScore` for GRAFT / PRUNE / lazy ordering |
 | Req/resp behaviour | Done | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) — `req_resp.runtime` (15s request / 5min inbound idle timeouts, `channel_id`, `onPeerDisconnected`); `req_resp.wire_framing`, TCP `req_resp.wire_tcp`, QUIC `req_resp.wire_quic`; `connection_manager.setReqResp` notifies `ReqResp` on last session close; end-to-end on live streams remains embedder transport + [`swarm`](#api-overview) (#34) |
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
-| Metrics (Prometheus-style) | Not started | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) |
+| Metrics (Prometheus-style) | Done | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) — [`metrics`](./src/metrics.zig), [`swarm` `SwarmConfig`](./src/swarm.zig), [`gossipsub.runtime` `GossipsubConfig`](./src/gossipsub/runtime.zig) |
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
 | Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
 
@@ -54,7 +54,8 @@ Application code: `@import("zig_libp2p")` — symbols below match `src/root.zig`
 
 **Tests:** `zig build test` runs the library test binary, then **smoke-runs** most `example-*` programs (exit code 0). The TCP status example is **compile-only** in that step (running it can stall: `Io.Threaded` + TCP accept/dial across threads is unreliable on Darwin and has hung CI on Linux). Run `./zig-out/bin/example-req-resp-tcp-status` manually after `zig build`; `src/req_resp/wire_tcp.zig` integration tests cover the same path on non-Darwin targets.  
 **Examples:** `zig build` installs `example-*` binaries under the install prefix; `zig build examples` compiles them without installing. See [`examples/README.md`](./examples/README.md).  
-**CI:** `zig fmt --check .`, `zig build test --summary all`, `zig build examples`, `zig build` (see `.github/workflows/ci.yml`).
+**CI:** `zig fmt --check .`, `zig build test --summary all`, `zig build examples`, `zig build` (see `.github/workflows/ci.yml`).  
+**Releases:** [release-please](https://github.com/googleapis/release-please) runs on `main` (`.github/workflows/release-please.yml`). Use [Conventional Commits](https://www.conventionalcommits.org/) so versions and `CHANGELOG.md` stay aligned with `build.zig.zon`.
 
 ---
 
@@ -67,10 +68,11 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | Module | Role |
 |--------|------|
 | `errors` | Layered errors: `ReqRespError`, `GossipsubError`, `TransportError`; `setLastErrorMessage` / `lastErrorMessage` / `clearLastErrorMessage` (#45) |
+| `metrics` | `Metrics`: `lean_gossip_mesh_peers{network_id}`, `swarm_command_dropped_total{reason}`; `writePrometheusText` (#43) |
 | `layer_events` | Event carriers: `ReqRespFailure`, `GossipsubFailure`, `TransportFailure` (each has a `kind:` field for `switch`) (#45) |
 | `peer_events` | Peer connection payloads: `Direction` (`inbound` / `outbound` / `unknown`), `DisconnectReason`, `ConnectionFailureResult`, connected / disconnected / failed event structs (#38) |
 | `connection_manager` | Known-peer dial scheduling (multiaddr without `/p2p`), reconnect backoff, refcount + peer events (#38), `knownPeerStatus` / `KnownPeerDialStatus`; optional `setReqResp` → `ReqResp.onPeerDisconnected` on last session close (#40) |
-| `swarm` | Bounded `submit` / `nextEvent`, `queueEvent`, `shutdown` (#34); `SwarmConfig` + `initWithConfig` (fixed `local_peer`), `tick` for single-threaded pumping, `commands_per_tick` / `command_capacity`; `RpcRequest.channel_id` (#40); dial stub forwards `expected_peer`; real I/O embedder-owned |
+| `swarm` | Bounded `submit` / `nextEvent`, `queueEvent`, `shutdown` (#34); `SwarmConfig` + `initWithConfig` (fixed `local_peer`, optional `metrics`, `command_ring_capacity`), `tick` for single-threaded pumping, `commands_per_tick` / `command_capacity`; `RpcRequest.channel_id` (#40); dial stub forwards `expected_peer`; real I/O embedder-owned |
 | `protocol` | Lean req/resp protocol id strings; `LeanSupportedProtocol` enum with `protocolId`, `fromInt`, `fromSlice` |
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
 | `addr_list` | Multiaddr CSV: `parseCsv` (`ParseCsvError`), `freeList` (uses bundled `multiaddr`) |
@@ -85,6 +87,10 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `snappyframesz` | Re-export of Snappy framing for libp2p streams |
 | `zquic` | Full **zquic** library (QUIC/TLS); use for transport integration |
 
+### Metrics (#43)
+
+Share one [`metrics.Metrics`](./src/metrics.zig) via [`swarm.SwarmConfig.metrics`](./src/swarm.zig) and [`gossipsub.runtime.GossipsubConfig.metrics`](./src/gossipsub/runtime.zig). Set `network_id` for the mesh gauge label. The swarm increments `full` / `closed` when `submit` fails; call `recordSwarmCommandDropped(.uninitialized)` from embedder-only paths that bypass an initialized swarm.
+
 ### `gossip`
 
 | Submodule | Role |
@@ -98,7 +104,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `gossipsub.config` | Zeam gossipsub constants: `mesh_n` / `mesh_n_low` / `mesh_n_high`, `gossip_lazy`, `heartbeat_interval_ms`, `duplicate_cache_ttl_ms`, `history_length`, `max_transmit_size_bytes` (#39) |
 | `gossipsub.message_id` | Wire message ID: `writeMessageId(topic, data, snappy_decompressed_ok, out20)` — SHA256 domain + topic len + topic + data, truncated to 20 bytes (#39) |
 | `gossipsub.duplicate_cache` | TTL map `(topic, id)` → expiry; `prune`, `checkDuplicate` (#39) |
-| `gossipsub.runtime` | `Gossipsub` + `GossipsubConfig` (`gossip_lazy`, `max_outbox_entries`, `max_queued_per_peer`, …); `OutDeliveryKind`; `setPeerBehaviourScore` / `peerBehaviourScore`; lazy IHAVE on `heartbeat`, IWANT → cached publish; `lazy_i_have_tx`, `dropped_lazy_ihave_backpressure`; `InitConfigError` (#39) |
+| `gossipsub.runtime` | `Gossipsub` + `GossipsubConfig` (`gossip_lazy`, `max_outbox_entries`, `max_queued_per_peer`, optional `metrics`, …); `OutDeliveryKind`; `setPeerBehaviourScore` / `peerBehaviourScore`; lazy IHAVE on `heartbeat`, IWANT → cached publish; `lazy_i_have_tx`, `dropped_lazy_ihave_backpressure`; `InitConfigError` (#39) |
 | `gossipsub.rpc` | RPC envelope: `encodeEmptyControlRpc`, `encodeControlOnlyRpc`, `encodeSubscribe` / `decodeFirstSubscribe` / `decodeSubscribes` / `freeSubscribeViews`, `deinitSubscribeView`, `decodeControlPayload`, `encodePublish` / `decodeFirstPublish`, `decodePublishes` / `freePublishBlobs` |
 | `gossipsub.control` | Control message fragments: **IHave** / **IWant** / **IDontWant** / **graft** / **prune**; **ControlExtensions** (`partialMessages`): `encodeControlExtensions`, `encodeControlMessageExtensionsOnly`, `decodeFirstControlExtensions`, `ControlExtensionsView` |
 | `gossipsub.message` | `Message` protobuf: `MessageView`, `MessageOwned`, `encode`, `decode`, `MessageOwned.deinit` |
