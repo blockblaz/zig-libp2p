@@ -3,7 +3,7 @@
 //! Typical flow:
 //! 1. [`parseQuicV1Endpoint`] from a dial multiaddr, or the same for listen.
 //! 2. [`initLibp2pQuicServerFromMultiaddr`] or bind with [`bindUdpSocket`] + `zquic.transport.io.Server.initFromSocket`.
-//! 3. [`initLibp2pQuicClientFromEndpoint`] for an IPv4 dial target (zquic client socket is IPv4 today).
+//! 3. [`initLibp2pQuicClientFromMultiaddr`] or [`initLibp2pQuicClientFromEndpoint`] for an IPv4 dial target (zquic client socket is IPv4 today).
 //! 4. After QUIC + TLS, open raw app bidi streams (`zquic.transport.io.rawAllocateNextLocalBidiStream`, …).
 //! 5. Run [`stream_multistream.initiatorHandshakeMultistream`] / [`responderHandshakeMultistream`] on each stream
 //!    using [`quic_raw_stream_io.RawAppBidiClient`] or [`RawAppBidiServer`] I/O adapters (see module [`quic_raw_stream_io`]).
@@ -163,6 +163,16 @@ pub fn initLibp2pQuicClientFromEndpoint(
     return ZIo.Client.init(allocator, cfg);
 }
 
+/// Same as [`initLibp2pQuicClientFromEndpoint`] after [`parseQuicV1Endpoint`]. Symmetric with [`initLibp2pQuicServerFromMultiaddr`].
+pub fn initLibp2pQuicClientFromMultiaddr(
+    allocator: std.mem.Allocator,
+    ma: multiaddr.Multiaddr,
+    dial_options: Libp2pZquicClientDialOptions,
+) !ZIo.Client {
+    const ep = try parseQuicV1Endpoint(ma);
+    return initLibp2pQuicClientFromEndpoint(allocator, ep, dial_options);
+}
+
 test "parse quic-v1 ipv4 multiaddr" {
     const a = std.testing.allocator;
     var ma = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/4001/quic-v1");
@@ -175,6 +185,18 @@ test "parse quic-v1 ipv4 multiaddr" {
         .ip4 => |x| try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, x.bytes),
         else => return error.TestFailed,
     }
+}
+
+test "parse quic-v1 ipv4 multiaddr captures p2p" {
+    const a = std.testing.allocator;
+    var ma = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA");
+    defer ma.deinit();
+
+    const ep = try parseQuicV1Endpoint(ma);
+    const want = try peer_id_mod.PeerId.fromString(a, "12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA");
+    defer want.deinit(a);
+    try std.testing.expect(ep.expected_peer != null);
+    try std.testing.expect(ep.expected_peer.?.eql(&want));
 }
 
 test "parse quic-v1 rejects missing udp" {
