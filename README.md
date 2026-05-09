@@ -19,8 +19,8 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | libp2p TLS on QUIC (ALPN, peer auth) | Partial | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — Dialer: [`transport.quic_peer_identity`](#transport) + zquic `Client.peerLeafCertificateDer` verify the **server** leaf (`dialExtended` / `dialMultiaddr` default). Listener: client `Certificate` flight not in zquic yet → inbound PeerId from TLS TBD. |
 | Ping behaviour (`/ipfs/ping/1.0.0`) | Done | [#42](https://github.com/ch4r10t33r/zig-libp2p/issues/42) |
 | KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
-| Swarm / network runtime | Partial | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — threaded command/event runtime; transport integration still embedder-owned |
-| Noise XX | Partial | [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36) — [`security.noise`](#security): use [`security.noise.stream_upgrade`](./src/security/noise/stream_upgrade.zig) for multistream `/noise` + handshake on a stream; interop tests can live in Zeam. |
+| Swarm / network runtime | Done | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — `std.Io.Threaded` command queue (8192) + event channel, 256 cmd/tick, [`Swarm.initWithConfig`] / [`Swarm.tick`] embedder mode, [`Swarm.startBackground`]/[`Swarm.run`]; dial command carries optional `expected_peer`; transport still embedder-owned |
+| Noise XX | Done | [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36) — [`security.noise`](./src/security/noise/libp2p_noise.zig) XX + libp2p identity protobuf; [`security.noise.stream_upgrade`](./src/security/noise/stream_upgrade.zig) multistream `/noise`; unit tests + TCP loopback handshake in `stream_upgrade` (Darwin TCP skipped like `wire_tcp`); rust-libp2p interop remains manual / [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
 | Connection manager | Done | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) — `connection_manager` + `peer_events` (`Direction.unknown`), dial string without `/p2p`, reconnect backoff, refcount + events, optional `setReqResp`; embedder wires transport → `tick` / `onDialFailure` / `onConnectionEstablished` / `onConnectionClosed` |
 | Gossipsub mesh runtime | Done | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) — `gossipsub.runtime`: mesh + heartbeat, lazy IHAVE (`gossip_lazy`, `OutDeliveryKind.lazy_ihave`), IWANT → pull cache, `max_transmit_size_bytes`, global + per-peer outbox caps (drop oldest lazy first), `setPeerBehaviourScore` / `peerBehaviourScore` for GRAFT / PRUNE / lazy ordering |
 | Req/resp behaviour | Done | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) — `req_resp.runtime` (15s request / 5min inbound idle timeouts, `channel_id`, `onPeerDisconnected`); `req_resp.wire_framing`, TCP `req_resp.wire_tcp`, QUIC `req_resp.wire_quic`; `connection_manager.setReqResp` notifies `ReqResp` on last session close; end-to-end on live streams remains embedder transport + [`swarm`](#api-overview) (#34) |
@@ -70,7 +70,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `layer_events` | Event carriers: `ReqRespFailure`, `GossipsubFailure`, `TransportFailure` (each has a `kind:` field for `switch`) (#45) |
 | `peer_events` | Peer connection payloads: `Direction` (`inbound` / `outbound` / `unknown`), `DisconnectReason`, `ConnectionFailureResult`, connected / disconnected / failed event structs (#38) |
 | `connection_manager` | Known-peer dial scheduling (multiaddr without `/p2p`), reconnect backoff, refcount + peer events (#38), `knownPeerStatus` / `KnownPeerDialStatus`; optional `setReqResp` → `ReqResp.onPeerDisconnected` on last session close (#40) |
-| `swarm` | Threaded runtime: bounded `submit` / `nextEvent`, `queueEvent`, `run` / `startBackground`, `shutdown` (#34); `RpcRequest.channel_id` for inbound req/resp (#40); stubs until real I/O |
+| `swarm` | Bounded `submit` / `nextEvent`, `queueEvent`, `shutdown` (#34); `SwarmConfig` + `initWithConfig` (fixed `local_peer`), `tick` for single-threaded pumping, `commands_per_tick` / `command_capacity`; `RpcRequest.channel_id` (#40); dial stub forwards `expected_peer`; real I/O embedder-owned |
 | `protocol` | Lean req/resp protocol id strings; `LeanSupportedProtocol` enum with `protocolId`, `fromInt`, `fromSlice` |
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
 | `addr_list` | Multiaddr CSV: `parseCsv` (`ParseCsvError`), `freeList` (uses bundled `multiaddr`) |
@@ -139,7 +139,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | Submodule | Role |
 |-----------|------|
 | `security.libp2p_tls` | libp2p TLS 1.3 profile (#16): ALPN / multistream ids, extension OID, `peerIdFromCertificate` (parse only), `peerIdFromVerifiedCertificate` (self-signed X.509 + `SignedKey` over SPKI), spec vectors 1–4 |
-| `security.noise` | Noise XX + libp2p framing (#36): `protocol` (handshake + transport keys), `payload` / `identity` (protobuf + static-key signing), `libp2p` (`/noise`, `readNoiseFrame` / `writeNoiseFrame`, `handshakeInitiator` / `handshakeResponder`, `SecureChannel`), `stream_upgrade` (`negotiateInitiator` / `negotiateResponder`, `toTransportError`) for multistream-then-Noise on one stream |
+| `security.noise` | Noise XX + libp2p framing (#36): `protocol` (handshake + transport keys), `payload` / `identity` (protobuf + static-key signing, `verifySignedPayload` rejects bad static-key sig), `libp2p_noise` (`/noise`, length-prefixed frames, `SecureChannel`), `stream_upgrade` (multistream + handshake; TCP loopback test on non-Darwin) |
 
 ---
 
@@ -148,11 +148,9 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 Priorities follow the [parity table](#zeam-parity) and [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31). Sensible next picks (after examples/CI hygiene):
 
 1. **QUIC (#37) + TLS #16** — `transport.quic_endpoint` covers listen/dial/pump, per-stream multistream, lifecycle hooks; peer-id from peer leaf cert remains #16; Rust↔Zig QUIC interop manual until #44; `example-quic-ping-loopback` exercises loopback ping.
-2. **Noise #36** — example using `security.noise.stream_upgrade` on a TCP stream after multistream.
-3. **Swarm #34** — thin example forwarding synthetic transport events into `ConnectionManager` + optional `ReqResp` (connection manager behaviour is in-tree for #38).
-4. **Metrics #43** — counters/histograms behind a narrow interface.
+2. **Metrics #43** — counters/histograms behind a narrow interface.
 
-Near term overlap: [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) / [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) QUIC + TLS verification. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
+Near term overlap: [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) / [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) QUIC + TLS verification. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields). **Noise ↔ rust-libp2p** TCP interop: tracked under [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) / Zeam harness.
 
 **Examples contract:** new public APIs should get or extend an `examples/` program that still exits 0 under `zig build test` (smoke-run after unit tests), unless there is a documented reason to compile-only (like the TCP + `Io.Threaded` demo). Avoid a second `addTest` root on the same `zig_libp2p` module — it recompiles the library graph and breaks Zig 0.16 type identity.
 

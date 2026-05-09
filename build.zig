@@ -9,6 +9,7 @@ const examples: []const struct {
     .{ .exe_name = "example-multistream-negotiate", .root = "examples/multistream_negotiate.zig" },
     .{ .exe_name = "example-gossipsub-mesh", .root = "examples/gossipsub_mesh.zig" },
     .{ .exe_name = "example-ping-membuf", .root = "examples/ping_membuf.zig" },
+    .{ .exe_name = "example-swarm-tick", .root = "examples/swarm_tick.zig" },
     .{ .exe_name = "example-req-resp-tcp-status", .root = "examples/req_resp_tcp_status.zig" },
     .{ .exe_name = "example-quic-ping-loopback", .root = "examples/quic_ping_loopback.zig" },
 };
