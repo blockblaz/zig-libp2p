@@ -3,11 +3,15 @@
 //! Embedders call [`ConnectionManager.tick`] with a monotonic clock and forward transport
 //! callbacks into [`onConnectionEstablished`], [`onConnectionClosed`], and [`onDialFailure`].
 //! Dial commands use multiaddrs with `/p2p` stripped so the transport dials by address only.
+//!
+//! Optional: set [`ConnectionManager.setReqResp`] so [`onConnectionClosed`] invokes
+//! [`req_resp.runtime.ReqResp.onPeerDisconnected`] when the last session to a peer ends.
 
 const std = @import("std");
 const multiaddr = @import("multiaddr");
 const identity = @import("identity.zig");
 const peer_events = @import("peer_events.zig");
+const req_resp_runtime = @import("req_resp/runtime.zig");
 const swarm_mod = @import("swarm.zig");
 
 pub const ConnectionId = u64;
@@ -46,6 +50,9 @@ const ConnEntry = struct {
 pub const ConnectionManager = struct {
     allocator: std.mem.Allocator,
     swarm: *swarm_mod.Swarm,
+    /// When set, [`onConnectionClosed`] calls [`req_resp.runtime.ReqResp.onPeerDisconnected`] if the
+    /// peer drops to zero active connections.
+    req_resp: ?*req_resp_runtime.ReqResp = null,
 
     known: std.HashMap(identity.PeerId, KnownState, PeerIdContext, std.hash_map.default_max_load_percentage),
     conns: std.AutoHashMap(ConnectionId, ConnEntry),
@@ -69,6 +76,10 @@ pub const ConnectionManager = struct {
         self.known.deinit(self.allocator);
         self.conns.deinit(self.allocator);
         self.peer_active.deinit(self.allocator);
+    }
+
+    pub fn setReqResp(self: *ConnectionManager, rr: ?*req_resp_runtime.ReqResp) void {
+        self.req_resp = rr;
     }
 
     fn peerActiveCount(self: *ConnectionManager, peer: identity.PeerId) u32 {
@@ -204,6 +215,10 @@ pub const ConnectionManager = struct {
                 .reason = reason,
             } });
 
+            if (self.req_resp) |rr| {
+                try rr.onPeerDisconnected(peer);
+            }
+
             if (reason != .local_close) {
                 if (self.known.getPtr(peer)) |st| {
                     st.dial_inflight = false;
@@ -288,4 +303,38 @@ test "connection manager emits single peer_connected for two conns" {
     try std.testing.expectEqual(@as(std.meta.Tag(swarm_mod.Event), .peer_disconnected), std.meta.activeTag(ev2));
     try std.testing.expect(ev2.peer_disconnected.peer.eql(&peer));
     try std.testing.expectEqual(@as(peer_events.Direction, .inbound), ev2.peer_disconnected.direction);
+}
+
+test "connection manager notifies ReqResp on last disconnect" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+
+    var rr = req_resp_runtime.ReqResp.init(a, &swarm, .{});
+    defer rr.deinit();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+    cm.setReqResp(&rr);
+
+    const peer = try identity.PeerId.random();
+    const stream_rid: u64 = 77;
+    _ = try rr.registerInboundChannel(peer, .status, stream_rid, 0);
+
+    try cm.onConnectionEstablished(1, peer, .outbound);
+    try cm.onConnectionClosed(1000, 1, .remote_close);
+
+    var ev1 = try swarm.nextEvent(200);
+    defer ev1.deinit(a);
+    try std.testing.expectEqual(.peer_disconnected, std.meta.activeTag(ev1));
+
+    var ev2 = try swarm.nextEvent(200);
+    defer ev2.deinit(a);
+    try std.testing.expectEqual(.rpc_error_response, std.meta.activeTag(ev2));
+    try std.testing.expectEqual(error.Disconnected, ev2.rpc_error_response.kind);
+    try std.testing.expectEqual(stream_rid, ev2.rpc_error_response.request_id);
+    try std.testing.expectEqual(@as(u32, 0), rr.inbound.count());
 }

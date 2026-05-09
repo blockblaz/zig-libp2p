@@ -37,7 +37,10 @@ pub const GossipMessage = struct {
 pub const RpcRequest = struct {
     peer: identity.PeerId,
     protocol: protocol.LeanSupportedProtocol,
+    /// Correlates [`SwarmCommand.send_response_chunk`] / [`Event.rpc_response_chunk`] with this RPC.
     request_id: u64,
+    /// Inbound only: handle from [`req_resp.runtime.ReqResp.registerInboundChannel`] (#40). Zero when unset.
+    channel_id: u64 = 0,
     payload: []const u8,
 };
 
@@ -131,6 +134,7 @@ const OwnedCommand = union(enum) {
         peer: identity.PeerId,
         protocol: protocol.LeanSupportedProtocol,
         request_id: u64,
+        channel_id: u64,
         payload: []u8,
     },
     send_response_chunk: struct {
@@ -179,6 +183,7 @@ fn cloneCommand(a: std.mem.Allocator, cmd: SwarmCommand) SubmitError!OwnedComman
                 .peer = r.peer,
                 .protocol = r.protocol,
                 .request_id = r.request_id,
+                .channel_id = r.channel_id,
                 .payload = try a.dupe(u8, r.payload),
             },
         },
@@ -356,6 +361,7 @@ pub const Swarm = struct {
                     .peer = r.peer,
                     .protocol = r.protocol,
                     .request_id = r.request_id,
+                    .channel_id = r.channel_id,
                     .payload = r.payload,
                 } }) catch {
                     destroyCommand(self.gpa, .{ .send_request = r });
