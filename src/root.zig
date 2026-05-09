@@ -67,6 +67,7 @@ pub const transport = struct {
     pub const multistream_negotiate = @import("transport/multistream_negotiate.zig");
     pub const transport_error = @import("transport/transport_error.zig");
     pub const yamux = @import("transport/yamux/root.zig");
+    pub const mplex = @import("transport/mplex/root.zig");
 };
 
 pub const security = struct {
@@ -88,4 +89,7 @@ test {
     _ = @import("transport/yamux/root.zig");
     _ = @import("transport/yamux/frame.zig");
     _ = @import("transport/yamux/session.zig");
+    _ = @import("transport/mplex/root.zig");
+    _ = @import("transport/mplex/frame.zig");
+    _ = @import("transport/mplex/session.zig");
 }
