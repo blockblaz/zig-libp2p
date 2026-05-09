@@ -2,16 +2,7 @@
 
 Small programs showing how to depend on `zig_libp2p` and call specific surfaces.
 
-| Binary | Source | What it demonstrates |
-|--------|--------|----------------------|
-| `example-varint` | `varint.zig` | `varint.encodeToScratch` / `decode` |
-| `example-addr-list-csv` | `addr_list_csv.zig` | `addr_list.parseCsv` / `freeList` |
-| `example-multistream-negotiate` | `multistream_negotiate.zig` | Buffer-only multistream-select for `/quic-v1` |
-| `example-gossipsub-mesh` | `gossipsub_mesh.zig` | `Gossipsub.subscribe`, inbound GRAFT, mesh size |
-| `example-ping-membuf` | `ping_membuf.zig` | `ping.handleInbound` with fixed `Io.Reader` / `Writer` |
-| `example-swarm-tick` | `swarm_tick.zig` | `swarm.Swarm.tick` + `nextEvent` without `startBackground` (#34); no-op single-threaded / WASI |
-| `example-req-resp-tcp-status` | `req_resp_tcp_status.zig` | `req_resp.wire_tcp` status unary over TCP loopback (no-op single-threaded / WASI; **Darwin skips** when run manually; **`zig build test` compile-only** so CI does not hang) |
-| `example-quic-ping-loopback` | `quic_ping_loopback.zig` | `transport.quic_endpoint.loopbackPingOnce`: zquic TLS + multistream + ping (needs `test/fixtures/quic_loopback/*.pem` from repo root) (#15) |
+The **catalog** (binary names, source links, one-line descriptions) is in the root [README Examples section](../README.md#examples).
 
 ## Build / CI
 
