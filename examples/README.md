@@ -9,12 +9,12 @@ Small programs showing how to depend on `zig_libp2p` and call specific surfaces.
 | `example-multistream-negotiate` | `multistream_negotiate.zig` | Buffer-only multistream-select for `/quic-v1` |
 | `example-gossipsub-mesh` | `gossipsub_mesh.zig` | `Gossipsub.subscribe`, inbound GRAFT, mesh size |
 | `example-ping-membuf` | `ping_membuf.zig` | `ping.handleInbound` with fixed `Io.Reader` / `Writer` |
-| `example-req-resp-tcp-status` | `req_resp_tcp_status.zig` | `req_resp.wire_tcp` status unary over TCP loopback (no-op single-threaded / WASI; **Darwin skips** with a message—full run on Linux) |
+| `example-req-resp-tcp-status` | `req_resp_tcp_status.zig` | `req_resp.wire_tcp` status unary over TCP loopback (no-op single-threaded / WASI; **Darwin skips** when run manually; **`zig build test` compile-only** so CI does not hang) |
 
 ## Build / CI
 
 - `zig build` — installs these into `zig-out/bin/` (or your install prefix).
 - `zig build examples` — compile only (no install).
-- `zig build test` — runs **library** unit tests, then **executes** each example (smoke check). Keep `main()` returning success on supported targets so CI stays green.
+- `zig build test` — runs **library** unit tests, then **executes** each smoke-run example; the TCP status binary is **compiled** but not run (see `build.zig`). Keep `main()` returning success on supported targets so CI stays green.
 
 Register new programs in the `examples` table in `build.zig`.

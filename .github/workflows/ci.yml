@@ -46,7 +46,7 @@ jobs:
     - name: Lint
       run: zig fmt --check .
 
-    - name: Run unit tests and example smoke runs
+    - name: Run unit tests and example checks (TCP status compile-only)
       run: |
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do

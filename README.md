@@ -51,7 +51,7 @@ exe.root_module.addImport("zig_libp2p", zig_libp2p.module("zig_libp2p"));
 
 Application code: `@import("zig_libp2p")` — symbols below match `src/root.zig`.
 
-**Tests:** `zig build test` runs the library test binary, then **smoke-runs** each `example-*` program (exit code 0). On Apple platforms the TCP status example exits immediately with a skip message (Darwin `Io.Threaded` TCP loopback is unreliable); Linux runs the full demo.  
+**Tests:** `zig build test` runs the library test binary, then **smoke-runs** most `example-*` programs (exit code 0). The TCP status example is **compile-only** in that step (running it can stall: `Io.Threaded` + TCP accept/dial across threads is unreliable on Darwin and has hung CI on Linux). Run `./zig-out/bin/example-req-resp-tcp-status` manually after `zig build`; `src/req_resp/wire_tcp.zig` integration tests cover the same path on non-Darwin targets.  
 **Examples:** `zig build` installs `example-*` binaries under the install prefix; `zig build examples` compiles them without installing. See [`examples/README.md`](./examples/README.md).  
 **CI:** `zig fmt --check .`, `zig build test --summary all`, `zig build examples`, `zig build` (see `.github/workflows/ci.yml`).
 
@@ -151,7 +151,7 @@ Priorities follow the [parity table](#zeam-parity) and [#31](https://github.com/
 
 Near term overlap: [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) mesh + heartbeat polish, [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) req/resp streaming ergonomics, [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) / [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) QUIC + TLS verification. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
 
-**Examples contract:** new public APIs should get or extend an `examples/` program that still exits 0 under `zig build test` (smoke-run after unit tests). Avoid a second `addTest` root on the same `zig_libp2p` module — it recompiles the library graph and breaks Zig 0.16 type identity.
+**Examples contract:** new public APIs should get or extend an `examples/` program that still exits 0 under `zig build test` (smoke-run after unit tests), unless there is a documented reason to compile-only (like the TCP + `Io.Threaded` demo). Avoid a second `addTest` root on the same `zig_libp2p` module — it recompiles the library graph and breaks Zig 0.16 type identity.
 
 ---
 
