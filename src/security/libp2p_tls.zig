@@ -7,10 +7,10 @@
 //! * **QUIC + TLS 1.3 (libp2p-on-QUIC):** After the QUIC handshake, TLS uses application-layer
 //!   protocol [`quic_application_layer_protocol`] (value `libp2p`). [`transport.quic_v1`] presets
 //!   (`libp2pZquicServerConfig` / `libp2pZquicClientConfig`) set this via `tls_alpn`, which aliases
-//!   the constant below—keep them in sync. The pinned zquic stack does not yet expose the peer leaf
-//!   certificate on [`zquic.transport.io.ConnState`]; use [`leafCertificateDerFromTls13HandshakeCertificateMessage`]
-//!   on captured TLS Certificate handshake bytes, then [`peerIdFromVerifiedCertificate`] or
-//!   [`verifiedPeerIdFromQuicLeafCertificate`].
+//!   the constant below—keep them in sync. zquic ≥ 1.6.2 exposes the **server** leaf DER on
+//!   [`zquic.transport.io.Client.peerLeafCertificateDer`]; [`transport.quic_peer_identity`] wires that to
+//!   [`verifiedPeerIdFromQuicLeafCertificate`]. For raw TLS bytes elsewhere, use
+//!   [`leafCertificateDerFromTls13HandshakeCertificateMessage`] then [`peerIdFromVerifiedCertificate`].
 //! * **TCP (or other) via multistream-select:** negotiate [`multistream_protocol_id`] (`/tls/1.0.0`)
 //!   before the TLS layer, per the TLS spec multistream path.
 //! * **Noise XX** for devnets that require it is **not** implemented here; track [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36).

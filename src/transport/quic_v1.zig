@@ -1,9 +1,10 @@
 //! Libp2p QUIC v1 transport labels and **zquic** integration helpers.
 //!
 //! Multiaddr listen/dial helpers live in [`transport.quic`]. This module centralizes ALPN,
-//! raw-stream presets, and multistream byte helpers. After TLS, tie peer identity to
-//! `/p2p` using [`security.libp2p_tls.verifiedPeerIdFromQuicLeafCertificate`] once you have
-//! the peer leaf DER (from captured Certificate handshake bytes or future zquic hooks).
+//! raw-stream presets, and multistream byte helpers. On zquic QUIC clients, the server leaf DER
+//! is available from [`zquic.transport.io.Client.peerLeafCertificateDer`]; use
+//! [`transport.quic_peer_identity.verifiedPeerIdFromLibp2pQuicClient`] or [`transport.quic_endpoint.dialExtended`]
+//! (default verify) with [`security.libp2p_tls`].
 
 const std = @import("std");
 const zquic = @import("zquic");

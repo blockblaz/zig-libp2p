@@ -11,6 +11,9 @@
 //!
 //! This module adds multiaddr parsing for typical `/udp/.../quic-v1` dial and listen addresses.
 //! For listen / dial / [`drive`] / accept over UDP, see [`quic_endpoint`] (#15).
+//! Issue #37 helpers: [`quic_endpoint.listenMultiaddr`], [`quic_endpoint.dialMultiaddr`], [`quic_endpoint.dialExtended`],
+//! [`quic_endpoint.QuicLifecycleHooks`], [`stream_multistream.responderHandshakeMultistreamAmong`].
+//! QUIC TLS PeerId (dialer): [`quic_peer_identity`].
 
 const std = @import("std");
 const multiaddr = @import("multiaddr");

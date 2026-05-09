@@ -198,3 +198,104 @@ pub fn responderHandshakeMultistream(
         return;
     }
 }
+
+/// Responder: same as [`responderHandshakeMultistream`], but accept the first matching protocol in `candidates`.
+/// Returns the index into `candidates` on success. If the offered protocol is not listed, sends `na` and returns [`error.ProtocolNegotiationFailed`].
+pub fn responderHandshakeMultistreamAmong(
+    r: *Io.Reader,
+    w: *Io.Writer,
+    candidates: []const []const u8,
+    allocator: std.mem.Allocator,
+) StreamHandshakeError!usize {
+    if (candidates.len == 0) return error.ProtocolNegotiationFailed;
+
+    var acc = std.ArrayList(u8).empty;
+    defer acc.deinit(allocator);
+
+    while (true) {
+        var rem: []const u8 = acc.items;
+        if (neg.responderReadMultistreamOffer(&rem, neg.default_max_body_len)) |_| {
+            try compactConsumed(&acc, allocator, rem);
+            break;
+        } else |err| switch (err) {
+            error.MissingNewline => try readMoreHandshake(&acc, r, allocator),
+            else => return terr.fromMultistreamStreamLayer(err),
+        }
+    }
+
+    while (true) {
+        var rem_probe: []const u8 = acc.items;
+        const offered_prefetch = neg.responderReadProtocolOffer(&rem_probe, neg.default_max_body_len) catch |err| switch (err) {
+            error.MissingNewline => @as(?[]const u8, null),
+            else => |e| return terr.fromMultistreamStreamLayer(e),
+        };
+        if (offered_prefetch) |offered| {
+            var out = std.ArrayList(u8).empty;
+            defer out.deinit(allocator);
+            try neg.responderSendMultistreamHeader(&out, allocator);
+            const picked = neg.responderReplyProtocolAmong(&out, allocator, offered, candidates) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => |err| return terr.fromMultistreamStreamLayer(err),
+            };
+            try compactConsumed(&acc, allocator, rem_probe);
+            Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
+            Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+            return picked orelse return terr.fromMultistreamStreamLayer(error.ProtocolNotSupported);
+        }
+        const pulled = try tryReadMoreHandshake(&acc, r, allocator);
+        if (!pulled) break;
+    }
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try neg.responderSendMultistreamHeader(&out, allocator);
+    Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
+    Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+
+    while (true) {
+        var rem: []const u8 = acc.items;
+        const offered = neg.responderReadProtocolOffer(&rem, neg.default_max_body_len) catch |err| switch (err) {
+            error.MissingNewline => {
+                try readMoreHandshake(&acc, r, allocator);
+                continue;
+            },
+            else => return terr.fromMultistreamStreamLayer(err),
+        };
+        try compactConsumed(&acc, allocator, rem);
+        out.clearRetainingCapacity();
+        const picked = neg.responderReplyProtocolAmong(&out, allocator, offered, candidates) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => |err| return terr.fromMultistreamStreamLayer(err),
+        };
+        Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
+        Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+        return picked orelse return terr.fromMultistreamStreamLayer(error.ProtocolNotSupported);
+    }
+}
+
+test "responderHandshakeMultistreamAmong matches second candidate" {
+    const a = std.testing.allocator;
+    const ping_mod = @import("../ping.zig");
+    const wire = "/multistream/1.0.0\n" ++ "/ipfs/ping/1.0.0\n";
+    var r = Io.Reader.fixed(wire);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+    var w = Io.Writer.allocating(&out, a);
+
+    const cands: []const []const u8 = &.{ "/meshsub/1.1.0", ping_mod.multistream_protocol_id };
+    const ix = try responderHandshakeMultistreamAmong(&r, &w, cands, a);
+    try std.testing.expectEqual(@as(usize, 1), ix);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, ping_mod.multistream_protocol_id) != null);
+}
+
+test "responderHandshakeMultistreamAmong na for unknown protocol" {
+    const a = std.testing.allocator;
+    const wire = "/multistream/1.0.0\n/weird/proto\n";
+    var r = Io.Reader.fixed(wire);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+    var w = Io.Writer.allocating(&out, a);
+
+    const cands: []const []const u8 = &.{"/meshsub/1.1.0"};
+    try std.testing.expectError(error.ProtocolNegotiationFailed, responderHandshakeMultistreamAmong(&r, &w, cands, a));
+}
