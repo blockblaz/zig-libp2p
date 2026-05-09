@@ -30,12 +30,14 @@ pub fn decode(bytes: []const u8) DecodeError!struct { value: usize, len: usize }
         if (b < 0x80) {
             if (i == max_encoding_bytes - 1 and b > 1) return error.Overflow;
             const v = @as(usize, b);
-            const r = x | (v << @as(usize, @intCast(s)));
+            const sh: std.math.Log2Int(usize) = @truncate(s);
+            const r = x | (v << sh);
             if (r < x) return error.Overflow;
             return .{ .value = r, .len = i + 1 };
         }
         const v = @as(usize, b & 0x7f);
-        const r = x | (v << @as(usize, @intCast(s)));
+        const sh: std.math.Log2Int(usize) = @truncate(s);
+        const r = x | (v << sh);
         if (r < x) return error.Overflow;
         x = r;
         s += 7;

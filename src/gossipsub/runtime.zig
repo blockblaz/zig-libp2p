@@ -49,8 +49,8 @@ const TopicMesh = struct {
         return .{ .peers = .init(allocator) };
     }
 
-    fn deinit(self: *TopicMesh, allocator: std.mem.Allocator) void {
-        self.peers.deinit(allocator);
+    fn deinit(self: *TopicMesh) void {
+        self.peers.deinit();
     }
 };
 
@@ -85,31 +85,31 @@ pub const Gossipsub = struct {
             .remote_interest = std.StringHashMap(TopicMesh).init(allocator),
             .connected = .init(allocator),
             .clock_ms = 0,
-            .outbox = .init(allocator),
+            .outbox = .empty,
             .inbound_delivered = 0,
             .control_i_have_rx = 0,
             .control_i_want_rx = 0,
-            .scratch_peers = .init(allocator),
+            .scratch_peers = .empty,
         };
         return p;
     }
 
     pub fn deinit(self: *Gossipsub) void {
         self.dup.deinit();
-        self.subs.deinit(self.allocator);
+        self.subs.deinit();
         var mit = self.mesh.iterator();
         while (mit.next()) |e| {
-            e.value_ptr.deinit(self.allocator);
+            e.value_ptr.deinit();
         }
-        self.mesh.deinit(self.allocator);
+        self.mesh.deinit();
         var rit = self.remote_interest.iterator();
         while (rit.next()) |e| {
-            e.value_ptr.deinit(self.allocator);
+            e.value_ptr.deinit();
         }
-        self.remote_interest.deinit(self.allocator);
+        self.remote_interest.deinit();
         for (self.outbox.items) |d| self.allocator.free(d.wire);
         self.outbox.deinit(self.allocator);
-        self.connected.deinit(self.allocator);
+        self.connected.deinit();
         self.scratch_peers.deinit(self.allocator);
         const a = self.allocator;
         a.destroy(self);
@@ -121,7 +121,7 @@ pub const Gossipsub = struct {
 
     fn appendOut(self: *Gossipsub, wire: []u8, to: ?identity.PeerId) (errors.GossipsubError || std.mem.Allocator.Error)!void {
         if (self.outbox.items.len >= self.cfg.max_outbox_entries) return error.PublishQueueFull;
-        try self.outbox.append(.{ .wire = wire, .to = to });
+        try self.outbox.append(self.allocator, .{ .wire = wire, .to = to });
     }
 
     fn ensureTopicMesh(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error!void {
@@ -164,11 +164,11 @@ pub const Gossipsub = struct {
         if (self.subs.fetchRemove(topic)) |_| {
             if (self.mesh.fetchRemove(topic)) |kv| {
                 var tm = kv.value;
-                tm.deinit(self.allocator);
+                tm.deinit();
             }
             if (self.remote_interest.fetchRemove(topic)) |kv| {
                 var tm = kv.value;
-                tm.deinit(self.allocator);
+                tm.deinit();
             }
             const w = try rpc.encodeSubscribe(self.allocator, topic, false);
             errdefer self.allocator.free(w);
@@ -230,7 +230,7 @@ pub const Gossipsub = struct {
                 const ip = interest.?;
                 if (!ip.peers.contains(p)) continue;
             }
-            try self.scratch_peers.append(p);
+            try self.scratch_peers.append(self.allocator, p);
         }
         sortPeersByBytes(self.scratch_peers.items);
         return self.scratch_peers.items;
@@ -286,7 +286,7 @@ pub const Gossipsub = struct {
 
         self.scratch_peers.clearRetainingCapacity();
         var pit = mp.peers.keyIterator();
-        while (pit.next()) |kp| try self.scratch_peers.append(kp.*);
+        while (pit.next()) |kp| try self.scratch_peers.append(self.allocator, kp.*);
         sortPeersByBytes(self.scratch_peers.items);
 
         const n = @min(excess, self.scratch_peers.items.len);

@@ -1,6 +1,7 @@
 .zig-cache/
 zig-pkg/
 zig-out/
+zig-out-smoke/
 *.o
 *.a
 *.dylib

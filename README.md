@@ -51,8 +51,9 @@ exe.root_module.addImport("zig_libp2p", zig_libp2p.module("zig_libp2p"));
 
 Application code: `@import("zig_libp2p")` — symbols below match `src/root.zig`.
 
-**Tests:** `zig build test`  
-**CI:** `zig fmt --check .`, `zig build test --summary all`, `zig build` (see `.github/workflows/ci.yml`).
+**Tests:** `zig build test` runs the library test binary, then **smoke-runs** each `example-*` program (exit code 0). On Apple platforms the TCP status example exits immediately with a skip message (Darwin `Io.Threaded` TCP loopback is unreliable); Linux runs the full demo.  
+**Examples:** `zig build` installs `example-*` binaries under the install prefix; `zig build examples` compiles them without installing. See [`examples/README.md`](./examples/README.md).  
+**CI:** `zig fmt --check .`, `zig build test --summary all`, `zig build examples`, `zig build` (see `.github/workflows/ci.yml`).
 
 ---
 
@@ -114,7 +115,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `req_resp.stream` | Incremental scan: `peekRpcUnaryRequest` / `peekRpcUnaryResponse`, `scanCompleteRequest` / `scanCompleteResponse`, `consumePrefix`, `InboundBuffer` |
 | `req_resp.snappy_wire` | Snappy + framing for `ssz_snappy`: `compressBlock`, `decompressBlock`, `compressFramed`, `decompressFramed`, `buildRequestWire`, `buildResponseWire`, `decodeRequestSsz`, `decodeResponseSsz` |
 | `req_resp.runtime` | `ReqResp` / `ReqRespConfig`: outbound `request_id`, inbound `channel_id`, `onPeerDisconnected` → `Disconnected`, `sendResponseChunk` / `finishResponseStream` / `sendErrorResponse`, `create`/`destroy`, `shutdown`, timeouts (#40) |
-| `req_resp.wire_framing` | Shared `ssz_snappy` unary read/write on `std.Io.Reader`/`Writer` after protocol selection (#40) |
+| `req_resp.wire_framing` | Shared `ssz_snappy` unary read/write on `std.Io.Reader`/`Writer` after protocol selection; `UnaryResponse` (#40) |
 | `req_resp.wire_tcp` | TCP: one socket = one substream; `initiatorUnaryExchange`, `initiatorReadResponseSequence`, `responderUnarySequence` (`transport.tcp` multistream + `wire_framing`) (#40) |
 | `req_resp.wire_quic` | QUIC raw bidi stream: same helpers as TCP using `quic_raw_stream_io` + `stream_multistream` + `wire_framing`; requires zquic UDP pumping (#40) |
 
@@ -140,7 +141,17 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 ## Roadmap
 
-Priorities follow the [parity table](#zeam-parity) and [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31). Near term: [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) gossipsub mesh + heartbeat, [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) req/resp behaviour, [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) / [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) QUIC + TLS verification ergonomics. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
+Priorities follow the [parity table](#zeam-parity) and [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31). Sensible next picks (after examples/CI hygiene):
+
+1. **Gossipsub #39** — lazy gossip (IHAVE → IWANT → deliver), mesh scoring, optional per-peer outbound caps on top of the global outbox.
+2. **QUIC #37 + TLS #16** — one documented end-to-end sample (tmpdir PEM + packet pump) or a small `transport.quic` helper that owns the pump; wire `peerIdFromVerifiedCertificate` at the handshake boundary.
+3. **Noise #36** — example using `security.noise.stream_upgrade` on a TCP stream after multistream.
+4. **Swarm / connection_manager #34 / #38** — thin example forwarding synthetic transport events into `ConnectionManager` + optional `ReqResp`.
+5. **Metrics #43** — counters/histograms behind a narrow interface.
+
+Near term overlap: [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) mesh + heartbeat polish, [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) req/resp streaming ergonomics, [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) / [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) QUIC + TLS verification. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
+
+**Examples contract:** new public APIs should get or extend an `examples/` program that still exits 0 under `zig build test` (smoke-run after unit tests). Avoid a second `addTest` root on the same `zig_libp2p` module — it recompiles the library graph and breaks Zig 0.16 type identity.
 
 ---
 

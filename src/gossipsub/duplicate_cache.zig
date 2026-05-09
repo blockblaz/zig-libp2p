@@ -17,7 +17,7 @@ pub const DuplicateCache = struct {
         pub fn hash(_: CacheContext, k: CacheKey) u64 {
             return std.hash.Wyhash.hash(0, k.topic) ^ std.hash.Wyhash.hash(0, &k.id);
         }
-        pub fn eql(_: CacheContext, a: CacheKey, b: CacheKey, _: usize) bool {
+        pub fn eql(_: CacheContext, a: CacheKey, b: CacheKey) bool {
             return std.mem.eql(u8, a.topic, b.topic) and std.mem.eql(u8, &a.id, &b.id);
         }
     };
@@ -27,24 +27,22 @@ pub const DuplicateCache = struct {
     }
 
     pub fn deinit(self: *DuplicateCache) void {
-        while (self.map.count() != 0) {
-            const k0 = self.map.keys()[0];
-            if (self.map.fetchRemove(k0)) |kv| {
-                self.allocator.free(kv.key.topic);
-            }
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.topic);
         }
-        self.map.deinit(self.allocator);
+        self.map.deinit();
     }
 
     /// Drops entries whose expiry is at or before `now_ms`.
     pub fn prune(self: *DuplicateCache, now_ms: i64) void {
-        var rm = std.ArrayList(CacheKey).init(self.allocator);
+        var rm: std.ArrayList(CacheKey) = .empty;
         defer rm.deinit(self.allocator);
 
         var it = self.map.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* <= now_ms) {
-                rm.append(e.key_ptr.*) catch return;
+                rm.append(self.allocator, e.key_ptr.*) catch return;
             }
         }
         for (rm.items) |k| {

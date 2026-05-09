@@ -112,7 +112,7 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
 
 /// Every `subscriptions` entry (`1`, length-delimited `SubOpts`). Caller frees with [`freeSubscribeViews`].
 pub fn decodeSubscribes(allocator: std.mem.Allocator, rpc_wire: []const u8) (Error || std.mem.Allocator.Error)![]SubscribeView {
-    var out = std.ArrayList(SubscribeView).init(allocator);
+    var out: std.ArrayList(SubscribeView) = .empty;
     errdefer {
         for (0..out.items.len) |i| {
             deinitSubscribeView(allocator, &out.items[i]);
@@ -170,7 +170,7 @@ pub fn decodeSubscribes(allocator: std.mem.Allocator, rpc_wire: []const u8) (Err
         }
         const sub = subscribe orelse return error.MissingSubscribeFields;
         const top = topic orelse return error.MissingSubscribeFields;
-        try out.append(.{ .subscribe = sub, .topic = try allocator.dupe(u8, top) });
+        try out.append(allocator, .{ .subscribe = sub, .topic = try allocator.dupe(u8, top) });
     }
     return try out.toOwnedSlice(allocator);
 }
@@ -237,7 +237,7 @@ pub fn decodeFirstPublish(allocator: std.mem.Allocator, rpc: []const u8) (Error 
 
 /// Every `publish` field (`2`, length-delimited) as owned `Message` wire blobs. Caller frees with [`freePublishBlobs`].
 pub fn decodePublishes(allocator: std.mem.Allocator, rpc_wire: []const u8) (Error || std.mem.Allocator.Error)![][]u8 {
-    var out = std.ArrayList([]u8).init(allocator);
+    var out: std.ArrayList([]u8) = .empty;
     errdefer {
         for (out.items) |s| allocator.free(s);
         out.deinit(allocator);
@@ -255,7 +255,7 @@ pub fn decodePublishes(allocator: std.mem.Allocator, rpc_wire: []const u8) (Erro
         if (key.field_number == 2 and key.wire_type == .length_delimited) {
             const blob = try allocator.dupe(u8, nv.value);
             errdefer allocator.free(blob);
-            try out.append(blob);
+            try out.append(allocator, blob);
         }
     }
     return try out.toOwnedSlice(allocator);

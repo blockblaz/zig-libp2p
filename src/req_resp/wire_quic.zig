@@ -39,7 +39,7 @@ pub fn initiatorUnaryExchange(
     uncompressed_request: []const u8,
     scratch_r: []u8,
     limits: ExchangeLimits,
-) (WireQuicError || std.mem.Allocator.Error)!struct { code: u8, ssz: []u8 } {
+) (WireQuicError || std.mem.Allocator.Error)!framing.UnaryResponse {
     var raw = quic_raw_stream_io.RawAppBidiClient{
         .client = client,
         .stream_id = stream_id,

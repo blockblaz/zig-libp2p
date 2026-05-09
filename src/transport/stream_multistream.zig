@@ -49,7 +49,10 @@ pub fn initiatorHandshakeMultistream(
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
-    try appendFirstStreamInitiatorHandshake(&out, allocator, protocol_id);
+    appendFirstStreamInitiatorHandshake(&out, allocator, protocol_id) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => |err| return terr.fromMultistreamStreamLayer(err),
+    };
     Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
     Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
 
@@ -114,7 +117,10 @@ pub fn responderHandshakeMultistream(
         };
         try compactConsumed(&acc, allocator, rem);
         out.clearRetainingCapacity();
-        try neg.responderReplyProtocol(&out, allocator, offered, supported_protocol_id);
+        neg.responderReplyProtocol(&out, allocator, offered, supported_protocol_id) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => |err| return terr.fromMultistreamStreamLayer(err),
+        };
         Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
         Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
         return;

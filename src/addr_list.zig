@@ -4,7 +4,10 @@ const std = @import("std");
 const multiaddr_mod = @import("multiaddr");
 const Multiaddr = multiaddr_mod.Multiaddr;
 
-pub const ParseCsvError = multiaddr_mod.multiaddr.Error || std.mem.Allocator.Error;
+pub const ParseCsvError = blk: {
+    const ret = @typeInfo(@TypeOf(Multiaddr.fromString)).@"fn".return_type.?;
+    break :blk @typeInfo(ret).error_union.error_set || std.mem.Allocator.Error;
+};
 
 pub fn parseCsv(allocator: std.mem.Allocator, csv: []const u8) ParseCsvError![]Multiaddr {
     var out = std.ArrayList(Multiaddr).empty;
