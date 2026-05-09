@@ -8,3 +8,4 @@ zig-out-smoke/
 *.so
 *.dll
 .DS_Store
+.cursor/
