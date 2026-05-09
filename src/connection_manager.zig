@@ -152,7 +152,7 @@ pub const ConnectionManager = struct {
             if (st.failure_count >= max_reconnect_failures) continue;
             if (st.next_dial_deadline_ms > now_ms) continue;
 
-            try self.swarm.submit(.{ .dial = .{ .addr = st.dial_str } });
+            try self.swarm.submit(.{ .dial = .{ .addr = st.dial_str, .expected_peer = peer } });
             st.dial_inflight = true;
             st.next_dial_deadline_ms = std.math.maxInt(i64);
         }

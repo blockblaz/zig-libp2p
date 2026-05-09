@@ -1,7 +1,17 @@
 //! Swarm command queue + typed event channel for a dedicated runtime thread (#34).
 //!
+//! ## Threading model (pick one)
+//!
+//! 1. **Owned thread** — call [`startBackground`] (or [`run`] on the swarm thread). Producers call
+//!    [`submit`] from any thread; the consumer calls [`nextEvent`] from one thread.
+//! 2. **Embedder-driven** — do **not** start [`run`]. On a single thread, interleave [`submit`],
+//!    [`tick`], and [`nextEvent`] so commands are drained without a background worker.
+//!
+//! Do not mix (1) and (2): running [`run`] concurrently with [`tick`] on another thread races on
+//! the command buffer.
+//!
 //! * Command channel: bounded MPSC, capacity [`command_capacity`], at most [`commands_per_tick`]
-//!   are processed per [`run`] loop iteration.
+//!   are processed per [`run`] loop iteration (or per [`tick`] call, up to its `budget`).
 //! * Event channel: bounded SPSC (one [`nextEvent`] consumer), same capacity as commands by default.
 //! * Synchronization uses `std.Io` primitives backed by [`Io.Threaded`] (futex + condvar).
 //!
@@ -56,6 +66,11 @@ pub const RpcError = struct {
     kind: errors.ReqRespError,
 };
 
+pub const RpcResponseEnd = struct {
+    peer: identity.PeerId,
+    request_id: u64,
+};
+
 /// Application → swarm control plane. Slices are copied by [`Swarm.submit`].
 pub const SwarmCommand = union(enum) {
     publish: struct {
@@ -67,13 +82,12 @@ pub const SwarmCommand = union(enum) {
     },
     send_request: RpcRequest,
     send_response_chunk: RpcResponseChunk,
-    send_end_of_stream: struct {
-        peer: identity.PeerId,
-        request_id: u64,
-    },
+    send_end_of_stream: RpcResponseEnd,
     send_error_response: RpcError,
     dial: struct {
         addr: []const u8,
+        /// Hint for embedder correlation when the dial stub reports failure (no heap copy).
+        expected_peer: ?identity.PeerId = null,
     },
     shutdown,
 };
@@ -83,10 +97,7 @@ pub const Event = union(enum) {
     gossip_message: GossipMessage,
     rpc_request: RpcRequest,
     rpc_response_chunk: RpcResponseChunk,
-    rpc_response_end: struct {
-        peer: identity.PeerId,
-        request_id: u64,
-    },
+    rpc_response_end: RpcResponseEnd,
     rpc_error_response: RpcError,
     peer_connected: peer_events.PeerConnectedPayload,
     peer_disconnected: peer_events.PeerDisconnectedPayload,
@@ -127,6 +138,9 @@ pub const Event = union(enum) {
 pub const SubmitError = error{ QueueFull, QueueClosed } || std.mem.Allocator.Error;
 pub const NextEventError = error{ Timeout, QueueClosed };
 
+pub const InitError = std.mem.Allocator.Error ||
+    @typeInfo(@TypeOf(identity.PeerId.random())).error_union.error_set;
+
 const OwnedCommand = union(enum) {
     publish: struct { topic: []u8, payload: []u8 },
     subscribe: struct { topic: []u8 },
@@ -142,9 +156,9 @@ const OwnedCommand = union(enum) {
         request_id: u64,
         chunk: []u8,
     },
-    send_end_of_stream: struct { peer: identity.PeerId, request_id: u64 },
+    send_end_of_stream: RpcResponseEnd,
     send_error_response: RpcError,
-    dial: struct { addr: []u8 },
+    dial: struct { addr: []u8, expected_peer: ?identity.PeerId },
     shutdown,
 };
 
@@ -197,7 +211,10 @@ fn cloneCommand(a: std.mem.Allocator, cmd: SwarmCommand) SubmitError!OwnedComman
         .send_end_of_stream => |e| OwnedCommand{ .send_end_of_stream = e },
         .send_error_response => |e| OwnedCommand{ .send_error_response = e },
         .dial => |d| OwnedCommand{
-            .dial = .{ .addr = try a.dupe(u8, d.addr) },
+            .dial = .{
+                .addr = try a.dupe(u8, d.addr),
+                .expected_peer = d.expected_peer,
+            },
         },
         .shutdown => .shutdown,
     };
@@ -229,7 +246,17 @@ pub const Swarm = struct {
 
     runner: ?std.Thread = null,
 
-    pub fn init(gpa: std.mem.Allocator, event_capacity: usize) std.mem.Allocator.Error!Swarm {
+    pub const SwarmConfig = struct {
+        event_capacity: usize = default_event_capacity,
+        /// When `null`, a random [`identity.PeerId`] is generated at init.
+        local_peer: ?identity.PeerId = null,
+    };
+
+    pub fn init(gpa: std.mem.Allocator, event_capacity: usize) InitError!Swarm {
+        return initWithConfig(gpa, .{ .event_capacity = event_capacity });
+    }
+
+    pub fn initWithConfig(gpa: std.mem.Allocator, config: SwarmConfig) InitError!Swarm {
         var threaded = Io.Threaded.init(gpa, .{
             .async_limit = .nothing,
             .concurrent_limit = .nothing,
@@ -240,18 +267,20 @@ pub const Swarm = struct {
         errdefer gpa.free(cmd_buf);
         @memset(std.mem.sliceAsBytes(cmd_buf), 0);
 
-        const evt_buf = try gpa.alloc(OwnedEvent, event_capacity);
+        const evt_buf = try gpa.alloc(OwnedEvent, config.event_capacity);
         errdefer gpa.free(evt_buf);
         @memset(std.mem.sliceAsBytes(evt_buf), 0);
+
+        const lp = config.local_peer orelse try identity.PeerId.random();
 
         return .{
             .gpa = gpa,
             .threaded = threaded,
             .io = io,
-            .local_peer = try identity.PeerId.random(),
+            .local_peer = lp,
             .cmd_buf = cmd_buf,
             .evt_buf = evt_buf,
-            .evt_cap = event_capacity,
+            .evt_cap = config.event_capacity,
         };
     }
 
@@ -290,6 +319,23 @@ pub const Swarm = struct {
 
     fn runWorkerTrampoline(ctx: *Swarm) void {
         ctx.run();
+    }
+
+    /// Drains up to `budget` queued commands without blocking when the queue is empty.
+    ///
+    /// For use on the **same** thread as [`nextEvent`] when [`run`] / [`startBackground`] are not
+    /// used (#34). Does nothing useful if a background [`run`] loop is active.
+    pub fn tick(self: *Swarm, budget: u32) void {
+        var processed: u32 = 0;
+        while (processed < budget) : (processed += 1) {
+            const cmd = self.popCommand() orelse return;
+            if (cmd == .shutdown) {
+                destroyCommand(self.gpa, cmd);
+                self.finishShutdown();
+                return;
+            }
+            self.dispatchCommand(cmd);
+        }
     }
 
     /// Blocks the calling thread until [`shutdown`] completes processing.
@@ -386,7 +432,7 @@ pub const Swarm = struct {
             },
             .dial => |d| {
                 self.pushEvent(.{ .peer_connection_failed = .{
-                    .peer = null,
+                    .peer = d.expected_peer,
                     .direction = .outbound,
                     .result = .{ .err = error.DialFailed },
                 } }) catch {
@@ -492,7 +538,6 @@ pub const Swarm = struct {
             self.evt_notify.waitTimeout(io, timeout) catch |err| switch (err) {
                 error.Timeout => return error.Timeout,
                 error.Canceled => return error.Timeout,
-                else => return error.Timeout,
             };
         }
     }
@@ -518,6 +563,78 @@ test "swarm publish produces gossip_message" {
     var closed = try swarm.nextEvent(5000);
     defer closed.deinit(a);
     try std.testing.expectEqual(@as(std.meta.Tag(Event), .swarm_closed), std.meta.activeTag(closed));
+}
+
+test "swarm tick processes submit without background thread" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try Swarm.init(a, default_event_capacity);
+    defer swarm.deinit();
+
+    try swarm.submit(.{ .publish = .{ .topic = "/tick", .payload = "ok" } });
+    swarm.tick(commands_per_tick);
+
+    var ev = try swarm.nextEvent(1000);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(.gossip_message, std.meta.activeTag(ev));
+    try std.testing.expectEqualStrings("/tick", ev.gossip_message.topic);
+
+    swarm.shutdown();
+    swarm.tick(commands_per_tick);
+    var closed = try swarm.nextEvent(1000);
+    defer closed.deinit(a);
+    try std.testing.expectEqual(.swarm_closed, std.meta.activeTag(closed));
+}
+
+test "swarm initWithConfig fixes local_peer for gossip_message" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    const fixed = try identity.PeerId.random();
+    var swarm = try Swarm.initWithConfig(a, .{ .event_capacity = 32, .local_peer = fixed });
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    try swarm.submit(.{ .publish = .{ .topic = "t", .payload = "p" } });
+    var ev = try swarm.nextEvent(2000);
+    defer ev.deinit(a);
+    try std.testing.expect(ev.gossip_message.from.eql(&fixed));
+
+    swarm.shutdown();
+    while (true) {
+        var e = swarm.nextEvent(2000) catch break;
+        defer e.deinit(a);
+        if (std.meta.activeTag(e) == .swarm_closed) break;
+    }
+}
+
+test "swarm dial stub forwards expected_peer" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try Swarm.init(a, default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    const hint = try identity.PeerId.random();
+    try swarm.submit(.{ .dial = .{ .addr = "/ip4/127.0.0.1/tcp/0", .expected_peer = hint } });
+
+    var ev = try swarm.nextEvent(2000);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(.peer_connection_failed, std.meta.activeTag(ev));
+    try std.testing.expect(ev.peer_connection_failed.peer != null);
+    try std.testing.expect(ev.peer_connection_failed.peer.?.eql(&hint));
+
+    swarm.shutdown();
+    while (true) {
+        var e = swarm.nextEvent(2000) catch break;
+        defer e.deinit(a);
+        if (std.meta.activeTag(e) == .swarm_closed) break;
+    }
 }
 
 test "swarm submit returns QueueClosed after shutdown" {
