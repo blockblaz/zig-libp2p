@@ -55,7 +55,7 @@ pub fn main() !void {
             ) catch return;
             defer alloc.free(req);
         }
-    }.run;
+    };
 
     const thr = try std.Thread.spawn(.{}, Server.run, .{ &server, io, gpa, limits });
     defer thr.join();
