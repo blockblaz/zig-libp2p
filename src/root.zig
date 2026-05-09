@@ -66,6 +66,7 @@ pub const transport = struct {
     pub const tcp = @import("transport/tcp.zig");
     pub const multistream_negotiate = @import("transport/multistream_negotiate.zig");
     pub const transport_error = @import("transport/transport_error.zig");
+    pub const yamux = @import("transport/yamux/root.zig");
 };
 
 pub const security = struct {
@@ -84,4 +85,7 @@ pub const zquic = @import("zquic");
 
 test {
     _ = @import("wire_boundaries.zig");
+    _ = @import("transport/yamux/root.zig");
+    _ = @import("transport/yamux/frame.zig");
+    _ = @import("transport/yamux/session.zig");
 }
