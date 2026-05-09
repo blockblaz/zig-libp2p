@@ -74,7 +74,8 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
 | `addr_list` | Multiaddr CSV: `parseCsv` (`ParseCsvError`), `freeList` (uses bundled `multiaddr`) |
 | `multistream` | Multistream-select 1.0.0 line I/O: `multistream_1_0_0`, `max_protocol_id_body_bytes`, `writeProtocolLine`, `writeProtocolLineWithMax`, `ProtocolLineError`, `trimNegotiationLine` |
-| `ping` | Ping 1.0.0: `WireError` = `errors.ReqRespError`, `handleInbound`, `initiatorRoundTripMs`, `Ping` / `PingConfig` |
+| `ping` | Ping 1.0.0: `WireError` = `errors.ReqRespError`, `multistream_protocol_id`, `handleInbound`, `initiatorRoundTripMs`, `Ping` / `PingConfig` |
+| `ping_wire_quic` | QUIC raw bidi stream: multistream + ping echo (`initiatorPingRoundTripMs`, `responderHandleInbound`); requires zquic UDP pumping (#37) |
 | `identify` | Identify 1.0.0: oversized wire uses global `PayloadTooLarge` (same tag as other codecs); `encode` / `decodeOwned`, `Identify` helpers |
 | `peer_id` | Re-export of `peer-id` package |
 | `identity` | `PeerId`, `ParseError` aliases |

@@ -7,6 +7,9 @@ const errors = @import("errors.zig");
 /// Multistream negotiation line including newline.
 pub const protocol_line: []const u8 = "/ipfs/ping/1.0.0\n";
 
+/// Protocol id passed to multistream-select (no trailing newline), same logical name as [`protocol_line`].
+pub const multistream_protocol_id: []const u8 = std.mem.trimRight(u8, protocol_line, "\n");
+
 /// Payload size for each ping or pong datagram on the stream.
 pub const payload_len: usize = 32;
 
@@ -149,6 +152,10 @@ pub const Ping = struct {
 
 test "protocol_line ends with newline" {
     try std.testing.expect(std.mem.endsWith(u8, protocol_line, "\n"));
+}
+
+test "multistream_protocol_id matches protocol_line without newline" {
+    try std.testing.expectEqualStrings("/ipfs/ping/1.0.0", multistream_protocol_id);
 }
 
 test "ping responder echoes payload" {

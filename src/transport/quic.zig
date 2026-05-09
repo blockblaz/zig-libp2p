@@ -6,7 +6,8 @@
 //! 3. [`initLibp2pQuicClientFromMultiaddr`] or [`initLibp2pQuicClientFromEndpoint`] for an IPv4 dial target (zquic client socket is IPv4 today).
 //! 4. After QUIC + TLS, open raw app bidi streams (`zquic.transport.io.rawAllocateNextLocalBidiStream`, …).
 //! 5. Run [`stream_multistream.initiatorHandshakeMultistream`] / [`responderHandshakeMultistream`] on each stream
-//!    using [`quic_raw_stream_io.RawAppBidiClient`] or [`RawAppBidiServer`] I/O adapters (see module [`quic_raw_stream_io`]).
+//!    using [`quic_raw_stream_io.RawAppBidiClient`] or [`RawAppBidiServer`] I/O adapters (see module [`quic_raw_stream_io`]),
+//!    or use [`ping_wire_quic`] / [`req_resp.wire_quic`] for ping / ssz_snappy req/resp on a raw stream.
 //!
 //! This module adds multiaddr parsing for typical `/udp/.../quic-v1` dial and listen addresses.
 

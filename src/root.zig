@@ -13,6 +13,7 @@ pub const varint = @import("varint.zig");
 pub const addr_list = @import("addr_list.zig");
 pub const multistream = @import("multistream.zig");
 pub const ping = @import("ping.zig");
+pub const ping_wire_quic = @import("ping_wire_quic.zig");
 pub const identify = @import("identify.zig");
 
 pub const gossip = struct {
