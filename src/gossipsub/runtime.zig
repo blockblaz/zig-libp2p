@@ -1,21 +1,37 @@
 //! Gossipsub mesh runtime (incremental, #39): subscriptions, peer presence, per-topic mesh,
 //! heartbeat GRAFT/PRUNE toward Zeam `mesh_n` / `mesh_n_low` / `mesh_n_high`, inbound control,
-//! publish forwarding, duplicate cache, and a targeted outbox.
+//! publish forwarding, duplicate cache, lazy gossip IHAVE toward non-mesh peers, IWANT fulfillment
+//! from a bounded pull cache, and a targeted outbox.
 //!
 //! Inbound `subscriptions` RPC entries record remote interest per topic. When at least one peer
 //! has advertised interest for a topic, GRAFT candidates are restricted to those peers; if none
 //! have, the implementation falls back to all connected peers (flood-style bootstrap).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const identity = @import("../identity.zig");
 const connection_manager = @import("../connection_manager.zig");
 const errors = @import("../errors.zig");
 const control = @import("control.zig");
 const duplicate_cache = @import("duplicate_cache.zig");
 const gs_cfg = @import("config.zig");
+const lim = @import("wire_limits.zig");
 const message_id = @import("message_id.zig");
 const msg_mod = @import("message.zig");
 const rpc = @import("rpc.zig");
+
+const SeenMsg = struct {
+    topic: []u8,
+    id: [20]u8,
+    seen_ms: i64,
+};
+
+const PullEntry = struct {
+    id: [20]u8,
+    topic: []u8,
+    data: []u8,
+    stored_ms: i64,
+};
 
 pub const GossipsubConfig = struct {
     local_peer_id: identity.PeerId,
@@ -23,6 +39,15 @@ pub const GossipsubConfig = struct {
     mesh_n_low: u8 = gs_cfg.mesh_n_low,
     mesh_n: u8 = gs_cfg.mesh_n,
     mesh_n_high: u8 = gs_cfg.mesh_n_high,
+    gossip_lazy: u8 = gs_cfg.gossip_lazy,
+    history_length: u8 = gs_cfg.history_length,
+    heartbeat_interval_ms: i64 = gs_cfg.heartbeat_interval_ms,
+    duplicate_cache_ttl_ms: i64 = gs_cfg.duplicate_cache_ttl_ms,
+    max_transmit_size_bytes: usize = gs_cfg.max_transmit_size_bytes,
+    /// Recent `(topic, message_id)` pairs kept for IHAVE advertisement (FIFO cap).
+    max_recent_messages: usize = 4096,
+    /// Cached full payloads for answering IWANT (FIFO cap, TTL `duplicate_cache_ttl_ms`).
+    max_pull_cache_entries: usize = 1024,
     /// Max queued outbound RPC blobs (`OutDelivery`) before subscribe/publish/heartbeat return
     /// `errors.GossipsubError.PublishQueueFull` (#39).
     max_outbox_entries: usize = 4096,
@@ -31,10 +56,13 @@ pub const GossipsubConfig = struct {
         if (c.mesh_n_low > c.mesh_n) return error.InvalidMeshKnobs;
         if (c.mesh_n > c.mesh_n_high) return error.InvalidMeshKnobs;
         if (c.max_outbox_entries == 0) return error.InvalidOutboxCap;
+        if (c.history_length == 0) return error.InvalidGossipParams;
+        if (c.max_recent_messages == 0) return error.InvalidGossipParams;
+        if (c.max_pull_cache_entries == 0) return error.InvalidGossipParams;
     }
 };
 
-pub const InitConfigError = error{ InvalidMeshKnobs, InvalidOutboxCap };
+pub const InitConfigError = error{ InvalidMeshKnobs, InvalidOutboxCap, InvalidGossipParams };
 
 pub const OutDelivery = struct {
     wire: []u8,
@@ -70,12 +98,25 @@ pub const Gossipsub = struct {
     control_i_have_rx: u64,
     /// Count of inbound control blobs that contained at least one IWANT entry.
     control_i_want_rx: u64,
+    /// Publishes queued in response to IWANT when the id was still in the pull cache.
+    control_i_want_fulfilled: u64,
+    /// Outbound IHAVE RPCs emitted from [`heartbeat`] lazy gossip.
+    lazy_i_have_tx: u64,
+    recent_seen: std.ArrayList(SeenMsg),
+    pull_fifo: std.ArrayList(PullEntry),
+    rng: std.Random.DefaultPrng,
     scratch_peers: std.ArrayList(identity.PeerId),
 
     pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
         try config.validate();
         const p = try allocator.create(Gossipsub);
         errdefer allocator.destroy(p);
+        const seed: u64 = if (builtin.is_test) 0x1111_2222_3333_4444 else seed: {
+            var s: u64 = undefined;
+            const bytes = std.mem.asBytes(&s);
+            std.c.arc4random_buf(bytes.ptr, bytes.len);
+            break :seed if (s == 0) 0xa5a5_a5a5_a5a5_a5a5 else s;
+        };
         p.* = .{
             .allocator = allocator,
             .cfg = config,
@@ -89,6 +130,11 @@ pub const Gossipsub = struct {
             .inbound_delivered = 0,
             .control_i_have_rx = 0,
             .control_i_want_rx = 0,
+            .control_i_want_fulfilled = 0,
+            .lazy_i_have_tx = 0,
+            .recent_seen = .empty,
+            .pull_fifo = .empty,
+            .rng = std.Random.DefaultPrng.init(seed),
             .scratch_peers = .empty,
         };
         return p;
@@ -96,6 +142,13 @@ pub const Gossipsub = struct {
 
     pub fn deinit(self: *Gossipsub) void {
         self.dup.deinit();
+        for (self.recent_seen.items) |s| self.allocator.free(s.topic);
+        self.recent_seen.deinit(self.allocator);
+        for (self.pull_fifo.items) |e| {
+            self.allocator.free(e.topic);
+            self.allocator.free(e.data);
+        }
+        self.pull_fifo.deinit(self.allocator);
         self.subs.deinit();
         var mit = self.mesh.iterator();
         while (mit.next()) |e| {
@@ -117,6 +170,133 @@ pub const Gossipsub = struct {
 
     pub fn setClockMs(self: *Gossipsub, t: i64) void {
         self.clock_ms = t;
+    }
+
+    fn historyWindowMs(self: *const Gossipsub) i64 {
+        return @as(i64, self.cfg.history_length) * self.cfg.heartbeat_interval_ms;
+    }
+
+    fn pruneRecentSeen(self: *Gossipsub) void {
+        const win = self.historyWindowMs();
+        var i: usize = 0;
+        while (i < self.recent_seen.items.len) {
+            const s = self.recent_seen.items[i];
+            if (self.clock_ms - s.seen_ms > win) {
+                self.allocator.free(s.topic);
+                _ = self.recent_seen.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn prunePullCache(self: *Gossipsub) void {
+        const cutoff = self.clock_ms - self.cfg.duplicate_cache_ttl_ms;
+        var i: usize = 0;
+        while (i < self.pull_fifo.items.len) {
+            if (self.pull_fifo.items[i].stored_ms < cutoff) {
+                const e = self.pull_fifo.orderedRemove(i);
+                self.allocator.free(e.topic);
+                self.allocator.free(e.data);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn recordSeenForLazy(self: *Gossipsub, topic: []const u8, id: [20]u8) std.mem.Allocator.Error!void {
+        self.pruneRecentSeen();
+        const topic_owned = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(topic_owned);
+        try self.recent_seen.append(self.allocator, .{ .topic = topic_owned, .id = id, .seen_ms = self.clock_ms });
+        while (self.recent_seen.items.len > self.cfg.max_recent_messages) {
+            const old = self.recent_seen.orderedRemove(0);
+            self.allocator.free(old.topic);
+        }
+    }
+
+    fn rememberPullPayload(self: *Gossipsub, topic: []const u8, id: [20]u8, data: []const u8) std.mem.Allocator.Error!void {
+        const t = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(t);
+        const d = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(d);
+
+        var j: usize = 0;
+        while (j < self.pull_fifo.items.len) {
+            if (std.mem.eql(u8, &self.pull_fifo.items[j].id, &id)) {
+                const old = self.pull_fifo.orderedRemove(j);
+                self.allocator.free(old.topic);
+                self.allocator.free(old.data);
+            } else {
+                j += 1;
+            }
+        }
+
+        if (self.pull_fifo.items.len >= self.cfg.max_pull_cache_entries) {
+            const old = self.pull_fifo.orderedRemove(0);
+            self.allocator.free(old.topic);
+            self.allocator.free(old.data);
+        }
+        try self.pull_fifo.append(self.allocator, .{ .id = id, .topic = t, .data = d, .stored_ms = self.clock_ms });
+    }
+
+    fn findPullPayload(self: *const Gossipsub, id: [20]u8) ?PullEntry {
+        var i: usize = self.pull_fifo.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, &self.pull_fifo.items[i].id, &id)) return self.pull_fifo.items[i];
+        }
+        return null;
+    }
+
+    fn emitLazyIHAVE(self: *Gossipsub) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (self.cfg.gossip_lazy == 0) return;
+
+        var uniq: std.ArrayList([20]u8) = .empty;
+        defer uniq.deinit(self.allocator);
+        var mid_slices: std.ArrayList([]const u8) = .empty;
+        defer mid_slices.deinit(self.allocator);
+
+        var sit = self.subs.iterator();
+        while (sit.next()) |e| {
+            const topic = e.key_ptr.*;
+            uniq.clearRetainingCapacity();
+            mid_slices.clearRetainingCapacity();
+
+            for (self.recent_seen.items) |s| {
+                if (!std.mem.eql(u8, s.topic, topic)) continue;
+                var dup_id = false;
+                for (uniq.items) |u| {
+                    if (std.mem.eql(u8, &u, &s.id)) {
+                        dup_id = true;
+                        break;
+                    }
+                }
+                if (dup_id) continue;
+                try uniq.append(self.allocator, s.id);
+                if (uniq.items.len >= lim.max_message_ids_per_entry) break;
+            }
+            if (uniq.items.len == 0) continue;
+
+            for (uniq.items) |*mid| {
+                try mid_slices.append(self.allocator, mid[0..]);
+            }
+
+            const cand = try self.candidatesOutsideMesh(topic);
+            if (cand.len == 0) continue;
+
+            const k: usize = @min(@as(usize, self.cfg.gossip_lazy), cand.len);
+            const rng = self.rng.random();
+            rng.shuffle(identity.PeerId, cand);
+            for (cand[0..k]) |target| {
+                const ctl = try control.encodeIHave(self.allocator, topic, mid_slices.items);
+                defer self.allocator.free(ctl);
+                const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
+                errdefer self.allocator.free(rpcw);
+                try self.appendOut(rpcw, target);
+                self.lazy_i_have_tx += 1;
+            }
+        }
     }
 
     fn appendOut(self: *Gossipsub, wire: []u8, to: ?identity.PeerId) (errors.GossipsubError || std.mem.Allocator.Error)!void {
@@ -179,6 +359,13 @@ pub const Gossipsub = struct {
     pub fn publish(self: *Gossipsub, topic: []const u8, payload: []const u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         const inner = try msg_mod.encode(self.allocator, .{ .topic = topic, .data = payload });
         defer self.allocator.free(inner);
+        if (inner.len > self.cfg.max_transmit_size_bytes) return error.PayloadTooLarge;
+
+        var id: [20]u8 = undefined;
+        message_id.writeMessageId(topic, payload, self.cfg.message_id_domain_snappy_ok, &id);
+        try self.recordSeenForLazy(topic, id);
+        try self.rememberPullPayload(topic, id, payload);
+
         const wire = try rpc.encodePublish(self.allocator, inner);
         errdefer self.allocator.free(wire);
         try self.appendOut(wire, null);
@@ -236,7 +423,7 @@ pub const Gossipsub = struct {
         return self.scratch_peers.items;
     }
 
-    fn handleInboundControl(self: *Gossipsub, sender: identity.PeerId, ctl: []const u8) (control.Error || std.mem.Allocator.Error)!void {
+    fn handleInboundControl(self: *Gossipsub, sender: identity.PeerId, ctl: []const u8) (control.Error || rpc.Error || msg_mod.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         if (try control.decodeFirstGraftTopic(self.allocator, ctl)) |gt| {
             defer self.allocator.free(gt);
             if (self.subs.contains(gt)) {
@@ -261,6 +448,18 @@ pub const Gossipsub = struct {
             var owned = iw;
             defer control.deinitIWantOwned(self.allocator, &owned);
             self.control_i_want_rx += 1;
+            for (owned.message_ids) |mid_raw| {
+                if (mid_raw.len != 20) continue;
+                var id: [20]u8 = undefined;
+                @memcpy(id[0..], mid_raw[0..20]);
+                const hit = self.findPullPayload(id) orelse continue;
+                const inner = try msg_mod.encode(self.allocator, .{ .topic = hit.topic, .data = hit.data });
+                defer self.allocator.free(inner);
+                const wire = try rpc.encodePublish(self.allocator, inner);
+                errdefer self.allocator.free(wire);
+                try self.appendOut(wire, sender);
+                self.control_i_want_fulfilled += 1;
+            }
         }
     }
 
@@ -323,12 +522,16 @@ pub const Gossipsub = struct {
             message_id.writeMessageId(topic, data, self.cfg.message_id_domain_snappy_ok, &id);
             if (try self.dup.checkDuplicate(topic, id, self.clock_ms)) continue;
             self.inbound_delivered += 1;
+            try self.recordSeenForLazy(topic, id);
+            try self.rememberPullPayload(topic, id, data);
             try self.forwardPublish(sender, topic, data);
         }
     }
 
     pub fn heartbeat(self: *Gossipsub) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         self.dup.prune(self.clock_ms);
+        self.prunePullCache();
+        self.pruneRecentSeen();
 
         var sit = self.subs.iterator();
         while (sit.next()) |e| {
@@ -355,6 +558,8 @@ pub const Gossipsub = struct {
                 try self.pruneMeshDownToN(topic, self.cfg.mesh_n);
             }
         }
+
+        try self.emitLazyIHAVE();
     }
 
     /// Sum of per-topic mesh sizes (a peer in multiple topics is counted multiple times).
@@ -659,4 +864,112 @@ test "inbound IHAVE and IWANT increment control counters" {
     try g.handleInboundRpc(peer, iwant_rpc);
     try std.testing.expectEqual(@as(u64, 1), g.control_i_have_rx);
     try std.testing.expectEqual(@as(u64, 1), g.control_i_want_rx);
+}
+
+test "lazy gossip heartbeat emits IHAVE to non-mesh peers" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 12, .gossip_lazy = 6 });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    const sub_d = g.popOutboxDelivery().?;
+    defer a.free(sub_d.wire);
+
+    const graft_ctl = try control.encodeGraft(a, "t");
+    defer a.free(graft_ctl);
+    const graft_full = try rpc.encodeControlOnlyRpc(a, graft_ctl);
+    defer a.free(graft_full);
+
+    var peers: [7]identity.PeerId = undefined;
+    for (&peers) |*p| {
+        p.* = try identity.PeerId.random();
+        g.onPeerConnected(p.*);
+    }
+    try g.handleInboundRpc(peers[0], graft_full);
+
+    try g.publish("t", "hello");
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+    }
+
+    try g.heartbeat();
+    try std.testing.expectEqual(@as(u64, 6), g.lazy_i_have_tx);
+
+    var ihave_out: u32 = 0;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if (try control.decodeFirstIHave(a, ctl)) |ih| {
+            var owned = ih;
+            defer control.deinitIHaveOwned(a, &owned);
+            ihave_out += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 6), ihave_out);
+}
+
+test "IWANT with 20-byte id replays cached publish to requester" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const requester = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    try g.publish("t", "cached-body");
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+    }
+
+    var id: [20]u8 = undefined;
+    message_id.writeMessageId("t", "cached-body", g.cfg.message_id_domain_snappy_ok, &id);
+
+    const iwant_ctl = try control.encodeIWant(a, &[_][]const u8{id[0..]});
+    defer a.free(iwant_ctl);
+    const iwant_rpc = try rpc.encodeControlOnlyRpc(a, iwant_ctl);
+    defer a.free(iwant_rpc);
+
+    try g.handleInboundRpc(requester, iwant_rpc);
+    try std.testing.expectEqual(@as(u64, 1), g.control_i_want_fulfilled);
+
+    const d = g.popOutboxDelivery().?;
+    defer a.free(d.wire);
+    try std.testing.expect(d.to != null and d.to.?.eql(&requester));
+    const blobs = try rpc.decodePublishes(a, d.wire);
+    defer rpc.freePublishBlobs(a, blobs);
+    try std.testing.expectEqual(@as(usize, 1), blobs.len);
+    var decoded = try msg_mod.decode(a, blobs[0]);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings("t", decoded.topic.?);
+    try std.testing.expectEqualStrings("cached-body", decoded.data.?);
+}
+
+test "Gossipsub init rejects invalid lazy gossip cache params" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    try std.testing.expectError(
+        error.InvalidGossipParams,
+        Gossipsub.init(a, .{ .local_peer_id = me, .history_length = 0 }),
+    );
+    try std.testing.expectError(
+        error.InvalidGossipParams,
+        Gossipsub.init(a, .{ .local_peer_id = me, .max_recent_messages = 0 }),
+    );
+    try std.testing.expectError(
+        error.InvalidGossipParams,
+        Gossipsub.init(a, .{ .local_peer_id = me, .max_pull_cache_entries = 0 }),
+    );
+}
+
+test "publish rejects wire over max_transmit_size_bytes" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .max_transmit_size_bytes = 24 });
+    defer g.deinit();
+
+    const big = try a.alloc(u8, 80);
+    defer a.free(big);
+    @memset(big, 'q');
+    try std.testing.expectError(error.PayloadTooLarge, g.publish("t", big));
 }
