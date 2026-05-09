@@ -6,6 +6,8 @@ const identity = @import("identity.zig");
 pub const Direction = enum {
     inbound,
     outbound,
+    /// Transport has not classified direction yet (#38).
+    unknown,
 };
 
 pub const DisconnectReason = enum {

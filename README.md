@@ -21,15 +21,15 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
 | Swarm / network runtime | Partial | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — threaded command/event runtime; transport integration still embedder-owned |
 | Noise XX | Partial | [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36) — [`security.noise`](#security): use [`security.noise.stream_upgrade`](./src/security/noise/stream_upgrade.zig) for multistream `/noise` + handshake on a stream; interop tests can live in Zeam. |
-| Connection manager | Partial | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) — `connection_manager` + `peer_events`; embedder must call `tick` / `onDialFailure` / `onConnectionEstablished` / `onConnectionClosed` from transport |
-| Gossipsub mesh runtime | Partial | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) — `gossipsub.runtime`: mesh + heartbeat as above, lazy IHAVE toward non-mesh peers (`gossip_lazy`), IWANT → replay from bounded pull cache (TTL `duplicate_cache_ttl_ms`), `max_transmit_size_bytes` on publish; mesh **scoring**, **per-peer** queue caps still TBD |
+| Connection manager | Done | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) — `connection_manager` + `peer_events` (`Direction.unknown`), dial string without `/p2p`, reconnect backoff, refcount + events, optional `setReqResp`; embedder wires transport → `tick` / `onDialFailure` / `onConnectionEstablished` / `onConnectionClosed` |
+| Gossipsub mesh runtime | Done | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) — `gossipsub.runtime`: mesh + heartbeat, lazy IHAVE (`gossip_lazy`, `OutDeliveryKind.lazy_ihave`), IWANT → pull cache, `max_transmit_size_bytes`, global + per-peer outbox caps (drop oldest lazy first), `setPeerBehaviourScore` / `peerBehaviourScore` for GRAFT / PRUNE / lazy ordering |
 | Req/resp behaviour | Done | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) — `req_resp.runtime` (15s request / 5min inbound idle timeouts, `channel_id`, `onPeerDisconnected`); `req_resp.wire_framing`, TCP `req_resp.wire_tcp`, QUIC `req_resp.wire_quic`; `connection_manager.setReqResp` notifies `ReqResp` on last session close; end-to-end on live streams remains embedder transport + [`swarm`](#api-overview) (#34) |
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Not started | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) |
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
 | Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
 
-**Still heavy lift for embedders:** gossipsub mesh **scoring** / per-peer queues, forwarding transport events into [`connection_manager`](./src/connection_manager.zig) + [`swarm`](./src/swarm.zig), and binding req/resp to real substreams. QUIC **UDP pumping** is [`transport.quic_endpoint.drive`](#transport) + zquic; QUIC **dial** path runs default TLS PeerId verification via [`transport.quic_peer_identity`](#transport). Non-zquic TLS still needs [`peerIdFromVerifiedCertificate`](./src/security/libp2p_tls.zig) at the right handshake boundary (#16).
+**Still heavy lift for embedders:** forwarding transport events into [`connection_manager`](./src/connection_manager.zig) + [`swarm`](./src/swarm.zig) and binding req/resp to real substreams (behaviour in-tree; wiring remains app-owned). QUIC **UDP pumping** is [`transport.quic_endpoint.drive`](#transport) + zquic; QUIC **dial** path runs default TLS PeerId verification via [`transport.quic_peer_identity`](#transport). Non-zquic TLS still needs [`peerIdFromVerifiedCertificate`](./src/security/libp2p_tls.zig) at the right handshake boundary (#16).
 
 | Requirement | Version / note |
 |-------------|----------------|
@@ -68,8 +68,8 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 |--------|------|
 | `errors` | Layered errors: `ReqRespError`, `GossipsubError`, `TransportError`; `setLastErrorMessage` / `lastErrorMessage` / `clearLastErrorMessage` (#45) |
 | `layer_events` | Event carriers: `ReqRespFailure`, `GossipsubFailure`, `TransportFailure` (each has a `kind:` field for `switch`) (#45) |
-| `peer_events` | Peer connection payloads: `Direction`, `DisconnectReason`, `ConnectionFailureResult`, connected / disconnected / failed event structs (#38) |
-| `connection_manager` | Known-peer dial scheduling (multiaddr without `/p2p`), reconnect backoff, refcount + peer events (#38); optional `setReqResp` → `ReqResp.onPeerDisconnected` on last session close (#40) |
+| `peer_events` | Peer connection payloads: `Direction` (`inbound` / `outbound` / `unknown`), `DisconnectReason`, `ConnectionFailureResult`, connected / disconnected / failed event structs (#38) |
+| `connection_manager` | Known-peer dial scheduling (multiaddr without `/p2p`), reconnect backoff, refcount + peer events (#38), `knownPeerStatus` / `KnownPeerDialStatus`; optional `setReqResp` → `ReqResp.onPeerDisconnected` on last session close (#40) |
 | `swarm` | Threaded runtime: bounded `submit` / `nextEvent`, `queueEvent`, `run` / `startBackground`, `shutdown` (#34); `RpcRequest.channel_id` for inbound req/resp (#40); stubs until real I/O |
 | `protocol` | Lean req/resp protocol id strings; `LeanSupportedProtocol` enum with `protocolId`, `fromInt`, `fromSlice` |
 | `varint` | Unsigned varint encode (`encodeToScratch`) / decode (`decode`) |
@@ -98,7 +98,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `gossipsub.config` | Zeam gossipsub constants: `mesh_n` / `mesh_n_low` / `mesh_n_high`, `gossip_lazy`, `heartbeat_interval_ms`, `duplicate_cache_ttl_ms`, `history_length`, `max_transmit_size_bytes` (#39) |
 | `gossipsub.message_id` | Wire message ID: `writeMessageId(topic, data, snappy_decompressed_ok, out20)` — SHA256 domain + topic len + topic + data, truncated to 20 bytes (#39) |
 | `gossipsub.duplicate_cache` | TTL map `(topic, id)` → expiry; `prune`, `checkDuplicate` (#39) |
-| `gossipsub.runtime` | `Gossipsub` + `GossipsubConfig` (`gossip_lazy`, `history_length`, `max_transmit_size_bytes`, pull cache caps); lazy IHAVE on `heartbeat`, IWANT → cached publish; `lazy_i_have_tx`, `control_i_want_fulfilled`; `InitConfigError` (#39) |
+| `gossipsub.runtime` | `Gossipsub` + `GossipsubConfig` (`gossip_lazy`, `max_outbox_entries`, `max_queued_per_peer`, …); `OutDeliveryKind`; `setPeerBehaviourScore` / `peerBehaviourScore`; lazy IHAVE on `heartbeat`, IWANT → cached publish; `lazy_i_have_tx`, `dropped_lazy_ihave_backpressure`; `InitConfigError` (#39) |
 | `gossipsub.rpc` | RPC envelope: `encodeEmptyControlRpc`, `encodeControlOnlyRpc`, `encodeSubscribe` / `decodeFirstSubscribe` / `decodeSubscribes` / `freeSubscribeViews`, `deinitSubscribeView`, `decodeControlPayload`, `encodePublish` / `decodeFirstPublish`, `decodePublishes` / `freePublishBlobs` |
 | `gossipsub.control` | Control message fragments: **IHave** / **IWant** / **IDontWant** / **graft** / **prune**; **ControlExtensions** (`partialMessages`): `encodeControlExtensions`, `encodeControlMessageExtensionsOnly`, `decodeFirstControlExtensions`, `ControlExtensionsView` |
 | `gossipsub.message` | `Message` protobuf: `MessageView`, `MessageOwned`, `encode`, `decode`, `MessageOwned.deinit` |
@@ -147,13 +147,12 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 Priorities follow the [parity table](#zeam-parity) and [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31). Sensible next picks (after examples/CI hygiene):
 
-1. **Gossipsub #39** — mesh **scoring**, optional **per-peer** outbound caps on top of the global outbox (IHAVE / IWANT / replay path is in `gossipsub.runtime`).
-2. **QUIC (#37) + TLS #16** — `transport.quic_endpoint` covers listen/dial/pump, per-stream multistream, lifecycle hooks; peer-id from peer leaf cert remains #16; Rust↔Zig QUIC interop manual until #44; `example-quic-ping-loopback` exercises loopback ping.
-3. **Noise #36** — example using `security.noise.stream_upgrade` on a TCP stream after multistream.
-4. **Swarm / connection_manager #34 / #38** — thin example forwarding synthetic transport events into `ConnectionManager` + optional `ReqResp`.
-5. **Metrics #43** — counters/histograms behind a narrow interface.
+1. **QUIC (#37) + TLS #16** — `transport.quic_endpoint` covers listen/dial/pump, per-stream multistream, lifecycle hooks; peer-id from peer leaf cert remains #16; Rust↔Zig QUIC interop manual until #44; `example-quic-ping-loopback` exercises loopback ping.
+2. **Noise #36** — example using `security.noise.stream_upgrade` on a TCP stream after multistream.
+3. **Swarm #34** — thin example forwarding synthetic transport events into `ConnectionManager` + optional `ReqResp` (connection manager behaviour is in-tree for #38).
+4. **Metrics #43** — counters/histograms behind a narrow interface.
 
-Near term overlap: [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) mesh scoring / per-peer queues, [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) / [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) QUIC + TLS verification. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
+Near term overlap: [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) / [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) QUIC + TLS verification. **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control` (experimental fields).
 
 **Examples contract:** new public APIs should get or extend an `examples/` program that still exits 0 under `zig build test` (smoke-run after unit tests), unless there is a documented reason to compile-only (like the TCP + `Io.Threaded` demo). Avoid a second `addTest` root on the same `zig_libp2p` module — it recompiles the library graph and breaks Zig 0.16 type identity.
 

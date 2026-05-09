@@ -1,7 +1,9 @@
 //! Gossipsub mesh runtime (incremental, #39): subscriptions, peer presence, per-topic mesh,
 //! heartbeat GRAFT/PRUNE toward Zeam `mesh_n` / `mesh_n_low` / `mesh_n_high`, inbound control,
 //! publish forwarding, duplicate cache, lazy gossip IHAVE toward non-mesh peers, IWANT fulfillment
-//! from a bounded pull cache, and a targeted outbox.
+//! from a bounded pull cache, and a targeted outbox with global plus per-peer caps (lazy IHAVE
+//! dropped first on overflow). Optional [`setPeerBehaviourScore`] orders GRAFT targets, PRUNE
+//! victims, and lazy IHAVE peer selection (with a shuffled prefix among top-ranked peers).
 //!
 //! Inbound `subscriptions` RPC entries record remote interest per topic. When at least one peer
 //! has advertised interest for a topic, GRAFT candidates are restricted to those peers; if none
@@ -80,11 +82,14 @@ pub const GossipsubConfig = struct {
     /// Max queued outbound RPC blobs (`OutDelivery`) before subscribe/publish/heartbeat return
     /// `errors.GossipsubError.PublishQueueFull` (#39).
     max_outbox_entries: usize = 4096,
+    /// Per-peer cap on directed outbox entries; overflow drops oldest `lazy_ihave` to that peer first (#39).
+    max_queued_per_peer: usize = 256,
 
     pub fn validate(c: GossipsubConfig) InitConfigError!void {
         if (c.mesh_n_low > c.mesh_n) return error.InvalidMeshKnobs;
         if (c.mesh_n > c.mesh_n_high) return error.InvalidMeshKnobs;
         if (c.max_outbox_entries == 0) return error.InvalidOutboxCap;
+        if (c.max_queued_per_peer == 0) return error.InvalidGossipParams;
         if (c.history_length == 0) return error.InvalidGossipParams;
         if (c.max_recent_messages == 0) return error.InvalidGossipParams;
         if (c.max_pull_cache_entries == 0) return error.InvalidGossipParams;
@@ -93,10 +98,16 @@ pub const GossipsubConfig = struct {
 
 pub const InitConfigError = error{ InvalidMeshKnobs, InvalidOutboxCap, InvalidGossipParams };
 
+pub const OutDeliveryKind = enum {
+    generic,
+    lazy_ihave,
+};
+
 pub const OutDelivery = struct {
     wire: []u8,
     /// `null` means broadcast to all connected peers (subscribe / publish announcements).
     to: ?identity.PeerId,
+    kind: OutDeliveryKind = .generic,
 };
 
 const TopicMesh = struct {
@@ -131,10 +142,14 @@ pub const Gossipsub = struct {
     control_i_want_fulfilled: u64,
     /// Outbound IHAVE RPCs emitted from [`heartbeat`] lazy gossip.
     lazy_i_have_tx: u64,
+    /// Lazy IHAVE entries dropped due to per-peer or global outbox backpressure (#39).
+    dropped_lazy_ihave_backpressure: u64,
     recent_seen: std.ArrayList(SeenMsg),
     pull_fifo: std.ArrayList(PullEntry),
     rng: std.Random.DefaultPrng,
     scratch_peers: std.ArrayList(identity.PeerId),
+    /// Optional mesh / behaviour scores for candidate ordering (higher = preferred GRAFT target) (#39).
+    peer_scores: std.HashMap(identity.PeerId, i32, connection_manager.PeerIdContext, std.hash_map.default_max_load_percentage),
 
     pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
         try config.validate();
@@ -156,10 +171,12 @@ pub const Gossipsub = struct {
             .control_i_want_rx = 0,
             .control_i_want_fulfilled = 0,
             .lazy_i_have_tx = 0,
+            .dropped_lazy_ihave_backpressure = 0,
             .recent_seen = .empty,
             .pull_fifo = .empty,
             .rng = std.Random.DefaultPrng.init(seed),
             .scratch_peers = .empty,
+            .peer_scores = .init(allocator),
         };
         return p;
     }
@@ -187,6 +204,7 @@ pub const Gossipsub = struct {
         for (self.outbox.items) |d| self.allocator.free(d.wire);
         self.outbox.deinit(self.allocator);
         self.connected.deinit();
+        self.peer_scores.deinit();
         self.scratch_peers.deinit(self.allocator);
         const a = self.allocator;
         a.destroy(self);
@@ -310,22 +328,79 @@ pub const Gossipsub = struct {
             if (cand.len == 0) continue;
 
             const k: usize = @min(@as(usize, self.cfg.gossip_lazy), cand.len);
+            const prefix_len = @max(k, @min(cand.len, 2 * k));
             const rng = self.rng.random();
-            rng.shuffle(identity.PeerId, cand);
+            rng.shuffle(identity.PeerId, cand[0..prefix_len]);
             for (cand[0..k]) |target| {
                 const ctl = try control.encodeIHave(self.allocator, topic, mid_slices.items);
                 defer self.allocator.free(ctl);
                 const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
                 errdefer self.allocator.free(rpcw);
-                try self.appendOut(rpcw, target);
+                try self.appendOutKind(rpcw, target, .lazy_ihave);
                 self.lazy_i_have_tx += 1;
             }
         }
     }
 
+    fn countDirectedTo(self: *Gossipsub, peer: identity.PeerId) usize {
+        var n: usize = 0;
+        for (self.outbox.items) |d| {
+            if (d.to) |t| {
+                if (t.eql(&peer)) n += 1;
+            }
+        }
+        return n;
+    }
+
+    fn dropOldestDirectedTo(self: *Gossipsub, peer: identity.PeerId, lazy_only: bool) bool {
+        for (self.outbox.items, 0..) |d, i| {
+            const to = d.to orelse continue;
+            if (!to.eql(&peer)) continue;
+            if (lazy_only and d.kind != .lazy_ihave) continue;
+            const removed = self.outbox.orderedRemove(i);
+            self.allocator.free(removed.wire);
+            if (removed.kind == .lazy_ihave) self.dropped_lazy_ihave_backpressure += 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn enforcePerPeerCap(self: *Gossipsub, peer: identity.PeerId) void {
+        while (self.countDirectedTo(peer) >= self.cfg.max_queued_per_peer) {
+            if (self.dropOldestDirectedTo(peer, true)) continue;
+            if (self.dropOldestDirectedTo(peer, false)) continue;
+            return;
+        }
+    }
+
+    fn dropOldestLazyIHaveAny(self: *Gossipsub) bool {
+        for (self.outbox.items, 0..) |d, i| {
+            if (d.kind != .lazy_ihave) continue;
+            const removed = self.outbox.orderedRemove(i);
+            self.allocator.free(removed.wire);
+            self.dropped_lazy_ihave_backpressure += 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn enforceGlobalOutboxCap(self: *Gossipsub) errors.GossipsubError!void {
+        while (self.outbox.items.len >= self.cfg.max_outbox_entries) {
+            if (self.dropOldestLazyIHaveAny()) continue;
+            return error.PublishQueueFull;
+        }
+    }
+
+    fn appendOutKind(self: *Gossipsub, wire: []u8, to: ?identity.PeerId, kind: OutDeliveryKind) (errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (to) |p| {
+            self.enforcePerPeerCap(p);
+        }
+        try self.enforceGlobalOutboxCap();
+        try self.outbox.append(self.allocator, .{ .wire = wire, .to = to, .kind = kind });
+    }
+
     fn appendOut(self: *Gossipsub, wire: []u8, to: ?identity.PeerId) (errors.GossipsubError || std.mem.Allocator.Error)!void {
-        if (self.outbox.items.len >= self.cfg.max_outbox_entries) return error.PublishQueueFull;
-        try self.outbox.append(self.allocator, .{ .wire = wire, .to = to });
+        return self.appendOutKind(wire, to, .generic);
     }
 
     fn ensureTopicMesh(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error!void {
@@ -401,6 +476,7 @@ pub const Gossipsub = struct {
 
     pub fn onPeerDisconnected(self: *Gossipsub, peer: identity.PeerId) void {
         _ = self.connected.remove(peer);
+        _ = self.peer_scores.remove(peer);
         var mit = self.mesh.iterator();
         while (mit.next()) |e| {
             _ = e.value_ptr.peers.remove(peer);
@@ -411,17 +487,49 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn sortPeersByBytes(peers: []identity.PeerId) void {
+    pub fn peerBehaviourScore(self: *const Gossipsub, peer: identity.PeerId) i32 {
+        return self.peer_scores.get(peer) orelse 0;
+    }
+
+    /// Sets a behaviour score used for mesh GRAFT / PRUNE ordering and lazy IHAVE peer selection (#39).
+    pub fn setPeerBehaviourScore(self: *Gossipsub, peer: identity.PeerId, score: i32) std.mem.Allocator.Error!void {
+        try self.peer_scores.put(peer, score);
+    }
+
+    fn sortPeersByScoreDescThenBytes(self: *Gossipsub, peers: []identity.PeerId) void {
+        const Ctx = struct { gs: *Gossipsub };
+        const ctx = Ctx{ .gs = self };
         const S = struct {
-            fn less(_: void, a: identity.PeerId, b: identity.PeerId) bool {
+            fn less(c: Ctx, a: identity.PeerId, b: identity.PeerId) bool {
+                const sa = c.gs.peerBehaviourScore(a);
+                const sb = c.gs.peerBehaviourScore(b);
+                if (sa != sb) return sa > sb;
                 var ba: [128]u8 = undefined;
                 var bb: [128]u8 = undefined;
-                const sa = a.toBytes(&ba) catch return false;
-                const sb = b.toBytes(&bb) catch return true;
-                return std.mem.order(u8, sa, sb) == .lt;
+                const ab = a.toBytes(&ba) catch return false;
+                const bb2 = b.toBytes(&bb) catch return true;
+                return std.mem.order(u8, ab, bb2) == .lt;
             }
         };
-        std.mem.sort(identity.PeerId, peers, {}, S.less);
+        std.mem.sort(identity.PeerId, peers, ctx, S.less);
+    }
+
+    fn sortPeersByScoreAscThenBytes(self: *Gossipsub, peers: []identity.PeerId) void {
+        const Ctx = struct { gs: *Gossipsub };
+        const ctx = Ctx{ .gs = self };
+        const S = struct {
+            fn less(c: Ctx, a: identity.PeerId, b: identity.PeerId) bool {
+                const sa = c.gs.peerBehaviourScore(a);
+                const sb = c.gs.peerBehaviourScore(b);
+                if (sa != sb) return sa < sb;
+                var ba: [128]u8 = undefined;
+                var bb: [128]u8 = undefined;
+                const ab = a.toBytes(&ba) catch return false;
+                const bb2 = b.toBytes(&bb) catch return true;
+                return std.mem.order(u8, ab, bb2) == .lt;
+            }
+        };
+        std.mem.sort(identity.PeerId, peers, ctx, S.less);
     }
 
     fn candidatesOutsideMesh(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error![]identity.PeerId {
@@ -443,7 +551,7 @@ pub const Gossipsub = struct {
             }
             try self.scratch_peers.append(self.allocator, p);
         }
-        sortPeersByBytes(self.scratch_peers.items);
+        self.sortPeersByScoreDescThenBytes(self.scratch_peers.items);
         return self.scratch_peers.items;
     }
 
@@ -510,7 +618,7 @@ pub const Gossipsub = struct {
         self.scratch_peers.clearRetainingCapacity();
         var pit = mp.peers.keyIterator();
         while (pit.next()) |kp| try self.scratch_peers.append(self.allocator, kp.*);
-        sortPeersByBytes(self.scratch_peers.items);
+        self.sortPeersByScoreAscThenBytes(self.scratch_peers.items);
 
         const n = @min(excess, self.scratch_peers.items.len);
         for (self.scratch_peers.items[0..n]) |victim| {
@@ -984,6 +1092,197 @@ test "Gossipsub init rejects invalid lazy gossip cache params" {
         error.InvalidGossipParams,
         Gossipsub.init(a, .{ .local_peer_id = me, .max_pull_cache_entries = 0 }),
     );
+    try std.testing.expectError(
+        error.InvalidGossipParams,
+        Gossipsub.init(a, .{ .local_peer_id = me, .max_queued_per_peer = 0 }),
+    );
+}
+
+test "lazy IHAVE per-peer cap drops older lazy first" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const pm = try identity.PeerId.random();
+    const pv = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 12,
+        .gossip_lazy = 1,
+        .max_queued_per_peer = 1,
+    });
+    defer g.deinit();
+
+    try g.subscribe("t1");
+    try g.subscribe("t2");
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+    }
+
+    const ctl1 = try control.encodeGraft(a, "t1");
+    defer a.free(ctl1);
+    const ctl2 = try control.encodeGraft(a, "t2");
+    defer a.free(ctl2);
+    const graft1 = try rpc.encodeControlOnlyRpc(a, ctl1);
+    defer a.free(graft1);
+    const graft2 = try rpc.encodeControlOnlyRpc(a, ctl2);
+    defer a.free(graft2);
+
+    g.onPeerConnected(pm);
+    g.onPeerConnected(pv);
+    try g.handleInboundRpc(pm, graft1);
+    try g.handleInboundRpc(pm, graft2);
+
+    try g.publish("t1", "a");
+    try g.publish("t2", "b");
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+    }
+
+    try g.heartbeat();
+    try std.testing.expectEqual(@as(u64, 1), g.dropped_lazy_ihave_backpressure);
+    try std.testing.expectEqual(@as(u64, 2), g.lazy_i_have_tx);
+
+    const d = g.popOutboxDelivery().?;
+    defer a.free(d.wire);
+    try std.testing.expect(d.to != null and d.to.?.eql(&pv));
+    try std.testing.expectEqual(OutDeliveryKind.lazy_ihave, d.kind);
+}
+
+test "global outbox cap evicts oldest lazy IHAVE" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const pm = try identity.PeerId.random();
+    const pa = try identity.PeerId.random();
+    const pb = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 12,
+        .gossip_lazy = 2,
+        .max_outbox_entries = 2,
+    });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+    }
+
+    const gctl = try control.encodeGraft(a, "t");
+    defer a.free(gctl);
+    const graft = try rpc.encodeControlOnlyRpc(a, gctl);
+    defer a.free(graft);
+
+    g.onPeerConnected(pm);
+    g.onPeerConnected(pa);
+    g.onPeerConnected(pb);
+    try g.handleInboundRpc(pm, graft);
+
+    try g.publish("t", "x");
+    const pub_d = g.popOutboxDelivery().?;
+    defer a.free(pub_d.wire);
+
+    try g.heartbeat();
+    try std.testing.expectEqual(@as(u64, 1), g.dropped_lazy_ihave_backpressure);
+    try std.testing.expectEqual(@as(u64, 2), g.lazy_i_have_tx);
+
+    var saw_pa = false;
+    var saw_pb = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        try std.testing.expectEqual(OutDeliveryKind.lazy_ihave, d.kind);
+        if (d.to) |t| {
+            if (t.eql(&pa)) saw_pa = true;
+            if (t.eql(&pb)) saw_pb = true;
+        }
+    }
+    try std.testing.expect(saw_pa != saw_pb);
+}
+
+test "heartbeat GRAFT prefers higher behaviour score" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const plow = try identity.PeerId.random();
+    const phigh = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 2, .mesh_n = 2, .mesh_n_high = 12 });
+    defer g.deinit();
+
+    try g.setPeerBehaviourScore(plow, 1);
+    try g.setPeerBehaviourScore(phigh, 100);
+
+    try g.subscribe("t");
+    const sub_d = g.popOutboxDelivery().?;
+    defer a.free(sub_d.wire);
+
+    g.onPeerConnected(plow);
+    g.onPeerConnected(phigh);
+    try g.heartbeat();
+
+    const d0 = g.popOutboxDelivery().?;
+    defer a.free(d0.wire);
+    const d1 = g.popOutboxDelivery().?;
+    defer a.free(d1.wire);
+    try std.testing.expect(d0.to != null and d0.to.?.eql(&phigh));
+    try std.testing.expect(d1.to != null and d1.to.?.eql(&plow));
+}
+
+test "PRUNE prefers lowest behaviour score" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const p10 = try identity.PeerId.random();
+    const p20 = try identity.PeerId.random();
+    const p30 = try identity.PeerId.random();
+    const p40 = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 2, .mesh_n_high = 3 });
+    defer g.deinit();
+
+    try g.setPeerBehaviourScore(p10, 10);
+    try g.setPeerBehaviourScore(p20, 20);
+    try g.setPeerBehaviourScore(p30, 30);
+    try g.setPeerBehaviourScore(p40, 40);
+
+    try g.subscribe("t");
+    const sub_d = g.popOutboxDelivery().?;
+    defer a.free(sub_d.wire);
+
+    const graft_ctl = try control.encodeGraft(a, "t");
+    defer a.free(graft_ctl);
+    const graft_full = try rpc.encodeControlOnlyRpc(a, graft_ctl);
+    defer a.free(graft_full);
+
+    for ([_]identity.PeerId{ p10, p20, p30, p40 }) |p| {
+        g.onPeerConnected(p);
+        try g.handleInboundRpc(p, graft_full);
+    }
+    try std.testing.expectEqual(@as(u64, 4), g.meshPeers());
+
+    try g.heartbeat();
+
+    var pruned: [2]identity.PeerId = undefined;
+    var n: usize = 0;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if (try control.decodeFirstPrune(a, ctl)) |pv| {
+            var pvv = pv;
+            defer control.deinitPruneView(a, &pvv);
+            if (d.to) |to| {
+                pruned[n] = to;
+                n += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(pruned[0].eql(&p10));
+    try std.testing.expect(pruned[1].eql(&p20));
+    try std.testing.expectEqual(@as(?usize, 2), g.meshPeerCountForTopic("t"));
 }
 
 test "publish rejects wire over max_transmit_size_bytes" {
