@@ -45,7 +45,7 @@ QUIC UDP pumping: [`transport.quic_endpoint`](../src/transport/quic_endpoint.zig
 - **Tests:** `zig build test` runs library tests and smoke-runs most `example-*` binaries. `example-req-resp-tcp-status` is **compile-only** in that step (TCP + `Io.Threaded` can hang CI); run it manually from `zig-out/bin/`; [`req_resp/wire_tcp.zig`](../src/req_resp/wire_tcp.zig) integration tests cover the path on non-Darwin targets.
 - **Fuzz:** `zig build fuzz` runs `wire fuzz …` tests (`std.testing.fuzz` smoke). Long sessions: `zig build test --fuzz` with the Zig fuzzing UI.
 - **CI:** `zig fmt --check .`, `zig build test`, `zig build fuzz`, `zig build examples`, `zig build` — see [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
-- **Releases:** [release-please](https://github.com/googleapis/release-please) on `main` ([`.github/workflows/release-please.yml`](../.github/workflows/release-please.yml)). [Conventional Commits](https://www.conventionalcommits.org/) keep `CHANGELOG.md` aligned with `build.zig.zon`.
+- **Releases:** [release-please](https://github.com/googleapis/release-please) on `main` ([`.github/workflows/release-please.yml`](../.github/workflows/release-please.yml)). [Conventional Commits](https://www.conventionalcommits.org/) keep `CHANGELOG.md` aligned with `build.zig.zon`. If the release-please job fails because Actions cannot create PRs, enable **Allow GitHub Actions to create and approve pull requests** under repository Actions settings, or set secret `RELEASE_PLEASE_TOKEN` to a PAT with Contents and Pull requests write (the workflow prefers that token when set).
 
 ## Roadmap / hygiene
 
