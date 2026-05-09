@@ -1,10 +1,14 @@
 //! Deterministic wire smoke tests (#44): pseudo-random byte slices must not panic in core parsers.
-//! LibFuzzer / long-run fuzzing and rust-libp2p interop are tracked in [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44).
+//! Tests named `wire fuzz …` use [`std.testing.fuzz`] (corpus smoke in `zig build test`; long runs via `zig build fuzz` / Zig fuzzing).
+//! rust-libp2p interop remains manual — see [`tests/interop/README.md`](../../tests/interop/README.md).
 
 const std = @import("std");
 const varint = @import("varint.zig");
 const frame = @import("req_resp/frame.zig");
 const rpc = @import("gossipsub/rpc.zig");
+const pb = @import("protobuf/wire.zig");
+const snappy_wire = @import("req_resp/snappy_wire.zig");
+const gs_msg = @import("gossipsub/message.zig");
 
 test "wire smoke varint decode" {
     var prng = std.Random.DefaultPrng.init(0xFACADE000044);
@@ -59,4 +63,96 @@ test "wire smoke gossipsub rpc decode paths" {
             defer rpc.freePublishBlobs(a, blobs);
         } else |_| {}
     }
+}
+
+test "wire smoke protobuf varint and length-delimited" {
+    var prng = std.Random.DefaultPrng.init(0x50520044);
+    const rand = prng.random();
+    var buf: [512]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 2500) : (i += 1) {
+        const n = rand.intRangeLessThan(usize, 0, buf.len + 1);
+        rand.bytes(buf[0..n]);
+        _ = pb.decodeVarUInt64(buf[0..n]) catch {};
+        if (buf.len >= 2) {
+            const key = (@as(u64, 1) << 3) | 2;
+            var scratch: [256]u8 = undefined;
+            var key_tmp: [varint.max_encoding_bytes]u8 = undefined;
+            var len_tmp: [varint.max_encoding_bytes]u8 = undefined;
+            const pay_len = @min(n, 200);
+            const key_enc = varint.encodeToScratch(&key_tmp, @intCast(key));
+            const len_enc = varint.encodeToScratch(&len_tmp, pay_len);
+            const prefix_len = key_enc.len + len_enc.len;
+            if (prefix_len + pay_len <= scratch.len) {
+                @memcpy(scratch[0..key_enc.len], key_enc);
+                @memcpy(scratch[key_enc.len..][0..len_enc.len], len_enc);
+                @memcpy(scratch[prefix_len..][0..pay_len], buf[0..pay_len]);
+                var walk = scratch[0 .. prefix_len + pay_len];
+                if (pb.decodeVarUInt64(walk)) |fk| {
+                    walk = walk[fk.len..];
+                    const wt: pb.WireType = @enumFromInt(@as(u3, @truncate(fk.value & 7)));
+                    _ = pb.nextFieldValueLimited(walk, wt, 256) catch {};
+                } else |_| {}
+            }
+        }
+    }
+}
+
+test "wire smoke snappy framed and gossipsub message" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x534E500044);
+    const rand = prng.random();
+    var buf: [4096]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 1200) : (i += 1) {
+        const n = rand.intRangeLessThan(usize, 0, buf.len + 1);
+        rand.bytes(buf[0..n]);
+        if (snappy_wire.decompressFramed(a, buf[0..n])) |out| {
+            defer a.free(out);
+        } else |_| {}
+        if (gs_msg.decode(a, buf[0..n])) |got| {
+            var m = got;
+            defer m.deinit(a);
+        } else |_| {}
+    }
+}
+
+fn wireFuzzVarint(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytesWithHash(&buf, 0xA001);
+    _ = varint.decode(&buf) catch {};
+}
+
+test "wire fuzz varint decode" {
+    try std.testing.fuzz({}, wireFuzzVarint, .{});
+}
+
+fn wireFuzzFrameHeaders(_: void, smith: *std.testing.Smith) !void {
+    var buf: [320]u8 = undefined;
+    smith.bytesWithHash(&buf, 0xA002);
+    _ = frame.parseRequestHeader(&buf) catch {};
+    _ = frame.parseResponseHeader(&buf) catch {};
+}
+
+test "wire fuzz req/resp frame headers" {
+    try std.testing.fuzz({}, wireFuzzFrameHeaders, .{});
+}
+
+fn wireFuzzGossipsubRpc(_: void, smith: *std.testing.Smith) !void {
+    const a = std.testing.allocator;
+    var buf: [2048]u8 = undefined;
+    smith.bytesWithHash(&buf, 0xA003);
+    if (rpc.decodeFirstSubscribe(a, &buf)) |opt| {
+        if (opt) |sv| {
+            var owned = sv;
+            defer rpc.deinitSubscribeView(a, &owned);
+        }
+    } else |_| {}
+    if (rpc.decodeControlPayload(a, &buf)) |opt| {
+        if (opt) |ctl| a.free(ctl);
+    } else |_| {}
+}
+
+test "wire fuzz gossipsub rpc decode" {
+    try std.testing.fuzz({}, wireFuzzGossipsubRpc, .{});
 }

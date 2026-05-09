@@ -12,8 +12,9 @@
 //! Issue [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37): heap dial with connect timeout + optional `/p2p` consistency
 //! ([`dialMultiaddr`], [`dialExtended`]), optional [`QuicLifecycleHooks`] on [`QuicListener`], and
 //! [`stream_multistream.responderHandshakeMultistreamAmong`] for per-stream multistream on the responder.
-//! Issue [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) (dialer): [`dialExtended`] runs
-//! [`quic_peer_identity.verifiedPeerIdFromLibp2pQuicClient`] by default ([`QuicOutboundDialOptions.verify_libp2p_tls_peer`]).
+//! Issue [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16): [`dialExtended`] verifies the **server** leaf by default
+//! ([`QuicOutboundDialOptions.verify_libp2p_tls_peer`]); set [`quic.Libp2pZquicClientDialOptions.client_cert_path`] / `client_key_path`
+//! so mutual TLS completes. Inbound peer id: [`quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn`].
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -469,7 +470,10 @@ pub fn loopbackPingOnce(
     var ma_dial = try multiaddr.Multiaddr.fromString(allocator, dial_str);
     defer ma_dial.deinit();
 
-    var outbound = try QuicOutbound.dial(allocator, ma_dial, .{});
+    var outbound = try QuicOutbound.dial(allocator, ma_dial, .{
+        .client_cert_path = cert_path,
+        .client_key_path = key_path,
+    });
     defer outbound.deinit();
 
     var recv_buf: [65536]u8 = undefined;
@@ -515,7 +519,10 @@ pub fn loopbackPingTwoStreams(
     var ma_dial = try multiaddr.Multiaddr.fromString(allocator, dial_str);
     defer ma_dial.deinit();
 
-    var outbound = try QuicOutbound.dial(allocator, ma_dial, .{});
+    var outbound = try QuicOutbound.dial(allocator, ma_dial, .{
+        .client_cert_path = cert_path,
+        .client_key_path = key_path,
+    });
     defer outbound.deinit();
 
     var recv_buf: [65536]u8 = undefined;
@@ -603,18 +610,23 @@ test "quic tls remote peer id matches listener key" {
     var ma_dial = try multiaddr.Multiaddr.fromString(a, dial_str);
     defer ma_dial.deinit();
 
-    var outbound = try QuicOutbound.dial(a, ma_dial, .{});
+    var outbound = try QuicOutbound.dial(a, ma_dial, .{
+        .client_cert_path = cert_path,
+        .client_key_path = key_path,
+    });
     defer outbound.deinit();
 
     var recv_buf: [65536]u8 = undefined;
     const deadline_ms = wall_time.milliTimestamp() + 20_000;
 
-    var accepted = false;
+    var accepted_conn: ?*ZIo.ConnState = null;
     while (wall_time.milliTimestamp() < deadline_ms) {
         try listener.drive(&recv_buf, 50);
         try outbound.drive(&recv_buf, 50);
-        if (listener.pollAccept() != null) accepted = true;
-        if (accepted and outbound.client.conn.phase == .connected) break;
+        if (accepted_conn == null) {
+            if (listener.pollAccept()) |a2| accepted_conn = a2.conn;
+        }
+        if (accepted_conn != null and outbound.client.conn.phase == .connected) break;
     } else return error.Timeout;
     try outbound.waitConnected(&recv_buf, deadline_ms);
 
@@ -628,4 +640,9 @@ test "quic tls remote peer id matches listener key" {
     var got = try outbound.verifiedRemotePeerId(a, null, now_sec);
     defer got.deinit(a);
     try std.testing.expect(got.eql(&want));
+
+    const srv_conn = accepted_conn orelse return error.TestFailed;
+    var inbound_peer = try quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn(srv_conn, a, null, now_sec);
+    defer inbound_peer.deinit(a);
+    try std.testing.expect(inbound_peer.eql(&want));
 }

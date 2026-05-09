@@ -11,9 +11,9 @@ This directory is reserved for **rust-libp2p ↔ zig-libp2p** wire checks. Issue
 
 ## Today
 
-- In-repo **Zig** coverage: deterministic pseudo-random slices against varint, req/resp frame headers, and gossipsub RPC decoders ([`src/wire_boundaries.zig`](../../src/wire_boundaries.zig)), plus explicit max-size frame tests in [`src/req_resp/frame.zig`](../../src/req_resp/frame.zig).
-- **Rust** harness: not checked in yet; add a `tests/interop/rust/` (or workspace) crate when someone picks up the full #44 acceptance criteria.
+- In-repo **Zig** coverage: deterministic pseudo-random slices plus `std.testing.fuzz` entry points for varint, req/resp frame headers, gossipsub RPC, protobuf length-delimited walks, Snappy framing, and gossipsub `Message` decode ([`src/wire_boundaries.zig`](../../src/wire_boundaries.zig)); explicit max-size frame tests in [`src/req_resp/frame.zig`](../../src/req_resp/frame.zig). CI runs `zig build fuzz` (see root [`README.md`](../../README.md)).
+- **Rust** harness: not checked in yet; add a `tests/interop/rust/` (or workspace) crate when someone extends beyond the CI scope in #44 (24 h libFuzzer per parser, full protocol matrix).
 
 ## Running Zig parser smoke
 
-Same as normal tests: `zig build test` (see root [`README.md`](../../README.md)).
+`zig build test` runs the full suite; `zig build fuzz` runs only the `wire fuzz …` tests (faster, fuzz-oriented).

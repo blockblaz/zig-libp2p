@@ -16,7 +16,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | TCP transport | Done | [#35](https://github.com/ch4r10t33r/zig-libp2p/issues/35) |
 | QUIC /quic-v1 transport (listen, dial, UDP drive, accept) | Done | [#15](https://github.com/ch4r10t33r/zig-libp2p/issues/15) — [`transport.quic_endpoint`](#transport) + zquic |
 | QUIC multiaddr + per-stream negotiate | Done | [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) — [`transport.quic_endpoint`](./src/transport/quic_endpoint.zig): `listenMultiaddr` / `dialMultiaddr` / `dialExtended`, `QuicLifecycleHooks`, `popNextUnreportedPeerBidiStream`, per-stream [`stream_multistream.responderHandshakeMultistreamAmong`](./src/transport/stream_multistream.zig); two-stream loopback test. Server PeerId on outbound QUIC: [`transport.quic_peer_identity`](./src/transport/quic_peer_identity.zig). Rust listener interop: manual until [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44). |
-| libp2p TLS on QUIC (ALPN, peer auth) | Partial | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — Dialer: [`transport.quic_peer_identity`](#transport) + zquic `Client.peerLeafCertificateDer` verify the **server** leaf (`dialExtended` / `dialMultiaddr` default). Listener: client `Certificate` flight not in zquic yet → inbound PeerId from TLS TBD. |
+| libp2p TLS on QUIC (ALPN, peer auth) | Done | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — zquic **1.6.4+** sends TLS `CertificateRequest` on libp2p listeners; dialers set [`Libp2pZquicClientDialOptions.client_cert_path`](#transport) / `client_key_path` with the libp2p identity PEM. [`transport.quic_peer_identity`](#transport): outbound [`verifiedPeerIdFromLibp2pQuicClient`], inbound [`verifiedPeerIdFromLibp2pQuicServerConn`] (server `ConnState`). |
 | Ping behaviour (`/ipfs/ping/1.0.0`) | Done | [#42](https://github.com/ch4r10t33r/zig-libp2p/issues/42) |
 | KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
 | Swarm / network runtime | Done | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — `std.Io.Threaded` command queue (8192) + event channel, 256 cmd/tick, [`Swarm.initWithConfig`] / [`Swarm.tick`] embedder mode, [`Swarm.startBackground`]/[`Swarm.run`]; dial command carries optional `expected_peer`; transport still embedder-owned |
@@ -27,14 +27,14 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Done | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) — [`metrics`](./src/metrics.zig), [`swarm` `SwarmConfig`](./src/swarm.zig), [`gossipsub.runtime` `GossipsubConfig`](./src/gossipsub/runtime.zig) |
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
-| Fuzz / stress / interop harness | Partial | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) — deterministic wire smoke ([`wire_boundaries.zig`](./src/wire_boundaries.zig)), req/resp frame limits ([`req_resp/frame.zig`](./src/req_resp/frame.zig)); [`tests/interop/README.md`](./tests/interop/README.md) roadmap; libFuzzer + rust interop still open |
+| Fuzz / stress / interop harness | Done (CI scope) | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) — `zig build fuzz` runs `std.testing.fuzz` harnesses; expanded smoke in [`wire_boundaries.zig`](./src/wire_boundaries.zig). **Out of band:** multi-hour libFuzzer campaigns and the full rust-libp2p matrix remain manual (see [`tests/interop/README.md`](./tests/interop/README.md)). |
 
 **Still heavy lift for embedders:** forwarding transport events into [`connection_manager`](./src/connection_manager.zig) + [`swarm`](./src/swarm.zig) and binding req/resp to real substreams (behaviour in-tree; wiring remains app-owned). QUIC **UDP pumping** is [`transport.quic_endpoint.drive`](#transport) + zquic; QUIC **dial** path runs default TLS PeerId verification via [`transport.quic_peer_identity`](#transport). Non-zquic TLS still needs [`peerIdFromVerifiedCertificate`](./src/security/libp2p_tls.zig) at the right handshake boundary (#16).
 
 | Requirement | Version / note |
 |-------------|----------------|
 | Zig | **0.16.0** (`minimum_zig_version` in `build.zig.zon`) |
-| QUIC stack | **zquic ≥ 1.6.2** (pinned in `build.zig.zon`; local dev may use `path = \"../zquic\"`, re-exported as `zig_libp2p.zquic`) |
+| QUIC stack | **zquic ≥ 1.6.4** (pinned in `build.zig.zon`; re-exported as `zig_libp2p.zquic`) |
 
 ---
 
@@ -53,8 +53,11 @@ exe.root_module.addImport("zig_libp2p", zig_libp2p.module("zig_libp2p"));
 Application code: `@import("zig_libp2p")` — symbols below match `src/root.zig`.
 
 **Tests:** `zig build test` runs the library test binary (including [`wire_boundaries.zig`](./src/wire_boundaries.zig) pseudo-random parser smoke, #44), then **smoke-runs** most `example-*` programs (exit code 0). The TCP status example is **compile-only** in that step (running it can stall: `Io.Threaded` + TCP accept/dial across threads is unreliable on Darwin and has hung CI on Linux). Run `./zig-out/bin/example-req-resp-tcp-status` manually after `zig build`; `src/req_resp/wire_tcp.zig` integration tests cover the same path on non-Darwin targets.  
+
+**Fuzz (wire parsers, #44):** `zig build fuzz` runs tests whose names match `wire fuzz` (built-in `std.testing.fuzz` smoke). For long libFuzzer sessions use `zig build test --fuzz` with the Zig toolchain fuzzing UI.
+
 **Examples:** `zig build` installs `example-*` binaries under the install prefix; `zig build examples` compiles them without installing. See [`examples/README.md`](./examples/README.md).  
-**CI:** `zig fmt --check .`, `zig build test --summary all`, `zig build examples`, `zig build` (see `.github/workflows/ci.yml`).  
+**CI:** `zig fmt --check .`, `zig build test --summary all`, `zig build fuzz`, `zig build examples`, `zig build` (see `.github/workflows/ci.yml`).  
 **Releases:** [release-please](https://github.com/googleapis/release-please) runs on `main` (`.github/workflows/release-please.yml`). Use [Conventional Commits](https://www.conventionalcommits.org/) so versions and `CHANGELOG.md` stay aligned with `build.zig.zon`.
 
 ---
@@ -122,7 +125,7 @@ Mesh membership is updated on subscribe / unsubscribe / disconnect / inbound con
 | Submodule | Role |
 |-----------|------|
 | `req_resp.frame` | Length-prefixed framing: `max_rpc_message_size`, `parseRequestHeader`, `parseResponseHeader`, `appendRequestPrefix`, `appendResponsePrefix`; `FrameError` = `errors.ReqRespError` |
-| `req_resp.stream` | Incremental scan: `peekRpcUnaryRequest` / `peekRpcUnaryResponse`, `scanCompleteRequest` / `scanCompleteResponse`, `consumePrefix`, `InboundBuffer` |
+| `req_resp.stream` | Incremental scan: `peekRpcUnaryRequest` / `peekRpcUnaryResponse`, `scanCompleteRequest` / `scanCompleteResponse`, `consumePrefix(list, allocator, n)`, `InboundBuffer` |
 | `req_resp.snappy_wire` | Snappy + framing for `ssz_snappy`: `compressBlock`, `decompressBlock`, `compressFramed`, `decompressFramed`, `buildRequestWire`, `buildResponseWire`, `decodeRequestSsz`, `decodeResponseSsz` |
 | `req_resp.runtime` | `ReqResp` / `ReqRespConfig`: outbound `request_id`, inbound `channel_id`, `onPeerDisconnected` → `Disconnected`, `sendResponseChunk` / `finishResponseStream` / `sendErrorResponse`, `create`/`destroy`, `shutdown`, timeouts (#40) |
 | `req_resp.wire_framing` | Shared `ssz_snappy` unary read/write on `std.Io.Reader`/`Writer` after protocol selection; `UnaryResponse` (#40) |

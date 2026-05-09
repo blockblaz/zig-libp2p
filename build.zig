@@ -59,6 +59,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    const wire_fuzz_tests = b.addTest(.{
+        .name = "wire-fuzz",
+        .root_module = mod,
+        .filters = &.{"wire fuzz"},
+    });
+    const run_wire_fuzz = b.addRunArtifact(wire_fuzz_tests);
+    const fuzz_step = b.step("fuzz", "Run `wire fuzz …` tests (std.testing.fuzz smoke); long libFuzzer runs: zig build test --fuzz (#44)");
+    fuzz_step.dependOn(&run_wire_fuzz.step);
+
     const test_step = b.step("test", "Run library unit tests, smoke-run most examples, compile TCP status example");
     test_step.dependOn(&run_unit_tests.step);
 

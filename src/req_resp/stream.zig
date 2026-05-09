@@ -97,8 +97,8 @@ pub fn scanCompleteResponse(buf: []const u8) FrameError!?PoppedResponse {
 }
 
 /// Removes the first `n` bytes from the front of `list`.
-pub fn consumePrefix(list: *std.ArrayList(u8), n: usize) std.mem.Allocator.Error!void {
-    try list.replaceRange(0, n, &.{});
+pub fn consumePrefix(list: *std.ArrayList(u8), gpa: std.mem.Allocator, n: usize) std.mem.Allocator.Error!void {
+    try list.replaceRange(gpa, 0, n, &.{});
 }
 
 /// Default cap for buffered inbound bytes (several max-sized frames plus slack).
@@ -142,8 +142,8 @@ pub const InboundBuffer = struct {
         return peekRpcUnaryResponse(self.raw.items);
     }
 
-    pub fn consume(self: *InboundBuffer, n: usize) std.mem.Allocator.Error!void {
-        try consumePrefix(&self.raw, n);
+    pub fn consume(self: *InboundBuffer, gpa: std.mem.Allocator, n: usize) std.mem.Allocator.Error!void {
+        try consumePrefix(&self.raw, gpa, n);
     }
 };
 
@@ -159,11 +159,11 @@ test "scanCompleteRequest two frames back to back" {
     const f1 = (try scanCompleteRequest(buf.items)).?;
     try std.testing.expectEqual(@as(usize, 1), f1.declared_len);
     try std.testing.expectEqualStrings("a", f1.body);
-    try consumePrefix(&buf, f1.total_len);
+    try consumePrefix(&buf, a, f1.total_len);
 
     const f2 = (try scanCompleteRequest(buf.items)).?;
     try std.testing.expectEqualStrings("b", f2.body);
-    try consumePrefix(&buf, f2.total_len);
+    try consumePrefix(&buf, a, f2.total_len);
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
 
@@ -185,7 +185,7 @@ test "scanCompleteRequest incremental feed" {
     }
     const got = (try inbound.scanRequest()).?;
     try std.testing.expectEqualStrings("xyz", got.body);
-    try inbound.consume(got.total_len);
+    try inbound.consume(a, got.total_len);
     try std.testing.expectEqual(@as(usize, 0), inbound.raw.items.len);
 }
 

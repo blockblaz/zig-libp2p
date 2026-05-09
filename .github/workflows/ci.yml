@@ -60,6 +60,9 @@ jobs:
         echo "All unit test attempts failed"
         exit 1
 
+    - name: Wire fuzz harness (std.testing.fuzz smoke, #44)
+      run: zig build fuzz --summary all
+
     - name: Build example executables
       run: |
         max_attempts=3

@@ -32,6 +32,7 @@ pub const Libp2pZquicServerOptions = struct {
 };
 
 /// [`Io.ServerConfig`] preset: TLS ALPN `libp2p`, raw application streams (no HTTP parsing).
+/// Enables TLS `CertificateRequest` so dialers can present a client cert; zquic exposes the leaf via [`Io.serverConnPeerLeafCertificateDer`].
 /// Use with `zquic.transport.io.Server.init` (or `initFromSocket`) for libp2p-over-QUIC listeners.
 pub fn libp2pZquicServerConfig(options: Libp2pZquicServerOptions) Io.ServerConfig {
     return .{
@@ -46,6 +47,7 @@ pub fn libp2pZquicServerConfig(options: Libp2pZquicServerOptions) Io.ServerConfi
         .http3 = false,
         .alpn = tls_alpn,
         .raw_application_streams = true,
+        .request_client_certificate = true,
     };
 }
 
@@ -57,6 +59,9 @@ pub const Libp2pZquicClientOptions = struct {
     qlog_dir: ?[]const u8 = null,
     cubic: bool = false,
     v2: bool = false,
+    /// Non-empty with [`client_key_path`]: send a client `Certificate` when the server requests one (#16).
+    client_cert_path: []const u8 = "",
+    client_key_path: []const u8 = "",
 };
 
 /// [`Io.ClientConfig`] preset matching [`libp2pZquicServerConfig`].
@@ -72,6 +77,8 @@ pub fn libp2pZquicClientConfig(options: Libp2pZquicClientOptions) Io.ClientConfi
         .http3 = false,
         .alpn = tls_alpn,
         .raw_application_streams = true,
+        .client_cert_path = options.client_cert_path,
+        .client_key_path = options.client_key_path,
     };
 }
 
@@ -99,6 +106,7 @@ test "libp2p zquic server config uses libp2p ALPN and raw streams" {
     });
     try std.testing.expectEqualStrings(tls_alpn, cfg.alpn.?);
     try std.testing.expect(cfg.raw_application_streams);
+    try std.testing.expect(cfg.request_client_certificate);
     try std.testing.expect(!cfg.http3);
     try std.testing.expect(!cfg.http09);
     try std.testing.expectEqual(@as(u16, 4001), cfg.port);

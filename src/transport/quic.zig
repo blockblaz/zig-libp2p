@@ -147,6 +147,8 @@ pub const Libp2pZquicClientDialOptions = struct {
     qlog_dir: ?[]const u8 = null,
     cubic: bool = false,
     v2: bool = false,
+    client_cert_path: []const u8 = "",
+    client_key_path: []const u8 = "",
 };
 
 /// Build a [`ZIo.Client`] for an IPv4 [`QuicV1Endpoint`] using the libp2p QUIC presets.
@@ -164,6 +166,8 @@ pub fn initLibp2pQuicClientFromEndpoint(
         .qlog_dir = dial_options.qlog_dir,
         .cubic = dial_options.cubic,
         .v2 = dial_options.v2,
+        .client_cert_path = dial_options.client_cert_path,
+        .client_key_path = dial_options.client_key_path,
     });
     return ZIo.Client.init(allocator, cfg);
 }
