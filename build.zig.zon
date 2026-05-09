@@ -32,5 +32,6 @@
         "build.zig.zon",
         "src",
         "examples",
+        "tests",
     },
 }

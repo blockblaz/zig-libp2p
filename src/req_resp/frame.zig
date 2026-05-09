@@ -79,3 +79,26 @@ test "response header with code" {
     try std.testing.expectEqual(@as(usize, 5), h.declared_len);
     try std.testing.expectEqualStrings("hello", h.payload);
 }
+
+test "request header accepts declared len at max_rpc_message_size" {
+    var scratch: [varint.max_encoding_bytes]u8 = undefined;
+    const enc = varint.encodeToScratch(&scratch, max_rpc_message_size);
+    const h = try parseRequestHeader(enc);
+    try std.testing.expectEqual(max_rpc_message_size, h.declared_len);
+    try std.testing.expectEqual(@as(usize, 0), h.payload.len);
+}
+
+test "request header rejects declared len one over max" {
+    var scratch: [varint.max_encoding_bytes]u8 = undefined;
+    const enc = varint.encodeToScratch(&scratch, max_rpc_message_size + 1);
+    try std.testing.expectError(error.PayloadTooLarge, parseRequestHeader(enc));
+}
+
+test "response header rejects declared len one over max" {
+    var scratch: [varint.max_encoding_bytes]u8 = undefined;
+    const enc = varint.encodeToScratch(&scratch, max_rpc_message_size + 1);
+    var buf: [1 + varint.max_encoding_bytes]u8 = undefined;
+    buf[0] = 0;
+    @memcpy(buf[1..][0..enc.len], enc);
+    try std.testing.expectError(error.PayloadTooLarge, parseResponseHeader(buf[0 .. 1 + enc.len]));
+}

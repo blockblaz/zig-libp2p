@@ -140,12 +140,23 @@ test "message topic and data round trip" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, got.data.?);
 }
 
-test "decode rejects oversized data field" {
+test "decode rejects oversized data field (total wire over cap)" {
     const a = std.testing.allocator;
     const big = try a.alloc(u8, lim.max_gossip_message_data_bytes + 1);
     defer a.free(big);
     var list = std.ArrayList(u8).empty;
     defer list.deinit(a);
     try w.appendLengthDelimited(&list, a, 2, big);
+    try std.testing.expectError(error.PayloadTooLarge, decode(a, list.items));
+}
+
+test "decode rejects topic length over per-field cap" {
+    const a = std.testing.allocator;
+    const topic = try a.alloc(u8, lim.max_gossip_message_topic_bytes + 1);
+    defer a.free(topic);
+    @memset(topic, 'z');
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try w.appendLengthDelimited(&list, a, 4, topic);
     try std.testing.expectError(error.LengthDelimitedTooLong, decode(a, list.items));
 }

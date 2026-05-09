@@ -27,7 +27,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Done | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) — [`metrics`](./src/metrics.zig), [`swarm` `SwarmConfig`](./src/swarm.zig), [`gossipsub.runtime` `GossipsubConfig`](./src/gossipsub/runtime.zig) |
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
-| Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
+| Fuzz / stress / interop harness | Partial | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) — deterministic wire smoke ([`wire_boundaries.zig`](./src/wire_boundaries.zig)), req/resp frame limits ([`req_resp/frame.zig`](./src/req_resp/frame.zig)); [`tests/interop/README.md`](./tests/interop/README.md) roadmap; libFuzzer + rust interop still open |
 
 **Still heavy lift for embedders:** forwarding transport events into [`connection_manager`](./src/connection_manager.zig) + [`swarm`](./src/swarm.zig) and binding req/resp to real substreams (behaviour in-tree; wiring remains app-owned). QUIC **UDP pumping** is [`transport.quic_endpoint.drive`](#transport) + zquic; QUIC **dial** path runs default TLS PeerId verification via [`transport.quic_peer_identity`](#transport). Non-zquic TLS still needs [`peerIdFromVerifiedCertificate`](./src/security/libp2p_tls.zig) at the right handshake boundary (#16).
 
@@ -52,7 +52,7 @@ exe.root_module.addImport("zig_libp2p", zig_libp2p.module("zig_libp2p"));
 
 Application code: `@import("zig_libp2p")` — symbols below match `src/root.zig`.
 
-**Tests:** `zig build test` runs the library test binary, then **smoke-runs** most `example-*` programs (exit code 0). The TCP status example is **compile-only** in that step (running it can stall: `Io.Threaded` + TCP accept/dial across threads is unreliable on Darwin and has hung CI on Linux). Run `./zig-out/bin/example-req-resp-tcp-status` manually after `zig build`; `src/req_resp/wire_tcp.zig` integration tests cover the same path on non-Darwin targets.  
+**Tests:** `zig build test` runs the library test binary (including [`wire_boundaries.zig`](./src/wire_boundaries.zig) pseudo-random parser smoke, #44), then **smoke-runs** most `example-*` programs (exit code 0). The TCP status example is **compile-only** in that step (running it can stall: `Io.Threaded` + TCP accept/dial across threads is unreliable on Darwin and has hung CI on Linux). Run `./zig-out/bin/example-req-resp-tcp-status` manually after `zig build`; `src/req_resp/wire_tcp.zig` integration tests cover the same path on non-Darwin targets.  
 **Examples:** `zig build` installs `example-*` binaries under the install prefix; `zig build examples` compiles them without installing. See [`examples/README.md`](./examples/README.md).  
 **CI:** `zig fmt --check .`, `zig build test --summary all`, `zig build examples`, `zig build` (see `.github/workflows/ci.yml`).  
 **Releases:** [release-please](https://github.com/googleapis/release-please) runs on `main` (`.github/workflows/release-please.yml`). Use [Conventional Commits](https://www.conventionalcommits.org/) so versions and `CHANGELOG.md` stay aligned with `build.zig.zon`.
@@ -68,7 +68,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | Module | Role |
 |--------|------|
 | `errors` | Layered errors: `ReqRespError`, `GossipsubError`, `TransportError`; `setLastErrorMessage` / `lastErrorMessage` / `clearLastErrorMessage` (#45) |
-| `metrics` | `Metrics`: `lean_gossip_mesh_peers{network_id}`, `swarm_command_dropped_total{reason}`; `writePrometheusText` (#43) |
+| `metrics` | `Metrics`: `lean_gossip_mesh_peers{network_id}`, `swarm_command_dropped_total{network_id,reason}`; `writePrometheusText` / `snapshot` (#43) |
 | `layer_events` | Event carriers: `ReqRespFailure`, `GossipsubFailure`, `TransportFailure` (each has a `kind:` field for `switch`) (#45) |
 | `peer_events` | Peer connection payloads: `Direction` (`inbound` / `outbound` / `unknown`), `DisconnectReason`, `ConnectionFailureResult`, connected / disconnected / failed event structs (#38) |
 | `connection_manager` | Known-peer dial scheduling (multiaddr without `/p2p`), reconnect backoff, refcount + peer events (#38), `knownPeerStatus` / `KnownPeerDialStatus`; optional `setReqResp` → `ReqResp.onPeerDisconnected` on last session close (#40) |
@@ -89,7 +89,9 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 
 ### Metrics (#43)
 
-Share one [`metrics.Metrics`](./src/metrics.zig) via [`swarm.SwarmConfig.metrics`](./src/swarm.zig) and [`gossipsub.runtime.GossipsubConfig.metrics`](./src/gossipsub/runtime.zig). Set `network_id` for the mesh gauge label. The swarm increments `full` / `closed` when `submit` fails; call `recordSwarmCommandDropped(.uninitialized)` from embedder-only paths that bypass an initialized swarm.
+Share one [`metrics.Metrics`](./src/metrics.zig) via [`swarm.SwarmConfig.metrics`](./src/swarm.zig) and [`gossipsub.runtime.GossipsubConfig.metrics`](./src/gossipsub/runtime.zig). Set `network_id` on the registry so both the mesh gauge and swarm drop counters use the same label set. The swarm increments `full` / `closed` when `submit` fails; call `recordSwarmCommandDropped(.uninitialized)` from embedder-only paths that bypass an initialized swarm. Use [`snapshot`](./src/metrics.zig) or [`writePrometheusText`](./src/metrics.zig) for exporters.
+
+Mesh membership is updated on subscribe / unsubscribe / disconnect / inbound control / heartbeat (not per delivered message). Default gossipsub heartbeat is sub-second; for a strict 1 s refresh, the embedder may also call [`setMeshPeers`](./src/metrics.zig) on a timer.
 
 ### `gossip`
 

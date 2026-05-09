@@ -81,3 +81,7 @@ pub const security = struct {
 
 /// Pure-Zig QUIC/TLS stack ([zquic](https://github.com/ch4r10t33r/zquic)), Zig 0.16–pinned in `build.zig.zon`.
 pub const zquic = @import("zquic");
+
+test {
+    _ = @import("wire_boundaries.zig");
+}

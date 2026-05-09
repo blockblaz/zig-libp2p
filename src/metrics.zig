@@ -1,7 +1,7 @@
 //! Prometheus-style metrics for embedders (#43): atomic counters/gauges, lock-free reads.
 //!
 //! Metric names align with zeam / libp2p-glue expectations:
-//! `lean_gossip_mesh_peers{network_id}`, `swarm_command_dropped_total{reason}`.
+//! `lean_gossip_mesh_peers{network_id}`, `swarm_command_dropped_total{network_id,reason}`.
 
 const std = @import("std");
 
@@ -63,6 +63,11 @@ pub const Metrics = struct {
         };
     }
 
+    /// Alias for [`writePrometheusText`] (issue #43 `snapshot` / exporter iteration).
+    pub fn snapshot(self: *const Metrics, w: anytype) !void {
+        return self.writePrometheusText(w);
+    }
+
     /// OpenMetrics-style text (subset). `w` is typically [`std.Io.Writer`] or [`std.ArrayList`]'s writer.
     pub fn writePrometheusText(self: *const Metrics, w: anytype) !void {
         try w.writeAll("# TYPE lean_gossip_mesh_peers gauge\n");
@@ -78,7 +83,9 @@ pub const Metrics = struct {
 
         try w.writeAll("# TYPE swarm_command_dropped_total counter\n");
         inline for (std.enums.values(SwarmDropReason)) |r| {
-            try w.writeAll("swarm_command_dropped_total{reason=\"");
+            try w.writeAll("swarm_command_dropped_total{network_id=\"");
+            try writeEscapedLabelValue(w, self.network_id);
+            try w.writeAll("\",reason=\"");
             try w.writeAll(reasonLabel(r));
             try w.writeAll("\"} ");
             try std.fmt.format(w, "{d}\n", .{self.swarmCommandDropped(r)});
@@ -101,9 +108,26 @@ test "metrics prometheus text shape" {
     try std.testing.expect(std.mem.indexOf(u8, s, "lean_gossip_mesh_peers") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "network_id=\"devnet0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, " 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "network_id=\"devnet0\",reason=\"full\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "network_id=\"devnet0\",reason=\"closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "network_id=\"devnet0\",reason=\"uninitialized\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "reason=\"full\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "reason=\"closed\"} 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "reason=\"uninitialized\"} 0") != null);
+
+    var buf2 = std.ArrayList(u8).empty;
+    defer buf2.deinit(std.testing.allocator);
+    try m.snapshot(&buf2.writer(std.testing.allocator));
+    try std.testing.expectEqualStrings(s, buf2.items);
+}
+
+test "metrics empty network_id on swarm counters" {
+    var m = Metrics{};
+    m.recordSwarmCommandDropped(.full);
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(std.testing.allocator);
+    try m.writePrometheusText(&buf.writer(std.testing.allocator));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "network_id=\"\",reason=\"full\"") != null);
 }
 
 test "metrics label escaping" {
