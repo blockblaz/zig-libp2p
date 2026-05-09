@@ -1,14 +1,16 @@
 //! libp2p ping 1.0.0 (`/ipfs/ping/1.0.0`) — RTT payload exchange and optional keepalive policy.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const errors = @import("errors.zig");
+const wall_time = @import("wall_time.zig");
 
 /// Multistream negotiation line including newline.
 pub const protocol_line: []const u8 = "/ipfs/ping/1.0.0\n";
 
 /// Protocol id passed to multistream-select (no trailing newline), same logical name as [`protocol_line`].
-pub const multistream_protocol_id: []const u8 = std.mem.trimRight(u8, protocol_line, "\n");
+pub const multistream_protocol_id: []const u8 = std.mem.trimEnd(u8, protocol_line, "\n");
 
 /// Payload size for each ping or pong datagram on the stream.
 pub const payload_len: usize = 32;
@@ -31,7 +33,26 @@ fn mapWriterErr(err: Io.Writer.Error) errors.ReqRespError {
 
 /// Fill `payload` with random bytes suitable for a ping datagram.
 pub fn randomPayload(payload: *[payload_len]u8) void {
-    std.crypto.random.bytes(payload);
+    if (builtin.link_libc) {
+        std.c.arc4random_buf(payload.ptr, payload.len);
+        return;
+    }
+    if (builtin.os.tag == .linux) {
+        var off: usize = 0;
+        while (off < payload.len) {
+            const rc = std.os.linux.getrandom(payload.ptr + off, payload.len - off, 0);
+            const e = std.posix.errno(rc);
+            if (e == .SUCCESS) {
+                off += @intCast(rc);
+            } else if (e == .INTR) {
+                continue;
+            } else {
+                @panic("getrandom failed");
+            }
+        }
+        return;
+    }
+    @compileError("randomPayload requires libc (e.g. arc4random_buf) or Linux getrandom");
 }
 
 /// Write one ping/pong payload and flush.
@@ -55,11 +76,11 @@ pub fn handleInbound(r: *Io.Reader, w: *Io.Writer) WireError!void {
 /// Initiator: send `payload`, read echo, ensure it matches. Returns wall-clock RTT in milliseconds.
 pub fn initiatorRoundTripMs(r: *Io.Reader, w: *Io.Writer, payload: *[payload_len]u8) WireError!u64 {
     randomPayload(payload);
-    const t0: u64 = @intCast(std.time.milliTimestamp());
+    const t0: u64 = @intCast(wall_time.milliTimestamp());
     try writePayload(w, payload);
     var echo: [payload_len]u8 = undefined;
     try readPayload(r, &echo);
-    const t1: u64 = @intCast(std.time.milliTimestamp());
+    const t1: u64 = @intCast(wall_time.milliTimestamp());
     if (!std.mem.eql(u8, payload, &echo)) return error.InvalidData;
     return t1 - t0;
 }

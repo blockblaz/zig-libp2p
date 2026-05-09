@@ -10,6 +10,7 @@
 //!    or use [`ping_wire_quic`] / [`req_resp.wire_quic`] for ping / ssz_snappy req/resp on a raw stream.
 //!
 //! This module adds multiaddr parsing for typical `/udp/.../quic-v1` dial and listen addresses.
+//! For listen / dial / [`drive`] / accept over UDP, see [`quic_endpoint`] (#15).
 
 const std = @import("std");
 const multiaddr = @import("multiaddr");
@@ -23,6 +24,9 @@ pub const quic_raw_stream_io = @import("quic_raw_stream_io.zig");
 const net = std.Io.net;
 const posix = std.posix;
 const ZIo = zquic.transport.io;
+const quic_posix_udp = @import("quic_posix_udp.zig");
+
+const protocol_iter_next_err = @typeInfo(@typeInfo(@TypeOf(multiaddr.ProtocolIterator.next)).@"fn".return_type.?).error_union.error_set;
 
 /// IP + UDP port + optional `/p2p` expectation after `/quic-v1`.
 pub const QuicV1Endpoint = struct {
@@ -34,12 +38,12 @@ pub const ParseQuicV1EndpointError = error{
     MissingIp,
     MissingUdpPort,
     MissingQuicV1Component,
-} || multiaddr.multiaddr.Error;
+} || multiaddr.multiaddr.Error || protocol_iter_next_err;
 
 /// zquic `Client.init` / event loop is IPv4 UDP only in the current pin; use IPv6 once zquic grows an IPv6 client socket path.
 pub const Libp2pQuicClientDialError = error{ZquicClientIpv4Only};
 
-pub const BindUdpSocketError = posix.SocketError || posix.BindError;
+pub const BindUdpSocketError = quic_posix_udp.SocketError || quic_posix_udp.BindError;
 
 /// Extract host/port and optional PeerId from a multiaddr that includes `/udp/.../quic-v1`.
 /// Ignores unrelated components (for example `/p2p-circuit`) except those matched above.
@@ -93,28 +97,25 @@ pub fn formatZquicDialHost(address: net.IpAddress, buf: []u8) (Libp2pQuicClientD
 pub fn bindUdpSocket(address: net.IpAddress) BindUdpSocketError!posix.socket_t {
     return switch (address) {
         .ip4 => |v| {
-            const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
-            errdefer posix.close(sock);
+            const sock = try quic_posix_udp.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+            errdefer quic_posix_udp.close(sock);
             var sa: posix.sockaddr.in = .{
-                .family = posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, v.port),
                 .addr = @bitCast(v.bytes),
-                .padding = undefined,
             };
-            try posix.bind(sock, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+            try quic_posix_udp.bind(sock, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
             return sock;
         },
         .ip6 => |v| {
-            const sock = try posix.socket(posix.AF.INET6, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
-            errdefer posix.close(sock);
+            const sock = try quic_posix_udp.socket(posix.AF.INET6, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+            errdefer quic_posix_udp.close(sock);
             var sa: posix.sockaddr.in6 = .{
-                .family = posix.AF.INET6,
                 .port = std.mem.nativeToBig(u16, v.port),
                 .flowinfo = v.flow,
                 .addr = v.bytes,
                 .scope_id = v.interface.index,
             };
-            try posix.bind(sock, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+            try quic_posix_udp.bind(sock, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
             return sock;
         },
     };
@@ -129,7 +130,7 @@ pub fn initLibp2pQuicServerFromMultiaddr(
 ) !*ZIo.Server {
     const ep = try parseQuicV1Endpoint(ma);
     const sock = try bindUdpSocket(ep.address);
-    errdefer posix.close(sock);
+    errdefer quic_posix_udp.close(sock);
 
     var cfg_opts = options;
     cfg_opts.port = ep.address.getPort();
@@ -230,5 +231,5 @@ test "bindUdpSocket ipv4 loopback" {
         .bytes = .{ 127, 0, 0, 1 },
         .port = 0,
     } });
-    defer posix.close(sock);
+    defer quic_posix_udp.close(sock);
 }

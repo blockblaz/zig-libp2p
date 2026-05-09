@@ -21,8 +21,8 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            .url = "git+https://github.com/ch4r10t33r/zquic#637d38cfd9572d2a56daaff96c227f41d12f33d9",
-            .hash = "zquic-1.6.0-2zRc1KoWEACzqZx9oIYq9YjqBg5mRjParQWCTidrSr_0",
+            .url = "git+https://github.com/ch4r10t33r/zquic.git#v1.6.1",
+            .hash = "zquic-1.6.1-2zRc1IUcEAARvpZHmY5duLJSWUq9S69SyEJlxFRT6AVM",
         },
     },
     .paths = .{

@@ -14,7 +14,8 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Gossipsub codec | Done | — |
 | Snappy framing | Done | — |
 | TCP transport | Done | [#35](https://github.com/ch4r10t33r/zig-libp2p/issues/35) |
-| QUIC multiaddr + per-stream negotiate | Partial | [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) |
+| QUIC /quic-v1 transport (listen, dial, UDP drive, accept) | Done | [#15](https://github.com/ch4r10t33r/zig-libp2p/issues/15) — [`transport.quic_endpoint`](#transport) + zquic |
+| QUIC multiaddr + per-stream negotiate | Partial | [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) — interop / lifecycle hooks / Rust listener checks still open |
 | libp2p TLS on QUIC (ALPN, peer auth) | Partial | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — [`security.libp2p_tls`](#security) implements cert + SignedKey verification (`peerIdFromVerifiedCertificate`); embedders must invoke it on the peer leaf cert after TLS. |
 | Ping behaviour (`/ipfs/ping/1.0.0`) | Done | [#42](https://github.com/ch4r10t33r/zig-libp2p/issues/42) |
 | KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
@@ -28,7 +29,7 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
 | Fuzz / stress / interop harness | Not started | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) |
 
-**Still heavy lift for embedders:** gossipsub mesh policy (GRAFT/PRUNE, lazy gossip, per-topic peer sets), req/resp behaviour, wiring [`peerIdFromVerifiedCertificate`](./src/security/libp2p_tls.zig) into the TLS peer-cert path (library provides verification; transport must call it), and forwarding transport events into [`connection_manager`](./src/connection_manager.zig). QUIC listen/dial lifecycle remains primarily [zquic](https://github.com/ch4r10t33r/zquic) + [`transport.quic_v1`](#transport) presets.
+**Still heavy lift for embedders:** gossipsub mesh policy (GRAFT/PRUNE, lazy gossip, per-topic peer sets), req/resp behaviour, wiring [`peerIdFromVerifiedCertificate`](./src/security/libp2p_tls.zig) into the TLS peer-cert path (library provides verification; transport must call it), and forwarding transport events into [`connection_manager`](./src/connection_manager.zig). QUIC **UDP pumping** is [`transport.quic_endpoint.drive`](#transport) + zquic; embedders still own scheduling and peer-id verification from TLS material (#16).
 
 | Requirement | Version / note |
 |-------------|----------------|
@@ -126,6 +127,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 |-----------|------|
 | `transport.quic_v1` | QUIC v1 labels + zquic wiring: `multistream_protocol_id`, `tls_alpn` (alias of `security.libp2p_tls.quic_application_layer_protocol`), `libp2pZquicServerConfig` / `libp2pZquicClientConfig` (`raw_application_streams`), `appendFirstBidiStreamInitiatorHandshake` |
 | `transport.quic` | QUIC transport entrypoint: re-exports `quic_v1` + `stream_multistream`, `parseQuicV1Endpoint`, `initLibp2pQuicServerFromMultiaddr` / `initLibp2pQuicClientFromMultiaddr` / `initLibp2pQuicClientFromEndpoint`, `bindUdpSocket` for `/udp/.../quic-v1` (and optional `/p2p`) |
+| `transport.quic_endpoint` | **#15:** `QuicListener` (`listen`, `drive`, `pollAccept`, `boundUdpPortIpv4`), `QuicOutbound` (`dial`, `drive`, `waitConnected`, `nextLocalBidiStream`), `loopbackPingOnce` self-check; multistream length helpers in `stream_multistream` for single-threaded pumping |
 | `transport.transport_error` | Maps `std.Io.net`, multistream I/O, `security.libp2p_tls`, `security.noise.libp2p` (`fromLibp2pNoise`), and **zquic** (`fromZquicWireTransport`, `fromZquicOpenLocalStream`, typed `fromZquicIoSetup` / `fromZquicRun` on `ZquicIoSetupError` / `ZquicRunError`) into `TransportError` |
 | `transport.stream_multistream` | Per-stream multistream-select on `std.Io.Reader` / `Writer`: `StreamHandshakeError` = `errors.TransportError` \|\| `Allocator.Error`; `appendFirstStreamInitiatorHandshake` still uses `NegotiateError` for buffer-only builds |
 | `transport.tcp` | TCP over `std.Io.net`: `listen` / `dial` / `acceptTuned` surface `TransportError` (plus `SocketTuningFailed` where tuning runs), `multistream_protocol_id`, thin wrappers around `stream_multistream` |
@@ -145,7 +147,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 Priorities follow the [parity table](#zeam-parity) and [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31). Sensible next picks (after examples/CI hygiene):
 
 1. **Gossipsub #39** — lazy gossip (IHAVE → IWANT → deliver), mesh scoring, optional per-peer outbound caps on top of the global outbox.
-2. **QUIC #37 + TLS #16** — one documented end-to-end sample (tmpdir PEM + packet pump) or a small `transport.quic` helper that owns the pump; wire `peerIdFromVerifiedCertificate` at the handshake boundary.
+2. **QUIC #37 + TLS #16** — Rust listener interop / peer-id from peer leaf cert (#16); `transport.quic_endpoint` + `example-quic-ping-loopback` cover listen/dial/pump/ping on zquic.
 3. **Noise #36** — example using `security.noise.stream_upgrade` on a TCP stream after multistream.
 4. **Swarm / connection_manager #34 / #38** — thin example forwarding synthetic transport events into `ConnectionManager` + optional `ReqResp`.
 5. **Metrics #43** — counters/histograms behind a narrow interface.

@@ -6,6 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 const errors = @import("../errors.zig");
+const ms = @import("../multistream.zig");
 const neg = @import("multistream_negotiate.zig");
 const terr = @import("transport_error.zig");
 
@@ -21,6 +22,18 @@ pub fn appendFirstStreamInitiatorHandshake(
     try neg.initiatorSendProtocol(write, allocator, protocol_id);
 }
 
+/// Wire size of [`appendFirstStreamInitiatorHandshake`] output for length-based QUIC pumping.
+pub fn initiatorFirstWriteWireLen(protocol_id: []const u8) neg.NegotiateError!usize {
+    try neg.validateProtocolId(protocol_id);
+    return ms.multistream_1_0_0.len + protocol_id.len + 1;
+}
+
+/// Wire size of the responder's successful multistream reply (header + `protocol_id\n`).
+pub fn responderSuccessReplyWireLen(protocol_id: []const u8) neg.NegotiateError!usize {
+    try neg.validateProtocolId(protocol_id);
+    return ms.multistream_1_0_0.len + protocol_id.len + 1;
+}
+
 pub const StreamHandshakeError = errors.TransportError || std.mem.Allocator.Error;
 
 fn compactConsumed(acc: *std.ArrayList(u8), allocator: std.mem.Allocator, rem: []const u8) std.mem.Allocator.Error!void {
@@ -30,11 +43,28 @@ fn compactConsumed(acc: *std.ArrayList(u8), allocator: std.mem.Allocator, rem: [
 
 fn readMoreHandshake(acc: *std.ArrayList(u8), r: *Io.Reader, allocator: std.mem.Allocator) StreamHandshakeError!void {
     if (acc.items.len >= handshake_accum_cap) return error.ProtocolNegotiationFailed;
-    var chunk: [512]u8 = undefined;
-    const n = r.readSliceShort(&chunk) catch |e| return terr.fromMultistreamStreamLayer(e);
+    // `readSliceShort` keeps pulling until the slice is full or the stream ends. For finite
+    // buffered sources (QUIC recv buffer drained into `Io.Reader`), that can call `stream`
+    // again after all bytes were moved to the reader scratch and surface `ReadFailed`.
+    // One byte per step matches multistream line parsing and avoids over-reading.
+    var byte: [1]u8 = undefined;
+    const n = r.readSliceShort(&byte) catch |e| return terr.fromMultistreamStreamLayer(e);
     if (n == 0) return error.ProtocolNegotiationFailed;
-    try acc.appendSlice(allocator, chunk[0..n]);
+    try acc.appendSlice(allocator, &byte);
     if (acc.items.len > handshake_accum_cap) return error.ProtocolNegotiationFailed;
+}
+
+/// Like [`readMoreHandshake`], but returns `false` when the stream layer has no byte yet (`ReadFailed`).
+fn tryReadMoreHandshake(acc: *std.ArrayList(u8), r: *Io.Reader, allocator: std.mem.Allocator) StreamHandshakeError!bool {
+    if (acc.items.len >= handshake_accum_cap) return error.ProtocolNegotiationFailed;
+    var byte: [1]u8 = undefined;
+    const n = r.readSliceShort(&byte) catch |e| switch (e) {
+        error.ReadFailed => return false,
+    };
+    if (n == 0) return error.ProtocolNegotiationFailed;
+    try acc.appendSlice(allocator, &byte);
+    if (acc.items.len > handshake_accum_cap) return error.ProtocolNegotiationFailed;
+    return true;
 }
 
 /// Initiator: send multistream header + `protocol_id`, then read peer header and ack.
@@ -55,6 +85,20 @@ pub fn initiatorHandshakeMultistream(
     };
     Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
     Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+
+    return initiatorHandshakeMultistreamReadPhase(r, w, protocol_id, allocator);
+}
+
+/// Initiator: after [`appendFirstStreamInitiatorHandshake`] was written and flushed, read peer header and protocol ack.
+pub fn initiatorHandshakeMultistreamReadPhase(
+    r: *Io.Reader,
+    w: *Io.Writer,
+    protocol_id: []const u8,
+    allocator: std.mem.Allocator,
+) StreamHandshakeError!void {
+    _ = w;
+    var acc = std.ArrayList(u8).empty;
+    defer acc.deinit(allocator);
 
     while (true) {
         var rem: []const u8 = acc.items;
@@ -98,6 +142,34 @@ pub fn responderHandshakeMultistream(
             error.MissingNewline => try readMoreHandshake(&acc, r, allocator),
             else => return terr.fromMultistreamStreamLayer(err),
         }
+    }
+
+    // After the multistream offer line, `acc` often holds only that line: the protocol
+    // id may still sit in the QUIC recv buffer. Pull bytes until we can parse the
+    // protocol offer or the buffer is empty; if complete, send header+ack in **one**
+    // write (avoids a tiny second STREAM frame that loopback was losing at 22/36 bytes).
+    while (true) {
+        var rem_probe: []const u8 = acc.items;
+        const offered_prefetch = neg.responderReadProtocolOffer(&rem_probe, neg.default_max_body_len) catch |err| switch (err) {
+            error.MissingNewline => @as(?[]const u8, null),
+            else => |e| return terr.fromMultistreamStreamLayer(e),
+        };
+        if (offered_prefetch) |offered| {
+            // `offered` borrows from `acc`; build the wire reply before `compactConsumed` mutates `acc`.
+            var out = std.ArrayList(u8).empty;
+            defer out.deinit(allocator);
+            try neg.responderSendMultistreamHeader(&out, allocator);
+            neg.responderReplyProtocol(&out, allocator, offered, supported_protocol_id) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => |err| return terr.fromMultistreamStreamLayer(err),
+            };
+            try compactConsumed(&acc, allocator, rem_probe);
+            Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
+            Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+            return;
+        }
+        const pulled = try tryReadMoreHandshake(&acc, r, allocator);
+        if (!pulled) break;
     }
 
     var out = std.ArrayList(u8).empty;
