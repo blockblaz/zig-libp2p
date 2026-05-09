@@ -101,7 +101,8 @@ pub fn nextFieldValueLimited(buf: []const u8, wire_type: WireType, max_length_de
 pub fn decodeFieldKey(buf: []const u8) Error!struct { field_number: u32, wire_type: WireType, len: usize } {
     const dec = try decodeVarUInt64(buf);
     if (dec.value == 0) return error.InvalidFieldNumber;
-    const field_number = @as(u32, @intCast(dec.value >> 3));
+    const shifted = dec.value >> 3;
+    const field_number = std.math.cast(u32, shifted) orelse return error.InvalidFieldNumber;
     if (field_number == 0) return error.InvalidFieldNumber;
     const wt = dec.value & 7;
     const wire_type: WireType = switch (wt) {
@@ -112,6 +113,15 @@ pub fn decodeFieldKey(buf: []const u8) Error!struct { field_number: u32, wire_ty
         else => return error.UnsupportedWireType,
     };
     return .{ .field_number = field_number, .wire_type = wire_type, .len = dec.len };
+}
+
+test "decodeFieldKey rejects field number that does not fit u32" {
+    const a = std.testing.allocator;
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    const tag = (@as(u64, 1) << 35) | 2;
+    try appendVarUInt64(&list, a, tag);
+    try std.testing.expectError(error.InvalidFieldNumber, decodeFieldKey(list.items));
 }
 
 test "varUInt64 round trip small values" {
