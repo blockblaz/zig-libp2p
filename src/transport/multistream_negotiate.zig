@@ -116,6 +116,44 @@ pub fn responderReplyProtocol(
     }
 }
 
+/// Reply with the offered protocol line if it appears in `candidates`, otherwise `na\n`.
+/// Returns the index in `candidates` when acknowledged, or `null` when `na` was sent.
+pub fn responderReplyProtocolAmong(
+    write: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    offered: []const u8,
+    candidates: []const []const u8,
+) (NegotiateError || std.mem.Allocator.Error)!?usize {
+    try validateProtocolId(offered);
+    for (candidates, 0..) |p, i| {
+        try validateProtocolId(p);
+        if (std.mem.eql(u8, offered, p)) {
+            try appendProtocolLine(write, allocator, offered);
+            return i;
+        }
+    }
+    try write.appendSlice(allocator, "na\n");
+    return null;
+}
+
+test "responderReplyProtocolAmong picks first match" {
+    const a = std.testing.allocator;
+    var w = std.ArrayList(u8).empty;
+    defer w.deinit(a);
+    const cands: []const []const u8 = &.{ "/foo/a", "/foo/b" };
+    try std.testing.expectEqual(@as(?usize, 0), try responderReplyProtocolAmong(&w, a, "/foo/a", cands));
+    try std.testing.expectEqualStrings("/foo/a\n", w.items);
+}
+
+test "responderReplyProtocolAmong sends na when no match" {
+    const a = std.testing.allocator;
+    var w = std.ArrayList(u8).empty;
+    defer w.deinit(a);
+    const cands: []const []const u8 = &.{ "/foo/a", "/foo/b" };
+    try std.testing.expectEqual(@as(?usize, null), try responderReplyProtocolAmong(&w, a, "/other", cands));
+    try std.testing.expectEqualStrings("na\n", w.items);
+}
+
 test "readNegotiationLine happy" {
     const rem: []const u8 = "/foo/bar\nleftover";
     var p: []const u8 = rem;

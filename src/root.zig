@@ -60,6 +60,7 @@ pub const transport = struct {
     pub const quic = @import("transport/quic.zig");
     pub const quic_raw_stream_io = @import("transport/quic_raw_stream_io.zig");
     pub const quic_endpoint = @import("transport/quic_endpoint.zig");
+    pub const quic_peer_identity = @import("transport/quic_peer_identity.zig");
     pub const stream_multistream = @import("transport/stream_multistream.zig");
     pub const tcp = @import("transport/tcp.zig");
     pub const multistream_negotiate = @import("transport/multistream_negotiate.zig");
