@@ -21,8 +21,8 @@ Tracking native replacement for Zeam’s `libp2p-glue`: [#31](https://github.com
 | Swarm / network runtime | Partial | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — threaded command/event runtime; transport integration still embedder-owned |
 | Noise XX | Partial | [#36](https://github.com/ch4r10t33r/zig-libp2p/issues/36) — [`security.noise`](#security): use [`security.noise.stream_upgrade`](./src/security/noise/stream_upgrade.zig) for multistream `/noise` + handshake on a stream; interop tests can live in Zeam. |
 | Connection manager | Partial | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) — `connection_manager` + `peer_events`; embedder must call `tick` / `onDialFailure` / `onConnectionEstablished` / `onConnectionClosed` from transport |
-| Gossipsub mesh runtime | Partial | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) — `gossipsub.runtime`: per-topic mesh, inbound GRAFT/PRUNE, heartbeat GRAFT/PRUNE toward `mesh_n` / `mesh_n_low` / `mesh_n_high`, publish forwarding + `OutDelivery` outbox; IHave/IWant, scoring, bounded per-peer queues still TBD |
-| Req/resp behaviour | Partial | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40): `req_resp.runtime` + TCP wire harness `req_resp.wire_tcp` (multistream + framed bytes per connection); QUIC: same pattern on a raw stream via `transport.quic_raw_stream_io` + `transport.stream_multistream` |
+| Gossipsub mesh runtime | Partial | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) — `gossipsub.runtime`: per-topic mesh, inbound GRAFT/PRUNE, heartbeat GRAFT/PRUNE toward `mesh_n` / `mesh_n_low` / `mesh_n_high`, publish forwarding + bounded `OutDelivery` outbox (`max_outbox_entries`, `PublishQueueFull`), inbound IHAVE/IWant observation counters; lazy gossip behaviour, scoring, per-peer queue caps still TBD |
+| Req/resp behaviour | Partial | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40): `req_resp.runtime` + shared `req_resp.wire_framing`, TCP `req_resp.wire_tcp`, QUIC `req_resp.wire_quic` (multistream + same framing on a zquic raw bidi stream; embedder must pump UDP between reads) |
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Not started | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) |
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; per-thread `setLastErrorMessage` / `lastErrorMessage` for Rust-style string context |
@@ -95,7 +95,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `gossipsub.config` | Zeam gossipsub constants: `mesh_n` / `mesh_n_low` / `mesh_n_high`, `gossip_lazy`, `heartbeat_interval_ms`, `duplicate_cache_ttl_ms`, `history_length`, `max_transmit_size_bytes` (#39) |
 | `gossipsub.message_id` | Wire message ID: `writeMessageId(topic, data, snappy_decompressed_ok, out20)` — SHA256 domain + topic len + topic + data, truncated to 20 bytes (#39) |
 | `gossipsub.duplicate_cache` | TTL map `(topic, id)` → expiry; `prune`, `checkDuplicate` (#39) |
-| `gossipsub.runtime` | `Gossipsub` + `GossipsubConfig.validate` (`InitConfigError`), `meshPeerCountForTopic`, inbound `subscriptions` for GRAFT candidate narrowing, `popOutboxDelivery` (#39) |
+| `gossipsub.runtime` | `Gossipsub` + `GossipsubConfig.validate` (`InitConfigError`), `max_outbox_entries`, `meshPeerCountForTopic`, inbound `subscriptions` for GRAFT candidate narrowing, `popOutboxDelivery`, IHAVE/IWant rx counters (#39) |
 | `gossipsub.rpc` | RPC envelope: `encodeEmptyControlRpc`, `encodeControlOnlyRpc`, `encodeSubscribe` / `decodeFirstSubscribe` / `decodeSubscribes` / `freeSubscribeViews`, `deinitSubscribeView`, `decodeControlPayload`, `encodePublish` / `decodeFirstPublish`, `decodePublishes` / `freePublishBlobs` |
 | `gossipsub.control` | Control message fragments: **IHave** / **IWant** / **IDontWant** / **graft** / **prune**; **ControlExtensions** (`partialMessages`): `encodeControlExtensions`, `encodeControlMessageExtensionsOnly`, `decodeFirstControlExtensions`, `ControlExtensionsView` |
 | `gossipsub.message` | `Message` protobuf: `MessageView`, `MessageOwned`, `encode`, `decode`, `MessageOwned.deinit` |
@@ -114,7 +114,9 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `req_resp.stream` | Incremental scan: `peekRpcUnaryRequest` / `peekRpcUnaryResponse`, `scanCompleteRequest` / `scanCompleteResponse`, `consumePrefix`, `InboundBuffer` |
 | `req_resp.snappy_wire` | Snappy + framing for `ssz_snappy`: `compressBlock`, `decompressBlock`, `compressFramed`, `decompressFramed`, `buildRequestWire`, `buildResponseWire`, `decodeRequestSsz`, `decodeResponseSsz` |
 | `req_resp.runtime` | `ReqResp` / `ReqRespConfig`: outbound `request_id`, inbound `channel_id`, `onPeerDisconnected` → `Disconnected`, `sendResponseChunk` / `finishResponseStream` / `sendErrorResponse`, `create`/`destroy`, `shutdown`, timeouts (#40) |
-| `req_resp.wire_tcp` | TCP end-to-end: one socket = one substream; `initiatorUnaryExchange`, `initiatorReadResponseSequence`, `responderUnarySequence` (`transport.tcp` multistream + `snappy_wire`) (#40) |
+| `req_resp.wire_framing` | Shared `ssz_snappy` unary read/write on `std.Io.Reader`/`Writer` after protocol selection (#40) |
+| `req_resp.wire_tcp` | TCP: one socket = one substream; `initiatorUnaryExchange`, `initiatorReadResponseSequence`, `responderUnarySequence` (`transport.tcp` multistream + `wire_framing`) (#40) |
+| `req_resp.wire_quic` | QUIC raw bidi stream: same helpers as TCP using `quic_raw_stream_io` + `stream_multistream` + `wire_framing`; requires zquic UDP pumping (#40) |
 
 ### `transport`
 
