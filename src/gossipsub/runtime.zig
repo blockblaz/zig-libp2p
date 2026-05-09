@@ -9,6 +9,7 @@
 const std = @import("std");
 const identity = @import("../identity.zig");
 const connection_manager = @import("../connection_manager.zig");
+const errors = @import("../errors.zig");
 const control = @import("control.zig");
 const duplicate_cache = @import("duplicate_cache.zig");
 const gs_cfg = @import("config.zig");
@@ -22,14 +23,18 @@ pub const GossipsubConfig = struct {
     mesh_n_low: u8 = gs_cfg.mesh_n_low,
     mesh_n: u8 = gs_cfg.mesh_n,
     mesh_n_high: u8 = gs_cfg.mesh_n_high,
+    /// Max queued outbound RPC blobs (`OutDelivery`) before subscribe/publish/heartbeat return
+    /// `errors.GossipsubError.PublishQueueFull` (#39).
+    max_outbox_entries: usize = 4096,
 
     pub fn validate(c: GossipsubConfig) InitConfigError!void {
         if (c.mesh_n_low > c.mesh_n) return error.InvalidMeshKnobs;
         if (c.mesh_n > c.mesh_n_high) return error.InvalidMeshKnobs;
+        if (c.max_outbox_entries == 0) return error.InvalidOutboxCap;
     }
 };
 
-pub const InitConfigError = error{InvalidMeshKnobs};
+pub const InitConfigError = error{ InvalidMeshKnobs, InvalidOutboxCap };
 
 pub const OutDelivery = struct {
     wire: []u8,
@@ -61,6 +66,10 @@ pub const Gossipsub = struct {
     clock_ms: i64,
     outbox: std.ArrayList(OutDelivery),
     inbound_delivered: u64,
+    /// Count of inbound control blobs that contained at least one IHAVE entry (observability, #39).
+    control_i_have_rx: u64,
+    /// Count of inbound control blobs that contained at least one IWANT entry.
+    control_i_want_rx: u64,
     scratch_peers: std.ArrayList(identity.PeerId),
 
     pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
@@ -78,6 +87,8 @@ pub const Gossipsub = struct {
             .clock_ms = 0,
             .outbox = .init(allocator),
             .inbound_delivered = 0,
+            .control_i_have_rx = 0,
+            .control_i_want_rx = 0,
             .scratch_peers = .init(allocator),
         };
         return p;
@@ -108,7 +119,8 @@ pub const Gossipsub = struct {
         self.clock_ms = t;
     }
 
-    fn appendOut(self: *Gossipsub, wire: []u8, to: ?identity.PeerId) std.mem.Allocator.Error!void {
+    fn appendOut(self: *Gossipsub, wire: []u8, to: ?identity.PeerId) (errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (self.outbox.items.len >= self.cfg.max_outbox_entries) return error.PublishQueueFull;
         try self.outbox.append(.{ .wire = wire, .to = to });
     }
 
@@ -138,7 +150,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    pub fn subscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || std.mem.Allocator.Error)!void {
+    pub fn subscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         if (self.subs.contains(topic)) return;
         try self.subs.put(topic, {});
         errdefer _ = self.subs.fetchRemove(topic);
@@ -148,7 +160,7 @@ pub const Gossipsub = struct {
         try self.appendOut(w, null);
     }
 
-    pub fn unsubscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || std.mem.Allocator.Error)!void {
+    pub fn unsubscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         if (self.subs.fetchRemove(topic)) |_| {
             if (self.mesh.fetchRemove(topic)) |kv| {
                 var tm = kv.value;
@@ -164,7 +176,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    pub fn publish(self: *Gossipsub, topic: []const u8, payload: []const u8) (msg_mod.Error || rpc.Error || std.mem.Allocator.Error)!void {
+    pub fn publish(self: *Gossipsub, topic: []const u8, payload: []const u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         const inner = try msg_mod.encode(self.allocator, .{ .topic = topic, .data = payload });
         defer self.allocator.free(inner);
         const wire = try rpc.encodePublish(self.allocator, inner);
@@ -240,9 +252,19 @@ pub const Gossipsub = struct {
                 _ = mp.peers.remove(sender);
             }
         }
+        if (try control.decodeFirstIHave(self.allocator, ctl)) |ih| {
+            var owned = ih;
+            defer control.deinitIHaveOwned(self.allocator, &owned);
+            self.control_i_have_rx += 1;
+        }
+        if (try control.decodeFirstIWant(self.allocator, ctl)) |iw| {
+            var owned = iw;
+            defer control.deinitIWantOwned(self.allocator, &owned);
+            self.control_i_want_rx += 1;
+        }
     }
 
-    fn forwardPublish(self: *Gossipsub, sender: identity.PeerId, topic: []const u8, data: []const u8) (msg_mod.Error || rpc.Error || std.mem.Allocator.Error)!void {
+    fn forwardPublish(self: *Gossipsub, sender: identity.PeerId, topic: []const u8, data: []const u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         const mp = self.mesh.getPtr(topic) orelse return;
         var pit = mp.peers.keyIterator();
         while (pit.next()) |kp| {
@@ -256,7 +278,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn pruneMeshDownToN(self: *Gossipsub, topic: []const u8, target: usize) (control.Error || rpc.Error || std.mem.Allocator.Error)!void {
+    fn pruneMeshDownToN(self: *Gossipsub, topic: []const u8, target: usize) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         const mp = self.mesh.getPtr(topic) orelse return;
         const c = mp.peers.count();
         if (c <= target) return;
@@ -278,7 +300,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    pub fn handleInboundRpc(self: *Gossipsub, sender: identity.PeerId, frame: []const u8) (rpc.Error || msg_mod.Error || control.Error || std.mem.Allocator.Error)!void {
+    pub fn handleInboundRpc(self: *Gossipsub, sender: identity.PeerId, frame: []const u8) (rpc.Error || msg_mod.Error || control.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         const sub_views = try rpc.decodeSubscribes(self.allocator, frame);
         defer rpc.freeSubscribeViews(self.allocator, sub_views);
         for (sub_views) |sv| {
@@ -305,7 +327,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    pub fn heartbeat(self: *Gossipsub) (control.Error || rpc.Error || std.mem.Allocator.Error)!void {
+    pub fn heartbeat(self: *Gossipsub) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         self.dup.prune(self.clock_ms);
 
         var sit = self.subs.iterator();
@@ -595,4 +617,46 @@ test "remote subscription narrows GRAFT candidates" {
     const d = g.popOutboxDelivery().?;
     defer a.free(d.wire);
     try std.testing.expect(d.to != null and d.to.?.eql(&pa));
+}
+
+test "Gossipsub init rejects zero max_outbox_entries" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    try std.testing.expectError(
+        error.InvalidOutboxCap,
+        Gossipsub.init(a, .{ .local_peer_id = me, .max_outbox_entries = 0 }),
+    );
+}
+
+test "publish returns PublishQueueFull when outbox is full" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .max_outbox_entries = 1 });
+    defer g.deinit();
+
+    try g.publish("t", "one");
+    try std.testing.expectError(error.PublishQueueFull, g.publish("t", "two"));
+}
+
+test "inbound IHAVE and IWANT increment control counters" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const peer = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    const ihave_ctl = try control.encodeIHave(a, "blocks", &[_][]const u8{"mid"});
+    defer a.free(ihave_ctl);
+    const ihave_rpc = try rpc.encodeControlOnlyRpc(a, ihave_ctl);
+    defer a.free(ihave_rpc);
+
+    const iwant_ctl = try control.encodeIWant(a, &[_][]const u8{"want-id"});
+    defer a.free(iwant_ctl);
+    const iwant_rpc = try rpc.encodeControlOnlyRpc(a, iwant_ctl);
+    defer a.free(iwant_rpc);
+
+    try g.handleInboundRpc(peer, ihave_rpc);
+    try g.handleInboundRpc(peer, iwant_rpc);
+    try std.testing.expectEqual(@as(u64, 1), g.control_i_have_rx);
+    try std.testing.expectEqual(@as(u64, 1), g.control_i_want_rx);
 }

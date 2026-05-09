@@ -24,7 +24,7 @@ pub const ReqRespError = error{
     VarintOverflow,
 };
 
-/// Gossipsub mesh/codec surface (runtime behaviours like `PublishQueueFull` are reserved for #39).
+/// Gossipsub mesh/codec surface (#39); `PublishQueueFull` is returned when the runtime outbox exceeds config.
 pub const GossipsubError = error{
     TopicNotSubscribed,
     PayloadTooLarge,
