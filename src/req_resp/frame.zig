@@ -19,7 +19,7 @@ pub fn parseRequestHeader(bytes: []const u8) FrameError!struct { declared_len: u
     if (bytes.len == 0) return error.EmptyFrame;
     const dec = varint.decode(bytes) catch |err| switch (err) {
         error.Truncated => return error.IncompleteStream,
-        error.Overflow => return error.VarintOverflow,
+        error.Overflow, error.TooLong, error.NonMinimal => return error.VarintOverflow,
     };
     if (dec.value > max_rpc_message_size) return error.PayloadTooLarge;
     return .{
@@ -34,7 +34,7 @@ pub fn parseResponseHeader(bytes: []const u8) FrameError!struct { code: u8, decl
     const code = bytes[0];
     const dec = varint.decode(bytes[1..]) catch |err| switch (err) {
         error.Truncated => return error.IncompleteStream,
-        error.Overflow => return error.VarintOverflow,
+        error.Overflow, error.TooLong, error.NonMinimal => return error.VarintOverflow,
     };
     if (dec.value > max_rpc_message_size) return error.PayloadTooLarge;
     return .{

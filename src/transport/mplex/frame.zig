@@ -158,7 +158,7 @@ fn decodeVarint(bytes: []const u8) varint.DecodeError!struct { value: u64, len: 
 fn mapVarintErr(err: varint.DecodeError) FrameError {
     return switch (err) {
         error.Truncated => error.Truncated,
-        error.Overflow => error.BadVarint,
+        error.Overflow, error.TooLong, error.NonMinimal => error.BadVarint,
     };
 }
 
