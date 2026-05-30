@@ -93,6 +93,14 @@ pub const SwarmCommand = union(enum) {
     shutdown,
 };
 
+/// Reason for an embedder-actionable connection trim recommendation (#90).
+pub const TrimReason = enum {
+    /// Total connection count exceeded `high_watermark` and is being trimmed back to `low_watermark`.
+    over_global_watermark,
+    /// Connection count to one peer exceeded `max_per_peer`.
+    over_per_peer_cap,
+};
+
 /// Swarm → embedder events. Owned memory is released with [`Event.deinit`].
 pub const Event = union(enum) {
     gossip_message: GossipMessage,
@@ -103,6 +111,13 @@ pub const Event = union(enum) {
     peer_connected: peer_events.PeerConnectedPayload,
     peer_disconnected: peer_events.PeerDisconnectedPayload,
     peer_connection_failed: peer_events.PeerConnectionFailedPayload,
+    /// Connection manager has decided to trim a connection (#90). The embedder
+    /// owns the actual transport close; this is purely a recommendation.
+    connection_trim_recommended: struct {
+        peer: identity.PeerId,
+        conn_id: u64,
+        reason: TrimReason,
+    },
     log: struct {
         level: LogLevel,
         message: []const u8,
@@ -129,6 +144,7 @@ pub const Event = union(enum) {
             .peer_connected,
             .peer_disconnected,
             .peer_connection_failed,
+            .connection_trim_recommended,
             .swarm_closed,
             => {},
         }

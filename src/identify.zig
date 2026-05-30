@@ -15,6 +15,17 @@ const pid = @import("peer_id");
 /// Multistream negotiation line including newline (Identify 1.0.0).
 pub const protocol_line: []const u8 = "/ipfs/id/1.0.0\n";
 
+/// Multistream negotiation line for Identify Push (#88): same wire payload, one-way.
+/// Spec: https://github.com/libp2p/specs/blob/master/identify/README.md#identify-push
+pub const push_protocol_line: []const u8 = "/ipfs/id/push/1.0.0\n";
+
+/// libp2p RFC 0002 Signed Envelope — domain prefix the signature covers (#88).
+/// Spec: https://github.com/libp2p/specs/blob/master/RFC/0002-signed-envelopes.md
+pub const signed_envelope_domain: []const u8 = "libp2p-peer-record";
+
+/// `payload_type` multicodec for a [`PeerRecord`] inside a SignedEnvelope (RFC 0002 §appendix).
+pub const peer_record_payload_type: []const u8 = &.{ 0x03, 0x01 };
+
 pub const Error = proto.Error || error{
     /// Same global tag as [`errors.GossipsubError.PayloadTooLarge`] / [`errors.ReqRespError.PayloadTooLarge`] (#45).
     PayloadTooLarge,
@@ -190,15 +201,15 @@ pub fn decodeOwned(allocator: std.mem.Allocator, wire: []const u8, limits: Limit
     }
 
     out.listen_addrs = try listen.toOwnedSlice(allocator);
-    listen = .{};
+    listen = .empty;
     out.protocols = try protos.toOwnedSlice(allocator);
-    protos = .{};
+    protos = .empty;
 
     return out;
 }
 
 /// Read until end of stream (or `max_total`), returning one contiguous payload.
-pub fn readIdentifyWireAlloc(r: *Io.Reader, allocator: std.mem.Allocator, max_total: usize) (Io.Reader.ShortError || std.mem.Allocator.Error || error{IdentifyMessageTooLarge})![]u8 {
+pub fn readIdentifyWireAlloc(r: *Io.Reader, allocator: std.mem.Allocator, max_total: usize) (Io.Reader.ShortError || std.mem.Allocator.Error || error{ IdentifyMessageTooLarge, Overflow })![]u8 {
     var list = std.ArrayList(u8).empty;
     defer list.deinit(allocator);
     var buf: [8192]u8 = undefined;
@@ -263,7 +274,7 @@ pub const Identify = struct {
         reply_params: ReplyParams,
         context: anytype,
         comptime onIdentified: fn (ctx: @TypeOf(context), peer_id: pid.PeerId, msg: MessageView) void,
-    ) (Error || Io.Reader.ShortError || Io.Writer.Error || std.mem.Allocator.Error)!void {
+    ) (Error || Io.Reader.ShortError || Io.Writer.Error || std.mem.Allocator.Error || error{Overflow})!void {
         const wire = try readIdentifyWireAlloc(r, self.allocator, limits.max_message_bytes);
         defer self.allocator.free(wire);
         var owned = try decodeOwned(self.allocator, wire, limits);
@@ -286,7 +297,7 @@ pub const Identify = struct {
         reply_params: ReplyParams,
         context: anytype,
         comptime onIdentified: fn (ctx: @TypeOf(context), peer_id: pid.PeerId, msg: MessageView) void,
-    ) (Error || Io.Reader.ShortError || Io.Writer.Error || std.mem.Allocator.Error)!void {
+    ) (Error || Io.Reader.ShortError || Io.Writer.Error || std.mem.Allocator.Error || error{Overflow})!void {
         const rv = self.replyView(reply_params);
         const out = try encode(self.allocator, rv);
         defer self.allocator.free(out);
@@ -299,10 +310,323 @@ pub const Identify = struct {
         defer owned.deinit(self.allocator);
         onIdentified(context, peer, owned.asView());
     }
+
+    /// Send-only Identify Push (`/ipfs/id/push/1.0.0`): write our Identify and close (#88).
+    /// The receiver decodes the same wire format as plain Identify; there is no reply.
+    pub fn sendPush(
+        self: *const Identify,
+        w: *Io.Writer,
+        reply_params: ReplyParams,
+    ) (Error || Io.Writer.Error || std.mem.Allocator.Error)!void {
+        const rv = self.replyView(reply_params);
+        const out = try encode(self.allocator, rv);
+        defer self.allocator.free(out);
+        try Io.Writer.writeAll(w, out);
+        try Io.Writer.flush(w);
+    }
+
+    /// Receive-only Identify Push handler (#88): read the wire payload, decode, invoke
+    /// `onIdentified`. No reply is written. `MessageView` slices passed to the callback
+    /// are borrowed from the deferred `MessageOwned` and MUST be copied if the caller
+    /// wants to retain them.
+    pub fn handlePushInbound(
+        self: *Identify,
+        peer: pid.PeerId,
+        r: *Io.Reader,
+        limits: Limits,
+        context: anytype,
+        comptime onIdentified: fn (ctx: @TypeOf(context), peer_id: pid.PeerId, msg: MessageView) void,
+    ) (Error || Io.Reader.ShortError || std.mem.Allocator.Error || error{Overflow})!void {
+        const wire = try readIdentifyWireAlloc(r, self.allocator, limits.max_message_bytes);
+        defer self.allocator.free(wire);
+        var owned = try decodeOwned(self.allocator, wire, limits);
+        defer owned.deinit(self.allocator);
+        onIdentified(context, peer, owned.asView());
+    }
 };
+
+// ---------------------------------------------------------------------------
+// libp2p Signed Envelope + PeerRecord (RFC 0002), see [`signed_envelope_domain`].
+// ---------------------------------------------------------------------------
+
+pub const SignedEnvelopeOwned = struct {
+    /// libp2p PublicKey protobuf (matches Identify field 1).
+    public_key: []u8,
+    /// Multicodec bytes identifying the payload type (e.g. [`peer_record_payload_type`]).
+    payload_type: []u8,
+    /// Raw payload bytes the signature covers (e.g. an encoded [`PeerRecordOwned`]).
+    payload: []u8,
+    /// Signature bytes verified by [`signedEnvelopeVerifyMessage`] + the embedder's key.
+    signature: []u8,
+
+    pub fn deinit(self: *SignedEnvelopeOwned, allocator: std.mem.Allocator) void {
+        allocator.free(self.public_key);
+        allocator.free(self.payload_type);
+        allocator.free(self.payload);
+        allocator.free(self.signature);
+        self.* = undefined;
+    }
+};
+
+/// Decode a SignedEnvelope wire blob (RFC 0002). Required fields are `public_key`,
+/// `payload_type`, `payload`, and `signature`; missing any of them returns `error.MalformedSignedEnvelope`.
+pub fn decodeSignedEnvelope(allocator: std.mem.Allocator, wire: []const u8) (Error || std.mem.Allocator.Error || error{MalformedSignedEnvelope})!SignedEnvelopeOwned {
+    if (wire.len > 64 * 1024) return error.PayloadTooLarge;
+    var public_key: ?[]u8 = null;
+    var payload_type: ?[]u8 = null;
+    var payload: ?[]u8 = null;
+    var signature: ?[]u8 = null;
+    errdefer {
+        if (public_key) |x| allocator.free(x);
+        if (payload_type) |x| allocator.free(x);
+        if (payload) |x| allocator.free(x);
+        if (signature) |x| allocator.free(x);
+    }
+
+    var off: usize = 0;
+    while (off < wire.len) {
+        const key = try proto.decodeFieldKey(wire[off..]);
+        off += key.len;
+        const nv = try proto.nextFieldValueLimited(wire[off..], key.wire_type, 32 * 1024);
+        off += nv.total;
+        if (key.wire_type != .length_delimited) continue;
+        switch (key.field_number) {
+            1 => {
+                if (public_key != null) continue;
+                public_key = try allocator.dupe(u8, nv.value);
+            },
+            2 => {
+                if (payload_type != null) continue;
+                payload_type = try allocator.dupe(u8, nv.value);
+            },
+            3 => {
+                if (payload != null) continue;
+                payload = try allocator.dupe(u8, nv.value);
+            },
+            5 => {
+                if (signature != null) continue;
+                signature = try allocator.dupe(u8, nv.value);
+            },
+            else => {},
+        }
+    }
+
+    return SignedEnvelopeOwned{
+        .public_key = public_key orelse return error.MalformedSignedEnvelope,
+        .payload_type = payload_type orelse return error.MalformedSignedEnvelope,
+        .payload = payload orelse return error.MalformedSignedEnvelope,
+        .signature = signature orelse return error.MalformedSignedEnvelope,
+    };
+}
+
+/// Build the signature-domain message a SignedEnvelope signer must produce / a
+/// verifier must check: `varint(domain_len) || domain || varint(payload_type_len)
+/// || payload_type || varint(payload_len) || payload` (RFC 0002 §"Signature").
+/// `out_buf` must be at least `domain.len + payload_type.len + payload.len + 24`.
+pub fn signedEnvelopeVerifyMessage(
+    out_buf: []u8,
+    domain: []const u8,
+    payload_type: []const u8,
+    payload: []const u8,
+) error{BufferTooSmall}![]const u8 {
+    const need = domain.len + payload_type.len + payload.len + 24;
+    if (out_buf.len < need) return error.BufferTooSmall;
+    var i: usize = 0;
+    i += writeUvarint(out_buf[i..], domain.len);
+    @memcpy(out_buf[i..][0..domain.len], domain);
+    i += domain.len;
+    i += writeUvarint(out_buf[i..], payload_type.len);
+    @memcpy(out_buf[i..][0..payload_type.len], payload_type);
+    i += payload_type.len;
+    i += writeUvarint(out_buf[i..], payload.len);
+    @memcpy(out_buf[i..][0..payload.len], payload);
+    i += payload.len;
+    return out_buf[0..i];
+}
+
+fn writeUvarint(out: []u8, value: usize) usize {
+    var v = value;
+    var i: usize = 0;
+    while (v >= 0x80) : (i += 1) {
+        out[i] = @as(u8, @intCast(v & 0x7f)) | 0x80;
+        v >>= 7;
+    }
+    out[i] = @intCast(v);
+    return i + 1;
+}
+
+pub const PeerRecordOwned = struct {
+    /// libp2p PeerId bytes (multihash of the libp2p public key protobuf).
+    peer_id: []u8,
+    /// Monotonic record version per-peer; lets receivers ignore stale updates.
+    seq: u64,
+    /// Listen multiaddrs (each a length-prefixed binary multiaddr, wire-format identical
+    /// to Identify `listen_addrs`).
+    addresses: [][]u8,
+
+    pub fn deinit(self: *PeerRecordOwned, allocator: std.mem.Allocator) void {
+        allocator.free(self.peer_id);
+        for (self.addresses) |a| allocator.free(a);
+        allocator.free(self.addresses);
+        self.* = undefined;
+    }
+};
+
+/// Decode a libp2p RFC 0002 PeerRecord protobuf.
+///
+/// Wire: `bytes peer_id = 1; uint64 seq = 2; repeated AddressInfo addresses = 3;`
+/// where `AddressInfo { bytes multiaddr = 1; }`.
+pub fn decodePeerRecord(allocator: std.mem.Allocator, wire: []const u8) (Error || std.mem.Allocator.Error || error{MalformedPeerRecord})!PeerRecordOwned {
+    if (wire.len > 32 * 1024) return error.PayloadTooLarge;
+    var peer_id: ?[]u8 = null;
+    var seq: u64 = 0;
+    var addresses = std.ArrayList([]u8).empty;
+    errdefer {
+        if (peer_id) |x| allocator.free(x);
+        for (addresses.items) |a| allocator.free(a);
+        addresses.deinit(allocator);
+    }
+
+    var off: usize = 0;
+    while (off < wire.len) {
+        const key = try proto.decodeFieldKey(wire[off..]);
+        off += key.len;
+        const nv = try proto.nextFieldValueLimited(wire[off..], key.wire_type, 8 * 1024);
+        off += nv.total;
+        switch (key.field_number) {
+            1 => {
+                if (key.wire_type != .length_delimited) return error.MalformedPeerRecord;
+                if (peer_id != null) continue;
+                peer_id = try allocator.dupe(u8, nv.value);
+            },
+            2 => {
+                if (key.wire_type != .varint) return error.MalformedPeerRecord;
+                const vv = try proto.decodeVarUInt64(nv.value);
+                seq = vv.value;
+            },
+            3 => {
+                if (key.wire_type != .length_delimited) return error.MalformedPeerRecord;
+                if (addresses.items.len >= 128) return error.PayloadTooLarge;
+                // Parse the nested AddressInfo { multiaddr = 1; } message.
+                var addr_off: usize = 0;
+                while (addr_off < nv.value.len) {
+                    const ak = try proto.decodeFieldKey(nv.value[addr_off..]);
+                    addr_off += ak.len;
+                    const av = try proto.nextFieldValueLimited(nv.value[addr_off..], ak.wire_type, 1024);
+                    addr_off += av.total;
+                    if (ak.field_number == 1 and ak.wire_type == .length_delimited) {
+                        try addresses.append(allocator, try allocator.dupe(u8, av.value));
+                        break; // one multiaddr per AddressInfo
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    return PeerRecordOwned{
+        .peer_id = peer_id orelse return error.MalformedPeerRecord,
+        .seq = seq,
+        .addresses = try addresses.toOwnedSlice(allocator),
+    };
+}
 
 test "protocol_line ends with newline" {
     try std.testing.expect(std.mem.endsWith(u8, protocol_line, "\n"));
+}
+
+test "push_protocol_line is well-formed" {
+    try std.testing.expect(std.mem.endsWith(u8, push_protocol_line, "\n"));
+    try std.testing.expect(std.mem.startsWith(u8, push_protocol_line, "/ipfs/id/push/"));
+}
+
+test "Identify.sendPush writes our message; handlePushInbound reads it" {
+    const a = std.testing.allocator;
+    var id_sender = try Identify.init(a, "agent-sender/1");
+    defer id_sender.deinit();
+    var id_receiver = try Identify.init(a, "agent-receiver/1");
+    defer id_receiver.deinit();
+
+    var pipe: [512]u8 = undefined;
+    var ww = Io.Writer.fixed(&pipe);
+    try id_sender.sendPush(&ww, .{ .listen_addrs = &.{}, .protocols = &.{"/x"} });
+    const written = ww.buffered();
+    var rr = Io.Reader.fixed(written);
+
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        seen_agent: ?[]u8 = null,
+        fn cb(ctx: *@This(), _: pid.PeerId, msg: MessageView) void {
+            if (msg.agent_version) |av| ctx.seen_agent = ctx.allocator.dupe(u8, av) catch null;
+        }
+    };
+    var ctx: Context = .{ .allocator = a };
+    defer if (ctx.seen_agent) |s| a.free(s);
+
+    const peer = try pid.PeerId.random();
+    try id_receiver.handlePushInbound(peer, &rr, .standard, &ctx, Context.cb);
+    try std.testing.expectEqualStrings("agent-sender/1", ctx.seen_agent.?);
+}
+
+test "SignedEnvelope decode requires public_key, payload_type, payload, signature" {
+    const a = std.testing.allocator;
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try proto.appendLengthDelimited(&list, a, 1, "pubkey-bytes");
+    try proto.appendLengthDelimited(&list, a, 2, peer_record_payload_type);
+    try proto.appendLengthDelimited(&list, a, 3, "the-payload");
+    try proto.appendLengthDelimited(&list, a, 5, "sig-bytes");
+
+    var env = try decodeSignedEnvelope(a, list.items);
+    defer env.deinit(a);
+    try std.testing.expectEqualStrings("pubkey-bytes", env.public_key);
+    try std.testing.expectEqualSlices(u8, peer_record_payload_type, env.payload_type);
+    try std.testing.expectEqualStrings("the-payload", env.payload);
+    try std.testing.expectEqualStrings("sig-bytes", env.signature);
+}
+
+test "SignedEnvelope decode rejects missing signature" {
+    const a = std.testing.allocator;
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    try proto.appendLengthDelimited(&list, a, 1, "pubkey-bytes");
+    try proto.appendLengthDelimited(&list, a, 2, peer_record_payload_type);
+    try proto.appendLengthDelimited(&list, a, 3, "the-payload");
+    try std.testing.expectError(error.MalformedSignedEnvelope, decodeSignedEnvelope(a, list.items));
+}
+
+test "signedEnvelopeVerifyMessage layout" {
+    var buf: [256]u8 = undefined;
+    const msg = try signedEnvelopeVerifyMessage(&buf, signed_envelope_domain, peer_record_payload_type, "payload-x");
+    // Expect: varint(18) "libp2p-peer-record" varint(2) 0x03 0x01 varint(9) "payload-x"
+    try std.testing.expectEqual(@as(u8, signed_envelope_domain.len), msg[0]);
+    try std.testing.expectEqualStrings(signed_envelope_domain, msg[1 .. 1 + signed_envelope_domain.len]);
+    const after_domain = 1 + signed_envelope_domain.len;
+    try std.testing.expectEqual(@as(u8, 2), msg[after_domain]);
+    try std.testing.expectEqualSlices(u8, peer_record_payload_type, msg[after_domain + 1 .. after_domain + 3]);
+    try std.testing.expectEqual(@as(u8, 9), msg[after_domain + 3]);
+    try std.testing.expectEqualStrings("payload-x", msg[after_domain + 4 ..][0..9]);
+}
+
+test "PeerRecord decode reads peer_id, seq, addresses" {
+    const a = std.testing.allocator;
+    var inner_addr = std.ArrayList(u8).empty;
+    defer inner_addr.deinit(a);
+    try proto.appendLengthDelimited(&inner_addr, a, 1, &[_]u8{ 0x04, 0x7f, 0x00, 0x00, 0x01 });
+
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(a);
+    try proto.appendLengthDelimited(&wire, a, 1, "peerid-bytes");
+    try proto.appendFieldKey(&wire, a, 2, .varint);
+    try proto.appendVarUInt64(&wire, a, 42);
+    try proto.appendLengthDelimited(&wire, a, 3, inner_addr.items);
+
+    var rec = try decodePeerRecord(a, wire.items);
+    defer rec.deinit(a);
+    try std.testing.expectEqualStrings("peerid-bytes", rec.peer_id);
+    try std.testing.expectEqual(@as(u64, 42), rec.seq);
+    try std.testing.expectEqual(@as(usize, 1), rec.addresses.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x04, 0x7f, 0x00, 0x00, 0x01 }, rec.addresses[0]);
 }
 
 test "identify encode decode round trip" {
@@ -341,10 +665,17 @@ test "Identify handleInbound and onConnectionEstablished" {
 
     const peer = try pid.PeerId.random();
 
+    // `MessageView` is a borrowing view backed by the `MessageOwned` decoded inside
+    // `handleInbound` / `onConnectionEstablished`. That `MessageOwned` is freed via
+    // `defer owned.deinit(allocator)` on the way out, so the callback MUST copy any
+    // bytes it wants to hold past the call.
     const Context = struct {
-        seen_agent: ?[]const u8 = null,
+        allocator: std.mem.Allocator,
+        seen_agent: ?[]u8 = null,
         fn onInbound(ctx: *@This(), _: pid.PeerId, msg: MessageView) void {
-            ctx.seen_agent = msg.agent_version;
+            if (msg.agent_version) |av| {
+                ctx.seen_agent = ctx.allocator.dupe(u8, av) catch null;
+            }
         }
     };
 
@@ -363,7 +694,8 @@ test "Identify handleInbound and onConnectionEstablished" {
     var out_buf: [512]u8 = undefined;
     var ww = Io.Writer.fixed(&out_buf);
 
-    var ctx: Context = .{};
+    var ctx: Context = .{ .allocator = a };
+    defer if (ctx.seen_agent) |s| a.free(s);
     try id.handleInbound(peer, &rr, &ww, .standard, .{
         .listen_addrs = &.{&[_]u8{9}},
         .protocols = &.{"/y"},
@@ -379,7 +711,8 @@ test "Identify handleInbound and onConnectionEstablished" {
     try std.testing.expectEqual(@as(u8, 9), dec_reply.asView().listen_addrs[0][0]);
 
     // Initiator path: write then read.
-    var ctx2: Context = .{};
+    var ctx2: Context = .{ .allocator = a };
+    defer if (ctx2.seen_agent) |s| a.free(s);
     var pipe_out: [512]u8 = undefined;
     var w2 = Io.Writer.fixed(&pipe_out);
     const respond_view: MessageView = .{

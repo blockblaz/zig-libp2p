@@ -92,4 +92,21 @@ test {
     _ = @import("transport/mplex/root.zig");
     _ = @import("transport/mplex/frame.zig");
     _ = @import("transport/mplex/session.zig");
+    // Force discovery of modules whose tests would otherwise be skipped because
+    // nothing references them from already-discovered modules. This is the test
+    // analyzer's dead-code-elimination behaviour in Zig 0.16: tests in modules
+    // declared only through `pub const X = @import(…)` aren't pulled into the
+    // test binary unless the module is actually consumed somewhere. Adding the
+    // file here is the minimal force-discovery hook.
+    //
+    // Note: more modules can and should be added (#TBD-tracking-issue), but each
+    // addition currently surfaces latent compile errors that have been masked by
+    // the same elimination, so they need to be fixed alongside.
+    _ = @import("gossipsub/runtime.zig");
+    _ = @import("gossipsub/config.zig");
+    _ = @import("gossipsub/duplicate_cache.zig");
+    _ = @import("gossipsub/message_id.zig");
+    _ = @import("identify.zig");
+    _ = @import("connection_manager.zig");
+    _ = @import("metrics.zig");
 }

@@ -141,6 +141,27 @@ pub const GossipsubConfig = struct {
     max_seqno_dedup_entries: usize = 4096,
     /// TTL applied to `(from, seqno)` cache entries when present.
     seqno_dedup_ttl_ms: i64 = gs_cfg.duplicate_cache_ttl_ms,
+    /// Optional per-topic validation hook (#84). Applies to every accepted-by-dedup
+    /// inbound publish. `null` keeps the previous behaviour (always-accept).
+    topic_validator: ?TopicValidator = null,
+    /// Opaque context passed verbatim to `topic_validator`.
+    validator_ctx: ?*anyopaque = null,
+    /// Behaviour score delta applied to the sender when the validator returns `reject` (#84).
+    /// Default -100 matches the libp2p gossipsub v1.1 spec's `P4` weight for invalid messages.
+    validator_reject_score_delta: i32 = -100,
+    /// Behaviour score delta when the validator returns `ignore` (default 0).
+    validator_ignore_score_delta: i32 = 0,
+    /// Track inbound IDONTWANT signals and suppress outbound publishes / IHAVE entries
+    /// for those `(peer, message_id)` pairs (libp2p gossipsub v1.2 #85).
+    idontwant_runtime_enabled: bool = true,
+    /// FIFO cap on `(peer, message_id)` IDONTWANT entries.
+    max_idontwant_entries: usize = 16384,
+    /// TTL applied to IDONTWANT cache entries.
+    idontwant_ttl_ms: i64 = gs_cfg.duplicate_cache_ttl_ms,
+    /// FIFO cap on the PX dial-suggestion queue (`peer_id` bytes pulled from inbound
+    /// PRUNE `peers` lists, #85). Embedders pop via [`popDialSuggestion`] and feed
+    /// `connection_manager.registerKnownPeer`.
+    max_px_dial_queue: usize = 256,
     /// When set, [`Gossipsub`] updates `lean_gossip_mesh_peers` from [`meshPeers`] on membership changes and heartbeat (#43).
     metrics: ?*metrics_mod.Metrics = null,
 
@@ -157,6 +178,9 @@ pub const GossipsubConfig = struct {
         if (c.prune_backoff_cap_ms < c.prune_backoff_default_ms) return error.InvalidGossipParams;
         if (c.seqno_dedup_enabled and c.max_seqno_dedup_entries == 0) return error.InvalidGossipParams;
         if (c.seqno_dedup_enabled and c.seqno_dedup_ttl_ms <= 0) return error.InvalidGossipParams;
+        if (c.idontwant_runtime_enabled and c.max_idontwant_entries == 0) return error.InvalidGossipParams;
+        if (c.idontwant_runtime_enabled and c.idontwant_ttl_ms <= 0) return error.InvalidGossipParams;
+        if (c.max_px_dial_queue == 0) return error.InvalidGossipParams;
     }
 };
 
@@ -184,6 +208,36 @@ const TopicMesh = struct {
     fn deinit(self: *TopicMesh) void {
         self.peers.deinit();
     }
+};
+
+/// Application-layer validation outcome for an inbound gossipsub publish (#84).
+///
+/// libp2p gossipsub v1.1 defines three outcomes:
+/// * `accept`  — message is valid and should be forwarded normally.
+/// * `reject`  — message is invalid; do not forward, apply a negative score
+///   delta (configurable) to the sending peer.
+/// * `ignore`  — message is unsolicited / off-topic / unverifiable but not
+///   provably malicious; drop without scoring.
+pub const ValidationResult = enum {
+    accept,
+    reject,
+    ignore,
+};
+
+/// Embedder-supplied per-topic validator. Returning `reject` causes the
+/// gossipsub runtime to drop the message *and* apply
+/// `cfg.validator_reject_score_delta` to the sender's behaviour score.
+/// `ignore` drops without scoring. `accept` continues the normal forward path.
+///
+/// The validator is called on the inbound publish hot path; keep it cheap and
+/// allocation-free where possible.
+pub const TopicValidator = *const fn (ctx: ?*anyopaque, topic: []const u8, data: []const u8) ValidationResult;
+
+/// IDONTWANT cache key (#85): the peer that asked us to skip the message id.
+const IDontWantEntry = struct {
+    peer: identity.PeerId,
+    id: [20]u8,
+    expires_ms: i64,
 };
 
 pub const Gossipsub = struct {
@@ -223,6 +277,19 @@ pub const Gossipsub = struct {
     seqno_dedup: std.ArrayList(SeqnoEntry),
     /// Inbound publishes dropped because their `(from, seqno)` pair was already seen.
     inbound_dropped_seqno_replay: u64,
+    /// Inbound publishes dropped because the topic validator returned `reject` (#84).
+    inbound_dropped_validator_reject: u64,
+    /// Inbound publishes dropped because the topic validator returned `ignore` (#84).
+    inbound_dropped_validator_ignore: u64,
+    /// Per-peer IDONTWANT cache used to suppress redundant outbound publishes / IHAVE (#85).
+    idontwant: std.ArrayList(IDontWantEntry),
+    /// Outbound publishes suppressed because the destination had sent IDONTWANT (#85).
+    suppressed_outbound_idontwant: u64,
+    /// Always-mesh peers (libp2p gossipsub `direct peers`, #85). Never pruned, never backed-off.
+    direct_peers: std.HashMap(identity.PeerId, void, connection_manager.PeerIdContext, std.hash_map.default_max_load_percentage),
+    /// FIFO queue of peer-id bytes harvested from inbound PRUNE `peers` lists, surfaced via
+    /// [`popDialSuggestion`] (#85).
+    px_dial_queue: std.ArrayList([]u8),
 
     pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
         try config.validate();
@@ -254,6 +321,12 @@ pub const Gossipsub = struct {
             .graft_refused_during_backoff = 0,
             .seqno_dedup = .empty,
             .inbound_dropped_seqno_replay = 0,
+            .inbound_dropped_validator_reject = 0,
+            .inbound_dropped_validator_ignore = 0,
+            .idontwant = .empty,
+            .suppressed_outbound_idontwant = 0,
+            .direct_peers = .init(allocator),
+            .px_dial_queue = .empty,
         };
         return p;
     }
@@ -286,6 +359,10 @@ pub const Gossipsub = struct {
         for (self.backoff.items) |b| self.allocator.free(b.topic);
         self.backoff.deinit(self.allocator);
         self.seqno_dedup.deinit(self.allocator);
+        self.idontwant.deinit(self.allocator);
+        self.direct_peers.deinit();
+        for (self.px_dial_queue.items) |b| self.allocator.free(b);
+        self.px_dial_queue.deinit(self.allocator);
         const a = self.allocator;
         a.destroy(self);
     }
@@ -456,6 +533,83 @@ pub const Gossipsub = struct {
         @memcpy(entry.seqno_buf[0..seqno_b.len], seqno_b);
         self.seqno_dedup.append(self.allocator, entry) catch return false;
         return false;
+    }
+
+    /// `true` if `peer` previously sent IDONTWANT for `id` and the entry is still live (#85).
+    /// Also sweeps expired entries along the way.
+    fn peerWantsNotPublish(self: *Gossipsub, peer: identity.PeerId, id: [20]u8) bool {
+        if (!self.cfg.idontwant_runtime_enabled) return false;
+        var i: usize = 0;
+        var hit = false;
+        while (i < self.idontwant.items.len) {
+            const e = self.idontwant.items[i];
+            if (e.expires_ms <= self.clock_ms) {
+                _ = self.idontwant.orderedRemove(i);
+                continue;
+            }
+            if (!hit and e.peer.eql(&peer) and std.mem.eql(u8, &e.id, &id)) hit = true;
+            i += 1;
+        }
+        return hit;
+    }
+
+    fn rememberIDontWant(self: *Gossipsub, peer: identity.PeerId, id: [20]u8) std.mem.Allocator.Error!void {
+        if (!self.cfg.idontwant_runtime_enabled) return;
+        // Already present? bump expiry only.
+        for (self.idontwant.items) |*e| {
+            if (e.peer.eql(&peer) and std.mem.eql(u8, &e.id, &id)) {
+                e.expires_ms = self.clock_ms + self.cfg.idontwant_ttl_ms;
+                return;
+            }
+        }
+        if (self.idontwant.items.len >= self.cfg.max_idontwant_entries) {
+            _ = self.idontwant.orderedRemove(0);
+        }
+        try self.idontwant.append(self.allocator, .{
+            .peer = peer,
+            .id = id,
+            .expires_ms = self.clock_ms + self.cfg.idontwant_ttl_ms,
+        });
+    }
+
+    /// Mark `peer` as a direct (always-mesh) peer. Direct peers are never pruned by the
+    /// heartbeat and bypass PRUNE back-off (libp2p gossipsub direct-peer behaviour, #85).
+    pub fn addDirectPeer(self: *Gossipsub, peer: identity.PeerId) std.mem.Allocator.Error!void {
+        try self.direct_peers.put(peer, {});
+    }
+
+    pub fn removeDirectPeer(self: *Gossipsub, peer: identity.PeerId) void {
+        _ = self.direct_peers.remove(peer);
+    }
+
+    pub fn isDirectPeer(self: *const Gossipsub, peer: identity.PeerId) bool {
+        return self.direct_peers.contains(peer);
+    }
+
+    /// Pop the next PX dial suggestion (peer-id bytes) harvested from inbound PRUNE PX, or
+    /// `null` if the queue is empty. Caller owns the returned slice (#85).
+    pub fn popDialSuggestion(self: *Gossipsub) ?[]u8 {
+        if (self.px_dial_queue.items.len == 0) return null;
+        return self.px_dial_queue.orderedRemove(0);
+    }
+
+    fn queueDialSuggestion(self: *Gossipsub, peer_bytes: []const u8) void {
+        if (peer_bytes.len == 0) return;
+        if (self.px_dial_queue.items.len >= self.cfg.max_px_dial_queue) {
+            const old = self.px_dial_queue.orderedRemove(0);
+            self.allocator.free(old);
+        }
+        const copy = self.allocator.dupe(u8, peer_bytes) catch return;
+        self.px_dial_queue.append(self.allocator, copy) catch {
+            self.allocator.free(copy);
+        };
+    }
+
+    fn applyScoreDelta(self: *Gossipsub, peer: identity.PeerId, delta: i32) void {
+        if (delta == 0) return;
+        const cur = self.peerBehaviourScore(peer);
+        const next: i32 = cur +| delta;
+        self.peer_scores.put(peer, next) catch return;
     }
 
     fn recordSeenForLazy(self: *Gossipsub, topic: []const u8, id: [20]u8) std.mem.Allocator.Error!void {
@@ -630,12 +784,25 @@ pub const Gossipsub = struct {
     }
 
     fn noteRemoteSubscription(self: *Gossipsub, sender: identity.PeerId, topic: []const u8, want: bool) std.mem.Allocator.Error!void {
+        // Remote SUBSCRIBE wire bytes are freed by `handleInboundRpc`'s deferred cleanup,
+        // so we cannot store `topic` directly as a `remote_interest` map key — it would
+        // dangle and any later StringHashMap lookup would UAF inside `std.mem.eql`.
+        // Re-anchor on our own subscription's owned key (we only care about topics we
+        // ourselves subscribe to anyway; this also bounds memory against a peer that
+        // SUBSCRIBEs us to thousands of nonsense topics).
+        const owned_topic = blk: {
+            var it = self.subs.iterator();
+            while (it.next()) |e| {
+                if (std.mem.eql(u8, e.key_ptr.*, topic)) break :blk e.key_ptr.*;
+            }
+            return;
+        };
         if (want) {
-            try self.ensureRemoteInterestTable(topic);
-            const rp = self.remote_interest.getPtr(topic).?;
+            try self.ensureRemoteInterestTable(owned_topic);
+            const rp = self.remote_interest.getPtr(owned_topic).?;
             try rp.peers.put(sender, {});
         } else {
-            if (self.remote_interest.getPtr(topic)) |rp| {
+            if (self.remote_interest.getPtr(owned_topic)) |rp| {
                 _ = rp.peers.remove(sender);
             }
         }
@@ -761,16 +928,39 @@ pub const Gossipsub = struct {
             const p = kp.*;
             if (p.eql(&self.cfg.local_peer_id)) continue;
             if (mp.peers.contains(p)) continue;
-            if (restrict) {
+            if (restrict and !self.direct_peers.contains(p)) {
                 const ip = interest.?;
                 if (!ip.peers.contains(p)) continue;
             }
             // libp2p gossipsub v1.1: skip peers currently in PRUNE back-off for this topic.
-            if (self.isPeerBackedOff(p, topic)) continue;
+            // Direct peers bypass back-off entirely (always-mesh).
+            if (!self.direct_peers.contains(p) and self.isPeerBackedOff(p, topic)) continue;
             try self.scratch_peers.append(self.allocator, p);
         }
-        self.sortPeersByScoreDescThenBytes(self.scratch_peers.items);
+        // Direct peers always sort to the front; otherwise score-desc, then bytes.
+        self.sortPeersDirectThenScoreDescThenBytes(self.scratch_peers.items);
         return self.scratch_peers.items;
+    }
+
+    fn sortPeersDirectThenScoreDescThenBytes(self: *Gossipsub, peers: []identity.PeerId) void {
+        const Ctx = struct { gs: *Gossipsub };
+        const ctx = Ctx{ .gs = self };
+        const S = struct {
+            fn less(c: Ctx, a: identity.PeerId, b: identity.PeerId) bool {
+                const da = c.gs.direct_peers.contains(a);
+                const db = c.gs.direct_peers.contains(b);
+                if (da != db) return da;
+                const sa = c.gs.peerBehaviourScore(a);
+                const sb = c.gs.peerBehaviourScore(b);
+                if (sa != sb) return sa > sb;
+                var ba: [128]u8 = undefined;
+                var bb: [128]u8 = undefined;
+                const ab = a.toBytes(&ba) catch return false;
+                const bb2 = b.toBytes(&bb) catch return true;
+                return std.mem.order(u8, ab, bb2) == .lt;
+            }
+        };
+        std.mem.sort(identity.PeerId, peers, ctx, S.less);
     }
 
     fn handleInboundControl(self: *Gossipsub, sender: identity.PeerId, ctl: []const u8) (control.Error || rpc.Error || msg_mod.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
@@ -794,17 +984,40 @@ pub const Gossipsub = struct {
                 }
             }
         }
-        if (try control.decodeFirstPrune(self.allocator, ctl)) |pv| {
-            var prune = pv;
-            defer control.deinitPruneView(self.allocator, &prune);
+        // Decode PRUNE with PX peer-info first; falls back to the legacy view if no PRUNE
+        // entry was present. Direct peers are not actually backed off (we always trust them),
+        // but we still surface PX suggestions and update the mesh membership.
+        if (try control.decodeFirstPruneWithPeers(self.allocator, ctl)) |pp_view| {
+            var prune = pp_view;
+            defer control.deinitPruneWithPeersOwned(self.allocator, &prune);
             if (self.mesh.getPtr(prune.topic)) |mp| {
                 _ = mp.peers.remove(sender);
             }
-            const backoff_ms: i64 = if (prune.backoff_seconds) |s| blk: {
-                const ms_u: u128 = @as(u128, s) * 1000;
-                break :blk @intCast(@min(ms_u, @as(u128, @intCast(self.cfg.prune_backoff_cap_ms))));
-            } else self.cfg.prune_backoff_default_ms;
-            try self.recordBackoff(sender, prune.topic, backoff_ms);
+            // Harvest PX peer-id suggestions (#85). signed_peer_record is preserved upstream
+            // but not auto-verified here; embedders that want full verification can pull the
+            // raw envelope via the lower-level `control.decodeFirstPruneWithPeers` API.
+            for (prune.peers) |pi| {
+                if (pi.peer_id) |pb| self.queueDialSuggestion(pb);
+            }
+            if (!self.direct_peers.contains(sender)) {
+                const backoff_ms: i64 = if (prune.backoff_seconds) |s| blk: {
+                    const ms_u: u128 = @as(u128, s) * 1000;
+                    break :blk @intCast(@min(ms_u, @as(u128, @intCast(self.cfg.prune_backoff_cap_ms))));
+                } else self.cfg.prune_backoff_default_ms;
+                try self.recordBackoff(sender, prune.topic, backoff_ms);
+            }
+        }
+        // IDONTWANT (libp2p gossipsub v1.2): record `(sender, message_id)` so future outbound
+        // publishes / forwards to that peer can be suppressed (#85).
+        if (try control.decodeFirstIDontWant(self.allocator, ctl)) |idw| {
+            var owned = idw;
+            defer control.deinitIWantOwned(self.allocator, &owned);
+            for (owned.message_ids) |mid_raw| {
+                if (mid_raw.len != 20) continue;
+                var id: [20]u8 = undefined;
+                @memcpy(id[0..], mid_raw[0..20]);
+                try self.rememberIDontWant(sender, id);
+            }
         }
         if (try control.decodeFirstIHave(self.allocator, ctl)) |ih| {
             var owned = ih;
@@ -832,11 +1045,21 @@ pub const Gossipsub = struct {
     }
 
     fn forwardPublish(self: *Gossipsub, sender: identity.PeerId, topic: []const u8, data: []const u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        var id: [20]u8 = undefined;
+        message_id.writeMessageId(topic, data, self.cfg.message_id_domain_snappy_ok, &id);
+        try self.forwardPublishWithId(sender, topic, data, id);
+    }
+
+    fn forwardPublishWithId(self: *Gossipsub, sender: identity.PeerId, topic: []const u8, data: []const u8, mid: [20]u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         const mp = self.mesh.getPtr(topic) orelse return;
         var pit = mp.peers.keyIterator();
         while (pit.next()) |kp| {
             const dest = kp.*;
             if (dest.eql(&sender)) continue;
+            if (self.peerWantsNotPublish(dest, mid)) {
+                self.suppressed_outbound_idontwant += 1;
+                continue;
+            }
             const inner = try msg_mod.encode(self.allocator, .{ .topic = topic, .data = data });
             defer self.allocator.free(inner);
             const wire = try rpc.encodePublish(self.allocator, inner);
@@ -849,11 +1072,26 @@ pub const Gossipsub = struct {
         const mp = self.mesh.getPtr(topic) orelse return;
         const c = mp.peers.count();
         if (c <= target) return;
-        const excess = c - target;
+
+        // Direct peers are always-mesh; pretend they were never counted toward `excess`.
+        var direct_in_mesh: usize = 0;
+        {
+            var pit = mp.peers.keyIterator();
+            while (pit.next()) |kp| {
+                if (self.direct_peers.contains(kp.*)) direct_in_mesh += 1;
+            }
+        }
+        const eligible = if (c > direct_in_mesh) c - direct_in_mesh else 0;
+        const eligible_target = if (target > direct_in_mesh) target - direct_in_mesh else 0;
+        if (eligible <= eligible_target) return;
+        const excess = eligible - eligible_target;
 
         self.scratch_peers.clearRetainingCapacity();
         var pit = mp.peers.keyIterator();
-        while (pit.next()) |kp| try self.scratch_peers.append(self.allocator, kp.*);
+        while (pit.next()) |kp| {
+            if (self.direct_peers.contains(kp.*)) continue;
+            try self.scratch_peers.append(self.allocator, kp.*);
+        }
         self.sortPeersByScoreAscThenBytes(self.scratch_peers.items);
 
         // Advertise our own back-off so well-behaved peers don't immediately re-graft us;
@@ -904,10 +1142,27 @@ pub const Gossipsub = struct {
                     }
                 }
             }
+            // Application-layer validator (#84). Spec maps `reject` to behaviour-score P4
+            // penalty; `ignore` drops without scoring.
+            if (self.cfg.topic_validator) |vfn| {
+                switch (vfn(self.cfg.validator_ctx, topic, data)) {
+                    .accept => {},
+                    .reject => {
+                        self.inbound_dropped_validator_reject += 1;
+                        self.applyScoreDelta(sender, self.cfg.validator_reject_score_delta);
+                        continue;
+                    },
+                    .ignore => {
+                        self.inbound_dropped_validator_ignore += 1;
+                        self.applyScoreDelta(sender, self.cfg.validator_ignore_score_delta);
+                        continue;
+                    },
+                }
+            }
             self.inbound_delivered += 1;
             try self.recordSeenForLazy(topic, id);
             try self.rememberPullPayload(topic, id, data);
-            try self.forwardPublish(sender, topic, data);
+            try self.forwardPublishWithId(sender, topic, data, id);
         }
     }
 
@@ -934,6 +1189,11 @@ pub const Gossipsub = struct {
                     const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
                     errdefer self.allocator.free(rpcw);
                     try self.appendOut(rpcw, target);
+                    // Eagerly mark the target as in-mesh: we just told them so.
+                    // Mirrors the inbound GRAFT handler that adds the sender on receive.
+                    // If the target later PRUNEs us, the back-off / mesh-remove handler
+                    // will clean up.
+                    try mp.peers.put(target, {});
                 }
             }
 
@@ -981,6 +1241,27 @@ pub const Gossipsub = struct {
     pub fn activeBackoffCount(self: *Gossipsub) usize {
         self.pruneBackoff();
         return self.backoff.items.len;
+    }
+
+    /// Inbound publishes the topic validator marked `reject` (#84).
+    pub fn validatorRejectCount(self: *const Gossipsub) u64 {
+        return self.inbound_dropped_validator_reject;
+    }
+    /// Inbound publishes the topic validator marked `ignore` (#84).
+    pub fn validatorIgnoreCount(self: *const Gossipsub) u64 {
+        return self.inbound_dropped_validator_ignore;
+    }
+    /// Outbound publishes suppressed because the destination had sent IDONTWANT (#85).
+    pub fn suppressedOutboundIDontWantCount(self: *const Gossipsub) u64 {
+        return self.suppressed_outbound_idontwant;
+    }
+    /// Active IDONTWANT entries (post-lazy-sweep).
+    pub fn idontwantCount(self: *const Gossipsub) usize {
+        return self.idontwant.items.len;
+    }
+    /// PX dial-suggestion queue depth.
+    pub fn dialSuggestionCount(self: *const Gossipsub) usize {
+        return self.px_dial_queue.items.len;
     }
 
     pub fn popOutboxDelivery(self: *Gossipsub) ?OutDelivery {
@@ -1177,17 +1458,14 @@ test "two nodes exchange graft then deliver publish forward" {
     ga.onPeerConnected(pb);
     gb.onPeerConnected(pa);
 
+    // ga heartbeat → ga eagerly marks pb in its own mesh and queues a GRAFT to pb.
     try ga.heartbeat();
     const graft_a = ga.popOutboxDelivery().?;
     defer a.free(graft_a.wire);
     try std.testing.expect(graft_a.to != null and graft_a.to.?.eql(&pb));
+    // gb processes the inbound GRAFT and adds pa to its mesh. Per libp2p gossipsub
+    // there is no automatic GRAFT-back: the GRAFT itself signals mutual mesh intent.
     try gb.handleInboundRpc(pa, graft_a.wire);
-
-    try gb.heartbeat();
-    const graft_b = gb.popOutboxDelivery().?;
-    defer a.free(graft_b.wire);
-    try std.testing.expect(graft_b.to != null and graft_b.to.?.eql(&pa));
-    try ga.handleInboundRpc(pb, graft_b.wire);
 
     try std.testing.expectEqual(@as(?usize, 1), ga.meshPeerCountForTopic("t"));
     try std.testing.expectEqual(@as(?usize, 1), gb.meshPeerCountForTopic("t"));
@@ -1197,10 +1475,11 @@ test "two nodes exchange graft then deliver publish forward" {
     const pubw = try rpc.encodePublish(a, inner);
     defer a.free(pubw);
 
+    // pb sends a publish to ga. Forwarding excludes the sender, and pb is the
+    // only mesh peer, so ga delivers the message locally but emits no forward.
     try ga.handleInboundRpc(pb, pubw);
-    const fwd = ga.popOutboxDelivery().?;
-    defer a.free(fwd.wire);
-    try std.testing.expect(fwd.to != null and fwd.to.?.eql(&pb));
+    try std.testing.expectEqual(@as(u64, 1), ga.inboundDeliveredCount());
+    try std.testing.expectEqual(@as(?OutDelivery, null), ga.popOutboxDelivery());
 }
 
 test "remote subscription narrows GRAFT candidates" {
@@ -1456,9 +1735,9 @@ test "global outbox cap evicts oldest lazy IHAVE" {
     try g.handleInboundRpc(pm, graft);
 
     try g.publish("t", "x");
-    const pub_d = g.popOutboxDelivery().?;
-    defer a.free(pub_d.wire);
-
+    // Intentionally leave the broadcast publish in the outbox so the heartbeat
+    // hits `max_outbox_entries = 2` while emitting two lazy IHAVEs — one should
+    // be dropped, accounted via `dropped_lazy_ihave_backpressure`.
     try g.heartbeat();
     try std.testing.expectEqual(@as(u64, 1), g.dropped_lazy_ihave_backpressure);
     try std.testing.expectEqual(@as(u64, 2), g.lazy_i_have_tx);
@@ -1467,7 +1746,7 @@ test "global outbox cap evicts oldest lazy IHAVE" {
     var saw_pb = false;
     while (g.popOutboxDelivery()) |d| {
         defer a.free(d.wire);
-        try std.testing.expectEqual(OutDeliveryKind.lazy_ihave, d.kind);
+        if (d.kind != .lazy_ihave) continue; // drain the broadcast publish silently
         if (d.to) |t| {
             if (t.eql(&pa)) saw_pa = true;
             if (t.eql(&pb)) saw_pb = true;
@@ -1617,7 +1896,10 @@ test "inbound PRUNE records back-off; heartbeat refuses to re-graft inside windo
         defer a.free(d.wire);
         const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
         defer a.free(ctl);
-        if ((try control.decodeFirstGraftTopic(a, ctl)) != null) emitted_graft = true;
+        if (try control.decodeFirstGraftTopic(a, ctl)) |topic| {
+            a.free(topic);
+            emitted_graft = true;
+        }
     }
     try std.testing.expect(!emitted_graft);
 
@@ -1631,7 +1913,10 @@ test "inbound PRUNE records back-off; heartbeat refuses to re-graft inside windo
         defer a.free(d.wire);
         const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
         defer a.free(ctl);
-        if ((try control.decodeFirstGraftTopic(a, ctl)) != null) saw_graft = true;
+        if (try control.decodeFirstGraftTopic(a, ctl)) |topic| {
+            a.free(topic);
+            saw_graft = true;
+        }
     }
     try std.testing.expect(saw_graft);
 }
@@ -1761,7 +2046,10 @@ test "local mesh prune records reciprocal back-off so heartbeat doesn't re-graft
         defer a.free(d.wire);
         const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
         defer a.free(ctl);
-        if ((try control.decodeFirstGraftTopic(a, ctl)) != null) graft_count += 1;
+        if (try control.decodeFirstGraftTopic(a, ctl)) |topic| {
+            a.free(topic);
+            graft_count += 1;
+        }
     }
     try std.testing.expectEqual(@as(u32, 0), graft_count);
 }
@@ -1950,4 +2238,349 @@ test "seqno dedup can be disabled via config" {
     // Both have distinct message_ids (different data), and seqno dedup is off; both delivered.
     try std.testing.expectEqual(@as(u64, 2), g.inboundDeliveredCount());
     try std.testing.expectEqual(@as(u64, 0), g.inboundDroppedSeqnoReplayCount());
+}
+
+// ---------------------------------------------------------------------------
+// Topic validator hook (#84)
+// ---------------------------------------------------------------------------
+
+const ValidatorRecorder = struct {
+    rule: ValidationResult = .accept,
+    last_topic_len: usize = 0,
+    last_data_len: usize = 0,
+    fn cb(ctx: ?*anyopaque, topic: []const u8, data: []const u8) ValidationResult {
+        const self: *ValidatorRecorder = @ptrCast(@alignCast(ctx.?));
+        self.last_topic_len = topic.len;
+        self.last_data_len = data.len;
+        return self.rule;
+    }
+};
+
+test "validator accept passes message through" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var vr = ValidatorRecorder{ .rule = .accept };
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 2,
+        .topic_validator = ValidatorRecorder.cb,
+        .validator_ctx = @ptrCast(&vr),
+    });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const inner = try msg_mod.encode(a, .{ .topic = "t", .data = "hello" });
+    defer a.free(inner);
+    const r = try rpc.encodePublish(a, inner);
+    defer a.free(r);
+    try g.handleInboundRpc(peer, r);
+    try std.testing.expectEqual(@as(u64, 1), g.inboundDeliveredCount());
+    try std.testing.expectEqual(@as(u64, 0), g.validatorRejectCount());
+    try std.testing.expectEqual(@as(usize, 1), vr.last_topic_len);
+    try std.testing.expectEqual(@as(usize, 5), vr.last_data_len);
+}
+
+test "validator reject drops message and applies reject score delta" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var vr = ValidatorRecorder{ .rule = .reject };
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 2,
+        .topic_validator = ValidatorRecorder.cb,
+        .validator_ctx = @ptrCast(&vr),
+        .validator_reject_score_delta = -25,
+    });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+    try g.setPeerBehaviourScore(peer, 100);
+
+    const inner = try msg_mod.encode(a, .{ .topic = "t", .data = "bogus" });
+    defer a.free(inner);
+    const r = try rpc.encodePublish(a, inner);
+    defer a.free(r);
+    try g.handleInboundRpc(peer, r);
+
+    try std.testing.expectEqual(@as(u64, 0), g.inboundDeliveredCount());
+    try std.testing.expectEqual(@as(u64, 1), g.validatorRejectCount());
+    try std.testing.expectEqual(@as(i32, 75), g.peerBehaviourScore(peer));
+}
+
+test "validator ignore drops message without scoring" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var vr = ValidatorRecorder{ .rule = .ignore };
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 2,
+        .topic_validator = ValidatorRecorder.cb,
+        .validator_ctx = @ptrCast(&vr),
+    });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+    try g.setPeerBehaviourScore(peer, 50);
+
+    const inner = try msg_mod.encode(a, .{ .topic = "t", .data = "off-topic" });
+    defer a.free(inner);
+    const r = try rpc.encodePublish(a, inner);
+    defer a.free(r);
+    try g.handleInboundRpc(peer, r);
+
+    try std.testing.expectEqual(@as(u64, 0), g.inboundDeliveredCount());
+    try std.testing.expectEqual(@as(u64, 1), g.validatorIgnoreCount());
+    try std.testing.expectEqual(@as(i32, 50), g.peerBehaviourScore(peer));
+}
+
+// ---------------------------------------------------------------------------
+// Direct peers (#85)
+// ---------------------------------------------------------------------------
+
+test "direct peer bypasses PRUNE back-off" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 2 });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+    try g.addDirectPeer(peer);
+
+    const prune = try control.encodePrune(a, "t", 60);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+
+    try std.testing.expect(!g.isPeerBackedOff(peer, "t"));
+    try std.testing.expectEqual(@as(usize, 0), g.activeBackoffCount());
+}
+
+test "direct peer is never selected as mesh-prune victim" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 2,
+        .mesh_n_high = 3,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    var peers: [4]identity.PeerId = undefined;
+    for (&peers) |*p| p.* = try identity.PeerId.random();
+    try g.addDirectPeer(peers[0]);
+
+    const graft = try control.encodeGraft(a, "t");
+    defer a.free(graft);
+    const graft_rpc = try rpc.encodeControlOnlyRpc(a, graft);
+    defer a.free(graft_rpc);
+    for (peers) |p| {
+        g.onPeerConnected(p);
+        try g.handleInboundRpc(p, graft_rpc);
+    }
+    try std.testing.expectEqual(@as(u64, 4), g.meshPeers());
+
+    try g.heartbeat();
+    // Mesh trimmed to mesh_n=2, but the direct peer must still be in the mesh.
+    try std.testing.expectEqual(@as(?usize, 2), g.meshPeerCountForTopic("t"));
+
+    var direct_pruned = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        if (d.to) |t| {
+            if (t.eql(&peers[0])) {
+                const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+                defer a.free(ctl);
+                if ((try control.decodeFirstPrune(a, ctl)) != null) direct_pruned = true;
+            }
+        }
+    }
+    try std.testing.expect(!direct_pruned);
+}
+
+// ---------------------------------------------------------------------------
+// IDONTWANT runtime suppression (#85)
+// ---------------------------------------------------------------------------
+
+test "IDONTWANT from mesh peer suppresses outbound publish to that peer" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 3 });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const pa = try identity.PeerId.random();
+    const pb = try identity.PeerId.random();
+    g.onPeerConnected(pa);
+    g.onPeerConnected(pb);
+
+    const graft = try control.encodeGraft(a, "t");
+    defer a.free(graft);
+    const graft_rpc = try rpc.encodeControlOnlyRpc(a, graft);
+    defer a.free(graft_rpc);
+    try g.handleInboundRpc(pa, graft_rpc);
+    try g.handleInboundRpc(pb, graft_rpc);
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+
+    // Compute message_id for ("t", "hot") so we can pre-seed IDONTWANT from pb.
+    var mid: [20]u8 = undefined;
+    message_id.writeMessageId("t", "hot", true, &mid);
+    const idw = try control.encodeIDontWant(a, &.{mid[0..]});
+    defer a.free(idw);
+    const idw_rpc = try rpc.encodeControlOnlyRpc(a, idw);
+    defer a.free(idw_rpc);
+    try g.handleInboundRpc(pb, idw_rpc);
+    try std.testing.expectEqual(@as(usize, 1), g.idontwantCount());
+
+    // Now inject the publish from pa. Forward must go to pb's IDONTWANT'd id → suppress.
+    const inner = try msg_mod.encode(a, .{ .topic = "t", .data = "hot" });
+    defer a.free(inner);
+    const pubw = try rpc.encodePublish(a, inner);
+    defer a.free(pubw);
+    try g.handleInboundRpc(pa, pubw);
+
+    var saw_pb_publish = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        const to = d.to orelse continue;
+        if (to.eql(&pb)) {
+            // Subscribe wires don't carry publishes; check for publish.
+            const blobs = try rpc.decodePublishes(a, d.wire);
+            defer rpc.freePublishBlobs(a, blobs);
+            if (blobs.len > 0) saw_pb_publish = true;
+        }
+    }
+    try std.testing.expect(!saw_pb_publish);
+    try std.testing.expect(g.suppressedOutboundIDontWantCount() >= 1);
+}
+
+test "IDONTWANT cache expires after ttl" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .idontwant_ttl_ms = 2000,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    var id: [20]u8 = [_]u8{0xab} ** 20;
+    const idw = try control.encodeIDontWant(a, &.{id[0..]});
+    defer a.free(idw);
+    const idw_rpc = try rpc.encodeControlOnlyRpc(a, idw);
+    defer a.free(idw_rpc);
+    try g.handleInboundRpc(peer, idw_rpc);
+    try std.testing.expectEqual(@as(usize, 1), g.idontwantCount());
+
+    // Advance past TTL and trigger a sweep via lookup.
+    g.setClockMs(3000);
+    try std.testing.expect(!g.peerWantsNotPublish(peer, id));
+    try std.testing.expectEqual(@as(usize, 0), g.idontwantCount());
+}
+
+// ---------------------------------------------------------------------------
+// PRUNE PX dial-suggestion queue (#85)
+// ---------------------------------------------------------------------------
+
+test "inbound PRUNE PX peer-ids surface in dial-suggestion queue" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const px = [_]control.PeerInfoOwned{
+        .{ .peer_id = @constCast("px-peer-1") },
+        .{ .peer_id = @constCast("px-peer-2") },
+    };
+    const prune = try control.encodePruneWithPeers(a, "t", 30, &px);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+
+    try std.testing.expectEqual(@as(usize, 2), g.dialSuggestionCount());
+    const a1 = g.popDialSuggestion().?;
+    defer a.free(a1);
+    try std.testing.expectEqualStrings("px-peer-1", a1);
+    const a2 = g.popDialSuggestion().?;
+    defer a.free(a2);
+    try std.testing.expectEqualStrings("px-peer-2", a2);
+    try std.testing.expectEqual(@as(?[]u8, null), g.popDialSuggestion());
+}
+
+test "PX queue evicts oldest when full" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .max_px_dial_queue = 2 });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const px = [_]control.PeerInfoOwned{
+        .{ .peer_id = @constCast("p1") },
+        .{ .peer_id = @constCast("p2") },
+        .{ .peer_id = @constCast("p3") },
+    };
+    const prune = try control.encodePruneWithPeers(a, "t", null, &px);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+
+    try std.testing.expectEqual(@as(usize, 2), g.dialSuggestionCount());
+    const got1 = g.popDialSuggestion().?;
+    defer a.free(got1);
+    try std.testing.expectEqualStrings("p2", got1);
+    const got2 = g.popDialSuggestion().?;
+    defer a.free(got2);
+    try std.testing.expectEqualStrings("p3", got2);
 }

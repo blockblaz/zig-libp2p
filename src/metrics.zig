@@ -79,7 +79,7 @@ pub const Metrics = struct {
         } else {
             try w.writeAll("{network_id=\"\"} ");
         }
-        try std.fmt.format(w, "{d}\n", .{self.meshPeers()});
+        try w.print("{d}\n", .{self.meshPeers()});
 
         try w.writeAll("# TYPE swarm_command_dropped_total counter\n");
         inline for (std.enums.values(SwarmDropReason)) |r| {
@@ -88,7 +88,7 @@ pub const Metrics = struct {
             try w.writeAll("\",reason=\"");
             try w.writeAll(reasonLabel(r));
             try w.writeAll("\"} ");
-            try std.fmt.format(w, "{d}\n", .{self.swarmCommandDropped(r)});
+            try w.print("{d}\n", .{self.swarmCommandDropped(r)});
         }
     }
 };
@@ -100,11 +100,11 @@ test "metrics prometheus text shape" {
     m.recordSwarmCommandDropped(.full);
     m.recordSwarmCommandDropped(.closed);
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(std.testing.allocator);
-    try m.writePrometheusText(&buf.writer(std.testing.allocator));
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try m.writePrometheusText(&aw.writer);
 
-    const s = buf.items;
+    const s = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, s, "lean_gossip_mesh_peers") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "network_id=\"devnet0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, " 7\n") != null);
@@ -115,25 +115,25 @@ test "metrics prometheus text shape" {
     try std.testing.expect(std.mem.indexOf(u8, s, "reason=\"closed\"} 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "reason=\"uninitialized\"} 0") != null);
 
-    var buf2 = std.ArrayList(u8).empty;
-    defer buf2.deinit(std.testing.allocator);
-    try m.snapshot(&buf2.writer(std.testing.allocator));
-    try std.testing.expectEqualStrings(s, buf2.items);
+    var aw2: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw2.deinit();
+    try m.snapshot(&aw2.writer);
+    try std.testing.expectEqualStrings(s, aw2.written());
 }
 
 test "metrics empty network_id on swarm counters" {
     var m = Metrics{};
     m.recordSwarmCommandDropped(.full);
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(std.testing.allocator);
-    try m.writePrometheusText(&buf.writer(std.testing.allocator));
-    try std.testing.expect(std.mem.indexOf(u8, buf.items, "network_id=\"\",reason=\"full\"") != null);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try m.writePrometheusText(&aw.writer);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "network_id=\"\",reason=\"full\"") != null);
 }
 
 test "metrics label escaping" {
     var m = Metrics{ .network_id = "a\"b\\c" };
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(std.testing.allocator);
-    try m.writePrometheusText(&buf.writer(std.testing.allocator));
-    try std.testing.expect(std.mem.indexOf(u8, buf.items, "a\\\"b\\\\c") != null);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try m.writePrometheusText(&aw.writer);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "a\\\"b\\\\c") != null);
 }

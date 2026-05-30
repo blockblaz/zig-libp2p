@@ -378,7 +378,8 @@ test "req_resp inbound idle timeout" {
     const cid = try rr.registerInboundChannel(peer, .status, 99, 500);
     try queueInboundRpcRequest(a, &swarm, peer, .status, 99, cid, "");
 
-    try rr.tick(530);
+    // last_activity = 500, idle_timeout = 40 → elapsed must be ≥ 40, i.e. now_ms ≥ 540.
+    try rr.tick(541);
 
     {
         var ev = try swarm.nextEvent(5000);
@@ -436,7 +437,9 @@ test "req_resp sendResponseChunk extends inbound idle window" {
     try rr.tick(80);
     try std.testing.expectError(error.Timeout, swarm.nextEvent(0));
 
-    try rr.tick(95);
+    // After sendResponseChunk(.., 50) last_activity = 50; idle_timeout = 50.
+    // Need now_ms - 50 ≥ 50, i.e. now_ms ≥ 100.
+    try rr.tick(101);
     {
         var ev = try swarm.nextEvent(5000);
         defer ev.deinit(a);
