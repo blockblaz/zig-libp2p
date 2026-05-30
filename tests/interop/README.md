@@ -17,3 +17,20 @@ This directory is reserved for **rust-libp2p ↔ zig-libp2p** wire checks. Issue
 ## Running Zig parser smoke
 
 `zig build test` runs the full suite; `zig build fuzz` runs only the `wire fuzz …` tests (faster, fuzz-oriented).
+
+## Interop CI (#95)
+
+`.github/workflows/interop.yml` runs nightly and on manual dispatch:
+
+1. **`fuzz-extended`** — extended libFuzzer budget over the wire-conformance
+   harness (varint, req/resp frames, gossipsub RPC + control, yamux/mplex
+   headers, Snappy, gossipsub `Message`). Catches divergences against
+   adversarial inputs before they show up in cross-impl tests.
+2. **`rust-libp2p-ping-interop`** — builds the zig-libp2p QUIC ping example
+   and sanity-runs the bundled loopback. Currently a single-stack check;
+   the workflow has a marked TODO and an explicit skeleton for adding a
+   rust-libp2p ping responder Docker container (ghcr.io/libp2p/rust-libp2p-head)
+   so a follow-up can extend it without re-litigating workflow shape.
+
+The per-PR CI in `ci.yml` runs the full unit-test + 60s fuzz smoke; only the
+nightly job here pulls in cross-impl Docker images and longer fuzz budgets.

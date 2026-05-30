@@ -6,7 +6,7 @@ const pid = @import("peer_id");
 /// Supported host key material loaded from PEM.
 pub const KeyPair = union(enum) {
     ed25519: std.crypto.sign.Ed25519.KeyPair,
-    secp256k1: std.crypto.ecdsa.EcdsaSecp256k1Sha256.KeyPair,
+    secp256k1: std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256.KeyPair,
 };
 
 pub const PemError = error{
@@ -14,7 +14,7 @@ pub const PemError = error{
     InvalidDer,
     UnsupportedKeyType,
     InvalidKeyMaterial,
-} || std.base64.Error;
+} || std.base64.Error || std.mem.Allocator.Error;
 
 /// Object identifier `1.3.101.112` (Ed25519) as DER `OBJECT IDENTIFIER` TLV.
 const oid_ed25519_tlv: [5]u8 = .{ 0x06, 0x03, 0x2B, 0x65, 0x70 };
@@ -62,8 +62,8 @@ fn keypairFromSec1EcSequence(seq: []const u8) PemError!KeyPair {
     const sk_raw = try readTlv(seq, &j, 0x04);
     if (sk_raw.len != 32) return error.InvalidKeyMaterial;
     const sk_bytes: [32]u8 = sk_raw[0..32].*;
-    const sec = std.crypto.ecdsa.EcdsaSecp256k1Sha256.SecretKey.fromBytes(sk_bytes) catch return error.InvalidKeyMaterial;
-    const kp = std.crypto.ecdsa.EcdsaSecp256k1Sha256.KeyPair.fromSecretKey(sec) catch return error.InvalidKeyMaterial;
+    const sec = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256.SecretKey.fromBytes(sk_bytes) catch return error.InvalidKeyMaterial;
+    const kp = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256.KeyPair.fromSecretKey(sec) catch return error.InvalidKeyMaterial;
     return .{ .secp256k1 = kp };
 }
 

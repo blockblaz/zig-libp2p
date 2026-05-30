@@ -64,6 +64,7 @@ pub const transport = struct {
     pub const quic_peer_identity = @import("transport/quic_peer_identity.zig");
     pub const stream_multistream = @import("transport/stream_multistream.zig");
     pub const tcp = @import("transport/tcp.zig");
+    pub const tcp_tls = @import("transport/tcp_tls.zig");
     pub const multistream_negotiate = @import("transport/multistream_negotiate.zig");
     pub const transport_error = @import("transport/transport_error.zig");
     pub const yamux = @import("transport/yamux/root.zig");
@@ -109,4 +110,7 @@ test {
     _ = @import("identify.zig");
     _ = @import("connection_manager.zig");
     _ = @import("metrics.zig");
+    _ = @import("security/libp2p_tls.zig");
+    _ = @import("security/noise/identity.zig");
+    _ = @import("transport/tcp_tls.zig");
 }
