@@ -45,6 +45,28 @@ const KnownState = struct {
 const ConnEntry = struct {
     peer: identity.PeerId,
     direction: peer_events.Direction,
+    /// Monotonic insertion order — used to pick the oldest connection during trimming (#90).
+    seq: u64,
+};
+
+/// Connection-limit knobs (libp2p connection manager profile, #90).
+///
+/// `null` for any field disables the corresponding policy. The default keeps the
+/// old un-capped behaviour so this is opt-in.
+pub const ConnectionLimits = struct {
+    /// Maximum concurrent connections to a single peer; excess connections are
+    /// surfaced as [`swarm.Event.connection_trim_recommended`] with
+    /// [`swarm.TrimReason.over_per_peer_cap`].
+    max_per_peer: ?u32 = null,
+    /// Hard cap on the total active connections kept open. The manager only
+    /// emits trim recommendations *after* `high_watermark` is crossed; the
+    /// embedder remains responsible for actual close.
+    max_total: ?u32 = null,
+    /// Trimming wakes up when `total >= high_watermark` …
+    high_watermark: ?u32 = null,
+    /// … and stops once we've shaved enough oldest connections to bring total
+    /// back to `low_watermark`. Must be ≤ `high_watermark`.
+    low_watermark: ?u32 = null,
 };
 
 /// Snapshot of dial scheduling state for a known peer (tests and diagnostics, #38).
@@ -60,10 +82,20 @@ pub const ConnectionManager = struct {
     /// When set, [`onConnectionClosed`] calls [`req_resp.runtime.ReqResp.onPeerDisconnected`] if the
     /// peer drops to zero active connections.
     req_resp: ?*req_resp_runtime.ReqResp = null,
+    /// Connection-limit policy (#90).
+    limits: ConnectionLimits = .{},
 
     known: std.HashMap(identity.PeerId, KnownState, PeerIdContext, std.hash_map.default_max_load_percentage),
     conns: std.AutoHashMap(ConnectionId, ConnEntry),
     peer_active: std.HashMap(identity.PeerId, u32, PeerIdContext, std.hash_map.default_max_load_percentage),
+    /// Monotonic counter assigned to each [`onConnectionEstablished`]; used to pick
+    /// the oldest connection for trim recommendations (#90).
+    next_seq: u64 = 0,
+    /// Conns whose trim recommendation has already been sent (#90); we keep them so
+    /// the embedder can still confirm via `onConnectionClosed` without re-recommending.
+    trim_recommended: std.AutoHashMap(ConnectionId, void),
+    /// Total trim recommendations emitted across both reason codes (#90 observability).
+    trim_recommendations_total: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, s: *swarm_mod.Swarm) ConnectionManager {
         return .{
@@ -72,7 +104,22 @@ pub const ConnectionManager = struct {
             .known = .init(allocator),
             .conns = .init(allocator),
             .peer_active = .init(allocator),
+            .trim_recommended = .init(allocator),
         };
+    }
+
+    pub fn setLimits(self: *ConnectionManager, limits: ConnectionLimits) void {
+        self.limits = limits;
+    }
+
+    /// Total active connections currently tracked (#90).
+    pub fn activeConnectionCount(self: *const ConnectionManager) usize {
+        return self.conns.count();
+    }
+
+    /// Number of trim recommendations emitted since init (#90).
+    pub fn trimRecommendationCount(self: *const ConnectionManager) u64 {
+        return self.trim_recommendations_total;
     }
 
     pub fn deinit(self: *ConnectionManager) void {
@@ -83,6 +130,7 @@ pub const ConnectionManager = struct {
         self.known.deinit();
         self.conns.deinit();
         self.peer_active.deinit();
+        self.trim_recommended.deinit();
     }
 
     pub fn setReqResp(self: *ConnectionManager, rr: ?*req_resp_runtime.ReqResp) void {
@@ -93,10 +141,13 @@ pub const ConnectionManager = struct {
         return self.peer_active.get(peer) orelse 0;
     }
 
+    /// Inferred from [`multiaddrDialString`] plus the local error tags. The dependency's
+    /// `ProtocolIterator.next` error set drifted in Zig 0.16, so we let the compiler
+    /// infer it rather than spell out every transitively-added variant.
     pub const RegisterError = error{
         PeerIdMismatch,
         KnownPeerRequiresPeerId,
-    } || multiaddr.multiaddr.Error || std.mem.Allocator.Error;
+    } || @typeInfo(@typeInfo(@TypeOf(multiaddrDialString)).@"fn".return_type.?).error_union.error_set;
 
     /// Registers interest in a peer. The dial string is the multiaddr without any `/p2p` segment.
     /// Either the multiaddr must end with `/p2p/<id>` or `peer_override` must be set.
@@ -197,7 +248,9 @@ pub const ConnectionManager = struct {
             st.next_dial_deadline_ms = std.math.maxInt(i64);
         }
 
-        try self.conns.put(conn_id, .{ .peer = peer, .direction = direction });
+        const seq = self.next_seq;
+        self.next_seq += 1;
+        try self.conns.put(conn_id, .{ .peer = peer, .direction = direction, .seq = seq });
 
         const gop = try self.peer_active.getOrPut(peer);
         const prev = if (gop.found_existing) gop.value_ptr.* else 0;
@@ -206,6 +259,86 @@ pub const ConnectionManager = struct {
             try self.swarm.queueEvent(.{ .peer_connected = .{
                 .peer = peer,
                 .direction = direction,
+            } });
+        }
+
+        // Per-peer cap: if this connection puts us over `max_per_peer`, recommend
+        // closing the oldest connection to that peer (#90).
+        if (self.limits.max_per_peer) |cap| {
+            if (gop.value_ptr.* > cap) {
+                try self.recommendOldestForPeer(peer, .over_per_peer_cap);
+            }
+        }
+
+        // Global watermark: once `high_watermark` is breached, trim oldest down to
+        // `low_watermark`.
+        if (self.limits.high_watermark) |hi| {
+            const low = self.limits.low_watermark orelse hi;
+            if (self.conns.count() >= hi) {
+                try self.trimOldestDownTo(low);
+            }
+        }
+    }
+
+    fn recommendOldestForPeer(self: *ConnectionManager, peer: identity.PeerId, reason: swarm_mod.TrimReason) !void {
+        var pick_id: ?ConnectionId = null;
+        var pick_seq: u64 = std.math.maxInt(u64);
+        var it = self.conns.iterator();
+        while (it.next()) |e| {
+            const cid = e.key_ptr.*;
+            const ent = e.value_ptr.*;
+            if (!ent.peer.eql(&peer)) continue;
+            if (self.trim_recommended.contains(cid)) continue;
+            if (ent.seq < pick_seq) {
+                pick_seq = ent.seq;
+                pick_id = cid;
+            }
+        }
+        const cid = pick_id orelse return;
+        try self.trim_recommended.put(cid, {});
+        self.trim_recommendations_total += 1;
+        try self.swarm.queueEvent(.{ .connection_trim_recommended = .{
+            .peer = peer,
+            .conn_id = cid,
+            .reason = reason,
+        } });
+    }
+
+    fn trimOldestDownTo(self: *ConnectionManager, target: u32) !void {
+        // We may issue several recommendations per breach; cap the loop by the
+        // current live conn count to avoid runaway.
+        var safety: usize = self.conns.count();
+        while (safety > 0) : (safety -= 1) {
+            const live_unrecommended = blk: {
+                var n: usize = 0;
+                var it = self.conns.iterator();
+                while (it.next()) |e| {
+                    if (!self.trim_recommended.contains(e.key_ptr.*)) n += 1;
+                }
+                break :blk n;
+            };
+            if (live_unrecommended <= target) return;
+
+            // Pick globally-oldest non-recommended conn.
+            var pick_id: ?ConnectionId = null;
+            var pick_peer: identity.PeerId = undefined;
+            var pick_seq: u64 = std.math.maxInt(u64);
+            var it = self.conns.iterator();
+            while (it.next()) |e| {
+                if (self.trim_recommended.contains(e.key_ptr.*)) continue;
+                if (e.value_ptr.seq < pick_seq) {
+                    pick_seq = e.value_ptr.seq;
+                    pick_id = e.key_ptr.*;
+                    pick_peer = e.value_ptr.peer;
+                }
+            }
+            const cid = pick_id orelse return;
+            try self.trim_recommended.put(cid, {});
+            self.trim_recommendations_total += 1;
+            try self.swarm.queueEvent(.{ .connection_trim_recommended = .{
+                .peer = pick_peer,
+                .conn_id = cid,
+                .reason = .over_global_watermark,
             } });
         }
     }
@@ -219,6 +352,7 @@ pub const ConnectionManager = struct {
         const ent = self.conns.fetchRemove(conn_id) orelse return;
         const peer = ent.value.peer;
         const direction = ent.value.direction;
+        _ = self.trim_recommended.remove(conn_id);
 
         const pr = self.peer_active.getPtr(peer) orelse return;
         pr.* -= 1;
@@ -261,7 +395,7 @@ fn peerIdFromMultiaddr(ma: *const multiaddr.Multiaddr) ?identity.PeerId {
     return last;
 }
 
-fn multiaddrDialString(allocator: std.mem.Allocator, ma: *const multiaddr.Multiaddr) (multiaddr.multiaddr.Error || std.mem.Allocator.Error)![]u8 {
+fn multiaddrDialString(allocator: std.mem.Allocator, ma: *const multiaddr.Multiaddr) ![]u8 {
     var out = multiaddr.Multiaddr.init(allocator);
     defer out.deinit();
     var iter = ma.iterator();
@@ -340,6 +474,12 @@ test "tick submits dial after remote close backoff" {
 
     try cm.onConnectionEstablished(1, peer, .outbound);
     try cm.onConnectionClosed(10_000, 1, .remote_close);
+
+    // Drain the peer_connected queued by onConnectionEstablished before we look
+    // at the peer_disconnected.
+    var evc = try swarm.nextEvent(100);
+    defer evc.deinit(a);
+    try std.testing.expectEqual(.peer_connected, std.meta.activeTag(evc));
 
     var evd = try swarm.nextEvent(100);
     defer evd.deinit(a);
@@ -427,6 +567,12 @@ test "connection manager notifies ReqResp on last disconnect" {
     try cm.onConnectionEstablished(1, peer, .outbound);
     try cm.onConnectionClosed(1000, 1, .remote_close);
 
+    // onConnectionEstablished queues peer_connected; drain it first so the next
+    // assertion lines up with peer_disconnected.
+    var ev0 = try swarm.nextEvent(200);
+    defer ev0.deinit(a);
+    try std.testing.expectEqual(.peer_connected, std.meta.activeTag(ev0));
+
     var ev1 = try swarm.nextEvent(200);
     defer ev1.deinit(a);
     try std.testing.expectEqual(.peer_disconnected, std.meta.activeTag(ev1));
@@ -437,4 +583,116 @@ test "connection manager notifies ReqResp on last disconnect" {
     try std.testing.expectEqual(error.Disconnected, ev2.rpc_error_response.kind);
     try std.testing.expectEqual(stream_rid, ev2.rpc_error_response.request_id);
     try std.testing.expectEqual(@as(u32, 0), rr.inbound.count());
+}
+
+// ---------------------------------------------------------------------------
+// Connection trimming policy (#90)
+// ---------------------------------------------------------------------------
+
+fn drainEventOfTag(swarm_in: *swarm_mod.Swarm, comptime tag: std.meta.Tag(swarm_mod.Event), a: std.mem.Allocator) !swarm_mod.Event {
+    while (true) {
+        var ev = try swarm_in.nextEvent(1000);
+        if (std.meta.activeTag(ev) == tag) return ev;
+        ev.deinit(a);
+    }
+}
+
+test "trim recommends close when per-peer cap is exceeded" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+    cm.setLimits(.{ .max_per_peer = 2 });
+
+    const peer = try identity.PeerId.random();
+    try cm.onConnectionEstablished(1, peer, .inbound);
+    try cm.onConnectionEstablished(2, peer, .outbound);
+    try std.testing.expectEqual(@as(u64, 0), cm.trimRecommendationCount());
+
+    try cm.onConnectionEstablished(3, peer, .inbound);
+    try std.testing.expectEqual(@as(u64, 1), cm.trimRecommendationCount());
+
+    var ev_trim = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
+    defer ev_trim.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), ev_trim.connection_trim_recommended.conn_id);
+    try std.testing.expectEqual(swarm_mod.TrimReason.over_per_peer_cap, ev_trim.connection_trim_recommended.reason);
+}
+
+test "trim recommends oldest conns down to low_watermark when high_watermark crossed" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+    cm.setLimits(.{ .high_watermark = 3, .low_watermark = 1 });
+
+    var peers: [3]identity.PeerId = undefined;
+    for (&peers) |*p| p.* = try identity.PeerId.random();
+    try cm.onConnectionEstablished(10, peers[0], .inbound);
+    try cm.onConnectionEstablished(11, peers[1], .inbound);
+    try std.testing.expectEqual(@as(u64, 0), cm.trimRecommendationCount());
+
+    // 3rd conn hits the high watermark; expect 2 trim recommendations (down to 1).
+    try cm.onConnectionEstablished(12, peers[2], .inbound);
+    try std.testing.expectEqual(@as(u64, 2), cm.trimRecommendationCount());
+
+    var saw_10 = false;
+    var saw_11 = false;
+    var collected: u32 = 0;
+    while (collected < 2) : (collected += 1) {
+        var ev = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(swarm_mod.TrimReason.over_global_watermark, ev.connection_trim_recommended.reason);
+        if (ev.connection_trim_recommended.conn_id == 10) saw_10 = true;
+        if (ev.connection_trim_recommended.conn_id == 11) saw_11 = true;
+    }
+    try std.testing.expect(saw_10 and saw_11);
+}
+
+test "trim already-recommended conn is not re-recommended" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+    cm.setLimits(.{ .max_per_peer = 1 });
+
+    const peer = try identity.PeerId.random();
+    try cm.onConnectionEstablished(1, peer, .inbound);
+    try cm.onConnectionEstablished(2, peer, .outbound);
+    try std.testing.expectEqual(@as(u64, 1), cm.trimRecommendationCount());
+
+    // Third connection: oldest non-recommended is conn 2 (conn 1 was already recommended).
+    try cm.onConnectionEstablished(3, peer, .outbound);
+    try std.testing.expectEqual(@as(u64, 2), cm.trimRecommendationCount());
+}
+
+test "trim entry is cleaned on close" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+    cm.setLimits(.{ .max_per_peer = 1 });
+
+    const peer = try identity.PeerId.random();
+    try cm.onConnectionEstablished(1, peer, .inbound);
+    try cm.onConnectionEstablished(2, peer, .inbound);
+    try std.testing.expectEqual(@as(usize, 1), cm.trim_recommended.count());
+
+    try cm.onConnectionClosed(0, 1, .remote_close);
+    try std.testing.expectEqual(@as(usize, 0), cm.trim_recommended.count());
 }
