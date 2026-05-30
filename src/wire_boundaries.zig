@@ -9,6 +9,9 @@ const rpc = @import("gossipsub/rpc.zig");
 const pb = @import("protobuf/wire.zig");
 const snappy_wire = @import("req_resp/snappy_wire.zig");
 const gs_msg = @import("gossipsub/message.zig");
+const gs_control = @import("gossipsub/control.zig");
+const yamux_frame = @import("transport/yamux/frame.zig");
+const mplex_frame = @import("transport/mplex/frame.zig");
 
 test "wire smoke varint decode" {
     var prng = std.Random.DefaultPrng.init(0xFACADE000044);
@@ -117,6 +120,75 @@ test "wire smoke snappy framed and gossipsub message" {
     }
 }
 
+test "wire smoke gossipsub control decoders" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xC100000044);
+    const rand = prng.random();
+    var buf: [2048]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 1500) : (i += 1) {
+        const n = rand.intRangeLessThan(usize, 0, buf.len + 1);
+        rand.bytes(buf[0..n]);
+        if (gs_control.decodeFirstIHave(a, buf[0..n])) |opt| {
+            if (opt) |ih| {
+                var owned = ih;
+                defer gs_control.deinitIHaveOwned(a, &owned);
+            }
+        } else |_| {}
+        if (gs_control.decodeFirstIWant(a, buf[0..n])) |opt| {
+            if (opt) |iw| {
+                var owned = iw;
+                defer gs_control.deinitIWantOwned(a, &owned);
+            }
+        } else |_| {}
+        if (gs_control.decodeFirstIDontWant(a, buf[0..n])) |opt| {
+            if (opt) |id| {
+                var owned = id;
+                defer gs_control.deinitIDontWantOwned(a, &owned);
+            }
+        } else |_| {}
+        if (gs_control.decodeFirstGraftTopic(a, buf[0..n])) |opt| {
+            if (opt) |topic| a.free(topic);
+        } else |_| {}
+        if (gs_control.decodeFirstPrune(a, buf[0..n])) |opt| {
+            if (opt) |pv| {
+                var owned = pv;
+                defer gs_control.deinitPruneView(a, &owned);
+            }
+        } else |_| {}
+        if (gs_control.decodeFirstPruneWithPeers(a, buf[0..n])) |opt| {
+            if (opt) |pp| {
+                var owned = pp;
+                defer gs_control.deinitPruneWithPeersOwned(a, &owned);
+            }
+        } else |_| {}
+        if (gs_control.decodeFirstControlExtensions(buf[0..n])) |_| {} else |_| {}
+    }
+}
+
+test "wire smoke yamux frame header" {
+    var prng = std.Random.DefaultPrng.init(0x7AAD000044);
+    const rand = prng.random();
+    var buf: [yamux_frame.header_len]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 4000) : (i += 1) {
+        rand.bytes(&buf);
+        _ = yamux_frame.Header.parse(&buf, 1 * 1024 * 1024) catch {};
+    }
+}
+
+test "wire smoke mplex frame header" {
+    var prng = std.Random.DefaultPrng.init(0x77100000044);
+    const rand = prng.random();
+    var buf: [64]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 4000) : (i += 1) {
+        const n = rand.intRangeLessThan(usize, 0, buf.len + 1);
+        rand.bytes(buf[0..n]);
+        _ = mplex_frame.Header.parse(buf[0..n], mplex_frame.default_max_frame_payload) catch {};
+    }
+}
+
 fn wireFuzzVarint(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     smith.bytesWithHash(&buf, 0xA001);
@@ -155,4 +227,68 @@ fn wireFuzzGossipsubRpc(_: void, smith: *std.testing.Smith) !void {
 
 test "wire fuzz gossipsub rpc decode" {
     try std.testing.fuzz({}, wireFuzzGossipsubRpc, .{});
+}
+
+fn wireFuzzGossipsubControl(_: void, smith: *std.testing.Smith) !void {
+    const a = std.testing.allocator;
+    var buf: [2048]u8 = undefined;
+    smith.bytesWithHash(&buf, 0xA004);
+    if (gs_control.decodeFirstIHave(a, &buf)) |opt| {
+        if (opt) |ih| {
+            var owned = ih;
+            defer gs_control.deinitIHaveOwned(a, &owned);
+        }
+    } else |_| {}
+    if (gs_control.decodeFirstIWant(a, &buf)) |opt| {
+        if (opt) |iw| {
+            var owned = iw;
+            defer gs_control.deinitIWantOwned(a, &owned);
+        }
+    } else |_| {}
+    if (gs_control.decodeFirstIDontWant(a, &buf)) |opt| {
+        if (opt) |id| {
+            var owned = id;
+            defer gs_control.deinitIDontWantOwned(a, &owned);
+        }
+    } else |_| {}
+    if (gs_control.decodeFirstGraftTopic(a, &buf)) |opt| {
+        if (opt) |topic| a.free(topic);
+    } else |_| {}
+    if (gs_control.decodeFirstPrune(a, &buf)) |opt| {
+        if (opt) |pv| {
+            var owned = pv;
+            defer gs_control.deinitPruneView(a, &owned);
+        }
+    } else |_| {}
+    if (gs_control.decodeFirstPruneWithPeers(a, &buf)) |opt| {
+        if (opt) |pp| {
+            var owned = pp;
+            defer gs_control.deinitPruneWithPeersOwned(a, &owned);
+        }
+    } else |_| {}
+    if (gs_control.decodeFirstControlExtensions(&buf)) |_| {} else |_| {}
+}
+
+test "wire fuzz gossipsub control decoders" {
+    try std.testing.fuzz({}, wireFuzzGossipsubControl, .{});
+}
+
+fn wireFuzzYamuxHeader(_: void, smith: *std.testing.Smith) !void {
+    var buf: [yamux_frame.header_len]u8 = undefined;
+    smith.bytesWithHash(&buf, 0xA005);
+    _ = yamux_frame.Header.parse(&buf, 1 * 1024 * 1024) catch {};
+}
+
+test "wire fuzz yamux frame header" {
+    try std.testing.fuzz({}, wireFuzzYamuxHeader, .{});
+}
+
+fn wireFuzzMplexHeader(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytesWithHash(&buf, 0xA006);
+    _ = mplex_frame.Header.parse(&buf, mplex_frame.default_max_frame_payload) catch {};
+}
+
+test "wire fuzz mplex frame header" {
+    try std.testing.fuzz({}, wireFuzzMplexHeader, .{});
 }

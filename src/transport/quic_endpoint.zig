@@ -54,20 +54,36 @@ fn zquicAddr(a: feed_addr.Address) ZquicAddress {
 /// Tracks up to 256 **client-initiated** bidirectional streams (`stream_id` 0, 4, 8, …) per server connection slot.
 pub const max_tracked_peer_bidi_streams = 256;
 
-/// Next peer-initiated raw bidi stream on `conn` that has not yet been reported to [`QuicLifecycleHooks.on_inbound_stream_ready`].
-pub fn popNextUnreportedPeerBidiStream(conn: *ZIo.ConnState, reported: *std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams)) ?u64 {
+/// Outcome of one stream-discovery sweep over `conn.raw_app_streams`.
+///
+/// `over_cap` is non-zero when a peer-initiated bidi stream id ≥ `4 * max_tracked_peer_bidi_streams`
+/// was seen — those are silently skipped by [`popNextUnreportedPeerBidiStream`] because the per-slot
+/// reported-bitset has no room. Embedders can observe pressure via [`QuicListener.silentlySkippedInboundStreamsCount`].
+pub const InboundStreamScan = struct {
+    stream_id: ?u64 = null,
+    over_cap: u32 = 0,
+};
+
+/// Next peer-initiated raw bidi stream on `conn` that has not yet been reported to
+/// [`QuicLifecycleHooks.on_inbound_stream_ready`]. Counts (and skips) streams whose id is
+/// beyond what the per-connection bitset can track.
+pub fn popNextUnreportedPeerBidiStream(conn: *ZIo.ConnState, reported: *std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams)) InboundStreamScan {
+    var over_cap: u32 = 0;
     for (&conn.raw_app_streams) |*slot| {
         if (!slot.active) continue;
         const sid = slot.stream_id;
         if (sid % 4 != 0) continue;
         const n = sid / 4;
-        if (n >= max_tracked_peer_bidi_streams) continue;
+        if (n >= max_tracked_peer_bidi_streams) {
+            over_cap += 1;
+            continue;
+        }
         const ui: usize = @intCast(n);
         if (reported.isSet(ui)) continue;
         reported.set(ui);
-        return sid;
+        return .{ .stream_id = sid, .over_cap = over_cap };
     }
-    return null;
+    return .{ .stream_id = null, .over_cap = over_cap };
 }
 
 /// Optional callbacks after [`QuicListener.drive`] / [`QuicListener.pollAccept`] (single-threaded embedder assumption).
@@ -86,6 +102,12 @@ pub const QuicListener = struct {
     seen_connected: [ZIo.MAX_CONNECTIONS]bool,
     lifecycle: QuicLifecycleHooks,
     inbound_stream_reported: [ZIo.MAX_CONNECTIONS]std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams),
+    /// Total inbound streams handed to [`QuicLifecycleHooks.on_inbound_stream_ready`].
+    inbound_streams_reported_total: u64,
+    /// Total inbound streams ignored because their id is beyond the per-slot bitset capacity
+    /// (i.e. `stream_id / 4 >= max_tracked_peer_bidi_streams`). Observability for backpressure
+    /// against peers that try to open more streams than we can track on a single connection.
+    silently_skipped_inbound_streams_total: u64,
 
     /// Bind from a `/udp/.../quic-v1` multiaddr (port may be `0`; use [`boundUdpPortIpv4`] after listen).
     pub fn listen(
@@ -101,8 +123,28 @@ pub const QuicListener = struct {
             .seen_connected = .{false} ** ZIo.MAX_CONNECTIONS,
             .lifecycle = .{},
             .inbound_stream_reported = [_]std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams){std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams).initEmpty()} ** ZIo.MAX_CONNECTIONS,
+            .inbound_streams_reported_total = 0,
+            .silently_skipped_inbound_streams_total = 0,
         };
         return self;
+    }
+
+    /// Total inbound stream-ready callbacks dispatched since listener init (#75).
+    pub fn inboundStreamsReportedCount(self: *const QuicListener) u64 {
+        return self.inbound_streams_reported_total;
+    }
+
+    /// Inbound streams whose id exceeded the per-slot tracking bitset (#75). A non-zero,
+    /// monotonically growing value indicates a peer (or peers) opening more bidi streams
+    /// than we can track on a single connection; either tune embedder logic to close streams
+    /// promptly or treat this as a sign of abuse.
+    pub fn silentlySkippedInboundStreamsCount(self: *const QuicListener) u64 {
+        return self.silently_skipped_inbound_streams_total;
+    }
+
+    /// Per-connection structural cap on simultaneously-trackable peer-initiated bidi streams (#75).
+    pub fn pendingInboundStreamCap(_: *const QuicListener) usize {
+        return max_tracked_peer_bidi_streams;
     }
 
     pub fn deinit(self: *QuicListener) void {
@@ -133,12 +175,18 @@ pub const QuicListener = struct {
     }
 
     fn dispatchInboundStreamCallbacks(self: *QuicListener) void {
-        const cb = self.lifecycle.on_inbound_stream_ready orelse return;
+        const cb = self.lifecycle.on_inbound_stream_ready;
         for (0..ZIo.MAX_CONNECTIONS) |i| {
             if (!self.seen_connected[i]) continue;
             if (self.server.conns[i]) |*c| {
-                while (popNextUnreportedPeerBidiStream(c, &self.inbound_stream_reported[i])) |sid| {
-                    cb(self.lifecycle.ctx, self, i, c, sid);
+                while (true) {
+                    const scan = popNextUnreportedPeerBidiStream(c, &self.inbound_stream_reported[i]);
+                    self.silently_skipped_inbound_streams_total += scan.over_cap;
+                    const sid = scan.stream_id orelse break;
+                    if (cb) |hook| {
+                        hook(self.lifecycle.ctx, self, i, c, sid);
+                    }
+                    self.inbound_streams_reported_total += 1;
                 }
             }
         }
