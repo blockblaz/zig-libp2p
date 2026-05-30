@@ -3,7 +3,7 @@
 const std = @import("std");
 const wire = @import("../../protobuf/wire.zig");
 
-pub const Error = wire.Error || error{
+pub const Error = wire.Error || std.mem.Allocator.Error || error{
     MissingIdentityKey,
     MissingIdentitySig,
 };

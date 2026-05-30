@@ -62,7 +62,7 @@ pub const Error = error{
     SignedKeySignatureInvalid,
     InvalidHostPublicKeyEncoding,
     UnsupportedHostPublicKeyType,
-};
+} || std.mem.Allocator.Error;
 
 /// Full TLS identity verification (certificate + SignedKey), per the libp2p TLS spec.
 pub const VerifyPeerCertificateError = Error || X509.ParseError || X509.Parsed.VerifyError;
@@ -156,7 +156,7 @@ fn verifyHostKeySignature(
     message: []const u8,
 ) Error!void {
     const Ed25519 = std.crypto.sign.Ed25519;
-    const ecdsa = std.crypto.ecdsa;
+    const ecdsa = std.crypto.sign.ecdsa;
     switch (key_type) {
         .ED25519 => {
             if (pubkey_data.len != Ed25519.PublicKey.encoded_length) return error.InvalidHostPublicKeyEncoding;
@@ -166,7 +166,7 @@ fn verifyHostKeySignature(
             const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
             sig.verify(message, pk) catch return error.SignedKeySignatureInvalid;
         },
-        .Secp256k1 => {
+        .SECP256K1 => {
             if (pubkey_data.len != 33) return error.InvalidHostPublicKeyEncoding;
             const pk = ecdsa.EcdsaSecp256k1Sha256.PublicKey.fromSec1(pubkey_data) catch
                 return error.InvalidHostPublicKeyEncoding;
@@ -273,7 +273,14 @@ pub fn verifiedPeerIdFromQuicLeafCertificate(
     return id;
 }
 
-pub fn peerIdFromCertificate(allocator: std.mem.Allocator, cert_der: []const u8) Error!peer_id.PeerId {
+/// Decode the libp2p extension and derive a PeerId **without** verifying the
+/// certificate's self-signature, validity window, or the libp2p SignedKey
+/// signature. **Do not use this for authenticated handshakes** — a hostile peer
+/// can supply any PeerId in the extension and this function will happily return
+/// it. Prefer [`peerIdFromVerifiedCertificate`] / [`verifiedPeerIdFromQuicLeafCertificate`]
+/// (#89). Retained for test-vector replay and protocol-id derivation scenarios
+/// where the cert is already trusted out-of-band.
+pub fn peerIdFromCertificateUnverified(allocator: std.mem.Allocator, cert_der: []const u8) Error!peer_id.PeerId {
     const ext = try findLibp2pExtensionExtValue(cert_der);
     const sk = try parseSignedKey(ext);
     const reader = peer_id.PublicKeyReader.init(sk.public_key_pb) catch return error.InvalidPublicKeyProtobuf;
@@ -290,6 +297,11 @@ pub fn peerIdFromCertificate(allocator: std.mem.Allocator, cert_der: []const u8)
     return peer_id.PeerId.fromPublicKey(allocator, &pk) catch return error.InvalidPublicKeyProtobuf;
 }
 
+/// Back-compat alias for [`peerIdFromCertificateUnverified`]. The renamed name
+/// makes the security trade-off explicit at the call site; this alias keeps
+/// existing callers compiling. Schedule for removal after embedders migrate.
+pub const peerIdFromCertificate = peerIdFromCertificateUnverified;
+
 fn tlsVectorValidityMidpointSec(cert_der: []const u8) X509.ParseError!i64 {
     const c = X509{ .buffer = cert_der, .index = 0 };
     const p = try c.parse();
@@ -302,8 +314,8 @@ test "libp2p TLS spec vector 1 (Ed25519) peer id" {
         \\308201ae30820156a0030201020204499602d2300a06082a8648ce3d040302302031123010060355040a13096c69627032702e696f310a300806035504051301313020170d3735303130313133303030305a180f34303936303130313133303030305a302031123010060355040a13096c69627032702e696f310a300806035504051301313059301306072a8648ce3d020106082a8648ce3d030107034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569ea37c307a3078060a2b0601040183a25a0101046a3068042408011220a77f1d92fedb59dddaea5a1c4abd1ac2fbde7d7b879ed364501809923d7c11b90440d90d2769db992d5e6195dbb08e706b6651e024fda6cfb8846694a435519941cac215a8207792e42849cccc6cd8136c6e4bde92a58c5e08cfd4206eb5fe0bf909300a06082a8648ce3d0403020346003043021f50f6b6c52711a881778718238f650c9fb48943ae6ee6d28427dc6071ae55e702203625f116a7a454db9c56986c82a25682f7248ea1cb764d322ea983ed36a31b77
     ;
     var buf: [512]u8 = undefined;
-    const n = try std.fmt.hexToBytes(&buf, hex);
-    const cert = buf[0..n];
+    const cert_slice = try std.fmt.hexToBytes(&buf, hex);
+    const cert = cert_slice;
 
     const id = try peerIdFromCertificate(a, cert);
     var b58: [128]u8 = undefined;
@@ -323,8 +335,8 @@ test "libp2p TLS spec vector 2 (ECDSA) peer id" {
         \\308201f63082019da0030201020204499602d2300a06082a8648ce3d040302302031123010060355040a13096c69627032702e696f310a300806035504051301313020170d3735303130313133303030305a180f34303936303130313133303030305a302031123010060355040a13096c69627032702e696f310a300806035504051301313059301306072a8648ce3d020106082a8648ce3d030107034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569ea381c23081bf3081bc060a2b0601040183a25a01010481ad3081aa045f0803125b3059301306072a8648ce3d020106082a8648ce3d03010703420004bf30511f909414ebdd3242178fd290f093a551cf75c973155de0bb5a96fedf6cb5d52da7563e794b512f66e60c7f55ba8a3acf3dd72a801980d205e8a1ad29f2044730450220064ea8124774caf8f50e57f436aa62350ce652418c019df5d98a3ac666c9386a022100aa59d704a931b5f72fb9222cb6cc51f954d04a4e2e5450f8805fe8918f71eaae300a06082a8648ce3d04030203470030440220799395b0b6c1e940a7e4484705f610ab51ed376f19ff9d7c16757cfbf61b8d4302206205c03fbb0f95205c779be86581d3e31c01871ad5d1f3435bcf375cb0e5088a
     ;
     var buf: [512]u8 = undefined;
-    const n = try std.fmt.hexToBytes(&buf, hex);
-    const cert = buf[0..n];
+    const cert_slice = try std.fmt.hexToBytes(&buf, hex);
+    const cert = cert_slice;
     const id = try peerIdFromCertificate(a, cert);
     var b58: [128]u8 = undefined;
     const s = try id.toBase58(&b58);
@@ -343,8 +355,8 @@ test "libp2p TLS spec vector 3 (secp256k1) peer id" {
         \\308201ba3082015fa0030201020204499602d2300a06082a8648ce3d040302302031123010060355040a13096c69627032702e696f310a300806035504051301313020170d3735303130313133303030305a180f34303936303130313133303030305a302031123010060355040a13096c69627032702e696f310a300806035504051301313059301306072a8648ce3d020106082a8648ce3d030107034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569ea38184308181307f060a2b0601040183a25a01010471306f0425080212210206dc6968726765b820f050263ececf7f71e4955892776c0970542efd689d2382044630440220145e15a991961f0d08cd15425bb95ec93f6ffa03c5a385eedc34ecf464c7a8ab022026b3109b8a3f40ef833169777eb2aa337cfb6282f188de0666d1bcec2a4690dd300a06082a8648ce3d0403020349003046022100e1a217eeef9ec9204b3f774a08b70849646b6a1e6b8b27f93dc00ed58545d9fe022100b00dafa549d0f03547878338c7b15e7502888f6d45db387e5ae6b5d46899cef0
     ;
     var buf: [512]u8 = undefined;
-    const n = try std.fmt.hexToBytes(&buf, hex);
-    const cert = buf[0..n];
+    const cert_slice = try std.fmt.hexToBytes(&buf, hex);
+    const cert = cert_slice;
     const id = try peerIdFromCertificate(a, cert);
     var b58: [128]u8 = undefined;
     const s = try id.toBase58(&b58);
@@ -363,8 +375,8 @@ test "libp2p TLS spec vector 4 (invalid) rejected after verify" {
         \\308201f73082019da0030201020204499602d2300a06082a8648ce3d040302302031123010060355040a13096c69627032702e696f310a300806035504051301313020170d3735303130313133303030305a180f34303936303130313133303030305a302031123010060355040a13096c69627032702e696f310a300806035504051301313059301306072a8648ce3d020106082a8648ce3d030107034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569ea381c23081bf3081bc060a2b0601040183a25a01010481ad3081aa045f0803125b3059301306072a8648ce3d020106082a8648ce3d03010703420004bf30511f909414ebdd3242178fd290f093a551cf75c973155de0bb5a96fedf6cb5d52da7563e794b512f66e60c7f55ba8a3acf3dd72a801980d205e8a1ad29f204473045022100bb6e03577b7cc7a3cd1558df0da2b117dfdcc0399bc2504ebe7de6f65cade72802206de96e2a5be9b6202adba24ee0362e490641ac45c240db71fe955f2c5cf8df6e300a06082a8648ce3d0403020348003045022100e847f267f43717358f850355bdcabbefb2cfbf8a3c043b203a14788a092fe8db022027c1d04a2d41fd6b57a7e8b3989e470325de4406e52e084e34a3fd56eef0d0df
     ;
     var buf: [512]u8 = undefined;
-    const n = try std.fmt.hexToBytes(&buf, hex);
-    const cert = buf[0..n];
+    const cert_slice = try std.fmt.hexToBytes(&buf, hex);
+    const cert = cert_slice;
     const now = try tlsVectorValidityMidpointSec(cert);
     try std.testing.expectError(error.SignedKeySignatureInvalid, peerIdFromVerifiedCertificate(a, cert, now));
 }
@@ -376,6 +388,48 @@ test "missing extension" {
 
 test "QUIC TLS ALPN matches libp2p TLS spec string" {
     try std.testing.expectEqualStrings("libp2p", quic_application_layer_protocol);
+}
+
+test "verified path rejects expired certificate" {
+    const a = std.testing.allocator;
+    // Same cert as spec vector 1 (Ed25519).
+    const hex =
+        \\308201ae30820156a0030201020204499602d2300a06082a8648ce3d040302302031123010060355040a13096c69627032702e696f310a300806035504051301313020170d3735303130313133303030305a180f34303936303130313133303030305a302031123010060355040a13096c69627032702e696f310a300806035504051301313059301306072a8648ce3d020106082a8648ce3d030107034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569ea37c307a3078060a2b0601040183a25a0101046a3068042408011220a77f1d92fedb59dddaea5a1c4abd1ac2fbde7d7b879ed364501809923d7c11b90440d90d2769db992d5e6195dbb08e706b6651e024fda6cfb8846694a435519941cac215a8207792e42849cccc6cd8136c6e4bde92a58c5e08cfd4206eb5fe0bf909300a06082a8648ce3d0403020346003043021f50f6b6c52711a881778718238f650c9fb48943ae6ee6d28427dc6071ae55e702203625f116a7a454db9c56986c82a25682f7248ea1cb764d322ea983ed36a31b77
+    ;
+    var buf: [512]u8 = undefined;
+    const cert_slice = try std.fmt.hexToBytes(&buf, hex);
+    const cert = cert_slice;
+
+    // Cert validity: notBefore = 1975-01-01, notAfter = 4096-01-01. Use a moment
+    // before notBefore to exercise the cert-time-range check (#89).
+    const way_before: i64 = -1_000_000_000;
+    try std.testing.expectError(error.CertificateNotYetValid, peerIdFromVerifiedCertificate(a, cert, way_before));
+}
+
+test "unverified path returns same PeerId as verified for valid spec vector" {
+    const a = std.testing.allocator;
+    const hex =
+        \\308201ae30820156a0030201020204499602d2300a06082a8648ce3d040302302031123010060355040a13096c69627032702e696f310a300806035504051301313020170d3735303130313133303030305a180f34303936303130313133303030305a302031123010060355040a13096c69627032702e696f310a300806035504051301313059301306072a8648ce3d020106082a8648ce3d030107034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569ea37c307a3078060a2b0601040183a25a0101046a3068042408011220a77f1d92fedb59dddaea5a1c4abd1ac2fbde7d7b879ed364501809923d7c11b90440d90d2769db992d5e6195dbb08e706b6651e024fda6cfb8846694a435519941cac215a8207792e42849cccc6cd8136c6e4bde92a58c5e08cfd4206eb5fe0bf909300a06082a8648ce3d0403020346003043021f50f6b6c52711a881778718238f650c9fb48943ae6ee6d28427dc6071ae55e702203625f116a7a454db9c56986c82a25682f7248ea1cb764d322ea983ed36a31b77
+    ;
+    var buf: [512]u8 = undefined;
+    const cert_slice = try std.fmt.hexToBytes(&buf, hex);
+    const cert = cert_slice;
+
+    const id_unverified = try peerIdFromCertificateUnverified(a, cert);
+    const now = try tlsVectorValidityMidpointSec(cert);
+    const id_verified = try peerIdFromVerifiedCertificate(a, cert, now);
+
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try id_unverified.toBase58(&b1),
+        try id_verified.toBase58(&b2),
+    );
+}
+
+test "unverified path warns about no-crypto helper via doc-comment" {
+    // This is a behavioural test of the alias: both names resolve to the same fn.
+    try std.testing.expectEqual(@as(*const @TypeOf(peerIdFromCertificateUnverified), &peerIdFromCertificateUnverified), &peerIdFromCertificate);
 }
 
 test "parse synthetic TLS 1.3 Certificate handshake (first leaf)" {
