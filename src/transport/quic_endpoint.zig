@@ -93,7 +93,18 @@ pub const QuicLifecycleHooks = struct {
     on_connection_closed: ?*const fn (ctx: ?*anyopaque, slot: usize) void = null,
     /// Fires at most once per inbound stream id (see [`popNextUnreportedPeerBidiStream`]) after each [`QuicListener.drive`].
     on_inbound_stream_ready: ?*const fn (ctx: ?*anyopaque, listener: *QuicListener, slot: usize, conn: *ZIo.ConnState, stream_id: u64) void = null,
+    /// Fires when over-cap inbound streams (those beyond the per-slot bitset) exceed
+    /// [`OverCapPolicy.threshold`] inside [`OverCapPolicy.window_ms`] for a slot (#75 / #105).
+    /// Embedders should close the connection on this signal — the listener itself only
+    /// recommends; it does not own the transport close.
+    on_inbound_stream_over_cap_breach: ?*const fn (ctx: ?*anyopaque, slot: usize, recent_skips: u32) void = null,
 };
+
+const over_cap_mod = @import("over_cap.zig");
+
+/// Re-export of [`over_cap_mod.Policy`] so callers configure the listener without
+/// importing the helper module directly.
+pub const OverCapPolicy = over_cap_mod.Policy;
 
 pub const QuicListener = struct {
     allocator: std.mem.Allocator,
@@ -108,6 +119,14 @@ pub const QuicListener = struct {
     /// (i.e. `stream_id / 4 >= max_tracked_peer_bidi_streams`). Observability for backpressure
     /// against peers that try to open more streams than we can track on a single connection.
     silently_skipped_inbound_streams_total: u64,
+    /// Rate-policy state per slot — running count and the wall-clock millisecond at which
+    /// the count last reset. Driven by [`OverCapPolicy`] (#105).
+    over_cap_count: [ZIo.MAX_CONNECTIONS]u32,
+    over_cap_window_start_ms: [ZIo.MAX_CONNECTIONS]i64,
+    /// Active over-cap policy. When `threshold == 0` the policy is off.
+    over_cap_policy: OverCapPolicy,
+    /// Total times [`QuicLifecycleHooks.on_inbound_stream_over_cap_breach`] has fired.
+    over_cap_breaches_total: u64,
 
     /// Bind from a `/udp/.../quic-v1` multiaddr (port may be `0`; use [`boundUdpPortIpv4`] after listen).
     pub fn listen(
@@ -125,8 +144,25 @@ pub const QuicListener = struct {
             .inbound_stream_reported = [_]std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams){std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams).initEmpty()} ** ZIo.MAX_CONNECTIONS,
             .inbound_streams_reported_total = 0,
             .silently_skipped_inbound_streams_total = 0,
+            .over_cap_count = .{0} ** ZIo.MAX_CONNECTIONS,
+            .over_cap_window_start_ms = .{0} ** ZIo.MAX_CONNECTIONS,
+            .over_cap_policy = .{},
+            .over_cap_breaches_total = 0,
         };
         return self;
+    }
+
+    /// Configure the rate-based over-cap policy (#105). `OverCapPolicy { .threshold = 0 }`
+    /// (the default) disables it; any positive threshold enables the breach callback.
+    pub fn setOverCapPolicy(self: *QuicListener, policy: OverCapPolicy) void {
+        self.over_cap_policy = policy;
+        self.over_cap_count = .{0} ** ZIo.MAX_CONNECTIONS;
+        self.over_cap_window_start_ms = .{0} ** ZIo.MAX_CONNECTIONS;
+    }
+
+    /// Total breach callbacks emitted (#105).
+    pub fn overCapBreachCount(self: *const QuicListener) u64 {
+        return self.over_cap_breaches_total;
     }
 
     /// Total inbound stream-ready callbacks dispatched since listener init (#75).
@@ -176,18 +212,38 @@ pub const QuicListener = struct {
 
     fn dispatchInboundStreamCallbacks(self: *QuicListener) void {
         const cb = self.lifecycle.on_inbound_stream_ready;
+        const now_ms = wall_time.milliTimestamp();
         for (0..ZIo.MAX_CONNECTIONS) |i| {
             if (!self.seen_connected[i]) continue;
             if (self.server.conns[i]) |*c| {
                 while (true) {
                     const scan = popNextUnreportedPeerBidiStream(c, &self.inbound_stream_reported[i]);
                     self.silently_skipped_inbound_streams_total += scan.over_cap;
+                    if (scan.over_cap > 0) self.recordOverCap(i, scan.over_cap, now_ms);
                     const sid = scan.stream_id orelse break;
                     if (cb) |hook| {
                         hook(self.lifecycle.ctx, self, i, c, sid);
                     }
                     self.inbound_streams_reported_total += 1;
                 }
+            }
+        }
+    }
+
+    /// Per-slot sliding-window tally for the over-cap policy. Bookkeeping math
+    /// lives in [`over_cap.step`] so it is testable without a live listener.
+    fn recordOverCap(self: *QuicListener, slot: usize, delta: u32, now_ms: i64) void {
+        const cur = over_cap_mod.State{
+            .count = self.over_cap_count[slot],
+            .window_start_ms = self.over_cap_window_start_ms[slot],
+        };
+        const step = over_cap_mod.step(cur, delta, now_ms, self.over_cap_policy);
+        self.over_cap_count[slot] = step.state.count;
+        self.over_cap_window_start_ms[slot] = step.state.window_start_ms;
+        if (step.breach) {
+            self.over_cap_breaches_total +%= 1;
+            if (self.lifecycle.on_inbound_stream_over_cap_breach) |cb| {
+                cb(self.lifecycle.ctx, slot, delta);
             }
         }
     }
@@ -694,3 +750,8 @@ test "quic tls remote peer id matches listener key" {
     defer inbound_peer.deinit(a);
     try std.testing.expect(inbound_peer.eql(&want));
 }
+
+// Tests for [`overCapStep`] live in `wire_boundaries.zig` so they're picked up
+// by the root test analyzer (this file itself is not in the test-discovery set
+// because it pulls in transport modules with 0.16 drift bugs that are queued
+// for a separate cleanup).

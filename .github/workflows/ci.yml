@@ -63,6 +63,9 @@ jobs:
     - name: Wire fuzz harness (std.testing.fuzz smoke, #44)
       run: zig build fuzz --summary all
 
+    - name: Microbenchmarks (compile + smoke run, #19)
+      run: zig build bench --summary all
+
     - name: Build example executables
       run: |
         max_attempts=3

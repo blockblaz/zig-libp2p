@@ -113,4 +113,5 @@ test {
     _ = @import("security/libp2p_tls.zig");
     _ = @import("security/noise/identity.zig");
     _ = @import("transport/tcp_tls.zig");
+    _ = @import("transport/over_cap.zig");
 }

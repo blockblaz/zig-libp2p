@@ -74,6 +74,23 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run `wire fuzz …` tests (std.testing.fuzz smoke); long libFuzzer runs: zig build test --fuzz (#44)");
     fuzz_step.dependOn(&run_wire_fuzz.step);
 
+    // Microbenchmark binary (#19). Tiny, deterministic, grep-friendly output;
+    // CI builds it under the test step so a compile regression is caught.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("zig_libp2p", mod);
+    const bench_exe = b.addExecutable(.{
+        .name = "zig-libp2p-bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run microbenchmarks for hot paths (#19)");
+    bench_step.dependOn(&run_bench.step);
+
     const test_step = b.step("test", "Run library unit tests, smoke-run most examples, compile TCP status example");
     test_step.dependOn(&run_unit_tests.step);
 
