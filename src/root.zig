@@ -115,13 +115,19 @@ test {
     _ = @import("security/noise/libp2p_noise.zig");
     _ = @import("security/noise/payload.zig");
     _ = @import("security/noise/protocol.zig");
-    // `security/noise/stream_upgrade.zig` and `transport/quic_endpoint.zig` are
-    // deliberately *not* in discovery: each runs a TCP/QUIC loopback handshake
-    // on a real OS thread, and the same Io.Threaded + accept/dial parallel
-    // ordering that hangs the example smoke runs (`build.zig` runs them
-    // serially for that reason) also hangs the test runner under CI on Linux.
-    // Their wire-level logic is covered via `noise/identity.zig`,
-    // `noise/protocol.zig`, `noise/payload.zig`, and `transport/over_cap.zig`.
+    // The following files run TCP/QUIC loopback handshakes on real OS
+    // threads via `Io.Threaded` and are deliberately *not* in test discovery:
+    // the same parallel accept/dial ordering that already forces the example
+    // smoke step to run serially (`build.zig` comment "Parallel runs were
+    // observed to hang indefinitely") also hangs the test runner on Linux CI.
+    // Their wire-level logic is covered by sibling modules that don't open
+    // real sockets (`noise/identity.zig`, `noise/protocol.zig`,
+    // `noise/payload.zig`, `transport/over_cap.zig`, `req_resp/frame.zig`,
+    // `req_resp/stream.zig`, etc.).
+    //   - security/noise/stream_upgrade.zig
+    //   - transport/quic_endpoint.zig
+    //   - transport/tcp.zig
+    //   - req_resp/wire_tcp.zig
     _ = @import("transport/tcp_tls.zig");
     _ = @import("transport/over_cap.zig");
     _ = @import("transport/multistream_negotiate.zig");
@@ -130,7 +136,6 @@ test {
     _ = @import("transport/quic_raw_stream_io.zig");
     _ = @import("transport/quic_v1.zig");
     _ = @import("transport/stream_multistream.zig");
-    _ = @import("transport/tcp.zig");
     _ = @import("transport/transport_error.zig");
     _ = @import("transport/zquic_feed_addr.zig");
     _ = @import("transport/quic_posix_udp.zig");
@@ -157,7 +162,7 @@ test {
     _ = @import("req_resp/snappy_wire.zig");
     _ = @import("req_resp/runtime.zig");
     _ = @import("req_resp/wire_framing.zig");
-    _ = @import("req_resp/wire_tcp.zig");
+    // `req_resp/wire_tcp.zig` excluded — see TCP loopback note above.
     _ = @import("req_resp/wire_quic.zig");
     _ = @import("wall_time.zig");
 }
