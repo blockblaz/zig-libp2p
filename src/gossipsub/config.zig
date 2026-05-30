@@ -21,3 +21,11 @@ pub const history_length: u8 = 6;
 /// Upper bound on serialized gossipsub message size (publish path), per #39:
 /// `max(snappy(10 MiB) + 1 KiB, 1 MiB)`.
 pub const max_transmit_size_bytes: usize = @max(10 * 1024 * 1024 + 1024, 1024 * 1024);
+
+/// Default PRUNE back-off when a peer sends PRUNE without an explicit `backoff_seconds`
+/// (libp2p gossipsub v1.1 spec recommends 1 minute).
+pub const prune_backoff_default_ms: i64 = 60_000;
+
+/// Upper bound applied to peer-supplied `backoff_seconds` to prevent griefing via
+/// abusive long back-offs that would lock us out of a peer indefinitely.
+pub const prune_backoff_cap_ms: i64 = 15 * 60_000;
