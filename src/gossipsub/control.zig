@@ -391,6 +391,183 @@ pub fn deinitPruneView(allocator: std.mem.Allocator, p: *PruneView) void {
     p.* = undefined;
 }
 
+/// One `PeerInfo` entry carried inside `ControlPrune.peers` (libp2p gossipsub v1.1 PX).
+///
+/// We currently surface only the `peerID` (field 1) bytes; the optional
+/// `signedPeerRecord` (field 2) is preserved verbatim so callers that
+/// understand it can pass it through to a libp2p TLS verifier.
+pub const PeerInfoOwned = struct {
+    peer_id: ?[]u8 = null,
+    signed_peer_record: ?[]u8 = null,
+};
+
+pub const PruneWithPeersOwned = struct {
+    topic: []u8,
+    backoff_seconds: ?u64 = null,
+    peers: []PeerInfoOwned,
+};
+
+pub fn deinitPeerInfoOwned(allocator: std.mem.Allocator, p: *PeerInfoOwned) void {
+    if (p.peer_id) |x| allocator.free(x);
+    if (p.signed_peer_record) |x| allocator.free(x);
+    p.* = .{};
+}
+
+pub fn deinitPruneWithPeersOwned(allocator: std.mem.Allocator, p: *PruneWithPeersOwned) void {
+    allocator.free(p.topic);
+    for (p.peers) |*pi| deinitPeerInfoOwned(allocator, pi);
+    allocator.free(p.peers);
+    p.* = undefined;
+}
+
+/// Encode a single nested `PeerInfo` value (just the field-1/field-2 fragments, no outer key).
+fn appendPeerInfoNested(list: *std.ArrayList(u8), allocator: std.mem.Allocator, p: PeerInfoOwned) (Error || std.mem.Allocator.Error)!void {
+    if (p.peer_id) |b| {
+        try checkMessageIdLen(b.len); // peer_id fits comfortably within the message-id cap
+        try w.appendLengthDelimited(list, allocator, 1, b);
+    }
+    if (p.signed_peer_record) |b| {
+        if (b.len > lim.max_control_entry_bytes) return error.PayloadTooLarge;
+        try w.appendLengthDelimited(list, allocator, 2, b);
+    }
+}
+
+/// `repeated ControlPrune prune = 4` with topic, optional backoff, and optional PX peers list.
+pub fn encodePruneWithPeers(
+    allocator: std.mem.Allocator,
+    topic_id: []const u8,
+    backoff_seconds: ?u64,
+    peers: []const PeerInfoOwned,
+) (Error || std.mem.Allocator.Error)![]u8 {
+    try checkTopicLen(topic_id.len);
+    if (peers.len > lim.max_message_ids_per_entry) return error.PayloadTooLarge;
+
+    var prune = std.ArrayList(u8).empty;
+    defer prune.deinit(allocator);
+    try w.appendLengthDelimited(&prune, allocator, 1, topic_id);
+    for (peers) |p| {
+        var nested = std.ArrayList(u8).empty;
+        defer nested.deinit(allocator);
+        try appendPeerInfoNested(&nested, allocator, p);
+        try w.appendLengthDelimited(&prune, allocator, 2, nested.items);
+    }
+    if (backoff_seconds) |b| {
+        try w.appendFieldKey(&prune, allocator, 3, .varint);
+        try w.appendVarUInt64(&prune, allocator, b);
+    }
+
+    var ctl = std.ArrayList(u8).empty;
+    defer ctl.deinit(allocator);
+    try w.appendLengthDelimited(&ctl, allocator, 4, prune.items);
+    return try ctl.toOwnedSlice(allocator);
+}
+
+fn decodePeerInfo(allocator: std.mem.Allocator, blob: []const u8) (Error || std.mem.Allocator.Error)!PeerInfoOwned {
+    var out: PeerInfoOwned = .{};
+    errdefer deinitPeerInfoOwned(allocator, &out);
+
+    var off: usize = 0;
+    while (off < blob.len) {
+        const key = try w.decodeFieldKey(blob[off..]);
+        off += key.len;
+        const ld_cap: usize = switch (key.field_number) {
+            1 => lim.max_message_id_bytes,
+            2 => lim.max_control_entry_bytes,
+            else => lim.max_control_entry_bytes,
+        };
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(blob[off..], key.wire_type, ld_cap)
+        else
+            try w.nextFieldValue(blob[off..], key.wire_type);
+        off += nv.total;
+        switch (key.field_number) {
+            1 => {
+                if (key.wire_type != .length_delimited) return error.UnsupportedWireType;
+                if (out.peer_id != null) continue;
+                out.peer_id = try allocator.dupe(u8, nv.value);
+            },
+            2 => {
+                if (key.wire_type != .length_delimited) return error.UnsupportedWireType;
+                if (out.signed_peer_record != null) continue;
+                out.signed_peer_record = try allocator.dupe(u8, nv.value);
+            },
+            else => {},
+        }
+    }
+    return out;
+}
+
+/// First `ControlPrune` entry including PX `peers`, or null. Variant of [`decodeFirstPrune`].
+pub fn decodeFirstPruneWithPeers(allocator: std.mem.Allocator, control: []const u8) (Error || std.mem.Allocator.Error)!?PruneWithPeersOwned {
+    var off: usize = 0;
+    while (off < control.len) {
+        const key = try w.decodeFieldKey(control[off..]);
+        off += key.len;
+        const nv = if (key.wire_type == .length_delimited)
+            try w.nextFieldValueLimited(control[off..], key.wire_type, lim.max_control_entry_bytes)
+        else
+            try w.nextFieldValue(control[off..], key.wire_type);
+        off += nv.total;
+
+        if (key.field_number != 4 or key.wire_type != .length_delimited) continue;
+
+        var topic: ?[]const u8 = null;
+        var backoff: ?u64 = null;
+        var peers = std.ArrayList(PeerInfoOwned).empty;
+        defer {
+            for (peers.items) |*p| deinitPeerInfoOwned(allocator, p);
+            peers.deinit(allocator);
+        }
+
+        var po: usize = 0;
+        while (po < nv.value.len) {
+            const pk = try w.decodeFieldKey(nv.value[po..]);
+            po += pk.len;
+            const ld_cap: usize = switch (pk.field_number) {
+                1 => lim.max_topic_str_bytes,
+                2 => lim.max_control_entry_bytes,
+                else => lim.max_control_entry_bytes,
+            };
+            const pv = if (pk.wire_type == .length_delimited)
+                try w.nextFieldValueLimited(nv.value[po..], pk.wire_type, ld_cap)
+            else
+                try w.nextFieldValue(nv.value[po..], pk.wire_type);
+            po += pv.total;
+            switch (pk.field_number) {
+                1 => {
+                    if (pk.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    topic = pv.value;
+                },
+                2 => {
+                    if (pk.wire_type != .length_delimited) return error.UnsupportedWireType;
+                    if (peers.items.len >= lim.max_message_ids_per_entry) return error.PayloadTooLarge;
+                    var pi = try decodePeerInfo(allocator, pv.value);
+                    errdefer deinitPeerInfoOwned(allocator, &pi);
+                    try peers.append(allocator, pi);
+                },
+                3 => {
+                    if (pk.wire_type != .varint) return error.UnsupportedWireType;
+                    const vv = try w.decodeVarUInt64(pv.value);
+                    backoff = vv.value;
+                },
+                else => {},
+            }
+        }
+        const top = topic orelse return error.MissingPruneTopic;
+        const owned_peers = try peers.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_peers) |*p| deinitPeerInfoOwned(allocator, p);
+            allocator.free(owned_peers);
+        }
+        return PruneWithPeersOwned{
+            .topic = try allocator.dupe(u8, top),
+            .backoff_seconds = backoff,
+            .peers = owned_peers,
+        };
+    }
+    return null;
+}
+
 /// Subset of `ControlExtensions` from [rpc.proto](https://github.com/libp2p/go-libp2p-pubsub/blob/master/pb/rpc.proto):
 /// `optional bool partialMessages = 10` only. Experimental fields (e.g. 6492434) are skipped on decode.
 pub const ControlExtensionsView = struct {
@@ -612,4 +789,65 @@ test "control extensions wire matches manual key for field 10 true" {
     const wire = try encodeControlMessageExtensionsOnly(a, .{ .partial_messages = true });
     defer a.free(wire);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x32, 0x02, 0x50, 0x01 }, wire);
+}
+
+// ---------------------------------------------------------------------------
+// PRUNE peer exchange (PX, #75 major)
+// ---------------------------------------------------------------------------
+
+test "prune with PX peers round trip carries topic, backoff, peer ids" {
+    const a = std.testing.allocator;
+    const peer1_id = "peer-id-bytes-1";
+    const peer2_id = "peer-id-bytes-2";
+    const peers = [_]PeerInfoOwned{
+        .{ .peer_id = @constCast(peer1_id) },
+        .{ .peer_id = @constCast(peer2_id), .signed_peer_record = @constCast("signed-record-blob") },
+    };
+    const wire = try encodePruneWithPeers(a, "t", 45, &peers);
+    defer a.free(wire);
+
+    var got = (try decodeFirstPruneWithPeers(a, wire)).?;
+    defer deinitPruneWithPeersOwned(a, &got);
+    try std.testing.expectEqualStrings("t", got.topic);
+    try std.testing.expectEqual(@as(?u64, 45), got.backoff_seconds);
+    try std.testing.expectEqual(@as(usize, 2), got.peers.len);
+    try std.testing.expectEqualStrings(peer1_id, got.peers[0].peer_id.?);
+    try std.testing.expectEqual(@as(?[]u8, null), got.peers[0].signed_peer_record);
+    try std.testing.expectEqualStrings(peer2_id, got.peers[1].peer_id.?);
+    try std.testing.expectEqualStrings("signed-record-blob", got.peers[1].signed_peer_record.?);
+}
+
+test "prune with empty PX peers list still decodes" {
+    const a = std.testing.allocator;
+    const wire = try encodePruneWithPeers(a, "t", null, &[_]PeerInfoOwned{});
+    defer a.free(wire);
+    var got = (try decodeFirstPruneWithPeers(a, wire)).?;
+    defer deinitPruneWithPeersOwned(a, &got);
+    try std.testing.expectEqualStrings("t", got.topic);
+    try std.testing.expectEqual(@as(?u64, null), got.backoff_seconds);
+    try std.testing.expectEqual(@as(usize, 0), got.peers.len);
+}
+
+test "decodeFirstPrune is backwards compatible with PX-bearing wire" {
+    const a = std.testing.allocator;
+    const peers = [_]PeerInfoOwned{.{ .peer_id = @constCast("peer-id-bytes-1") }};
+    const wire = try encodePruneWithPeers(a, "t", 10, &peers);
+    defer a.free(wire);
+    // Old decoder ignores the unknown PX field but still surfaces topic + backoff.
+    var legacy = (try decodeFirstPrune(a, wire)).?;
+    defer deinitPruneView(a, &legacy);
+    try std.testing.expectEqualStrings("t", legacy.topic);
+    try std.testing.expectEqual(@as(?u64, 10), legacy.backoff_seconds);
+}
+
+test "decodeFirstPruneWithPeers handles missing optional fields" {
+    const a = std.testing.allocator;
+    // Hand-build a PRUNE with only topic (no backoff, no peers) to mirror old encoder output.
+    const wire = try encodePrune(a, "alpha", null);
+    defer a.free(wire);
+    var got = (try decodeFirstPruneWithPeers(a, wire)).?;
+    defer deinitPruneWithPeersOwned(a, &got);
+    try std.testing.expectEqualStrings("alpha", got.topic);
+    try std.testing.expectEqual(@as(?u64, null), got.backoff_seconds);
+    try std.testing.expectEqual(@as(usize, 0), got.peers.len);
 }
