@@ -65,6 +65,45 @@ const PullEntry = struct {
     stored_ms: i64,
 };
 
+/// Per-(peer, topic) PRUNE back-off entry (libp2p gossipsub v1.1).
+///
+/// While `expires_ms > clock_ms` the local node MUST NOT send GRAFT to `peer` on
+/// `topic`. Inbound GRAFT received during the back-off window is refused with a
+/// fresh PRUNE carrying the remaining back-off (spec: "graft flood mitigation").
+const BackoffEntry = struct {
+    peer: identity.PeerId,
+    topic: []u8,
+    expires_ms: i64,
+};
+
+/// Defense-in-depth (`from`, `seqno`) replay-suppression entry.
+///
+/// Eth2 / Lean gossipsub use the StrictNoSign policy (no signature, no seqno
+/// expected on the wire), so this cache stays empty in normal operation. When a
+/// peer *does* include `from` and `seqno` (e.g. a misbehaving or hostile node),
+/// we still want to suppress trivial replays of the same `(from, seqno)` pair
+/// even when the `data` differs, since one of the two is necessarily forged.
+///
+/// `from` and `seqno` are size-capped by [`wire_limits`]; we stash both inline
+/// to avoid per-entry heap traffic on the inbound hot path.
+const SeqnoEntry = struct {
+    from_buf: [lim.max_gossip_message_from_bytes]u8 = undefined,
+    from_len: u16 = 0,
+    seqno_buf: [lim.max_gossip_message_seqno_bytes]u8 = undefined,
+    seqno_len: u16 = 0,
+    expires_ms: i64,
+
+    fn from(self: *const SeqnoEntry) []const u8 {
+        return self.from_buf[0..self.from_len];
+    }
+    fn seqno(self: *const SeqnoEntry) []const u8 {
+        return self.seqno_buf[0..self.seqno_len];
+    }
+    fn matches(self: *const SeqnoEntry, f: []const u8, s: []const u8) bool {
+        return std.mem.eql(u8, self.from(), f) and std.mem.eql(u8, self.seqno(), s);
+    }
+};
+
 pub const GossipsubConfig = struct {
     local_peer_id: identity.PeerId,
     message_id_domain_snappy_ok: bool = true,
@@ -85,6 +124,23 @@ pub const GossipsubConfig = struct {
     max_outbox_entries: usize = 4096,
     /// Per-peer cap on directed outbox entries; overflow drops oldest `lazy_ihave` to that peer first (#39).
     max_queued_per_peer: usize = 256,
+    /// Fallback PRUNE back-off applied when an inbound PRUNE omits `backoff_seconds`,
+    /// when the local node prunes a peer in `pruneMeshDownToN`, and when an inbound
+    /// GRAFT is refused (libp2p gossipsub v1.1).
+    prune_backoff_default_ms: i64 = gs_cfg.prune_backoff_default_ms,
+    /// Upper bound applied to peer-supplied `backoff_seconds` to bound griefing.
+    prune_backoff_cap_ms: i64 = gs_cfg.prune_backoff_cap_ms,
+    /// Hard upper bound on tracked `(peer, topic)` back-off entries; oldest evicted first.
+    max_backoff_entries: usize = 4096,
+    /// Defense-in-depth: when set, inbound publishes carrying both `from` and `seqno`
+    /// are suppressed if a `(from, seqno)` pair has been seen within `seqno_dedup_ttl_ms`.
+    /// Lean / eth2 use StrictNoSign at the gossipsub layer so this is a no-op for spec-compliant
+    /// peers; the cache exists to throttle obvious replays from misbehaving peers (#75).
+    seqno_dedup_enabled: bool = true,
+    /// FIFO cap on `(from, seqno)` cache size.
+    max_seqno_dedup_entries: usize = 4096,
+    /// TTL applied to `(from, seqno)` cache entries when present.
+    seqno_dedup_ttl_ms: i64 = gs_cfg.duplicate_cache_ttl_ms,
     /// When set, [`Gossipsub`] updates `lean_gossip_mesh_peers` from [`meshPeers`] on membership changes and heartbeat (#43).
     metrics: ?*metrics_mod.Metrics = null,
 
@@ -96,6 +152,11 @@ pub const GossipsubConfig = struct {
         if (c.history_length == 0) return error.InvalidGossipParams;
         if (c.max_recent_messages == 0) return error.InvalidGossipParams;
         if (c.max_pull_cache_entries == 0) return error.InvalidGossipParams;
+        if (c.max_backoff_entries == 0) return error.InvalidGossipParams;
+        if (c.prune_backoff_default_ms < 0) return error.InvalidGossipParams;
+        if (c.prune_backoff_cap_ms < c.prune_backoff_default_ms) return error.InvalidGossipParams;
+        if (c.seqno_dedup_enabled and c.max_seqno_dedup_entries == 0) return error.InvalidGossipParams;
+        if (c.seqno_dedup_enabled and c.seqno_dedup_ttl_ms <= 0) return error.InvalidGossipParams;
     }
 };
 
@@ -153,6 +214,15 @@ pub const Gossipsub = struct {
     scratch_peers: std.ArrayList(identity.PeerId),
     /// Optional mesh / behaviour scores for candidate ordering (higher = preferred GRAFT target) (#39).
     peer_scores: std.HashMap(identity.PeerId, i32, connection_manager.PeerIdContext, std.hash_map.default_max_load_percentage),
+    /// Active PRUNE back-off windows keyed by (peer, topic). Linear-scanned because the
+    /// list stays bounded by `max_backoff_entries` and back-offs are short-lived.
+    backoff: std.ArrayList(BackoffEntry),
+    /// Inbound GRAFT messages refused because the sender was in active back-off.
+    graft_refused_during_backoff: u64,
+    /// Defense-in-depth `(from, seqno)` replay cache.
+    seqno_dedup: std.ArrayList(SeqnoEntry),
+    /// Inbound publishes dropped because their `(from, seqno)` pair was already seen.
+    inbound_dropped_seqno_replay: u64,
 
     pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
         try config.validate();
@@ -180,6 +250,10 @@ pub const Gossipsub = struct {
             .rng = std.Random.DefaultPrng.init(seed),
             .scratch_peers = .empty,
             .peer_scores = .init(allocator),
+            .backoff = .empty,
+            .graft_refused_during_backoff = 0,
+            .seqno_dedup = .empty,
+            .inbound_dropped_seqno_replay = 0,
         };
         return p;
     }
@@ -209,6 +283,9 @@ pub const Gossipsub = struct {
         self.connected.deinit();
         self.peer_scores.deinit();
         self.scratch_peers.deinit(self.allocator);
+        for (self.backoff.items) |b| self.allocator.free(b.topic);
+        self.backoff.deinit(self.allocator);
+        self.seqno_dedup.deinit(self.allocator);
         const a = self.allocator;
         a.destroy(self);
     }
@@ -253,6 +330,132 @@ pub const Gossipsub = struct {
                 i += 1;
             }
         }
+    }
+
+    /// Drops expired back-off windows. Called from [`heartbeat`] and read paths.
+    fn pruneBackoff(self: *Gossipsub) void {
+        var i: usize = 0;
+        while (i < self.backoff.items.len) {
+            if (self.backoff.items[i].expires_ms <= self.clock_ms) {
+                const e = self.backoff.orderedRemove(i);
+                self.allocator.free(e.topic);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Returns the active back-off entry's index for `(peer, topic)` or `null`.
+    /// Side effect: removes the entry on the fly if it has expired.
+    fn findActiveBackoff(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) ?usize {
+        var i: usize = 0;
+        while (i < self.backoff.items.len) {
+            const b = self.backoff.items[i];
+            if (b.expires_ms <= self.clock_ms) {
+                const removed = self.backoff.orderedRemove(i);
+                self.allocator.free(removed.topic);
+                continue;
+            }
+            if (b.peer.eql(&peer) and std.mem.eql(u8, b.topic, topic)) return i;
+            i += 1;
+        }
+        return null;
+    }
+
+    /// `true` iff the local node is currently in PRUNE back-off toward `(peer, topic)`,
+    /// i.e. MUST NOT send GRAFT.
+    pub fn isPeerBackedOff(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) bool {
+        return self.findActiveBackoff(peer, topic) != null;
+    }
+
+    /// Records (or extends) a back-off window for `(peer, topic)` to at least
+    /// `clock_ms + backoff_ms` (capped at `prune_backoff_cap_ms` and floored to the
+    /// existing expiry so successive PRUNEs only ever extend, never shorten).
+    fn recordBackoff(self: *Gossipsub, peer: identity.PeerId, topic: []const u8, backoff_ms: i64) std.mem.Allocator.Error!void {
+        const clamped = @max(@as(i64, 0), @min(backoff_ms, self.cfg.prune_backoff_cap_ms));
+        const expires = self.clock_ms + clamped;
+
+        if (self.findActiveBackoff(peer, topic)) |idx| {
+            const cur = &self.backoff.items[idx];
+            if (expires > cur.expires_ms) cur.expires_ms = expires;
+            return;
+        }
+
+        // Cap pressure: drop the entry expiring soonest before appending.
+        if (self.backoff.items.len >= self.cfg.max_backoff_entries) {
+            var min_idx: usize = 0;
+            var min_exp: i64 = self.backoff.items[0].expires_ms;
+            for (self.backoff.items[1..], 1..) |b, j| {
+                if (b.expires_ms < min_exp) {
+                    min_exp = b.expires_ms;
+                    min_idx = j;
+                }
+            }
+            const removed = self.backoff.orderedRemove(min_idx);
+            self.allocator.free(removed.topic);
+        }
+
+        const topic_owned = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(topic_owned);
+        try self.backoff.append(self.allocator, .{
+            .peer = peer,
+            .topic = topic_owned,
+            .expires_ms = expires,
+        });
+    }
+
+    /// Remaining back-off in seconds for an inbound GRAFT refusal PRUNE (rounded up).
+    fn remainingBackoffSecondsFor(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) ?u64 {
+        const idx = self.findActiveBackoff(peer, topic) orelse return null;
+        const remain_ms = self.backoff.items[idx].expires_ms - self.clock_ms;
+        if (remain_ms <= 0) return 0;
+        return @intCast(@divTrunc(remain_ms + 999, 1000));
+    }
+
+    fn clearBackoffForPeer(self: *Gossipsub, peer: identity.PeerId) void {
+        var i: usize = 0;
+        while (i < self.backoff.items.len) {
+            if (self.backoff.items[i].peer.eql(&peer)) {
+                const removed = self.backoff.orderedRemove(i);
+                self.allocator.free(removed.topic);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Returns `true` if `(from, seqno)` was already cached inside the TTL window; otherwise
+    /// records the entry. `from` and `seqno` are size-capped by [`wire_limits`]; oversize input
+    /// is treated as "not a duplicate" and not cached (the per-field protobuf decoder rejects
+    /// out-of-bound values upstream, so this only fires for the empty-input edge case).
+    fn checkSeqnoDuplicate(self: *Gossipsub, from_b: []const u8, seqno_b: []const u8) bool {
+        if (!self.cfg.seqno_dedup_enabled) return false;
+        if (from_b.len == 0 or seqno_b.len == 0) return false;
+        if (from_b.len > lim.max_gossip_message_from_bytes) return false;
+        if (seqno_b.len > lim.max_gossip_message_seqno_bytes) return false;
+
+        // Cheap LRU-ish: scan forward, evict expired in-flight.
+        var i: usize = 0;
+        while (i < self.seqno_dedup.items.len) {
+            const e = &self.seqno_dedup.items[i];
+            if (e.expires_ms <= self.clock_ms) {
+                _ = self.seqno_dedup.orderedRemove(i);
+                continue;
+            }
+            if (e.matches(from_b, seqno_b)) return true;
+            i += 1;
+        }
+
+        if (self.seqno_dedup.items.len >= self.cfg.max_seqno_dedup_entries) {
+            _ = self.seqno_dedup.orderedRemove(0);
+        }
+        var entry = SeqnoEntry{ .expires_ms = self.clock_ms + self.cfg.seqno_dedup_ttl_ms };
+        entry.from_len = @intCast(from_b.len);
+        entry.seqno_len = @intCast(seqno_b.len);
+        @memcpy(entry.from_buf[0..from_b.len], from_b);
+        @memcpy(entry.seqno_buf[0..seqno_b.len], seqno_b);
+        self.seqno_dedup.append(self.allocator, entry) catch return false;
+        return false;
     }
 
     fn recordSeenForLazy(self: *Gossipsub, topic: []const u8, id: [20]u8) std.mem.Allocator.Error!void {
@@ -496,6 +699,7 @@ pub const Gossipsub = struct {
         while (rit.next()) |e| {
             _ = e.value_ptr.peers.remove(peer);
         }
+        self.clearBackoffForPeer(peer);
         self.syncMeshPeers();
     }
 
@@ -561,6 +765,8 @@ pub const Gossipsub = struct {
                 const ip = interest.?;
                 if (!ip.peers.contains(p)) continue;
             }
+            // libp2p gossipsub v1.1: skip peers currently in PRUNE back-off for this topic.
+            if (self.isPeerBackedOff(p, topic)) continue;
             try self.scratch_peers.append(self.allocator, p);
         }
         self.sortPeersByScoreDescThenBytes(self.scratch_peers.items);
@@ -571,9 +777,21 @@ pub const Gossipsub = struct {
         if (try control.decodeFirstGraftTopic(self.allocator, ctl)) |gt| {
             defer self.allocator.free(gt);
             if (self.subs.contains(gt)) {
-                try self.ensureTopicMesh(gt);
-                const mp = self.mesh.getPtr(gt).?;
-                try mp.peers.put(sender, {});
+                // libp2p gossipsub v1.1 "graft flood mitigation": if we are currently in
+                // PRUNE back-off toward `sender` for `gt`, refuse the GRAFT and reply
+                // with a fresh PRUNE carrying the remaining back-off (rounded up).
+                if (self.remainingBackoffSecondsFor(sender, gt)) |remain_s| {
+                    self.graft_refused_during_backoff += 1;
+                    const ctl_out = try control.encodePrune(self.allocator, gt, remain_s);
+                    defer self.allocator.free(ctl_out);
+                    const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl_out);
+                    errdefer self.allocator.free(rpcw);
+                    try self.appendOut(rpcw, sender);
+                } else {
+                    try self.ensureTopicMesh(gt);
+                    const mp = self.mesh.getPtr(gt).?;
+                    try mp.peers.put(sender, {});
+                }
             }
         }
         if (try control.decodeFirstPrune(self.allocator, ctl)) |pv| {
@@ -582,6 +800,11 @@ pub const Gossipsub = struct {
             if (self.mesh.getPtr(prune.topic)) |mp| {
                 _ = mp.peers.remove(sender);
             }
+            const backoff_ms: i64 = if (prune.backoff_seconds) |s| blk: {
+                const ms_u: u128 = @as(u128, s) * 1000;
+                break :blk @intCast(@min(ms_u, @as(u128, @intCast(self.cfg.prune_backoff_cap_ms))));
+            } else self.cfg.prune_backoff_default_ms;
+            try self.recordBackoff(sender, prune.topic, backoff_ms);
         }
         if (try control.decodeFirstIHave(self.allocator, ctl)) |ih| {
             var owned = ih;
@@ -633,10 +856,14 @@ pub const Gossipsub = struct {
         while (pit.next()) |kp| try self.scratch_peers.append(self.allocator, kp.*);
         self.sortPeersByScoreAscThenBytes(self.scratch_peers.items);
 
+        // Advertise our own back-off so well-behaved peers don't immediately re-graft us;
+        // also record a local back-off so our heartbeat won't immediately re-graft them.
+        const backoff_s: u64 = @intCast(@divTrunc(self.cfg.prune_backoff_default_ms + 999, 1000));
         const n = @min(excess, self.scratch_peers.items.len);
         for (self.scratch_peers.items[0..n]) |victim| {
             _ = mp.peers.remove(victim);
-            const ctl = try control.encodePrune(self.allocator, topic, null);
+            try self.recordBackoff(victim, topic, self.cfg.prune_backoff_default_ms);
+            const ctl = try control.encodePrune(self.allocator, topic, backoff_s);
             defer self.allocator.free(ctl);
             const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
             errdefer self.allocator.free(rpcw);
@@ -666,6 +893,17 @@ pub const Gossipsub = struct {
             var id: [20]u8 = undefined;
             message_id.writeMessageId(topic, data, self.cfg.message_id_domain_snappy_ok, &id);
             if (try self.dup.checkDuplicate(topic, id, self.clock_ms)) continue;
+            // Defense-in-depth: if the peer included both `from` and `seqno`, suppress
+            // trivial `(from, seqno)` replays even when the payload differs. No-op for
+            // Lean / eth2 StrictNoSign traffic (neither field is set on the wire).
+            if (decoded.from) |f| {
+                if (decoded.seqno) |sq| {
+                    if (self.checkSeqnoDuplicate(f, sq)) {
+                        self.inbound_dropped_seqno_replay += 1;
+                        continue;
+                    }
+                }
+            }
             self.inbound_delivered += 1;
             try self.recordSeenForLazy(topic, id);
             try self.rememberPullPayload(topic, id, data);
@@ -677,6 +915,7 @@ pub const Gossipsub = struct {
         self.dup.prune(self.clock_ms);
         self.prunePullCache();
         self.pruneRecentSeen();
+        self.pruneBackoff();
 
         var sit = self.subs.iterator();
         while (sit.next()) |e| {
@@ -726,6 +965,22 @@ pub const Gossipsub = struct {
 
     pub fn inboundDeliveredCount(self: *const Gossipsub) u64 {
         return self.inbound_delivered;
+    }
+
+    /// Inbound GRAFTs refused because the sender was in active PRUNE back-off (#75).
+    pub fn graftRefusedDuringBackoffCount(self: *const Gossipsub) u64 {
+        return self.graft_refused_during_backoff;
+    }
+
+    /// Inbound publishes dropped because their `(from, seqno)` pair was already cached (#75).
+    pub fn inboundDroppedSeqnoReplayCount(self: *const Gossipsub) u64 {
+        return self.inbound_dropped_seqno_replay;
+    }
+
+    /// Active back-off window count (post-expiry sweep).
+    pub fn activeBackoffCount(self: *Gossipsub) usize {
+        self.pruneBackoff();
+        return self.backoff.items.len;
     }
 
     pub fn popOutboxDelivery(self: *Gossipsub) ?OutDelivery {
@@ -1313,4 +1568,386 @@ test "publish rejects wire over max_transmit_size_bytes" {
     defer a.free(big);
     @memset(big, 'q');
     try std.testing.expectError(error.PayloadTooLarge, g.publish("t", big));
+}
+
+// ---------------------------------------------------------------------------
+// PRUNE back-off (#75 blocker 1)
+// ---------------------------------------------------------------------------
+
+test "inbound PRUNE records back-off; heartbeat refuses to re-graft inside window" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 2,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    // Graft → PRUNE with 30s back-off from the remote.
+    const graft = try control.encodeGraft(a, "t");
+    defer a.free(graft);
+    const graft_rpc = try rpc.encodeControlOnlyRpc(a, graft);
+    defer a.free(graft_rpc);
+    try g.handleInboundRpc(peer, graft_rpc);
+    try std.testing.expectEqual(@as(?usize, 1), g.meshPeerCountForTopic("t"));
+
+    const prune = try control.encodePrune(a, "t", 30);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+    try std.testing.expectEqual(@as(?usize, 0), g.meshPeerCountForTopic("t"));
+    try std.testing.expect(g.isPeerBackedOff(peer, "t"));
+
+    // Heartbeat while inside back-off window must not re-graft.
+    g.setClockMs(15_000);
+    try g.heartbeat();
+    try std.testing.expectEqual(@as(?usize, 0), g.meshPeerCountForTopic("t"));
+    var emitted_graft = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if ((try control.decodeFirstGraftTopic(a, ctl)) != null) emitted_graft = true;
+    }
+    try std.testing.expect(!emitted_graft);
+
+    // After expiry the peer becomes graftable again.
+    g.setClockMs(31_000);
+    try g.heartbeat();
+    try std.testing.expectEqual(@as(usize, 0), g.activeBackoffCount());
+
+    var saw_graft = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if ((try control.decodeFirstGraftTopic(a, ctl)) != null) saw_graft = true;
+    }
+    try std.testing.expect(saw_graft);
+}
+
+test "PRUNE without backoff falls back to prune_backoff_default_ms" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 2,
+        .prune_backoff_default_ms = 5_000,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const prune = try control.encodePrune(a, "t", null);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+
+    try std.testing.expect(g.isPeerBackedOff(peer, "t"));
+    g.setClockMs(4_999);
+    try std.testing.expect(g.isPeerBackedOff(peer, "t"));
+    g.setClockMs(5_000);
+    try std.testing.expect(!g.isPeerBackedOff(peer, "t"));
+}
+
+test "inbound GRAFT during back-off is refused with a PRUNE carrying remaining backoff" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 2,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const prune = try control.encodePrune(a, "t", 30);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+
+    // Sender tries to GRAFT us back while still in the back-off window.
+    g.setClockMs(10_000);
+    const graft = try control.encodeGraft(a, "t");
+    defer a.free(graft);
+    const graft_rpc = try rpc.encodeControlOnlyRpc(a, graft);
+    defer a.free(graft_rpc);
+    try g.handleInboundRpc(peer, graft_rpc);
+
+    try std.testing.expectEqual(@as(u64, 1), g.graftRefusedDuringBackoffCount());
+    try std.testing.expectEqual(@as(?usize, 0), g.meshPeerCountForTopic("t"));
+
+    // The refusal PRUNE must be queued to that same peer with remaining_s ≥ 20.
+    var saw_refusal_prune = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        try std.testing.expect(d.to != null and d.to.?.eql(&peer));
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if (try control.decodeFirstPrune(a, ctl)) |pv| {
+            var pvv = pv;
+            defer control.deinitPruneView(a, &pvv);
+            try std.testing.expectEqualStrings("t", pvv.topic);
+            try std.testing.expect(pvv.backoff_seconds.? >= 20);
+            saw_refusal_prune = true;
+        }
+    }
+    try std.testing.expect(saw_refusal_prune);
+}
+
+test "local mesh prune records reciprocal back-off so heartbeat doesn't re-graft victim" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 2,
+        .mesh_n_high = 3,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    var peers: [4]identity.PeerId = undefined;
+    for (&peers) |*p| p.* = try identity.PeerId.random();
+    const graft = try control.encodeGraft(a, "t");
+    defer a.free(graft);
+    const graft_rpc = try rpc.encodeControlOnlyRpc(a, graft);
+    defer a.free(graft_rpc);
+    for (peers) |p| {
+        g.onPeerConnected(p);
+        try g.handleInboundRpc(p, graft_rpc);
+    }
+    try std.testing.expectEqual(@as(u64, 4), g.meshPeers());
+
+    try g.heartbeat();
+    try std.testing.expectEqual(@as(?usize, 2), g.meshPeerCountForTopic("t"));
+    try std.testing.expect(g.activeBackoffCount() >= 2);
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+
+    // Immediate next heartbeat must not re-graft the just-pruned peers.
+    try g.heartbeat();
+    try std.testing.expectEqual(@as(?usize, 2), g.meshPeerCountForTopic("t"));
+    var graft_count: u32 = 0;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if ((try control.decodeFirstGraftTopic(a, ctl)) != null) graft_count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 0), graft_count);
+}
+
+test "peer disconnect clears its back-off entries" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const prune = try control.encodePrune(a, "t", 30);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+    try std.testing.expect(g.isPeerBackedOff(peer, "t"));
+
+    g.onPeerDisconnected(peer);
+    try std.testing.expectEqual(@as(usize, 0), g.activeBackoffCount());
+}
+
+test "PRUNE backoff_seconds is clamped to prune_backoff_cap_ms" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .prune_backoff_default_ms = 1_000,
+        .prune_backoff_cap_ms = 10_000,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    // Hostile peer asks for 24h back-off.
+    const prune = try control.encodePrune(a, "t", 24 * 60 * 60);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+
+    g.setClockMs(10_000);
+    try std.testing.expect(!g.isPeerBackedOff(peer, "t"));
+}
+
+// ---------------------------------------------------------------------------
+// (from, seqno) defense-in-depth dedup (#75 blocker 2)
+// ---------------------------------------------------------------------------
+
+test "duplicate (from, seqno) inbound publish is dropped even when data differs" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 2 });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const inner1 = try msg_mod.encode(a, .{
+        .topic = "t",
+        .data = "payload-1",
+        .from = "spoofed-from",
+        .seqno = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 },
+    });
+    defer a.free(inner1);
+    const rpc1 = try rpc.encodePublish(a, inner1);
+    defer a.free(rpc1);
+
+    const inner2 = try msg_mod.encode(a, .{
+        .topic = "t",
+        .data = "payload-2-different",
+        .from = "spoofed-from",
+        .seqno = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 },
+    });
+    defer a.free(inner2);
+    const rpc2 = try rpc.encodePublish(a, inner2);
+    defer a.free(rpc2);
+
+    try g.handleInboundRpc(peer, rpc1);
+    try g.handleInboundRpc(peer, rpc2);
+    try std.testing.expectEqual(@as(u64, 1), g.inboundDeliveredCount());
+    try std.testing.expectEqual(@as(u64, 1), g.inboundDroppedSeqnoReplayCount());
+}
+
+test "different (from, seqno) pairs are not deduped" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 2 });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const inner1 = try msg_mod.encode(a, .{ .topic = "t", .data = "d1", .from = "A", .seqno = &[_]u8{1} });
+    defer a.free(inner1);
+    const r1 = try rpc.encodePublish(a, inner1);
+    defer a.free(r1);
+    const inner2 = try msg_mod.encode(a, .{ .topic = "t", .data = "d2", .from = "A", .seqno = &[_]u8{2} });
+    defer a.free(inner2);
+    const r2 = try rpc.encodePublish(a, inner2);
+    defer a.free(r2);
+    const inner3 = try msg_mod.encode(a, .{ .topic = "t", .data = "d3", .from = "B", .seqno = &[_]u8{1} });
+    defer a.free(inner3);
+    const r3 = try rpc.encodePublish(a, inner3);
+    defer a.free(r3);
+
+    try g.handleInboundRpc(peer, r1);
+    try g.handleInboundRpc(peer, r2);
+    try g.handleInboundRpc(peer, r3);
+    try std.testing.expectEqual(@as(u64, 3), g.inboundDeliveredCount());
+    try std.testing.expectEqual(@as(u64, 0), g.inboundDroppedSeqnoReplayCount());
+}
+
+test "StrictNoSign publishes (no from / no seqno) are unaffected" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 2 });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const inner = try msg_mod.encode(a, .{ .topic = "t", .data = "one-shot" });
+    defer a.free(inner);
+    const r = try rpc.encodePublish(a, inner);
+    defer a.free(r);
+
+    try g.handleInboundRpc(peer, r);
+    try std.testing.expectEqual(@as(u64, 1), g.inboundDeliveredCount());
+    try std.testing.expectEqual(@as(u64, 0), g.inboundDroppedSeqnoReplayCount());
+}
+
+test "seqno dedup can be disabled via config" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 2,
+        .seqno_dedup_enabled = false,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const inner1 = try msg_mod.encode(a, .{ .topic = "t", .data = "d1", .from = "A", .seqno = &[_]u8{1} });
+    defer a.free(inner1);
+    const r1 = try rpc.encodePublish(a, inner1);
+    defer a.free(r1);
+    const inner2 = try msg_mod.encode(a, .{ .topic = "t", .data = "d2-different", .from = "A", .seqno = &[_]u8{1} });
+    defer a.free(inner2);
+    const r2 = try rpc.encodePublish(a, inner2);
+    defer a.free(r2);
+
+    try g.handleInboundRpc(peer, r1);
+    try g.handleInboundRpc(peer, r2);
+    // Both have distinct message_ids (different data), and seqno dedup is off; both delivered.
+    try std.testing.expectEqual(@as(u64, 2), g.inboundDeliveredCount());
+    try std.testing.expectEqual(@as(u64, 0), g.inboundDroppedSeqnoReplayCount());
 }
