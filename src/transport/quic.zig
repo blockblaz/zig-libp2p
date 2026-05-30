@@ -203,7 +203,6 @@ test "parse quic-v1 ipv4 multiaddr captures p2p" {
 
     const ep = try parseQuicV1Endpoint(ma);
     const want = try peer_id_mod.PeerId.fromString(a, "12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA");
-    defer want.deinit(a);
     try std.testing.expect(ep.expected_peer != null);
     try std.testing.expect(ep.expected_peer.?.eql(&want));
 }

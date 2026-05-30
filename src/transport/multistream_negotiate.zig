@@ -218,9 +218,11 @@ test "full handshake initiator as client quic-v1" {
     try initiatorSendProtocol(&to_server, a, proto);
     rs = to_server.items;
     const offered = try responderReadProtocolOffer(&rs, default_max_body_len);
-    try compactAfterRead(&to_server, a, rs);
+    // Assert and consume before `compactAfterRead` — the helper reallocates
+    // `to_server`'s backing buffer, which would dangle `offered` if used after.
     try std.testing.expectEqualStrings(proto, offered);
     try responderReplyProtocol(&to_client, a, offered, proto);
+    try compactAfterRead(&to_server, a, rs);
 
     rc = to_client.items;
     try initiatorReadProtocolAck(&rc, proto, default_max_body_len);
@@ -261,6 +263,6 @@ test "wrong multistream version from peer" {
     defer to_client.deinit(a);
     try to_client.appendSlice(a, "/multistream/2.0.0\n");
 
-    var rc = to_client.items;
+    var rc: []const u8 = to_client.items;
     try std.testing.expectError(error.InvalidMultistreamVersion, initiatorReadPeerMultistream(&rc, default_max_body_len));
 }

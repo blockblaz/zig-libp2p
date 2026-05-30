@@ -126,12 +126,12 @@ test "Noise XX + multistream over TCP loopback" {
 
     var sk_i: [32]u8 = undefined;
     @memset(&sk_i, 0x11);
-    const ed_i = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(sk_i);
+    const ed_i = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(sk_i);
     const host_i: keypair.KeyPair = .{ .ed25519 = ed_i };
 
     var sk_r: [32]u8 = undefined;
     @memset(&sk_r, 0x22);
-    const ed_r = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(sk_r);
+    const ed_r = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(sk_r);
     const host_r: keypair.KeyPair = .{ .ed25519 = ed_r };
 
     var ns_i: [32]u8 = undefined;
@@ -166,7 +166,7 @@ test "Noise XX + multistream over TCP loopback" {
             var r = net.Stream.reader(st, io_inner, &scratch_r);
             var w = net.Stream.writer(st, io_inner, &scratch_w);
             const muxers = [_][]const u8{"/yamux/1.0.0"};
-            const hs = negotiateResponder(
+            var hs = negotiateResponder(
                 a,
                 io_inner,
                 "",
@@ -203,7 +203,7 @@ test "Noise XX + multistream over TCP loopback" {
     var w = net.Stream.writer(client, io, &scratch_w);
     const muxers = [_][]const u8{"/yamux/1.0.0"};
 
-    const hs = try negotiateInitiator(
+    var hs = try negotiateInitiator(
         a,
         io,
         "",

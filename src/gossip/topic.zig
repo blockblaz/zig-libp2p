@@ -73,7 +73,13 @@ pub const LeanNetworkTopic = struct {
         self.allocator.free(self.fork_digest);
     }
 
-    pub fn encode(self: *const LeanNetworkTopic) std.mem.Allocator.Error![]u8 {
+    pub const EncodeError = std.mem.Allocator.Error || error{
+        InvalidEncoding,
+        InvalidTopic,
+        MissingSubnetId,
+    };
+
+    pub fn encode(self: *const LeanNetworkTopic) EncodeError![]u8 {
         const gossip_part = try self.gossip_topic.encode(self.allocator);
         defer self.allocator.free(gossip_part);
         return std.fmt.allocPrint(self.allocator, "/{s}/{s}/{s}/{s}", .{
@@ -84,7 +90,7 @@ pub const LeanNetworkTopic = struct {
         });
     }
 
-    pub fn encodeZ(self: *const LeanNetworkTopic) std.mem.Allocator.Error![:0]u8 {
+    pub fn encodeZ(self: *const LeanNetworkTopic) EncodeError![:0]u8 {
         const gossip_part = try self.gossip_topic.encode(self.allocator);
         defer self.allocator.free(gossip_part);
         return std.fmt.allocPrintSentinel(self.allocator, "/{s}/{s}/{s}/{s}", .{

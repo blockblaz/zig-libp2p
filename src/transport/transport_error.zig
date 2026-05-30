@@ -123,12 +123,10 @@ pub fn fromZquicIoSetup(err: ZquicIoSetupError) (errors.TransportError || std.me
         error.NoCertEnd,
         error.MissingEndMarker,
         => error.SecurityUpgradeFailed,
-        error.NetworkUnreachable,
-        error.HostUnreachable,
-        => error.Unreachable,
         error.AddressNotAvailable => error.Unreachable,
-        error.ConnectionRefused => error.DialFailed,
-        error.Timeout => error.DialFailed,
+        // 0.16 drift: `NetworkUnreachable` / `HostUnreachable` / `ConnectionRefused`
+        // / `Timeout` are no longer in the zquic init error union; the `else`
+        // arm catches anything we can't classify into the named buckets above.
         else => error.DialFailed,
     };
 }
@@ -143,8 +141,9 @@ pub fn fromZquicRun(err: ZquicRunError) (errors.TransportError || std.mem.Alloca
         error.HostUnreachable,
         => error.Unreachable,
         error.AddressNotAvailable => error.Unreachable,
-        error.ConnectionRefused => error.DialFailed,
-        error.Timeout => error.DialFailed,
+        // 0.16 drift: `ConnectionRefused` / `Timeout` were removed from the
+        // zquic init / run error unions; the `else` arm catches anything we
+        // can't classify into one of the named buckets above.
         else => error.DialFailed,
     };
 }
