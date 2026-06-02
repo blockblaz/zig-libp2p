@@ -261,6 +261,13 @@ pub const Swarm = struct {
     shutdown_requested: std.atomic.Value(bool) = .init(false),
     cmd_closed: std.atomic.Value(bool) = .init(false),
 
+    /// Fires once the background worker enters [`run`] (or the embedder calls
+    /// [`tick`] for the first time in single-threaded mode). Mirrors the
+    /// `wait_for_network_ready` FFI zeam's Rust glue exports so a host thread
+    /// can park until it is safe to submit commands. One-shot: once set, stays
+    /// set for the lifetime of the swarm.
+    ready_event: Io.Event = .unset,
+
     /// When non-null, failed [`submit`] calls record [`metrics.SwarmDropReason`] on this registry.
     metrics: ?*metrics.Metrics = null,
 
@@ -356,6 +363,9 @@ pub const Swarm = struct {
     /// For use on the **same** thread as [`nextEvent`] when [`run`] / [`startBackground`] are not
     /// used (#34). Does nothing useful if a background [`run`] loop is active.
     pub fn tick(self: *Swarm, budget: u32) void {
+        // Self-bootstrap [`ready_event`] so [`waitUntilReady`] also works under
+        // tick-mode embedders (single-threaded).
+        self.ready_event.set(self.io);
         var processed: u32 = 0;
         while (processed < budget) : (processed += 1) {
             const cmd = self.popCommand() orelse return;
@@ -368,9 +378,43 @@ pub const Swarm = struct {
         }
     }
 
+    /// Blocks the calling thread until the background worker has entered its
+    /// main loop (or, under [`tick`]-mode embedders, the first tick has run).
+    /// Returns `true` once ready, `false` on timeout. Idempotent and safe to
+    /// call from any thread — once the swarm is ready, subsequent calls return
+    /// `true` immediately.
+    ///
+    /// Mirrors the `wait_for_network_ready(network_id, timeout_ms) -> bool` FFI
+    /// zeam's Rust libp2p-glue exports today, so a host thread can park until
+    /// it is safe to submit subscribe / publish / dial commands.
+    pub fn waitUntilReady(self: *Swarm, timeout_ms: u32) bool {
+        const io = self.io;
+        const timeout: Io.Timeout = if (timeout_ms == 0) blk: {
+            break :blk .{ .duration = .{ .raw = Io.Duration.zero, .clock = .awake } };
+        } else blk: {
+            const dur: Io.Clock.Duration = .{
+                .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+                .clock = .awake,
+            };
+            break :blk .{ .deadline = Io.Clock.Timestamp.fromNow(io, dur) };
+        };
+        self.ready_event.waitTimeout(io, timeout) catch return false;
+        return true;
+    }
+
+    /// Convenience: non-blocking poll. Returns `true` if the worker has entered
+    /// its loop (or [`tick`] has been called at least once), `false` otherwise.
+    pub fn isReady(self: *Swarm) bool {
+        return self.waitUntilReady(0);
+    }
+
     /// Blocks the calling thread until [`shutdown`] completes processing.
     pub fn run(self: *Swarm) void {
         const io = self.io;
+        // Signal readiness as the very first thing so producers can park on
+        // [`waitUntilReady`] until the worker is genuinely spinning. Set under
+        // the embedder's `io` instance for the same back-end the worker uses.
+        self.ready_event.set(io);
         while (true) {
             var processed: u32 = 0;
             while (processed < commands_per_tick) : (processed += 1) {
@@ -723,4 +767,82 @@ test "swarm submit QueueFull increments metrics" {
     var closed = try swarm.nextEvent(1000);
     defer closed.deinit(a);
     try std.testing.expectEqual(.swarm_closed, std.meta.activeTag(closed));
+}
+
+// ---------------------------------------------------------------------------
+// Ready signal (zeam parity: wait_for_network_ready FFI semantic)
+// ---------------------------------------------------------------------------
+
+test "waitUntilReady returns true after startBackground" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try Swarm.init(a, default_event_capacity);
+    defer swarm.deinit();
+
+    // Before the worker has started the event has not been set yet.
+    try std.testing.expect(!swarm.isReady());
+
+    try swarm.startBackground();
+    // Generous timeout: the OS scheduler should give us the worker thread
+    // within seconds, but CI under load can be slow.
+    try std.testing.expect(swarm.waitUntilReady(5_000));
+    // Idempotent: a second call returns immediately, still true.
+    try std.testing.expect(swarm.isReady());
+
+    swarm.shutdown();
+    var closed = try swarm.nextEvent(1_000);
+    defer closed.deinit(a);
+    try std.testing.expectEqual(.swarm_closed, std.meta.activeTag(closed));
+}
+
+test "waitUntilReady times out before startBackground" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try Swarm.init(a, default_event_capacity);
+    defer swarm.deinit();
+
+    // Short timeout — the worker never starts, so this MUST return false
+    // and MUST NOT hang the test.
+    try std.testing.expect(!swarm.waitUntilReady(25));
+    try std.testing.expect(!swarm.isReady());
+}
+
+test "waitUntilReady self-bootstraps under tick-mode embedders" {
+    const a = std.testing.allocator;
+    var swarm = try Swarm.init(a, default_event_capacity);
+    defer swarm.deinit();
+
+    // Single-threaded embedders never call `startBackground`; their first
+    // `tick()` should self-set the ready event so library code that gates on
+    // `waitUntilReady` still works.
+    try std.testing.expect(!swarm.isReady());
+    swarm.tick(0); // budget=0 → no commands dispatched but ready still fires
+    try std.testing.expect(swarm.isReady());
+}
+
+test "isReady stays true across shutdown (one-shot semantics)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try Swarm.init(a, default_event_capacity);
+    defer swarm.deinit();
+
+    try swarm.startBackground();
+    try std.testing.expect(swarm.waitUntilReady(5_000));
+    swarm.shutdown();
+
+    // Drain the swarm_closed event so deinit doesn't trip the leak detector.
+    var closed = try swarm.nextEvent(1_000);
+    defer closed.deinit(a);
+    try std.testing.expectEqual(.swarm_closed, std.meta.activeTag(closed));
+
+    // The ready event is one-shot: once set, calling `isReady` after shutdown
+    // still returns true. Embedders should pair `waitUntilReady` with their
+    // own shutdown observation, not re-poll it.
+    try std.testing.expect(swarm.isReady());
 }
