@@ -278,24 +278,22 @@ test "responderHandshakeMultistreamAmong matches second candidate" {
     const ping_mod = @import("../ping.zig");
     const wire = "/multistream/1.0.0\n" ++ "/ipfs/ping/1.0.0\n";
     var r = Io.Reader.fixed(wire);
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(a);
-    var w = Io.Writer.allocating(&out, a);
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
 
     const cands: []const []const u8 = &.{ "/meshsub/1.1.0", ping_mod.multistream_protocol_id };
-    const ix = try responderHandshakeMultistreamAmong(&r, &w, cands, a);
+    const ix = try responderHandshakeMultistreamAmong(&r, &aw.writer, cands, a);
     try std.testing.expectEqual(@as(usize, 1), ix);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, ping_mod.multistream_protocol_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), ping_mod.multistream_protocol_id) != null);
 }
 
 test "responderHandshakeMultistreamAmong na for unknown protocol" {
     const a = std.testing.allocator;
     const wire = "/multistream/1.0.0\n/weird/proto\n";
     var r = Io.Reader.fixed(wire);
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(a);
-    var w = Io.Writer.allocating(&out, a);
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
 
     const cands: []const []const u8 = &.{"/meshsub/1.1.0"};
-    try std.testing.expectError(error.ProtocolNegotiationFailed, responderHandshakeMultistreamAmong(&r, &w, cands, a));
+    try std.testing.expectError(error.ProtocolNegotiationFailed, responderHandshakeMultistreamAmong(&r, &aw.writer, cands, a));
 }

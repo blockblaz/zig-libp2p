@@ -134,9 +134,14 @@ test "first bidi stream initiator handshake round trip with responder" {
 
     var reply = std.ArrayList(u8).empty;
     defer reply.deinit(a);
+    // Real multistream-select responder sends the version header first, then the
+    // acknowledged protocol line; previously the test omitted the header which
+    // tripped `InvalidMultistreamVersion` once the test became reachable under
+    // discovery (#chore/zig-0.16-drift-cleanup).
+    try neg.responderSendMultistreamHeader(&reply, a);
     try neg.responderReplyProtocol(&reply, a, offered, "/meshsub/1.1.0");
 
-    var ack = reply.items;
+    var ack: []const u8 = reply.items;
     try neg.initiatorReadPeerMultistream(&ack, neg.default_max_body_len);
     try neg.initiatorReadProtocolAck(&ack, "/meshsub/1.1.0", neg.default_max_body_len);
     try std.testing.expectEqual(@as(usize, 0), ack.len);

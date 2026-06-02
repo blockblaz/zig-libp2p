@@ -112,6 +112,57 @@ test {
     _ = @import("metrics.zig");
     _ = @import("security/libp2p_tls.zig");
     _ = @import("security/noise/identity.zig");
+    _ = @import("security/noise/libp2p_noise.zig");
+    _ = @import("security/noise/payload.zig");
+    _ = @import("security/noise/protocol.zig");
+    // The following files run TCP/QUIC loopback handshakes on real OS
+    // threads via `Io.Threaded` and are deliberately *not* in test discovery:
+    // the same parallel accept/dial ordering that already forces the example
+    // smoke step to run serially (`build.zig` comment "Parallel runs were
+    // observed to hang indefinitely") also hangs the test runner on Linux CI.
+    // Their wire-level logic is covered by sibling modules that don't open
+    // real sockets (`noise/identity.zig`, `noise/protocol.zig`,
+    // `noise/payload.zig`, `transport/over_cap.zig`, `req_resp/frame.zig`,
+    // `req_resp/stream.zig`, etc.).
+    //   - security/noise/stream_upgrade.zig
+    //   - transport/quic_endpoint.zig
+    //   - transport/tcp.zig
+    //   - req_resp/wire_tcp.zig
     _ = @import("transport/tcp_tls.zig");
     _ = @import("transport/over_cap.zig");
+    _ = @import("transport/multistream_negotiate.zig");
+    _ = @import("transport/quic.zig");
+    _ = @import("transport/quic_peer_identity.zig");
+    _ = @import("transport/quic_raw_stream_io.zig");
+    _ = @import("transport/quic_v1.zig");
+    _ = @import("transport/stream_multistream.zig");
+    _ = @import("transport/transport_error.zig");
+    _ = @import("transport/zquic_feed_addr.zig");
+    _ = @import("transport/quic_posix_udp.zig");
+    _ = @import("multistream.zig");
+    _ = @import("swarm.zig");
+    _ = @import("identity.zig");
+    _ = @import("keypair.zig");
+    _ = @import("ping.zig");
+    _ = @import("ping_wire_quic.zig");
+    _ = @import("addr_list.zig");
+    _ = @import("protocol.zig");
+    _ = @import("varint.zig");
+    _ = @import("layer_events.zig");
+    _ = @import("peer_events.zig");
+    _ = @import("errors.zig");
+    _ = @import("protobuf/wire.zig");
+    _ = @import("gossip/topic.zig");
+    _ = @import("gossipsub/control.zig");
+    _ = @import("gossipsub/message.zig");
+    _ = @import("gossipsub/rpc.zig");
+    _ = @import("gossipsub/wire_limits.zig");
+    _ = @import("req_resp/frame.zig");
+    _ = @import("req_resp/stream.zig");
+    _ = @import("req_resp/snappy_wire.zig");
+    _ = @import("req_resp/runtime.zig");
+    _ = @import("req_resp/wire_framing.zig");
+    // `req_resp/wire_tcp.zig` excluded — see TCP loopback note above.
+    _ = @import("req_resp/wire_quic.zig");
+    _ = @import("wall_time.zig");
 }

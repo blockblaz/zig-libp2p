@@ -3,7 +3,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
-const HmacSha256 = crypto.hmac.sha2.HmacSha256;
+const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
 const X25519 = crypto.dh.X25519;
 
@@ -49,7 +49,7 @@ fn hashMix(h: *[hash_len]u8, data: []const u8) void {
 }
 
 fn noiseNonce(n: u64) [12]u8 {
-    var out: [12]u8 = [_]u8{0} ** 4;
+    var out: [12]u8 = [_]u8{0} ** 12;
     std.mem.writeInt(u64, out[4..][0..8], n, .little);
     return out;
 }
@@ -100,7 +100,7 @@ pub const CipherState = struct {
             if (buf.len < plen) return error.HandshakeBufferTooSmall;
             const n = self.n;
             const nonce = noiseNonce(n);
-            ChaCha20Poly1305.decrypt(buf[0..plen], ciphertext[0..plen], ciphertext[plen..].*, ad, nonce, k) catch {
+            ChaCha20Poly1305.decrypt(buf[0..plen], ciphertext[0..plen], ciphertext[plen..][0..16].*, ad, nonce, k) catch {
                 return error.DecryptFailed;
             };
             self.n += 1;
