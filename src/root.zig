@@ -75,6 +75,7 @@ pub const transport = struct {
 
 pub const security = struct {
     pub const libp2p_tls = @import("security/libp2p_tls.zig");
+    pub const libp2p_tls_cert = @import("security/libp2p_tls_cert.zig");
     pub const noise = struct {
         pub const protocol = @import("security/noise/protocol.zig");
         pub const payload = @import("security/noise/payload.zig");
@@ -113,6 +114,7 @@ test {
     _ = @import("connection_manager.zig");
     _ = @import("metrics.zig");
     _ = @import("security/libp2p_tls.zig");
+    _ = @import("security/libp2p_tls_cert.zig");
     _ = @import("security/noise/identity.zig");
     _ = @import("security/noise/libp2p_noise.zig");
     _ = @import("security/noise/payload.zig");
