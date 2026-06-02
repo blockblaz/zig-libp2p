@@ -40,6 +40,9 @@ pub const GossipsubError = gs_rpc.Error || gs_msg.Error || gs_control.Error ||
 pub const SwarmBootConfig = struct {
     event_capacity: usize = swarm_mod.default_event_capacity,
     command_ring_capacity: usize = 0,
+    /// Optional real-transport interception hook (#TBD). See
+    /// [`swarm_mod.CommandDispatchHook`].
+    command_dispatch: ?swarm_mod.CommandDispatchHook = null,
 };
 
 pub const HostConfig = struct {
@@ -97,6 +100,7 @@ pub const Host = struct {
             .local_peer = cfg.local_peer,
             .command_ring_capacity = cfg.swarm.command_ring_capacity,
             .metrics = cfg.metrics,
+            .command_dispatch = cfg.swarm.command_dispatch,
         }) catch return error.SwarmInitFailed;
         errdefer swarm.deinit();
 
