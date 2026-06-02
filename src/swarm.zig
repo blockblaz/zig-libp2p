@@ -93,6 +93,30 @@ pub const SwarmCommand = union(enum) {
     shutdown,
 };
 
+/// Embedder hook letting a real transport intercept [`SwarmCommand`]s before
+/// the loopback stubs in [`dispatchCommand`] fire. Returning `.handled` tells
+/// the swarm "I have taken ownership of the OwnedCommand bytes — do nothing
+/// else with them, and call [`destroyCommand`] yourself when you're done."
+/// Returning `.fallthrough` is a no-op assertion that the embedder will let
+/// the default stub run (matching pre-hook behaviour).
+///
+/// Typical use: a QUIC transport hook intercepts `.dial`, `.send_request`,
+/// `.publish` and the corresponding response-side commands so they reach
+/// the wire instead of being echoed back as events. Subscribe / shutdown
+/// flow through as before.
+pub const CommandDispatchHook = struct {
+    /// Opaque context handed back to `dispatch`. Lifetime is the embedder's;
+    /// the swarm only stores the pointer.
+    ctx: ?*anyopaque = null,
+    /// Called once per dispatched command. The pointed-to OwnedCommand carries
+    /// heap slices the embedder must free (via [`destroyCommand`]) IFF it
+    /// returns `.handled`. The swarm retains ownership when `.fallthrough`
+    /// is returned.
+    dispatch: *const fn (ctx: ?*anyopaque, cmd: *const OwnedCommand) Disposition,
+
+    pub const Disposition = enum { handled, fallthrough };
+};
+
 /// Reason for an embedder-actionable connection trim recommendation (#90).
 pub const TrimReason = enum {
     /// Total connection count exceeded `high_watermark` and is being trimmed back to `low_watermark`.
@@ -158,7 +182,7 @@ pub const NextEventError = error{ Timeout, QueueClosed };
 pub const InitError = std.mem.Allocator.Error ||
     @typeInfo(@TypeOf(identity.PeerId.random())).error_union.error_set;
 
-const OwnedCommand = union(enum) {
+pub const OwnedCommand = union(enum) {
     publish: struct { topic: []u8, payload: []u8 },
     subscribe: struct { topic: []u8 },
     send_request: struct {
@@ -181,7 +205,7 @@ const OwnedCommand = union(enum) {
 
 const OwnedEvent = Event;
 
-fn destroyCommand(a: std.mem.Allocator, c: OwnedCommand) void {
+pub fn destroyCommand(a: std.mem.Allocator, c: OwnedCommand) void {
     switch (c) {
         .publish => |x| {
             a.free(x.topic);
@@ -273,6 +297,11 @@ pub const Swarm = struct {
 
     runner: ?std.Thread = null,
 
+    /// Embedder hook for real-transport interception of commands. When `null`,
+    /// every command runs through the default loopback stubs in
+    /// [`dispatchCommand`]. See [`CommandDispatchHook`].
+    command_dispatch: ?CommandDispatchHook = null,
+
     pub const SwarmConfig = struct {
         event_capacity: usize = default_event_capacity,
         /// When `null`, a random [`identity.PeerId`] is generated at init.
@@ -281,6 +310,8 @@ pub const Swarm = struct {
         command_ring_capacity: usize = 0,
         /// Same pointer stored on [`Swarm.metrics`].
         metrics: ?*metrics.Metrics = null,
+        /// Optional real-transport interception hook. See [`CommandDispatchHook`].
+        command_dispatch: ?CommandDispatchHook = null,
     };
 
     pub fn init(gpa: std.mem.Allocator, event_capacity: usize) InitError!Swarm {
@@ -314,6 +345,7 @@ pub const Swarm = struct {
             .cmd_buf = cmd_buf,
             .evt_buf = evt_buf,
             .evt_cap = config.event_capacity,
+            .command_dispatch = config.command_dispatch,
         };
     }
 
@@ -456,6 +488,12 @@ pub const Swarm = struct {
     }
 
     fn dispatchCommand(self: *Swarm, cmd: OwnedCommand) void {
+        if (self.command_dispatch) |hook| {
+            switch (hook.dispatch(hook.ctx, &cmd)) {
+                .handled => return, // embedder took ownership of cmd's heap bytes
+                .fallthrough => {},
+            }
+        }
         switch (cmd) {
             .publish => |p| {
                 self.pushEvent(.{ .gossip_message = .{
@@ -663,6 +701,112 @@ test "swarm tick processes submit without background thread" {
     defer ev.deinit(a);
     try std.testing.expectEqual(.gossip_message, std.meta.activeTag(ev));
     try std.testing.expectEqualStrings("/tick", ev.gossip_message.topic);
+
+    swarm.shutdown();
+    swarm.tick(commands_per_tick);
+    var closed = try swarm.nextEvent(1000);
+    defer closed.deinit(a);
+    try std.testing.expectEqual(.swarm_closed, std.meta.activeTag(closed));
+}
+
+test "swarm CommandDispatchHook .handled suppresses default stub" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    // Real-transport hook: intercept `.publish` so the default loopback
+    // stub (which would emit a `gossip_message` event) is suppressed.
+    // Asserts the embedder can fully take ownership of intercepted
+    // commands before the swarm's stub fires.
+    const a = std.testing.allocator;
+
+    const Hook = struct {
+        gpa: std.mem.Allocator,
+        seen_publish: u32 = 0,
+
+        fn dispatch(ctx: ?*anyopaque, cmd: *const OwnedCommand) CommandDispatchHook.Disposition {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (cmd.*) {
+                .publish => {
+                    self.seen_publish += 1;
+                    // We took ownership; free the heap bytes ourselves.
+                    destroyCommand(self.gpa, cmd.*);
+                    return .handled;
+                },
+                else => return .fallthrough,
+            }
+        }
+    };
+    var hook_state = Hook{ .gpa = a };
+
+    var swarm = try Swarm.initWithConfig(a, .{
+        .command_dispatch = .{
+            .ctx = &hook_state,
+            .dispatch = Hook.dispatch,
+        },
+    });
+    defer swarm.deinit();
+
+    try swarm.submit(.{ .publish = .{ .topic = "/t/intercept", .payload = "blob" } });
+    // Also submit a `.subscribe` so the fallthrough path stays alive (it
+    // produces a `log` event via the default stub).
+    try swarm.submit(.{ .subscribe = .{ .topic = "/t/sub" } });
+    swarm.tick(commands_per_tick);
+
+    try std.testing.expectEqual(@as(u32, 1), hook_state.seen_publish);
+
+    // .subscribe fell through → emitted a `log` event. .publish did NOT
+    // produce a `gossip_message` because the hook suppressed the stub.
+    var ev = try swarm.nextEvent(1000);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(@as(std.meta.Tag(Event), .log), std.meta.activeTag(ev));
+    try std.testing.expectEqualStrings("/t/sub", ev.log.message);
+
+    // No further events are queued — the publish was eaten.
+    try std.testing.expectError(error.Timeout, swarm.nextEvent(50));
+
+    swarm.shutdown();
+    swarm.tick(commands_per_tick);
+    var closed = try swarm.nextEvent(1000);
+    defer closed.deinit(a);
+    try std.testing.expectEqual(.swarm_closed, std.meta.activeTag(closed));
+}
+
+test "swarm CommandDispatchHook .fallthrough preserves default stub" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    // Hook returns `.fallthrough` for every command → behaviour is
+    // byte-identical to the no-hook case. Guards against the hook silently
+    // breaking the existing event-emission contract.
+    const a = std.testing.allocator;
+
+    const Hook = struct {
+        seen: u32 = 0,
+        fn dispatch(ctx: ?*anyopaque, _: *const OwnedCommand) CommandDispatchHook.Disposition {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.seen += 1;
+            return .fallthrough;
+        }
+    };
+    var hook_state = Hook{};
+
+    var swarm = try Swarm.initWithConfig(a, .{
+        .command_dispatch = .{
+            .ctx = &hook_state,
+            .dispatch = Hook.dispatch,
+        },
+    });
+    defer swarm.deinit();
+
+    try swarm.submit(.{ .publish = .{ .topic = "/t/pass", .payload = "x" } });
+    swarm.tick(commands_per_tick);
+
+    try std.testing.expectEqual(@as(u32, 1), hook_state.seen);
+
+    var ev = try swarm.nextEvent(1000);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(.gossip_message, std.meta.activeTag(ev));
+    try std.testing.expectEqualStrings("/t/pass", ev.gossip_message.topic);
 
     swarm.shutdown();
     swarm.tick(commands_per_tick);
