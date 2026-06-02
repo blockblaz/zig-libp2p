@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.0...v0.1.1) (2026-06-02)
+
+
+### Bug Fixes
+
+* **host:** correct req/resp Error type namespace ([#111](https://github.com/ch4r10t33r/zig-libp2p/issues/111)) ([fb2faca](https://github.com/ch4r10t33r/zig-libp2p/commit/fb2facae9377c8bebf75c30aa2dda9b5e7f027e7))
+
 ## 0.1.0 (2026-06-02)
 
 First tagged release. Pure-Zig libp2p building blocks for Lean Ethereum
