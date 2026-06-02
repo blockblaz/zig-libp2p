@@ -9,6 +9,8 @@ pub const layer_events = @import("layer_events.zig");
 pub const peer_events = @import("peer_events.zig");
 pub const connection_manager = @import("connection_manager.zig");
 pub const swarm = @import("swarm.zig");
+pub const host = @import("host.zig");
+pub const wall_time = @import("wall_time.zig");
 pub const protocol = @import("protocol.zig");
 pub const varint = @import("varint.zig");
 pub const addr_list = @import("addr_list.zig");
@@ -141,6 +143,7 @@ test {
     _ = @import("transport/quic_posix_udp.zig");
     _ = @import("multistream.zig");
     _ = @import("swarm.zig");
+    _ = @import("host.zig");
     _ = @import("identity.zig");
     _ = @import("keypair.zig");
     _ = @import("ping.zig");

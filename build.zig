@@ -12,6 +12,7 @@ const examples: []const struct {
     .{ .exe_name = "example-swarm-tick", .root = "examples/swarm_tick.zig" },
     .{ .exe_name = "example-req-resp-tcp-status", .root = "examples/req_resp_tcp_status.zig" },
     .{ .exe_name = "example-quic-ping-loopback", .root = "examples/quic_ping_loopback.zig" },
+    .{ .exe_name = "example-host-quic-node", .root = "examples/host_quic_node.zig" },
 };
 
 pub fn build(b: *std.Build) void {
