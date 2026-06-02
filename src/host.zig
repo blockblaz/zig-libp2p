@@ -172,7 +172,7 @@ pub const Host = struct {
     /// scheduling). Background-mode embedders don't call this; the worker
     /// handles command dispatch and the embedder calls
     /// [`runPeriodicTicks`] from its own clock instead.
-    pub fn tick(self: *Host, command_budget: u32, now_ms: i64) (GossipsubError || req_resp_runtime.ReqResp.Error || std.mem.Allocator.Error || swarm_mod.SubmitError)!void {
+    pub fn tick(self: *Host, command_budget: u32, now_ms: i64) (GossipsubError || req_resp_runtime.Error || std.mem.Allocator.Error || swarm_mod.SubmitError)!void {
         _ = self.swarm.tick(command_budget);
         try self.runPeriodicTicks(now_ms);
     }
@@ -180,7 +180,7 @@ pub const Host = struct {
     /// Runs the periodic per-subsystem ticks: gossipsub heartbeat, req/resp
     /// timeout sweep, connection-manager dial scheduling. Call once per
     /// heartbeat interval (default 700ms) from your reactor.
-    pub fn runPeriodicTicks(self: *Host, now_ms: i64) (GossipsubError || req_resp_runtime.ReqResp.Error || std.mem.Allocator.Error || swarm_mod.SubmitError)!void {
+    pub fn runPeriodicTicks(self: *Host, now_ms: i64) (GossipsubError || req_resp_runtime.Error || std.mem.Allocator.Error || swarm_mod.SubmitError)!void {
         self.gossipsub.setClockMs(now_ms);
         try self.gossipsub.heartbeat();
         try self.req_resp.tick(now_ms);
@@ -222,7 +222,7 @@ pub const Host = struct {
         proto: protocol_mod.LeanSupportedProtocol,
         payload: []const u8,
         timeout_ms: u32,
-    ) (req_resp_runtime.ReqResp.Error || swarm_mod.SubmitError || std.mem.Allocator.Error)!u64 {
+    ) (req_resp_runtime.Error || swarm_mod.SubmitError || std.mem.Allocator.Error)!u64 {
         return self.req_resp.sendRequest(peer, proto, payload, timeout_ms);
     }
 
@@ -236,15 +236,15 @@ pub const Host = struct {
         return self.req_resp.registerInboundChannel(peer, proto, request_id, now_ms);
     }
 
-    pub fn sendResponseChunk(self: *Host, channel_id: u64, payload: []const u8, now_ms: i64) (req_resp_runtime.ReqResp.Error || swarm_mod.SubmitError)!void {
+    pub fn sendResponseChunk(self: *Host, channel_id: u64, payload: []const u8, now_ms: i64) (req_resp_runtime.Error || swarm_mod.SubmitError)!void {
         return self.req_resp.sendResponseChunk(channel_id, payload, now_ms);
     }
 
-    pub fn finishResponseStream(self: *Host, channel_id: u64) (req_resp_runtime.ReqResp.Error || swarm_mod.SubmitError)!void {
+    pub fn finishResponseStream(self: *Host, channel_id: u64) (req_resp_runtime.Error || swarm_mod.SubmitError)!void {
         return self.req_resp.finishResponseStream(channel_id);
     }
 
-    pub fn sendErrorResponse(self: *Host, channel_id: u64, message: []const u8) (req_resp_runtime.ReqResp.Error || swarm_mod.SubmitError)!void {
+    pub fn sendErrorResponse(self: *Host, channel_id: u64, message: []const u8) (req_resp_runtime.Error || swarm_mod.SubmitError)!void {
         return self.req_resp.sendErrorResponse(channel_id, message);
     }
 
@@ -362,6 +362,36 @@ test "Host.subscribe forwards to gossipsub" {
     // The subscribe broadcast was also pushed into the swarm queue; drain it
     // so deinit doesn't complain about leaked OwnedCommand.
     host.swarm.tick(8);
+}
+
+test "Host req/resp wrapper methods compile + route to runtime" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    // Regression for the v0.1.0 type-annotation bug: `Host.sendResponseChunk`
+    // / `finishResponseStream` / `sendErrorResponse` named `ReqResp.Error`
+    // where the type actually lives at module scope as `req_resp_runtime.Error`.
+    // Lazy compilation hid this in v0.1.0 because no test referenced the
+    // wrappers; this test does, so the signatures stay correct going forward.
+    const a = testing.allocator;
+    const me = try identity.PeerId.random();
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+    });
+    defer host.destroy();
+
+    // No inbound channel registered → both methods return `UnknownInboundChannel`.
+    // Routing through the wrappers exercises the type annotations.
+    try testing.expectError(error.UnknownInboundChannel, host.sendResponseChunk(999, "x", 0));
+    try testing.expectError(error.UnknownInboundChannel, host.finishResponseStream(999));
+    try testing.expectError(error.UnknownInboundChannel, host.sendErrorResponse(999, "boom"));
+
+    // tick / runPeriodicTicks reference the same union; calling them is the
+    // straightforward way to anchor the annotation against future refactors.
+    try host.runPeriodicTicks(0);
+    try host.tick(8, 0);
 }
 
 test "Host transport hooks update both connection_manager and gossipsub" {
