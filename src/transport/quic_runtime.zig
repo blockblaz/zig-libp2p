@@ -4,10 +4,15 @@
 //! that an embedder can start, hand a [`host_mod.Host`], and use without
 //! writing the accept loop, dial flow, or per-stream protocol dispatch.
 //!
-//! Status: minimum-viable. Only the req/resp send/receive path is implemented
-//! end-to-end (this is what the loopback test gates on). Gossipsub publish is
-//! a `log.warn` TODO — see [`onPublishCommand`]. Inbound gossipsub frames are
-//! delivered to [`host_mod.Host.handleGossipRpc`] after multistream-select.
+//! Status: minimum-viable. Both the req/resp send/receive path and the
+//! gossipsub publish / receive path are implemented end-to-end — the
+//! corresponding loopback tests at the bottom of this file are the truth
+//! gate. Outbound publish opens one `/meshsub/1.1.0` stream per currently
+//! connected peer per message (per-message-stream pattern), runs the
+//! initiator multistream handshake, then writes one `uvarint(len) + RPC
+//! protobuf` frame and FINs the stream. Inbound `/meshsub/1.1.0` streams
+//! drain length-prefixed frames into [`host_mod.Host.handleGossipRpc`]
+//! with the verified sender peer id.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,6 +38,11 @@ const stream_multistream = @import("stream_multistream.zig");
 
 const wire_framing = @import("../req_resp/wire_framing.zig");
 const snappy_wire = @import("../req_resp/snappy_wire.zig");
+
+const gossipsub_msg = @import("../gossipsub/message.zig");
+const gossipsub_rpc = @import("../gossipsub/rpc.zig");
+const gossipsub_wire_limits = @import("../gossipsub/wire_limits.zig");
+const varint = @import("../varint.zig");
 
 const zquic = @import("zquic");
 const ZIo = zquic.transport.io;
@@ -102,6 +112,10 @@ const InboundStream = struct {
     /// Accumulated bytes for an in-progress unary request. Cleared once a
     /// complete request is parsed and the inbound channel registered.
     req_acc: std.ArrayList(u8) = .empty,
+    /// Accumulated bytes for in-progress gossipsub frames on a `/meshsub/1.1.0`
+    /// stream. Each frame is `uvarint(len) + RPC protobuf` and the stream MAY
+    /// carry multiple frames. Bytes are consumed as full frames are decoded.
+    gossip_acc: std.ArrayList(u8) = .empty,
 };
 
 const OutboundRequest = struct {
@@ -119,6 +133,21 @@ const OutboundRequest = struct {
     payload: []u8,
     /// Accumulated response bytes (for incremental decode).
     resp_acc: std.ArrayList(u8) = .empty,
+};
+
+/// In-flight gossipsub publish on a `/meshsub/1.1.0` stream. One per outbound
+/// stream (`per-message stream` pattern — open, multistream-select, write one
+/// length-prefixed RPC frame, close).
+const OutboundPublish = struct {
+    peer: identity.PeerId,
+    stream_id: u64,
+    raw: quic_raw_stream_io.RawAppBidiClient,
+    handshake_sent: bool = false,
+    handshake_done: bool = false,
+    frame_written: bool = false,
+    finished: bool = false,
+    /// `uvarint(len) + RPC protobuf` wire bytes (heap-owned).
+    wire: []u8,
 };
 
 /// A queued command from the swarm hook to the drive thread.
@@ -179,6 +208,11 @@ pub const QuicRuntime = struct {
     inbound_streams: std.ArrayList(*InboundStream),
     /// Outbound request streams indexed by req/resp `request_id`.
     outbound_requests: std.AutoHashMap(u64, *OutboundRequest),
+    /// Outbound gossipsub publish streams (one stream per publish per peer).
+    /// Indexed by a monotonic id; entries are removed once the write completes
+    /// and we've FIN'd the stream.
+    outbound_publishes: std.AutoHashMap(u64, *OutboundPublish),
+    next_publish_id: u64 = 1,
     /// Inbound channels: req/resp's `channel_id` -> the InboundStream that
     /// originated it. So when `.send_response_chunk` etc. arrive we can find
     /// the stream to write back on.
@@ -230,6 +264,7 @@ pub const QuicRuntime = struct {
             .outbound_by_peer = PeerIdMap.init(a),
             .inbound_streams = .empty,
             .outbound_requests = std.AutoHashMap(u64, *OutboundRequest).init(a),
+            .outbound_publishes = std.AutoHashMap(u64, *OutboundPublish).init(a),
             .channel_to_inbound = std.AutoHashMap(u64, *InboundStream).init(a),
         };
 
@@ -274,6 +309,7 @@ pub const QuicRuntime = struct {
         // Free inbound streams.
         for (self.inbound_streams.items) |s| {
             s.req_acc.deinit(self.allocator);
+            s.gossip_acc.deinit(self.allocator);
             self.allocator.destroy(s);
         }
         self.inbound_streams.deinit(self.allocator);
@@ -286,6 +322,14 @@ pub const QuicRuntime = struct {
             self.allocator.destroy(r.*);
         }
         self.outbound_requests.deinit();
+
+        // Free outbound publishes.
+        var pit = self.outbound_publishes.valueIterator();
+        while (pit.next()) |p| {
+            self.allocator.free(p.*.wire);
+            self.allocator.destroy(p.*);
+        }
+        self.outbound_publishes.deinit();
 
         self.channel_to_inbound.deinit();
 
@@ -514,6 +558,11 @@ pub const QuicRuntime = struct {
                 log.warn("quic_runtime: advanceOutboundRequests: {s}", .{@errorName(err)});
             };
 
+            // Advance outbound gossipsub publish streams.
+            self.advanceOutboundPublishes() catch |err| {
+                log.warn("quic_runtime: advanceOutboundPublishes: {s}", .{@errorName(err)});
+            };
+
             // Periodic host ticks (~ every 100ms).
             const now_ms = self.opts.now_ms_fn();
             if (now_ms - last_tick_ms >= 100) {
@@ -550,17 +599,97 @@ pub const QuicRuntime = struct {
             .publish => |p| {
                 defer self.allocator.free(p.topic);
                 defer self.allocator.free(p.payload);
-                self.onPublishCommand();
+                self.onPublishCommand(p.topic, p.payload);
             },
         }
     }
 
-    fn onPublishCommand(_: *QuicRuntime) void {
-        // TODO(quic_runtime gossipsub): for each gossipsub mesh peer, open a
-        // new stream, run multistream-select with `/meshsub/1.1.0`, write the
-        // snappy-framed RPC, close the stream. See
-        // [`gossipsub_runtime.Gossipsub.queryMeshPeers`].
-        log.warn("quic_runtime: .publish hook is a TODO (gossipsub publish path not yet wired); message dropped", .{});
+    /// Outbound gossipsub publish path.
+    ///
+    /// The swarm's `.publish` command carries raw `(topic, payload)` — the
+    /// payload is the application data, not the gossipsub RPC frame.  We
+    /// build the RPC protobuf here (`Message{topic, data}` wrapped in
+    /// `RPC.publish[]`), length-prefix it with an unsigned varint per the
+    /// libp2p gossipsub wire spec, and open a fresh `/meshsub/1.1.0` stream
+    /// to every currently connected outbound peer.  The mesh-peer set is
+    /// `outbound_by_peer.keys()` because gossipsub's own outbox uses
+    /// broadcast semantics for `publish` (`to = null`) and we do not yet
+    /// run the SUBSCRIBE / GRAFT wire flow that would let us narrow to a
+    /// real mesh.  Each publish gets its own stream (per-message stream
+    /// pattern, one of two legal libp2p gossipsub send shapes).
+    fn onPublishCommand(self: *QuicRuntime, topic: []const u8, payload: []const u8) void {
+        const a = self.allocator;
+
+        // Build the gossipsub `Message` and wrap as `RPC.publish[0]`.
+        const inner = gossipsub_msg.encode(a, .{ .topic = topic, .data = payload }) catch |err| {
+            log.warn("quic_runtime: gossipsub message encode failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer a.free(inner);
+        if (inner.len > gossipsub_wire_limits.max_rpc_length_delimited_bytes) {
+            log.warn("quic_runtime: gossipsub publish dropped: payload exceeds wire limit", .{});
+            return;
+        }
+        const rpc_frame = gossipsub_rpc.encodePublish(a, inner) catch |err| {
+            log.warn("quic_runtime: gossipsub RPC encode failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer a.free(rpc_frame);
+
+        // Build `uvarint(len) + rpc_frame` once; clone per peer.
+        var wire_buf: std.ArrayList(u8) = .empty;
+        defer wire_buf.deinit(a);
+        varint.append(&wire_buf, a, @intCast(rpc_frame.len)) catch |err| {
+            log.warn("quic_runtime: varint append failed: {s}", .{@errorName(err)});
+            return;
+        };
+        wire_buf.appendSlice(a, rpc_frame) catch |err| {
+            log.warn("quic_runtime: wire append failed: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Snapshot peer ids before iterating: `startOutboundPublish` does not
+        // touch `outbound_by_peer`, but the snapshot keeps the publish loop
+        // resilient to future changes (e.g. if a stream-open failure ever
+        // triggered eviction).
+        var peers: std.ArrayList(identity.PeerId) = .empty;
+        defer peers.deinit(a);
+        var it = self.outbound_by_peer.iterator();
+        while (it.next()) |e| {
+            peers.append(a, e.key_ptr.*) catch return;
+        }
+
+        if (peers.items.len == 0) {
+            log.debug("quic_runtime: publish on \"{s}\": no connected peers", .{topic});
+            return;
+        }
+
+        for (peers.items) |peer| {
+            const wire_dup = a.dupe(u8, wire_buf.items) catch continue;
+            self.startOutboundPublish(peer, wire_dup) catch |err| {
+                log.warn("quic_runtime: startOutboundPublish failed: {s}", .{@errorName(err)});
+                a.free(wire_dup);
+            };
+        }
+    }
+
+    fn startOutboundPublish(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) !void {
+        const slot = self.outbound_by_peer.get(peer) orelse return error.NotConnected;
+        const sid = try slot.outbound.nextLocalBidiStream();
+        const pub_id = self.next_publish_id;
+        self.next_publish_id += 1;
+
+        const op = try self.allocator.create(OutboundPublish);
+        op.* = .{
+            .peer = peer,
+            .stream_id = sid,
+            .raw = .{
+                .client = slot.outbound.client,
+                .stream_id = sid,
+            },
+            .wire = wire,
+        };
+        try self.outbound_publishes.put(pub_id, op);
     }
 
     fn handleDial(self: *QuicRuntime, addr_str: []const u8, expected_peer: ?identity.PeerId) void {
@@ -823,10 +952,49 @@ pub const QuicRuntime = struct {
             const pi = ist.protocol_index orelse continue;
             switch (pi) {
                 0 => {
-                    // /meshsub/1.1.0 — TODO: snappy-framed gossipsub RPC.
-                    // For now, log and skip.
-                    log.warn("quic_runtime: inbound /meshsub/1.1.0 stream — TODO (frame reader)", .{});
-                    ist.protocol_index = null; // don't loop forever
+                    // /meshsub/1.1.0 — read length-prefixed gossipsub RPC
+                    // frames. The peer sends `uvarint(len) + RPC protobuf`
+                    // and MAY emit multiple frames before FIN; decode every
+                    // complete frame in the accumulator and hand each to
+                    // `host.handleGossipRpc` for sender attribution.
+                    const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse continue;
+                    if (recv_buf.len > ist.raw.read_cursor) {
+                        const new_bytes = recv_buf[ist.raw.read_cursor..];
+                        try ist.gossip_acc.appendSlice(a, new_bytes);
+                        ist.raw.read_cursor = recv_buf.len;
+                    }
+                    if (ist.gossip_acc.items.len == 0) continue;
+                    const sender_peer = ist.sender_peer orelse continue;
+
+                    // Drain every complete frame from the accumulator.
+                    // The buffer can contain a partial frame on the tail; if
+                    // varint decode or length check fails, we leave the bytes
+                    // alone and try again next loop.
+                    var consumed: usize = 0;
+                    while (consumed < ist.gossip_acc.items.len) {
+                        const tail = ist.gossip_acc.items[consumed..];
+                        const dec = varint.decode(tail) catch break; // need more bytes
+                        if (dec.value > gossipsub_wire_limits.max_rpc_length_delimited_bytes) {
+                            log.warn("quic_runtime: gossipsub frame length too large: {d}", .{dec.value});
+                            consumed = ist.gossip_acc.items.len;
+                            break;
+                        }
+                        const frame_len: usize = @intCast(dec.value);
+                        if (tail.len < dec.len + frame_len) break; // partial frame
+                        const frame_bytes = tail[dec.len .. dec.len + frame_len];
+                        self.host.handleGossipRpc(sender_peer, frame_bytes) catch |err| {
+                            log.warn("quic_runtime: handleGossipRpc failed: {s}", .{@errorName(err)});
+                        };
+                        consumed += dec.len + frame_len;
+                    }
+                    if (consumed > 0) {
+                        // Compact remaining (partial) frame to the front.
+                        const remaining = ist.gossip_acc.items.len - consumed;
+                        if (remaining > 0) {
+                            std.mem.copyForwards(u8, ist.gossip_acc.items[0..remaining], ist.gossip_acc.items[consumed..]);
+                        }
+                        ist.gossip_acc.shrinkRetainingCapacity(remaining);
+                    }
                 },
                 else => |idx| {
                     // SSZ req/resp path.
@@ -993,6 +1161,80 @@ pub const QuicRuntime = struct {
             self.allocator.free(kv.value.payload);
             kv.value.resp_acc.deinit(self.allocator);
             self.allocator.destroy(kv.value);
+        }
+    }
+
+    /// Drive every in-flight gossipsub publish stream: send the multistream
+    /// initiator handshake, read the responder ack, write the length-prefixed
+    /// RPC frame, FIN the stream, then drop the entry.
+    fn advanceOutboundPublishes(self: *QuicRuntime) !void {
+        const a = self.allocator;
+        // Collect ids to remove after iteration so we don't mutate the map mid-walk.
+        var to_remove: std.ArrayList(u64) = .empty;
+        defer to_remove.deinit(a);
+
+        var it = self.outbound_publishes.iterator();
+        while (it.next()) |e| {
+            const op = e.value_ptr.*;
+            if (op.finished) {
+                try to_remove.append(a, e.key_ptr.*);
+                continue;
+            }
+
+            // 1. Send initiator multistream offer + protocol id.
+            if (!op.handshake_sent) {
+                var out: std.ArrayList(u8) = .empty;
+                defer out.deinit(a);
+                stream_multistream.appendFirstStreamInitiatorHandshake(&out, a, meshsub_protocol_id) catch |err| {
+                    log.warn("quic_runtime: publish handshake build failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                var w = op.raw.writer();
+                std.Io.Writer.writeAll(&w, out.items) catch |err| {
+                    log.warn("quic_runtime: publish handshake write failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                std.Io.Writer.flush(&w) catch {};
+                op.handshake_sent = true;
+            }
+
+            // 2. Read responder ack.
+            if (!op.handshake_done) {
+                const need = stream_multistream.responderSuccessReplyWireLen(meshsub_protocol_id) catch continue;
+                if (op.raw.unreadRecvLen() < need) continue;
+                var r = op.raw.reader();
+                var w = op.raw.writer();
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a) catch |err| {
+                    log.warn("quic_runtime: publish read ack failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                op.handshake_done = true;
+            }
+
+            // 3. Write the gossipsub frame (`uvarint(len) + RPC protobuf`).
+            if (!op.frame_written) {
+                var w = op.raw.writer();
+                std.Io.Writer.writeAll(&w, op.wire) catch |err| {
+                    log.warn("quic_runtime: publish frame write failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                std.Io.Writer.flush(&w) catch {};
+                op.frame_written = true;
+
+                // FIN: per-message-stream pattern signals end of publish by
+                // closing the stream. The peer's reader treats EOF after a
+                // complete frame as a clean handoff.
+                op.raw.client.sendRawStreamData(op.stream_id, op.raw.send_offset, &[_]u8{}, true);
+                op.finished = true;
+                try to_remove.append(a, e.key_ptr.*);
+            }
+        }
+
+        for (to_remove.items) |id| {
+            if (self.outbound_publishes.fetchRemove(id)) |kv| {
+                a.free(kv.value.wire);
+                a.destroy(kv.value);
+            }
         }
     }
 };
@@ -1257,4 +1499,170 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
 
     try testing.expect(saw_chunk);
     try testing.expect(saw_end);
+}
+
+/// Holds the bytes the gossipsub validator captured on host A. The QUIC drive
+/// thread writes to it; the test thread reads it under the `len` atomic.
+const GossipCapture = struct {
+    buf: [256]u8 = undefined,
+    len: std.atomic.Value(usize) = .init(0),
+
+    fn record(self: *GossipCapture, data: []const u8) void {
+        if (data.len > self.buf.len) return;
+        @memcpy(self.buf[0..data.len], data);
+        self.len.store(data.len, .release);
+    }
+
+    fn get(self: *const GossipCapture) ?[]const u8 {
+        const n = self.len.load(.acquire);
+        if (n == 0) return null;
+        return self.buf[0..n];
+    }
+};
+
+fn gossipRecordValidator(ctx: ?*anyopaque, topic: []const u8, data: []const u8) gossipsub_runtime_pkg.ValidationResult {
+    _ = topic;
+    const cap: *GossipCapture = @ptrCast(@alignCast(ctx.?));
+    cap.record(data);
+    return .accept;
+}
+
+const gossipsub_runtime_pkg = @import("../gossipsub/runtime.zig");
+
+test "QuicRuntime: two instances exchange a gossipsub message over UDP loopback" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+
+    var bundle_a = try buildTestBundle(a, "ga", 0xC3);
+    defer bundle_a.deinit(a);
+    var bundle_b = try buildTestBundle(a, "gb", 0xD4);
+    defer bundle_b.deinit(a);
+
+    // Capture slot the validator writes into. Heap-allocated so the
+    // validator's `*anyopaque` stays valid across the test scope.
+    const capture = try a.create(GossipCapture);
+    defer a.destroy(capture);
+    capture.* = .{};
+
+    var host_a = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_a.peer,
+        .gossipsub = .{
+            .local_peer_id = bundle_a.peer,
+            .topic_validator = gossipRecordValidator,
+            .validator_ctx = capture,
+        },
+    });
+    defer host_a.destroy();
+    try host_a.startBackground();
+    try testing.expect(host_a.waitUntilReady(5_000));
+
+    var rt_a = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_a,
+        .cert_path = bundle_a.cert_path,
+        .key_path = bundle_a.key_path,
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_a.destroy();
+
+    var host_b = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_b.peer,
+        .gossipsub = .{ .local_peer_id = bundle_b.peer },
+    });
+    defer host_b.destroy();
+    try host_b.startBackground();
+    try testing.expect(host_b.waitUntilReady(5_000));
+
+    var rt_b = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_b,
+        .cert_path = bundle_b.cert_path,
+        .key_path = bundle_b.key_path,
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_b.destroy();
+
+    try rt_a.start();
+    try rt_b.start();
+
+    const a_port = rt_a.boundUdpPortIpv4() orelse return error.NoBoundPort;
+
+    // B dials A.
+    var a_peer_b58_buf: [128]u8 = undefined;
+    const a_peer_b58 = try bundle_a.peer.toBase58(&a_peer_b58_buf);
+    const a_ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ a_port, a_peer_b58 });
+    defer a.free(a_ma_str);
+    var a_ma = try multiaddr.Multiaddr.fromString(a, a_ma_str);
+    defer a_ma.deinit();
+    try rt_b.registerKnownPeer(&a_ma, bundle_a.peer);
+
+    // Drain events on both hosts so internal swarm rings don't back up while
+    // the test waits for the publish to land. We don't care about the event
+    // contents — only that the validator fires on A.
+    const Drainer = struct {
+        fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+            const deadline_ms = wall_time.milliTimestamp() + 25_000;
+            while (wall_time.milliTimestamp() < deadline_ms) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(100) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                ev.deinit(h.allocator);
+            }
+        }
+    };
+    var drain_done = std.atomic.Value(bool).init(false);
+    var a_drainer = try std.Thread.spawn(.{}, Drainer.run, .{ host_a, &drain_done });
+    defer a_drainer.join();
+    var b_drainer = try std.Thread.spawn(.{}, Drainer.run, .{ host_b, &drain_done });
+    defer b_drainer.join();
+    defer drain_done.store(true, .release);
+
+    // Wait for B's outbound dial to land.
+    var connected = false;
+    {
+        const deadline_ms = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            if (rt_b.outbound_by_peer.get(bundle_a.peer)) |_| {
+                connected = true;
+                break;
+            }
+            var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+    }
+    try testing.expect(connected);
+
+    // Subscribe both sides. This is required for the gossipsub layer on A to
+    // expose the topic to the duplicate cache; the validator itself runs
+    // regardless of local subscription state but it doesn't hurt to mirror
+    // a real two-node bring-up.
+    try host_a.subscribe("test/topic");
+    try host_b.subscribe("test/topic");
+
+    // Publish from B. host.publish enqueues a swarm `.publish` (eaten by the
+    // QuicRuntime hook) which fans the RPC frame out to every connected
+    // outbound peer — A in this test.
+    try host_b.publish("test/topic", "GOSSIP-FIXTURE");
+
+    // Poll the validator capture until it sees the bytes (or we time out).
+    var saw_payload = false;
+    const deadline_ms = wall_time.milliTimestamp() + 20_000;
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        if (capture.get()) |bytes| {
+            try testing.expectEqualStrings("GOSSIP-FIXTURE", bytes);
+            saw_payload = true;
+            break;
+        }
+        var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+    try testing.expect(saw_payload);
 }
