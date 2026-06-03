@@ -10,6 +10,10 @@ pub const peer_events = @import("peer_events.zig");
 pub const connection_manager = @import("connection_manager.zig");
 pub const swarm = @import("swarm.zig");
 pub const host = @import("host.zig");
+/// Canonical node bundle from [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31); same as [`host.Host`](host.zig).
+pub const Node = host.Host;
+/// Configuration for [`Node`]($).
+pub const NodeConfig = host.HostConfig;
 pub const wall_time = @import("wall_time.zig");
 pub const protocol = @import("protocol.zig");
 pub const varint = @import("varint.zig");
