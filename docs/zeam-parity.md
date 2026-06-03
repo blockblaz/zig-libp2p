@@ -1,6 +1,16 @@
 # Zeam parity
 
-This document is the **Zeam-facing** feature index for replacing `libp2p-glue` with `zig-libp2p`. Behavioural contract, sub-issue checklist, and API sketch live in [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31).
+This document is the **Zeam-facing** feature index for replacing `libp2p-glue` with `zig-libp2p`. Behavioural contract and sub-issue checklist: [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31) (**closed**, library-complete).
+
+## Issue hygiene (superseded trackers)
+
+These GitHub issues predate the current tree; behaviour is implemented and the issues are closed as part of [PR hygiene](https://github.com/ch4r10t33r/zig-libp2p/pulls):
+
+| Issue | Superseded by |
+|-------|----------------|
+| [#17](https://github.com/ch4r10t33r/zig-libp2p/issues/17) Gossipsub mesh behaviour | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) `gossipsub.runtime` |
+| [#18](https://github.com/ch4r10t33r/zig-libp2p/issues/18) Gossipsub scoring / backpressure | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) behaviour scores + outbox caps |
+| [#20](https://github.com/ch4r10t33r/zig-libp2p/issues/20) Non-QUIC transports | [#35](https://github.com/ch4r10t33r/zig-libp2p/issues/35) TCP + Noise; QUIC is primary. TCP TLS: [#86](https://github.com/ch4r10t33r/zig-libp2p/issues/86) |
 
 ## Surface checklist
 
@@ -15,6 +25,9 @@ This document is the **Zeam-facing** feature index for replacing `libp2p-glue` w
 | QUIC /quic-v1 transport (listen, dial, UDP drive, accept) | Done | [#15](https://github.com/ch4r10t33r/zig-libp2p/issues/15) — [`transport.quic_endpoint`](../src/transport/quic_endpoint.zig) + zquic |
 | QUIC multiaddr + per-stream negotiate | Done | [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) — `listenMultiaddr` / `dialMultiaddr` / `dialExtended`, `QuicLifecycleHooks`, `popNextUnreportedPeerBidiStream`, per-stream [`stream_multistream.responderHandshakeMultistreamAmong`](../src/transport/stream_multistream.zig); two-stream loopback test. Outbound server PeerId: [`quic_peer_identity`](../src/transport/quic_peer_identity.zig). |
 | libp2p TLS on QUIC (ALPN, peer auth) | Done | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — zquic **1.6.4+** sends TLS `CertificateRequest` on libp2p listeners; dialers set `Libp2pZquicClientDialOptions.client_cert_path` / `client_key_path`. [`quic_peer_identity`](../src/transport/quic_peer_identity.zig): `verifiedPeerIdFromLibp2pQuicClient`, `verifiedPeerIdFromLibp2pQuicServerConn`. |
+| `QuicRuntime` in-memory TLS PEM | Done | [#129](https://github.com/ch4r10t33r/zig-libp2p/issues/129) — [`TlsPemSource`](../src/transport/quic_runtime.zig) `.paths` or `.pem_bytes` (ephemeral files for zquic, unlinked on `destroy`) |
+| Gossipsub PRUNE backoff (60 s default) | Done | [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) — `recordBackoff`, inbound `backoff_seconds`, heartbeat GRAFT skip; see `gossipsub/runtime.zig` tests |
+| Gossipsub `unsubscribe_backoff` | Open | [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) (remaining spec bullet) |
 | Ping behaviour (`/ipfs/ping/1.0.0`) | Done | [#42](https://github.com/ch4r10t33r/zig-libp2p/issues/42) |
 | KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
 | Swarm / network runtime | Done | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — `std.Io.Threaded` command queue (8192) + event channel, 256 cmd/tick, `Swarm.initWithConfig` / `Swarm.tick`, `Swarm.startBackground` / `Swarm.run`; dial command carries optional `expected_peer`; transport still embedder-owned |
@@ -49,7 +62,7 @@ QUIC UDP pumping: [`transport.quic_endpoint`](../src/transport/quic_endpoint.zig
 
 ## Roadmap / hygiene
 
-Priorities and larger items are tracked in [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31).
+[#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31) is closed (library-complete). Active work: [#86](https://github.com/ch4r10t33r/zig-libp2p/issues/86) TCP `/tls/1.0.0`, [#87](https://github.com/ch4r10t33r/zig-libp2p/issues/87) Noise RSA/ECDSA, [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) `unsubscribe_backoff`, [#57](https://github.com/ch4r10t33r/zig-libp2p/issues/57) async swarm.
 
 **Examples contract:** new public APIs should add or extend an `examples/` program that exits 0 under `zig build test` (smoke-run after unit tests), unless documented as compile-only (e.g. TCP + `Io.Threaded` demos). Avoid a second `addTest` root on the same `zig_libp2p` module (Zig 0.16 type identity).
 
