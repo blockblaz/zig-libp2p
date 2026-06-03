@@ -53,6 +53,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        // `transport/quic_runtime.zig` (and its loopback test) reaches into
+        // `std.c` for file I/O — implicit on macOS, must be explicit on
+        // Linux. Setting on the module so the same flag applies to both
+        // `addTest` and any downstream consumer that pulls
+        // `transport.quic_runtime` in.
+        .link_libc = true,
     });
     mod.addImport("multiaddr", multiaddr_dep.module("multiaddr"));
     mod.addImport("snappyz", snappyz);

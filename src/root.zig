@@ -64,6 +64,7 @@ pub const transport = struct {
     pub const quic_raw_stream_io = @import("transport/quic_raw_stream_io.zig");
     pub const quic_endpoint = @import("transport/quic_endpoint.zig");
     pub const quic_peer_identity = @import("transport/quic_peer_identity.zig");
+    pub const quic_runtime = @import("transport/quic_runtime.zig");
     pub const stream_multistream = @import("transport/stream_multistream.zig");
     pub const tcp = @import("transport/tcp.zig");
     pub const tcp_tls = @import("transport/tcp_tls.zig");
@@ -138,6 +139,7 @@ test {
     _ = @import("transport/quic.zig");
     _ = @import("transport/quic_peer_identity.zig");
     _ = @import("transport/quic_raw_stream_io.zig");
+    _ = @import("transport/quic_runtime.zig");
     _ = @import("transport/quic_v1.zig");
     _ = @import("transport/stream_multistream.zig");
     _ = @import("transport/transport_error.zig");
