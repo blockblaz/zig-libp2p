@@ -43,6 +43,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("zquic");
+    // Vendored copy of zquic's pure-Zig RSA (PKCS#1 v1.5) to avoid Zig 0.16
+    // compiling the same `vendor/tls/...` paths in both `zquic` and a second module.
+    const zquic_rsa_mod = b.createModule(.{
+        .root_source_file = b.path("src/vendor/zquic_rsa/rsa.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const zig_varint_mod = b.dependency("zig_varint", .{
         .target = target,
@@ -65,6 +72,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("snappyframesz", snappyframesz);
     mod.addImport("peer_id", peer_id_mod);
     mod.addImport("zquic", zquic_mod);
+    mod.addImport("zquic_rsa", zquic_rsa_mod);
     mod.addImport("zig_varint", zig_varint_mod);
 
     const unit_tests = b.addTest(.{
