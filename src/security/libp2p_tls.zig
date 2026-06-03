@@ -319,7 +319,19 @@ pub fn verifiedPeerIdFromQuicLeafCertificate(
 ) QuicPeerIdentityError!peer_id.PeerId {
     const id = try peerIdFromVerifiedCertificate(allocator, cert_der, now_sec);
     if (expected_peer) |exp| {
-        if (!std.meta.eql(id, exp)) return error.PeerIdMismatch;
+        // Use `PeerId.eql` (compares multihash code + size + digest) — NOT
+        // `std.meta.eql` on the struct. `PeerId.multihash` is `Multihash(64)`,
+        // a fixed 64-byte buffer plus an active-length field; bytes past the
+        // active length carry whatever the heap had there at construction
+        // time. `std.meta.eql` compares the WHOLE buffer including those
+        // bytes, so two semantically-equal PeerIds (same code, same size,
+        // same digest) can compare unequal if their out-of-range padding
+        // differs. That made every outbound QUIC dial fail with
+        // `error.PeerIdMismatch` once a real `/p2p/...` expected_peer was
+        // threaded in, because the verified cert and the dial multiaddr
+        // had been constructed via different paths.
+        var exp_var = exp;
+        if (!id.eql(&exp_var)) return error.PeerIdMismatch;
     }
     return id;
 }
@@ -475,6 +487,63 @@ test "verifiedPeerIdFromQuicLeafCertificate rejects expected_peer mismatch" {
 
 test "QUIC TLS ALPN matches libp2p TLS spec string" {
     try std.testing.expectEqualStrings("libp2p", quic_application_layer_protocol);
+}
+
+// Regression test for the `std.meta.eql` vs `PeerId.eql` bug at the top of
+// this file: `verifiedPeerIdFromQuicLeafCertificate` USED to compare the
+// derived PeerId against `expected_peer` with `std.meta.eql`, which compares
+// the entire 64-byte Multihash buffer including bytes past the active length.
+// That made every real QUIC dial fail with `error.PeerIdMismatch` even though
+// the multihash digests matched. The fix swaps in `PeerId.eql` (code + size +
+// digest only). This test constructs the SAME PeerId twice through DIFFERENT
+// allocation paths (so out-of-range buffer bytes differ) and asserts the
+// happy path returns it.
+test "verifiedPeerIdFromQuicLeafCertificate accepts matching expected_peer (PeerId.eql semantics)" {
+    const a = std.testing.allocator;
+    const libp2p_tls_cert = @import("libp2p_tls_cert.zig");
+    const Ed25519 = std.crypto.sign.Ed25519;
+
+    var host_seed: [32]u8 = undefined;
+    @memset(&host_seed, 0x33);
+    const host_kp = try Ed25519.KeyPair.generateDeterministic(host_seed);
+    const TestSigner = struct {
+        kp: Ed25519.KeyPair,
+        fn sign(ctx: ?*anyopaque, message: []const u8, out_sig: *[64]u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            out_sig.* = (try self.kp.sign(message, null)).toBytes();
+        }
+    };
+    var signer = TestSigner{ .kp = host_kp };
+
+    var cert_seed: [32]u8 = undefined;
+    @memset(&cert_seed, 0x44);
+    const now: i64 = 1_700_000_000;
+    var gen = try libp2p_tls_cert.generate(a, .{
+        .host_identity = .{
+            .ed25519 = .{
+                .public_key_bytes = host_kp.public_key.bytes,
+                .sign = TestSigner.sign,
+                .sign_ctx = &signer,
+            },
+        },
+        .not_before_sec = now - 3600,
+        .not_after_sec = now + 86_400,
+        .cert_key_seed = cert_seed,
+    });
+    defer gen.deinit(a);
+
+    // Construct the expected PeerId via the libp2p PublicKey protobuf path
+    // — the same path consumers use to derive their `/p2p/...` dial-target
+    // peer id. The cert's SignedKey extension carries the SAME pubkey, but
+    // the two PeerId structs reach their `multihash` field through different
+    // allocations, so any bytes past the active digest length differ.
+    const PublicKey = @import("peer_id").PublicKey;
+    var data_buf: [32]u8 = host_kp.public_key.bytes;
+    var pk = PublicKey{ .type = .ED25519, .data = &data_buf };
+    const expected = try peer_id.PeerId.fromPublicKey(a, &pk);
+
+    const verified = try verifiedPeerIdFromQuicLeafCertificate(a, gen.cert_der, expected, now);
+    try std.testing.expect(verified.eql(&expected));
 }
 
 test "verified path rejects expired certificate" {
