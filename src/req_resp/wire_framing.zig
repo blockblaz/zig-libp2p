@@ -21,22 +21,6 @@ pub const UnaryResponse = struct {
     ssz: []u8,
 };
 
-fn firstUnaryResponseWireLen(allocator: std.mem.Allocator, wire: []const u8) (FramingError || std.mem.Allocator.Error)!usize {
-    const h = try frame.parseResponseHeader(wire);
-    const hdr_len = wire.len - h.payload.len;
-    if (h.payload.len == 0) return error.IncompleteStream;
-
-    var i: usize = 1;
-    while (i <= h.payload.len) : (i += 1) {
-        const plain = snappy_wire.decompressFramed(allocator, h.payload[0..i]) catch continue;
-        defer allocator.free(plain);
-        if (plain.len == h.declared_len) {
-            return hdr_len + i;
-        }
-    }
-    return error.IncompleteStream;
-}
-
 fn readMoreInto(
     acc: *std.ArrayList(u8),
     r: *Io.Reader,
@@ -82,11 +66,10 @@ pub fn readOneUnaryResponse(
     defer acc.deinit(allocator);
     while (true) {
         try readMoreInto(&acc, r, allocator, scratch, limits);
-        const frame_len = firstUnaryResponseWireLen(allocator, acc.items) catch |err| switch (err) {
-            error.IncompleteStream => continue,
+        const decoded = snappy_wire.decodeResponseSsz(allocator, acc.items) catch |err| switch (err) {
+            error.IncompleteHeader, error.InvalidData => continue,
             else => |e| return e,
         };
-        const decoded = try snappy_wire.decodeResponseSsz(allocator, acc.items[0..frame_len]);
         return UnaryResponse{ .code = decoded.code, .ssz = decoded.ssz };
     }
 }

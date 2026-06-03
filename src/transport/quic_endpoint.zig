@@ -13,7 +13,7 @@
 //! ([`dialMultiaddr`], [`dialExtended`]), optional [`QuicLifecycleHooks`] on [`QuicListener`], and
 //! [`stream_multistream.responderHandshakeMultistreamAmong`] for per-stream multistream on the responder.
 //! Issue [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16): [`dialExtended`] verifies the **server** leaf by default
-//! ([`QuicOutboundDialOptions.verify_libp2p_tls_peer`]); set [`quic.Libp2pZquicClientDialOptions.client_cert_path`] / `client_key_path`
+//! ([`quic_peer_identity.verifiedPeerIdFromLibp2pQuicClient`]); set [`quic.Libp2pZquicClientDialOptions.client_cert_path`] / `client_key_path`
 //! so mutual TLS completes. Inbound peer id: [`quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn`].
 
 const std = @import("std");
@@ -390,8 +390,6 @@ pub const QuicOutboundDialOptions = struct {
     connect_timeout_ms: u32 = 20_000,
     /// When the multiaddr includes `/p2p`, this must match when non-null. TLS leaf verification: [#16].
     expected_peer: ?peer_id_mod.PeerId = null,
-    /// Verify the server leaf with [`quic_peer_identity.verifiedPeerIdFromLibp2pQuicClient`] after connect.
-    verify_libp2p_tls_peer: bool = true,
 };
 
 /// [`QuicOutbound.dial`] then block until connected or deadline (stack `recv_buf` for pumping).
@@ -413,11 +411,9 @@ pub fn dialExtended(
     const deadline = wall_time.milliTimestamp() + @as(i64, @intCast(timeout));
     try out.waitConnected(&buf, deadline);
 
-    if (opts.verify_libp2p_tls_peer) {
-        const now_sec = @divTrunc(wall_time.milliTimestamp(), 1000);
-        const expected: ?peer_id_mod.PeerId = if (opts.expected_peer) |p| p else ep.expected_peer;
-        _ = try quic_peer_identity.verifiedPeerIdFromLibp2pQuicClient(out.client, allocator, expected, now_sec);
-    }
+    const now_sec = @divTrunc(wall_time.milliTimestamp(), 1000);
+    const expected: ?peer_id_mod.PeerId = if (opts.expected_peer) |p| p else ep.expected_peer;
+    _ = try quic_peer_identity.verifiedPeerIdFromLibp2pQuicClient(out.client, allocator, expected, now_sec);
     return out;
 }
 

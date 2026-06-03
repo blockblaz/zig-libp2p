@@ -22,7 +22,7 @@
 //! For authenticated handshakes, use [`peerIdFromVerifiedCertificate`]: it enforces a single
 //! certificate, self-signature and validity window (`std.crypto.Certificate.verify`), and verifies
 //! the host key signature over `handshake_signature_prefix` || SubjectPublicKeyInfo (TLS spec).
-//! [`peerIdFromCertificate`] only parses the extension and derives a PeerId (no crypto proof).
+//! [`peerIdFromCertificateUnverified`] only parses the extension and derives a PeerId (no crypto proof).
 
 const std = @import("std");
 const peer_id = @import("peer_id");
@@ -91,16 +91,67 @@ fn readConstructedTLV(buf: []const u8, pos: usize, expected_tag: u8) Error!struc
     return .{ .payload = buf[start..end], .next = end };
 }
 
-/// Raw `extnValue` OCTET STRING payload for the libp2p extension (still DER-encoded `SignedKey`).
-pub fn findLibp2pExtensionExtValue(cert_der: []const u8) Error![]const u8 {
-    const idx = std.mem.indexOf(u8, cert_der, &extension_oid_tlv) orelse return error.MissingLibp2pExtension;
-    var pos = idx + extension_oid_tlv.len;
-    if (pos < cert_der.len and cert_der[pos] == 0x01) {
-        if (pos + 2 >= cert_der.len) return error.MalformedExtension;
-        pos += 3;
+/// TBSCertificate `extensions` field payload (`SEQUENCE OF Extension`), if present.
+fn tbsExtensionsSequencePayload(cert_der: []const u8) (Error || X509.ParseError)![]const u8 {
+    const b = cert_der;
+    if (b.len < 4) return error.MissingLibp2pExtension;
+    const certificate = try X509.der.Element.parse(b, 0);
+    if (certificate.slice.start >= b.len or certificate.slice.end > b.len) return error.MissingLibp2pExtension;
+    const tbs_certificate = try X509.der.Element.parse(b, certificate.slice.start);
+    const version_elem = try X509.der.Element.parse(b, tbs_certificate.slice.start);
+    const serial_number = if (@as(u8, @bitCast(version_elem.identifier)) == 0xa0)
+        try X509.der.Element.parse(b, version_elem.slice.end)
+    else
+        version_elem;
+    const tbs_signature = try X509.der.Element.parse(b, serial_number.slice.end);
+    const issuer = try X509.der.Element.parse(b, tbs_signature.slice.end);
+    const validity = try X509.der.Element.parse(b, issuer.slice.end);
+    const subject = try X509.der.Element.parse(b, validity.slice.end);
+    const spki_start: u32 = subject.slice.end;
+    const pub_key_info = try X509.der.Element.parse(b, spki_start);
+
+    var pos: u32 = pub_key_info.slice.end;
+    while (pos < tbs_certificate.slice.end) {
+        if (pos >= b.len) return error.MalformedExtension;
+        if (b[pos] == 0xA3) {
+            const explicit = try readConstructedTLV(b, pos, 0xA3);
+            const inner = try readConstructedTLV(explicit.payload, 0, 0x30);
+            return inner.payload;
+        }
+        const elem = try X509.der.Element.parse(b, pos);
+        pos = elem.slice.end;
     }
-    const oct = try readConstructedTLV(cert_der, pos, 0x04);
-    return oct.payload;
+    return error.MissingLibp2pExtension;
+}
+
+/// Raw `extnValue` OCTET STRING payload for the libp2p extension (still DER-encoded `SignedKey`).
+///
+/// Walks the TBSCertificate `[3] EXPLICIT Extensions` sequence and matches OID
+/// `1.3.6.1.4.1.53594.1.1` only inside a proper `Extension` entry (#120).
+pub fn findLibp2pExtensionExtValue(cert_der: []const u8) Error![]const u8 {
+    const exts = tbsExtensionsSequencePayload(cert_der) catch |err| switch (err) {
+        error.MissingLibp2pExtension, error.MalformedExtension => |e| return e,
+        else => return error.MissingLibp2pExtension,
+    };
+
+    var pos: usize = 0;
+    var found: ?[]const u8 = null;
+    while (pos < exts.len) {
+        const ext = try readConstructedTLV(exts, pos, 0x30);
+        pos = ext.next;
+        if (ext.payload.len < extension_oid_tlv.len) continue;
+        if (!std.mem.eql(u8, ext.payload[0..extension_oid_tlv.len], &extension_oid_tlv)) continue;
+
+        var p = extension_oid_tlv.len;
+        if (p < ext.payload.len and ext.payload[p] == 0x01) {
+            if (p + 2 >= ext.payload.len) return error.MalformedExtension;
+            p += 3;
+        }
+        const oct = try readConstructedTLV(ext.payload, p, 0x04);
+        if (found != null) return error.MalformedExtension;
+        found = oct.payload;
+    }
+    return found orelse error.MissingLibp2pExtension;
 }
 
 /// Parse `SignedKey` (`SEQUENCE { publicKey OCTET STRING, signature OCTET STRING }`).
@@ -297,11 +348,6 @@ pub fn peerIdFromCertificateUnverified(allocator: std.mem.Allocator, cert_der: [
     return peer_id.PeerId.fromPublicKey(allocator, &pk) catch return error.InvalidPublicKeyProtobuf;
 }
 
-/// Back-compat alias for [`peerIdFromCertificateUnverified`]. The renamed name
-/// makes the security trade-off explicit at the call site; this alias keeps
-/// existing callers compiling. Schedule for removal after embedders migrate.
-pub const peerIdFromCertificate = peerIdFromCertificateUnverified;
-
 fn tlsVectorValidityMidpointSec(cert_der: []const u8) X509.ParseError!i64 {
     const c = X509{ .buffer = cert_der, .index = 0 };
     const p = try c.parse();
@@ -317,7 +363,7 @@ test "libp2p TLS spec vector 1 (Ed25519) peer id" {
     const cert_slice = try std.fmt.hexToBytes(&buf, hex);
     const cert = cert_slice;
 
-    const id = try peerIdFromCertificate(a, cert);
+    const id = try peerIdFromCertificateUnverified(a, cert);
     var b58: [128]u8 = undefined;
     const s = try id.toBase58(&b58);
     try std.testing.expectEqualStrings("12D3KooWM6CgA9iBFZmcYAHA6A2qvbAxqfkmrYiRQuz3XEsk4Ksv", s);
@@ -337,7 +383,7 @@ test "libp2p TLS spec vector 2 (ECDSA) peer id" {
     var buf: [512]u8 = undefined;
     const cert_slice = try std.fmt.hexToBytes(&buf, hex);
     const cert = cert_slice;
-    const id = try peerIdFromCertificate(a, cert);
+    const id = try peerIdFromCertificateUnverified(a, cert);
     var b58: [128]u8 = undefined;
     const s = try id.toBase58(&b58);
     try std.testing.expectEqualStrings("QmfXbAwNjJLXfesgztEHe8HwgVDCMMpZ9Eax1HYq6hn9uE", s);
@@ -357,7 +403,7 @@ test "libp2p TLS spec vector 3 (secp256k1) peer id" {
     var buf: [512]u8 = undefined;
     const cert_slice = try std.fmt.hexToBytes(&buf, hex);
     const cert = cert_slice;
-    const id = try peerIdFromCertificate(a, cert);
+    const id = try peerIdFromCertificateUnverified(a, cert);
     var b58: [128]u8 = undefined;
     const s = try id.toBase58(&b58);
     try std.testing.expectEqualStrings("16Uiu2HAkutTMoTzDw1tCvSRtu6YoixJwS46S1ZFxW8hSx9fWHiPs", s);
@@ -383,7 +429,7 @@ test "libp2p TLS spec vector 4 (invalid) rejected after verify" {
 
 test "missing extension" {
     const a = std.testing.allocator;
-    try std.testing.expectError(error.MissingLibp2pExtension, peerIdFromCertificate(a, &[_]u8{ 0x30, 0x00 }));
+    try std.testing.expectError(error.MissingLibp2pExtension, peerIdFromCertificateUnverified(a, &[_]u8{ 0x30, 0x00 }));
 }
 
 test "QUIC TLS ALPN matches libp2p TLS spec string" {
@@ -425,11 +471,6 @@ test "unverified path returns same PeerId as verified for valid spec vector" {
         try id_unverified.toBase58(&b1),
         try id_verified.toBase58(&b2),
     );
-}
-
-test "unverified path warns about no-crypto helper via doc-comment" {
-    // This is a behavioural test of the alias: both names resolve to the same fn.
-    try std.testing.expectEqual(@as(*const @TypeOf(peerIdFromCertificateUnverified), &peerIdFromCertificateUnverified), &peerIdFromCertificate);
 }
 
 test "parse synthetic TLS 1.3 Certificate handshake (first leaf)" {
