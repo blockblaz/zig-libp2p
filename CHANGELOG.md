@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.2](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.1...v0.1.2) (2026-06-03)
+
+
+### Features
+
+* **security:** libp2p TLS self-signed certificate generator ([#114](https://github.com/ch4r10t33r/zig-libp2p/issues/114)) ([71be9c5](https://github.com/ch4r10t33r/zig-libp2p/commit/71be9c5174627be552987518f2bb8b6e0c334e2c))
+* **swarm:** CommandDispatchHook for real-transport interception ([#113](https://github.com/ch4r10t33r/zig-libp2p/issues/113)) ([7008756](https://github.com/ch4r10t33r/zig-libp2p/commit/7008756721ab5f0e4ed4318e68754bf20e7d47bd))
+* **transport:** QuicRuntime + libp2p_tls_cert ECDSA-P-256 path ([#115](https://github.com/ch4r10t33r/zig-libp2p/issues/115)) ([ce93883](https://github.com/ch4r10t33r/zig-libp2p/commit/ce9388317054bf8a0a32974c5e3139ba08edf19f))
+
 ## [0.1.1](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.0...v0.1.1) (2026-06-02)
 
 
