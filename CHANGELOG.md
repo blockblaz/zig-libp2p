@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.2...v0.1.3) (2026-06-03)
+
+
+### Features
+
+* **transport:** gossipsub publish + inbound on the wire ([#117](https://github.com/ch4r10t33r/zig-libp2p/issues/117)) ([e17b95d](https://github.com/ch4r10t33r/zig-libp2p/commit/e17b95d1facf73eda19ba333d3abe87802f20e88))
+
 ## [0.1.2](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.1...v0.1.2) (2026-06-03)
 
 
