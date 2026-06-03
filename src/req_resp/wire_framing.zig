@@ -21,22 +21,6 @@ pub const UnaryResponse = struct {
     ssz: []u8,
 };
 
-fn firstUnaryResponseWireLen(allocator: std.mem.Allocator, wire: []const u8) (FramingError || std.mem.Allocator.Error)!usize {
-    const h = try frame.parseResponseHeader(wire);
-    const hdr_len = wire.len - h.payload.len;
-    if (h.payload.len == 0) return error.IncompleteStream;
-
-    var i: usize = 1;
-    while (i <= h.payload.len) : (i += 1) {
-        const plain = snappy_wire.decompressFramed(allocator, h.payload[0..i]) catch continue;
-        defer allocator.free(plain);
-        if (plain.len == h.declared_len) {
-            return hdr_len + i;
-        }
-    }
-    return error.IncompleteStream;
-}
-
 fn readMoreInto(
     acc: *std.ArrayList(u8),
     r: *Io.Reader,
@@ -82,11 +66,10 @@ pub fn readOneUnaryResponse(
     defer acc.deinit(allocator);
     while (true) {
         try readMoreInto(&acc, r, allocator, scratch, limits);
-        const frame_len = firstUnaryResponseWireLen(allocator, acc.items) catch |err| switch (err) {
-            error.IncompleteStream => continue,
+        const decoded = snappy_wire.decodeResponseSsz(allocator, acc.items) catch |err| switch (err) {
+            error.IncompleteHeader, error.InvalidData => continue,
             else => |e| return e,
         };
-        const decoded = try snappy_wire.decodeResponseSsz(allocator, acc.items[0..frame_len]);
         return UnaryResponse{ .code = decoded.code, .ssz = decoded.ssz };
     }
 }
@@ -163,4 +146,36 @@ pub fn responderUnarySequenceAfterHandshake(
     }
     Io.Writer.flush(w) catch return error.IoError;
     return req_ssz;
+}
+
+test "readOneUnaryResponse decodes from short incremental reads" {
+    const a = std.testing.allocator;
+    const plain = "chunked-response-" ** 4;
+    const wire = try snappy_wire.buildResponseWire(a, 0, plain);
+    defer a.free(wire);
+
+    var reader_buf: [8192]u8 = undefined;
+    try std.testing.expect(wire.len + 64 <= reader_buf.len);
+    var incremental = std.testing.Reader.init(&reader_buf, &.{.{ .buffer = wire }});
+    incremental.artificial_limit = .limited(8);
+
+    var scratch: [4096]u8 = undefined;
+    const got = try readOneUnaryResponse(a, &incremental.interface, &scratch, .{ .max_accumulated = wire.len + 64 });
+    defer a.free(got.ssz);
+    try std.testing.expectEqual(@as(u8, 0), got.code);
+    try std.testing.expectEqualStrings(plain, got.ssz);
+}
+
+test "readOneUnaryResponse returns IncompleteHeader on truncated prefix" {
+    const a = std.testing.allocator;
+    const plain = "x";
+    const wire = try snappy_wire.buildResponseWire(a, 0, plain);
+    defer a.free(wire);
+
+    var r = Io.Reader.fixed(wire[0 .. wire.len - 1]);
+    var scratch: [4096]u8 = undefined;
+    try std.testing.expectError(
+        error.Disconnected,
+        readOneUnaryResponse(a, &r, &scratch, .{ .max_accumulated = wire.len }),
+    );
 }

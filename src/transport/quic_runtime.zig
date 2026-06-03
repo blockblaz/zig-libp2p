@@ -49,6 +49,11 @@ const ZIo = zquic.transport.io;
 
 const meshsub_protocol_id: []const u8 = "/meshsub/1.1.0";
 
+/// Per-stream inbound accumulator caps (#119).
+const max_inbound_gossip_acc_bytes: usize =
+    gossipsub_wire_limits.max_rpc_length_delimited_bytes + varint.max_encoding_bytes + 4096;
+const max_inbound_req_acc_bytes: usize = (wire_framing.ExchangeLimits{}).max_accumulated;
+
 const supported_protocols: [4][]const u8 = .{
     meshsub_protocol_id,
     protocol_mod.blocks_by_root_v1,
@@ -888,12 +893,32 @@ pub const QuicRuntime = struct {
         if (found_key) |k| _ = self.channel_to_inbound.remove(k);
     }
 
+    fn appendInboundAccBounded(
+        self: *QuicRuntime,
+        list: *std.ArrayList(u8),
+        new_bytes: []const u8,
+        max_bytes: usize,
+    ) (errors_mod.ReqRespError || std.mem.Allocator.Error)!void {
+        const new_len = list.items.len + new_bytes.len;
+        if (new_len > max_bytes) return error.PayloadTooLarge;
+        try list.appendSlice(self.allocator, new_bytes);
+    }
+
+    fn removeInboundStreamAt(self: *QuicRuntime, index: usize) void {
+        const ist = self.inbound_streams.items[index];
+        if (ist.channel_id) |cid| _ = self.channel_to_inbound.remove(cid);
+        ist.req_acc.deinit(self.allocator);
+        ist.gossip_acc.deinit(self.allocator);
+        self.allocator.destroy(ist);
+        _ = self.inbound_streams.swapRemove(index);
+    }
+
     // ── Per-stream pump ────────────────────────────────────────────────────
 
     fn advanceInboundStreams(self: *QuicRuntime) !void {
         const a = self.allocator;
         var i: usize = 0;
-        while (i < self.inbound_streams.items.len) : (i += 1) {
+        while (i < self.inbound_streams.items.len) {
             const ist = self.inbound_streams.items[i];
 
             // 1. Multistream handshake: responder side, among 4 protocols.
@@ -919,12 +944,10 @@ pub const QuicRuntime = struct {
                 const cands: []const []const u8 = &supported_protocols;
                 const ix = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, a) catch |err| {
                     log.warn("quic_runtime: inbound responder handshake failed: {s}", .{@errorName(err)});
+                    self.removeInboundStreamAt(i);
                     continue;
                 };
-                ist.handshake_done = true;
-                ist.protocol_index = ix;
 
-                // Resolve sender peer id from server TLS leaf.
                 const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
                 const sender = quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn(
                     ist.conn,
@@ -933,8 +956,11 @@ pub const QuicRuntime = struct {
                     now_sec,
                 ) catch |perr| {
                     log.warn("quic_runtime: verify inbound peer failed: {s}", .{@errorName(perr)});
+                    self.removeInboundStreamAt(i);
                     continue;
                 };
+                ist.handshake_done = true;
+                ist.protocol_index = ix;
                 ist.sender_peer = sender;
 
                 // Lazily notify host of new inbound connection (once per slot).
@@ -948,8 +974,15 @@ pub const QuicRuntime = struct {
                 }
             }
 
-            // 2. Dispatch protocol-specific payload reader.
-            const pi = ist.protocol_index orelse continue;
+            // 2. Dispatch protocol-specific payload reader (verified peer only).
+            const sender_peer = ist.sender_peer orelse {
+                i += 1;
+                continue;
+            };
+            const pi = ist.protocol_index orelse {
+                i += 1;
+                continue;
+            };
             switch (pi) {
                 0 => {
                     // /meshsub/1.1.0 — read length-prefixed gossipsub RPC
@@ -957,26 +990,36 @@ pub const QuicRuntime = struct {
                     // and MAY emit multiple frames before FIN; decode every
                     // complete frame in the accumulator and hand each to
                     // `host.handleGossipRpc` for sender attribution.
-                    const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse continue;
+                    const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse {
+                        i += 1;
+                        continue;
+                    };
                     if (recv_buf.len > ist.raw.read_cursor) {
                         const new_bytes = recv_buf[ist.raw.read_cursor..];
-                        try ist.gossip_acc.appendSlice(a, new_bytes);
+                        self.appendInboundAccBounded(&ist.gossip_acc, new_bytes, max_inbound_gossip_acc_bytes) catch {
+                            log.warn("quic_runtime: gossip_acc cap exceeded, dropping inbound stream", .{});
+                            self.removeInboundStreamAt(i);
+                            continue;
+                        };
                         ist.raw.read_cursor = recv_buf.len;
                     }
-                    if (ist.gossip_acc.items.len == 0) continue;
-                    const sender_peer = ist.sender_peer orelse continue;
+                    if (ist.gossip_acc.items.len == 0) {
+                        i += 1;
+                        continue;
+                    }
 
                     // Drain every complete frame from the accumulator.
                     // The buffer can contain a partial frame on the tail; if
                     // varint decode or length check fails, we leave the bytes
                     // alone and try again next loop.
                     var consumed: usize = 0;
+                    var drop_stream = false;
                     while (consumed < ist.gossip_acc.items.len) {
                         const tail = ist.gossip_acc.items[consumed..];
                         const dec = varint.decode(tail) catch break; // need more bytes
                         if (dec.value > gossipsub_wire_limits.max_rpc_length_delimited_bytes) {
                             log.warn("quic_runtime: gossipsub frame length too large: {d}", .{dec.value});
-                            consumed = ist.gossip_acc.items.len;
+                            drop_stream = true;
                             break;
                         }
                         const frame_len: usize = @intCast(dec.value);
@@ -986,6 +1029,10 @@ pub const QuicRuntime = struct {
                             log.warn("quic_runtime: handleGossipRpc failed: {s}", .{@errorName(err)});
                         };
                         consumed += dec.len + frame_len;
+                    }
+                    if (drop_stream) {
+                        self.removeInboundStreamAt(i);
+                        continue;
                     }
                     if (consumed > 0) {
                         // Compact remaining (partial) frame to the front.
@@ -998,30 +1045,50 @@ pub const QuicRuntime = struct {
                 },
                 else => |idx| {
                     // SSZ req/resp path.
-                    if (ist.channel_id != null) continue;
+                    if (ist.channel_id != null) {
+                        i += 1;
+                        continue;
+                    }
                     const proto: protocol_mod.LeanSupportedProtocol = switch (idx) {
                         1 => .blocks_by_root,
                         2 => .blocks_by_range,
                         3 => .status,
-                        else => continue,
+                        else => {
+                            i += 1;
+                            continue;
+                        },
                     };
                     // Drain whatever new bytes have arrived into the per-stream
                     // accumulator. `wire_framing.readOneUnaryRequest` consumed
                     // bytes destructively on partial errors so we maintain our
                     // own accumulating buffer and decode straight from it.
-                    const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse continue;
+                    const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse {
+                        i += 1;
+                        continue;
+                    };
                     if (recv_buf.len > ist.raw.read_cursor) {
                         const new_bytes = recv_buf[ist.raw.read_cursor..];
-                        try ist.req_acc.appendSlice(a, new_bytes);
+                        self.appendInboundAccBounded(&ist.req_acc, new_bytes, max_inbound_req_acc_bytes) catch {
+                            log.warn("quic_runtime: req_acc cap exceeded, dropping inbound stream", .{});
+                            self.removeInboundStreamAt(i);
+                            continue;
+                        };
                         ist.raw.read_cursor = recv_buf.len;
                     }
-                    if (ist.req_acc.items.len == 0) continue;
+                    if (ist.req_acc.items.len == 0) {
+                        i += 1;
+                        continue;
+                    }
 
                     // Attempt to decode a full unary request from the acc.
                     const req_ssz = snappy_wire.decodeRequestSsz(a, ist.req_acc.items) catch |err| switch (err) {
-                        error.IncompleteHeader, error.InvalidData => continue, // need more bytes
+                        error.IncompleteHeader, error.InvalidData => {
+                            i += 1;
+                            continue;
+                        },
                         else => |e| {
                             log.warn("quic_runtime: decodeRequestSsz failed: {s}", .{@errorName(e)});
+                            self.removeInboundStreamAt(i);
                             continue;
                         },
                     };
@@ -1031,7 +1098,6 @@ pub const QuicRuntime = struct {
                     // id as the req/resp stream id correlator.
                     const stream_rid = ist.stream_id +% 1; // any nonzero u64 unique within this peer
                     const now_ms = self.opts.now_ms_fn();
-                    const sender_peer = ist.sender_peer orelse continue;
                     const channel_id = self.host.registerInboundReqRespChannel(sender_peer, proto, stream_rid, now_ms) catch |err| {
                         log.warn("quic_runtime: registerInboundReqRespChannel failed: {s}", .{@errorName(err)});
                         continue;
@@ -1055,6 +1121,7 @@ pub const QuicRuntime = struct {
                     ist.req_acc.clearRetainingCapacity();
                 },
             }
+            i += 1;
         }
     }
 
@@ -1362,6 +1429,19 @@ fn buildTestBundle(a: std.mem.Allocator, label: []const u8, seed: u8) !TestCertB
         .key_path = key_path,
         .peer = peer,
     };
+}
+
+test "appendInboundAccBounded rejects growth past cap" {
+    const a = std.testing.allocator;
+    var rt: QuicRuntime = undefined;
+    rt.allocator = a;
+
+    var acc = std.ArrayList(u8).empty;
+    defer acc.deinit(a);
+    const cap: usize = 64;
+    try acc.appendSlice(a, &[_]u8{0} ** (cap - 1));
+    try std.testing.expectError(error.PayloadTooLarge, rt.appendInboundAccBounded(&acc, &[_]u8{ 1, 2 }, cap));
+    try std.testing.expectEqual(cap - 1, acc.items.len);
 }
 
 test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {

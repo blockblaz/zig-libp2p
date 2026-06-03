@@ -33,7 +33,16 @@ pub const Error = proto.Error || error{
     TooManyProtocols,
     IdentifyMessageTooLarge,
     UnsupportedIdentifyField,
-};
+    /// Signed envelope signature failed RFC 0002 verification (#123).
+    BadSignature,
+    /// `signed_peer_record` payload type is not a libp2p PeerRecord.
+    InvalidSignedEnvelopePayloadType,
+    /// PeerRecord `peer_id` does not match the authenticated transport peer.
+    SignedPeerRecordPeerIdMismatch,
+    MalformedSignedEnvelope,
+    MalformedPeerRecord,
+    BufferTooSmall,
+} || std.mem.Allocator.Error;
 
 pub const Limits = struct {
     /// Maximum total bytes read for one Identify payload (until stream end).
@@ -252,6 +261,16 @@ pub const Identify = struct {
         self.allocator.free(self.protocol_version);
     }
 
+    fn verifyInboundSignedPeerRecordIfPresent(
+        self: *Identify,
+        transport_peer: pid.PeerId,
+        msg: *const MessageOwned,
+    ) Error!void {
+        const spr = msg.signed_peer_record orelse return;
+        var rec = try verifySignedPeerRecord(self.allocator, spr, transport_peer);
+        rec.deinit(self.allocator);
+    }
+
     fn replyView(self: *const Identify, params: ReplyParams) MessageView {
         return .{
             .protocol_version = self.protocol_version,
@@ -279,6 +298,7 @@ pub const Identify = struct {
         defer self.allocator.free(wire);
         var owned = try decodeOwned(self.allocator, wire, limits);
         defer owned.deinit(self.allocator);
+        try self.verifyInboundSignedPeerRecordIfPresent(peer, &owned);
         onIdentified(context, peer, owned.asView());
         const rv = self.replyView(reply_params);
         const out = try encode(self.allocator, rv);
@@ -308,6 +328,7 @@ pub const Identify = struct {
         defer self.allocator.free(wire);
         var owned = try decodeOwned(self.allocator, wire, limits);
         defer owned.deinit(self.allocator);
+        try self.verifyInboundSignedPeerRecordIfPresent(peer, &owned);
         onIdentified(context, peer, owned.asView());
     }
 
@@ -341,6 +362,7 @@ pub const Identify = struct {
         defer self.allocator.free(wire);
         var owned = try decodeOwned(self.allocator, wire, limits);
         defer owned.deinit(self.allocator);
+        try self.verifyInboundSignedPeerRecordIfPresent(peer, &owned);
         onIdentified(context, peer, owned.asView());
     }
 };
@@ -529,6 +551,218 @@ pub fn decodePeerRecord(allocator: std.mem.Allocator, wire: []const u8) (Error |
         .seq = seq,
         .addresses = try addresses.toOwnedSlice(allocator),
     };
+}
+
+fn verifySignedEnvelopeSignature(
+    key_type: pid.KeyType,
+    key_data: []const u8,
+    signature: []const u8,
+    message: []const u8,
+) Error!void {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const Secp256k1 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    switch (key_type) {
+        .ED25519 => {
+            if (signature.len != Ed25519.Signature.encoded_length) return error.BadSignature;
+            const pk = Ed25519.PublicKey.fromBytes(key_data[0..Ed25519.PublicKey.encoded_length].*) catch
+                return error.BadSignature;
+            const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
+            sig.verify(message, pk) catch return error.BadSignature;
+        },
+        .SECP256K1 => {
+            const pk = Secp256k1.PublicKey.fromSec1(key_data) catch return error.BadSignature;
+            const sig = Secp256k1.Signature.fromDer(signature) catch return error.BadSignature;
+            sig.verify(message, pk) catch return error.BadSignature;
+        },
+        .ECDSA => {
+            const sec1 = sec1FromSubjectPublicKeyInfoPkix(key_data) catch return error.BadSignature;
+            const pk = EcdsaP256.PublicKey.fromSec1(sec1) catch return error.BadSignature;
+            const sig = EcdsaP256.Signature.fromDer(signature) catch return error.BadSignature;
+            sig.verify(message, pk) catch return error.BadSignature;
+        },
+        else => return error.BadSignature,
+    }
+}
+
+fn sec1FromSubjectPublicKeyInfoPkix(spki: []const u8) Error![]const u8 {
+    const seq = try readConstructedTLV(spki, 0, 0x30);
+    if (seq.next != spki.len) return error.BadSignature;
+    var pos: usize = 0;
+    const algo = try readConstructedTLV(seq.payload, pos, 0x30);
+    pos = algo.next;
+    const bitstr = try readConstructedTLV(seq.payload, pos, 0x03);
+    if (bitstr.payload.len < 2 or bitstr.payload[0] != 0) return error.BadSignature;
+    return bitstr.payload[1..];
+}
+
+fn readConstructedTLV(buf: []const u8, pos: usize, expected_tag: u8) Error!struct { payload: []const u8, next: usize } {
+    if (pos >= buf.len or buf[pos] != expected_tag) return error.BadSignature;
+    const lh = try readShortDerLength(buf, pos + 1);
+    const start = pos + 1 + lh.header;
+    const end = start + lh.len;
+    if (end > buf.len) return error.BadSignature;
+    return .{ .payload = buf[start..end], .next = end };
+}
+
+fn readShortDerLength(buf: []const u8, pos: usize) Error!struct { len: usize, header: usize } {
+    if (pos >= buf.len) return error.BadSignature;
+    const first = buf[pos];
+    if (first & 0x80 == 0) {
+        return .{ .len = first, .header = 1 };
+    }
+    const nbytes = first & 0x7f;
+    if (nbytes == 0 or nbytes > 4 or pos + 1 + nbytes > buf.len) return error.BadSignature;
+    var len: usize = 0;
+    for (buf[pos + 1 .. pos + 1 + nbytes]) |b| {
+        len = (len << 8) | b;
+    }
+    return .{ .len = len, .header = 1 + nbytes };
+}
+
+/// Verify RFC 0002 `signed_peer_record` and return the decoded [`PeerRecordOwned`].
+/// `transport_peer` must be the peer authenticated by the security layer (TLS / Noise).
+pub fn verifySignedPeerRecord(
+    allocator: std.mem.Allocator,
+    signed_peer_record_wire: []const u8,
+    transport_peer: pid.PeerId,
+) (Error || std.mem.Allocator.Error)!PeerRecordOwned {
+    var env = try decodeSignedEnvelope(allocator, signed_peer_record_wire);
+    defer env.deinit(allocator);
+
+    if (!std.mem.eql(u8, env.payload_type, peer_record_payload_type))
+        return error.InvalidSignedEnvelopePayloadType;
+
+    var msg_buf: [96 * 1024]u8 = undefined;
+    const message = try signedEnvelopeVerifyMessage(
+        &msg_buf,
+        signed_envelope_domain,
+        env.payload_type,
+        env.payload,
+    );
+
+    const reader = pid.PublicKeyReader.init(env.public_key) catch return error.BadSignature;
+    try verifySignedEnvelopeSignature(reader.getType(), reader.getData(), env.signature, message);
+
+    const key_dup = try allocator.dupe(u8, reader.getData());
+    defer allocator.free(key_dup);
+    var pk = pid.PublicKey{ .type = reader.getType(), .data = key_dup };
+    const envelope_peer = pid.PeerId.fromPublicKey(allocator, &pk) catch return error.BadSignature;
+    if (!envelope_peer.eql(&transport_peer)) return error.SignedPeerRecordPeerIdMismatch;
+
+    var rec = try decodePeerRecord(allocator, env.payload);
+    errdefer rec.deinit(allocator);
+
+    var transport_bytes: [128]u8 = undefined;
+    const tb = transport_peer.toBytes(&transport_bytes) catch return error.SignedPeerRecordPeerIdMismatch;
+    if (!std.mem.eql(u8, tb, rec.peer_id)) return error.SignedPeerRecordPeerIdMismatch;
+
+    return rec;
+}
+
+fn encodeSignedPeerRecordTestWire(
+    allocator: std.mem.Allocator,
+    host_kp: std.crypto.sign.Ed25519.KeyPair,
+    peer_record_wire: []const u8,
+    opts: struct {
+        corrupt_signature: bool = false,
+    },
+) anyerror![]u8 {
+    const host_pub_proto = blk: {
+        var pk = pid.PublicKey{ .type = .ED25519, .data = &host_kp.public_key.bytes };
+        break :blk try pk.encode(allocator);
+    };
+    defer allocator.free(host_pub_proto);
+
+    var msg_buf: [96 * 1024]u8 = undefined;
+    const message = try signedEnvelopeVerifyMessage(
+        &msg_buf,
+        signed_envelope_domain,
+        peer_record_payload_type,
+        peer_record_wire,
+    );
+    const sig = host_kp.sign(message, null) catch return error.BadSignature;
+    var sig_bytes = sig.toBytes();
+    if (opts.corrupt_signature) sig_bytes[0] ^= 0xff;
+
+    var wire = std.ArrayList(u8).empty;
+    errdefer wire.deinit(allocator);
+    try proto.appendLengthDelimited(&wire, allocator, 1, host_pub_proto);
+    try proto.appendLengthDelimited(&wire, allocator, 2, peer_record_payload_type);
+    try proto.appendLengthDelimited(&wire, allocator, 3, peer_record_wire);
+    try proto.appendLengthDelimited(&wire, allocator, 5, &sig_bytes);
+    return try wire.toOwnedSlice(allocator);
+}
+
+fn encodePeerRecordTestWire(allocator: std.mem.Allocator, peer_id_bytes: []const u8, seq: u64) ![]u8 {
+    var wire = std.ArrayList(u8).empty;
+    errdefer wire.deinit(allocator);
+    try proto.appendLengthDelimited(&wire, allocator, 1, peer_id_bytes);
+    try proto.appendFieldKey(&wire, allocator, 2, .varint);
+    try proto.appendVarUInt64(&wire, allocator, seq);
+    return try wire.toOwnedSlice(allocator);
+}
+
+test "verifySignedPeerRecord rejects bad signature" {
+    const a = std.testing.allocator;
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0xA1);
+    const host_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var transport_pk = pid.PublicKey{ .type = .ED25519, .data = &host_kp.public_key.bytes };
+    const transport = try pid.PeerId.fromPublicKey(a, &transport_pk);
+
+    var peer_id_buf: [128]u8 = undefined;
+    const peer_id_bytes = try transport.toBytes(&peer_id_buf);
+    const rec_wire = try encodePeerRecordTestWire(a, peer_id_bytes, 1);
+    defer a.free(rec_wire);
+
+    const spr = try encodeSignedPeerRecordTestWire(a, host_kp, rec_wire, .{ .corrupt_signature = true });
+    defer a.free(spr);
+
+    try std.testing.expectError(error.BadSignature, verifySignedPeerRecord(a, spr, transport));
+}
+
+test "verifySignedPeerRecord rejects transport peer mismatch" {
+    const a = std.testing.allocator;
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0xA2);
+    const host_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var signing_pk = pid.PublicKey{ .type = .ED25519, .data = &host_kp.public_key.bytes };
+    const signing_peer = try pid.PeerId.fromPublicKey(a, &signing_pk);
+
+    var peer_id_buf: [128]u8 = undefined;
+    const peer_id_bytes = try signing_peer.toBytes(&peer_id_buf);
+    const rec_wire = try encodePeerRecordTestWire(a, peer_id_bytes, 1);
+    defer a.free(rec_wire);
+
+    const spr = try encodeSignedPeerRecordTestWire(a, host_kp, rec_wire, .{});
+    defer a.free(spr);
+
+    const other = try pid.PeerId.random();
+    try std.testing.expectError(
+        error.SignedPeerRecordPeerIdMismatch,
+        verifySignedPeerRecord(a, spr, other),
+    );
+}
+
+test "verifySignedPeerRecord rejects peer_id field mismatch" {
+    const a = std.testing.allocator;
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0xA3);
+    const host_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var transport_pk = pid.PublicKey{ .type = .ED25519, .data = &host_kp.public_key.bytes };
+    const transport = try pid.PeerId.fromPublicKey(a, &transport_pk);
+
+    const rec_wire = try encodePeerRecordTestWire(a, "wrong-peer-id-bytes", 1);
+    defer a.free(rec_wire);
+
+    const spr = try encodeSignedPeerRecordTestWire(a, host_kp, rec_wire, .{});
+    defer a.free(spr);
+
+    try std.testing.expectError(
+        error.SignedPeerRecordPeerIdMismatch,
+        verifySignedPeerRecord(a, spr, transport),
+    );
 }
 
 test "protocol_line ends with newline" {

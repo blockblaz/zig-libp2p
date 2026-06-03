@@ -4,6 +4,10 @@ Pure-Zig building blocks for **libp2p-style** networking: length-prefixed req/re
 
 **Zeam** (feature checklist, pins, CI/release notes): [docs/zeam-parity.md](docs/zeam-parity.md). Tracker: [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31).
 
+## Security
+
+Lean/Eth2 devnets use gossipsub **StrictNoSign** (signatures on SSZ payloads, not on gossipsub envelopes). Transport auth, Identify signed peer records, and DoS limits are documented in [docs/SECURITY.md](docs/SECURITY.md).
+
 ## Requirements
 
 - **Zig** 0.16.0 (`minimum_zig_version` in `build.zig.zon`)
