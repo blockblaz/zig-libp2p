@@ -2,7 +2,7 @@
 
 Pure-Zig building blocks for **libp2p-style** networking: length-prefixed req/resp, gossipsub protobuf, multistream-select, TCP/QUIC transport helpers, Noise and TLS profiles, and re-exports for `peer_id`, `multiaddr`, and Snappy stacks.
 
-**Zeam** (feature checklist, pins, CI/release notes): [docs/zeam-parity.md](docs/zeam-parity.md). [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31) (libp2p-glue replacement) is **library-complete**; use [`host.Host`](./src/host.zig) + transport wiring.
+**Zeam** (feature checklist, pins, CI/release notes): [docs/zeam-parity.md](docs/zeam-parity.md). The [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31) libp2p-glue replacement checklist is **library-complete**; use [`host.Host`](./src/host.zig) (alias `zig_libp2p.Node`) plus transport wiring — see [examples/host_quic_node.zig](examples/host_quic_node.zig).
 
 ## Security
 
@@ -41,6 +41,7 @@ Programs live under [`examples/`](./examples/). `zig build` installs them to `zi
 | `example-swarm-tick` | [swarm_tick.zig](examples/swarm_tick.zig) | `Swarm.tick` / `nextEvent` without background threads (Wasi-friendly) |
 | `example-req-resp-tcp-status` | [req_resp_tcp_status.zig](examples/req_resp_tcp_status.zig) | Req/resp status unary over TCP loopback (`wire_tcp`); **compile-only** in `zig build test` to avoid CI hangs |
 | `example-quic-ping-loopback` | [quic_ping_loopback.zig](examples/quic_ping_loopback.zig) | QUIC + TLS + multistream + ping via `quic_endpoint.loopbackPingOnce` (needs [`test/fixtures/quic_loopback/`](./test/fixtures/quic_loopback/) PEMs from repo root) |
+| `example-host-quic-node` | [host_quic_node.zig](examples/host_quic_node.zig) | `Host` + QUIC lifecycle hooks (compile-only; needs TLS PEMs to run) |
 
 Build/CI behaviour for examples: [examples/README.md](examples/README.md).
 
@@ -57,6 +58,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossi
 | `layer_events` | Event carriers: `ReqRespFailure`, `GossipsubFailure`, `TransportFailure` (discriminate on `kind`) |
 | `peer_events` | Connection events: `Direction`, `DisconnectReason`, `ConnectionFailureResult`, connected / disconnected / failed payloads |
 | `connection_manager` | Known-peer dial scheduling, reconnect backoff, refcount + peer events; optional `setReqResp` |
+| `host` / `Node` | Bundles `Swarm` + `Gossipsub` + `ReqResp` + `ConnectionManager`; `nextEvent`, subscribe/publish helpers; transport still embedder-owned |
 | `swarm` | Bounded `submit` / `nextEvent`, `queueEvent`, `shutdown`; `SwarmConfig`, `tick`, `startBackground` / `run` |
 | `protocol` | Lean req/resp protocol ids; `LeanSupportedProtocol` |
 | `varint` | Unsigned varint `encodeToScratch` / `decode` |

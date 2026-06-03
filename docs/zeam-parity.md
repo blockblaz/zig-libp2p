@@ -12,6 +12,22 @@ These GitHub issues predate the current tree; behaviour is implemented and the i
 | [#18](https://github.com/ch4r10t33r/zig-libp2p/issues/18) Gossipsub scoring / backpressure | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) behaviour scores + outbox caps |
 | [#20](https://github.com/ch4r10t33r/zig-libp2p/issues/20) Non-QUIC transports | [#35](https://github.com/ch4r10t33r/zig-libp2p/issues/35) TCP + Noise; QUIC is primary. TCP TLS: [#86](https://github.com/ch4r10t33r/zig-libp2p/issues/86) |
 
+## [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31) tracker — library-complete
+
+All behaviour layers listed in #31 are implemented in this repo (see **Surface checklist** below). There is no Rust FFI and no C-ABI callbacks.
+
+| #31 sketch | In-tree replacement |
+|------------|---------------------|
+| `libp2p.Node.init` / `deinit` | [`host.Host.create`](../src/host.zig) / `destroy` — public alias [`zig_libp2p.Node`](../src/root.zig) |
+| `subscribe` / `publish` | `Host.subscribe`, `Host.publish` (and underlying `gossipsub.runtime`) |
+| `while (node.nextEvent())` | `Host.nextEvent` → `Swarm.nextEvent` |
+| TCP + Noise + Yamux/Mplex + QUIC | `transport.tcp`, `security.noise`, `transport.yamux` / `transport.mplex`, `transport.quic_*` |
+| Keypair from PEM | `keypair` module |
+
+**Intentionally not in this library:** a single process that owns UDP/TCP listen sockets, certificate paths, and bootnode policy. That stays in the embedder (Zeam, lean-quickstart, etc.). Canonical wiring: [`examples/host_quic_node.zig`](../examples/host_quic_node.zig).
+
+**Follow-on (out of #31 scope):** Zeam deleting `libp2p-glue` and switching `pkgs/network` to `@import("zig_libp2p")` ([#86](https://github.com/ch4r10t33r/zig-libp2p/issues/86) TCP `/tls/1.0.0` if Zeam needs non-QUIC TLS, [#57](https://github.com/ch4r10t33r/zig-libp2p/issues/57) async swarm).
+
 ## Surface checklist
 
 | Surface | Status | Issue |
