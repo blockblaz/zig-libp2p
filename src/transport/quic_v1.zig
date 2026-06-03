@@ -21,10 +21,21 @@ pub const multistream_protocol_id: []const u8 = "/quic-v1";
 pub const tls_alpn: []const u8 = libp2p_tls.quic_application_layer_protocol;
 
 /// Options for [`libp2pZquicServerConfig`].
+///
+/// Supply either on-disk PEM (`cert_path` / `key_path`) or in-memory PEM
+/// (`cert_pem` / `key_pem`); if both are set on a side, zquic prefers the
+/// PEM bytes and skips the path-based loader (see zquic v1.6.6).
 pub const Libp2pZquicServerOptions = struct {
     port: u16 = 4433,
-    cert_path: []const u8,
-    key_path: []const u8,
+    cert_path: []const u8 = "",
+    key_path: []const u8 = "",
+    /// In-memory PEM-encoded server certificate (chain). When non-null zquic
+    /// parses these bytes and never reads `cert_path` from disk. Borrowed
+    /// until the resulting `Io.Server` finishes loading its TLS material.
+    cert_pem: ?[]const u8 = null,
+    /// In-memory PEM-encoded server private key. Same precedence/lifetime
+    /// rules as `cert_pem`.
+    key_pem: ?[]const u8 = null,
     keylog_path: ?[]const u8 = null,
     qlog_dir: ?[]const u8 = null,
     cubic: bool = false,
@@ -39,6 +50,8 @@ pub fn libp2pZquicServerConfig(options: Libp2pZquicServerOptions) Io.ServerConfi
         .port = options.port,
         .cert_path = options.cert_path,
         .key_path = options.key_path,
+        .cert_pem = options.cert_pem,
+        .key_pem = options.key_pem,
         .keylog_path = options.keylog_path,
         .qlog_dir = options.qlog_dir,
         .cubic = options.cubic,
@@ -62,6 +75,13 @@ pub const Libp2pZquicClientOptions = struct {
     /// Non-empty with [`client_key_path`]: send a client `Certificate` when the server requests one (#16).
     client_cert_path: []const u8 = "",
     client_key_path: []const u8 = "",
+    /// In-memory PEM-encoded client certificate. When non-null zquic parses
+    /// these bytes and never reads `client_cert_path` from disk (zquic
+    /// v1.6.6).
+    client_cert_pem: ?[]const u8 = null,
+    /// In-memory PEM-encoded client private key. Same precedence/lifetime
+    /// rules as `client_cert_pem`.
+    client_key_pem: ?[]const u8 = null,
 };
 
 /// [`Io.ClientConfig`] preset matching [`libp2pZquicServerConfig`].
@@ -79,6 +99,8 @@ pub fn libp2pZquicClientConfig(options: Libp2pZquicClientOptions) Io.ClientConfi
         .raw_application_streams = true,
         .client_cert_path = options.client_cert_path,
         .client_key_path = options.client_key_path,
+        .client_cert_pem = options.client_cert_pem,
+        .client_key_pem = options.client_key_pem,
     };
 }
 
