@@ -1044,6 +1044,10 @@ const TestEcdsaHostSigner = struct {
 };
 
 fn writeFileSync(path: [:0]const u8, data: []const u8) !void {
+    // Uses libc directly (`unit_tests.linkLibC()` in `build.zig` makes this
+    // cross-platform). Routing through `std.Io.Dir` would require plumbing an
+    // `Io` instance through the test, which the surrounding bring-up doesn't
+    // otherwise need.
     var o: std.c.O = .{};
     o.ACCMODE = .WRONLY;
     o.CREAT = true;
@@ -1217,7 +1221,8 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
                 connected = true;
                 break;
             }
-            // 20ms passive wait; the drive thread does the real work.
+            // 20ms passive wait; the drive thread does the real work. Uses
+            // libc nanosleep (Zig 0.16 dropped `std.Thread.sleep`).
             var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
             var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
             _ = std.c.nanosleep(&req, &rem);
