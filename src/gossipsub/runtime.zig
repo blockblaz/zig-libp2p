@@ -130,6 +130,8 @@ pub const GossipsubConfig = struct {
     prune_backoff_default_ms: i64 = gs_cfg.prune_backoff_default_ms,
     /// Upper bound applied to peer-supplied `backoff_seconds` to bound griefing.
     prune_backoff_cap_ms: i64 = gs_cfg.prune_backoff_cap_ms,
+    /// Back-off after `unsubscribe` before `subscribe` on the same topic (#83).
+    unsubscribe_backoff_ms: i64 = gs_cfg.unsubscribe_backoff_ms,
     /// Hard upper bound on tracked `(peer, topic)` back-off entries; oldest evicted first.
     max_backoff_entries: usize = 4096,
     /// Defense-in-depth: when set, inbound publishes carrying both `from` and `seqno`
@@ -176,6 +178,7 @@ pub const GossipsubConfig = struct {
         if (c.max_backoff_entries == 0) return error.InvalidGossipParams;
         if (c.prune_backoff_default_ms < 0) return error.InvalidGossipParams;
         if (c.prune_backoff_cap_ms < c.prune_backoff_default_ms) return error.InvalidGossipParams;
+        if (c.unsubscribe_backoff_ms < 0) return error.InvalidGossipParams;
         if (c.seqno_dedup_enabled and c.max_seqno_dedup_entries == 0) return error.InvalidGossipParams;
         if (c.seqno_dedup_enabled and c.seqno_dedup_ttl_ms <= 0) return error.InvalidGossipParams;
         if (c.idontwant_runtime_enabled and c.max_idontwant_entries == 0) return error.InvalidGossipParams;
@@ -290,6 +293,8 @@ pub const Gossipsub = struct {
     /// FIFO queue of peer-id bytes harvested from inbound PRUNE `peers` lists, surfaced via
     /// [`popDialSuggestion`] (#85).
     px_dial_queue: std.ArrayList([]u8),
+    /// Per-topic deadline until we may `subscribe` again after `unsubscribe` (#83).
+    topic_unsubscribed_until: std.StringHashMap(i64),
 
     pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
         try config.validate();
@@ -327,6 +332,7 @@ pub const Gossipsub = struct {
             .suppressed_outbound_idontwant = 0,
             .direct_peers = .init(allocator),
             .px_dial_queue = .empty,
+            .topic_unsubscribed_until = std.StringHashMap(i64).init(allocator),
         };
         return p;
     }
@@ -363,6 +369,9 @@ pub const Gossipsub = struct {
         self.direct_peers.deinit();
         for (self.px_dial_queue.items) |b| self.allocator.free(b);
         self.px_dial_queue.deinit(self.allocator);
+        var tut = self.topic_unsubscribed_until.iterator();
+        while (tut.next()) |e| self.allocator.free(e.key_ptr.*);
+        self.topic_unsubscribed_until.deinit();
         const a = self.allocator;
         a.destroy(self);
     }
@@ -487,6 +496,56 @@ pub const Gossipsub = struct {
         const remain_ms = self.backoff.items[idx].expires_ms - self.clock_ms;
         if (remain_ms <= 0) return 0;
         return @intCast(@divTrunc(remain_ms + 999, 1000));
+    }
+
+    fn remainingTopicUnsubscribeSeconds(self: *Gossipsub, topic: []const u8) ?u64 {
+        const exp = self.topic_unsubscribed_until.get(topic) orelse return null;
+        const remain_ms = exp - self.clock_ms;
+        if (remain_ms <= 0) return null;
+        return @intCast(@divTrunc(remain_ms + 999, 1000));
+    }
+
+    fn pruneTopicUnsubscribeCooldown(self: *Gossipsub) void {
+        var keys_to_remove: std.ArrayList([]const u8) = .empty;
+        defer keys_to_remove.deinit(self.allocator);
+        var it = self.topic_unsubscribed_until.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* <= self.clock_ms) {
+                keys_to_remove.append(self.allocator, e.key_ptr.*) catch {};
+            }
+        }
+        for (keys_to_remove.items) |k| {
+            if (self.topic_unsubscribed_until.fetchRemove(k)) |kv| {
+                self.allocator.free(kv.key);
+            }
+        }
+    }
+
+    /// LEAVE(topic): PRUNE every mesh peer and record reciprocal back-off (#83).
+    fn leaveTopicMesh(
+        self: *Gossipsub,
+        topic: []const u8,
+        backoff_ms: i64,
+    ) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        const mp = self.mesh.getPtr(topic) orelse return;
+        const backoff_s: u64 = @intCast(@divTrunc(backoff_ms + 999, 1000));
+
+        self.scratch_peers.clearRetainingCapacity();
+        var pit = mp.peers.keyIterator();
+        while (pit.next()) |kp| {
+            try self.scratch_peers.append(self.allocator, kp.*);
+        }
+        for (self.scratch_peers.items) |peer| {
+            _ = mp.peers.remove(peer);
+            if (!self.direct_peers.contains(peer)) {
+                try self.recordBackoff(peer, topic, backoff_ms);
+            }
+            const ctl = try control.encodePrune(self.allocator, topic, backoff_s);
+            defer self.allocator.free(ctl);
+            const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
+            errdefer self.allocator.free(rpcw);
+            try self.appendOut(rpcw, peer);
+        }
     }
 
     fn clearBackoffForPeer(self: *Gossipsub, peer: identity.PeerId) void {
@@ -810,6 +869,10 @@ pub const Gossipsub = struct {
 
     pub fn subscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         if (self.subs.contains(topic)) return;
+        if (self.remainingTopicUnsubscribeSeconds(topic)) |_| return error.TopicUnsubscribeBackoff;
+        if (self.topic_unsubscribed_until.fetchRemove(topic)) |kv| {
+            self.allocator.free(kv.key);
+        }
         try self.subs.put(topic, {});
         errdefer _ = self.subs.fetchRemove(topic);
         try self.ensureTopicMesh(topic);
@@ -819,21 +882,31 @@ pub const Gossipsub = struct {
         self.syncMeshPeers();
     }
 
-    pub fn unsubscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
-        if (self.subs.fetchRemove(topic)) |_| {
-            if (self.mesh.fetchRemove(topic)) |kv| {
-                var tm = kv.value;
-                tm.deinit();
-            }
-            if (self.remote_interest.fetchRemove(topic)) |kv| {
-                var tm = kv.value;
-                tm.deinit();
-            }
-            const w = try rpc.encodeSubscribe(self.allocator, topic, false);
-            errdefer self.allocator.free(w);
-            try self.appendOut(w, null);
-            self.syncMeshPeers();
+    pub fn unsubscribe(self: *Gossipsub, topic: []const u8) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (!self.subs.contains(topic)) return;
+        try self.leaveTopicMesh(topic, self.cfg.unsubscribe_backoff_ms);
+
+        const expires_ms = self.clock_ms + self.cfg.unsubscribe_backoff_ms;
+        if (self.topic_unsubscribed_until.fetchRemove(topic)) |kv| {
+            self.allocator.free(kv.key);
         }
+        const topic_owned = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(topic_owned);
+        try self.topic_unsubscribed_until.put(topic_owned, expires_ms);
+
+        _ = self.subs.fetchRemove(topic);
+        if (self.mesh.fetchRemove(topic)) |kv| {
+            var tm = kv.value;
+            tm.deinit();
+        }
+        if (self.remote_interest.fetchRemove(topic)) |kv| {
+            var tm = kv.value;
+            tm.deinit();
+        }
+        const w = try rpc.encodeSubscribe(self.allocator, topic, false);
+        errdefer self.allocator.free(w);
+        try self.appendOut(w, null);
+        self.syncMeshPeers();
     }
 
     pub fn publish(self: *Gossipsub, topic: []const u8, payload: []const u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
@@ -966,22 +1039,22 @@ pub const Gossipsub = struct {
     fn handleInboundControl(self: *Gossipsub, sender: identity.PeerId, ctl: []const u8) (control.Error || rpc.Error || msg_mod.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         if (try control.decodeFirstGraftTopic(self.allocator, ctl)) |gt| {
             defer self.allocator.free(gt);
-            if (self.subs.contains(gt)) {
-                // libp2p gossipsub v1.1 "graft flood mitigation": if we are currently in
-                // PRUNE back-off toward `sender` for `gt`, refuse the GRAFT and reply
-                // with a fresh PRUNE carrying the remaining back-off (rounded up).
-                if (self.remainingBackoffSecondsFor(sender, gt)) |remain_s| {
-                    self.graft_refused_during_backoff += 1;
-                    const ctl_out = try control.encodePrune(self.allocator, gt, remain_s);
-                    defer self.allocator.free(ctl_out);
-                    const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl_out);
-                    errdefer self.allocator.free(rpcw);
-                    try self.appendOut(rpcw, sender);
-                } else {
-                    try self.ensureTopicMesh(gt);
-                    const mp = self.mesh.getPtr(gt).?;
-                    try mp.peers.put(sender, {});
-                }
+            const remain_s: ?u64 = blk: {
+                if (self.remainingBackoffSecondsFor(sender, gt)) |s| break :blk s;
+                if (!self.subs.contains(gt)) break :blk self.remainingTopicUnsubscribeSeconds(gt);
+                break :blk null;
+            };
+            if (remain_s) |rs| {
+                self.graft_refused_during_backoff += 1;
+                const ctl_out = try control.encodePrune(self.allocator, gt, rs);
+                defer self.allocator.free(ctl_out);
+                const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl_out);
+                errdefer self.allocator.free(rpcw);
+                try self.appendOut(rpcw, sender);
+            } else if (self.subs.contains(gt)) {
+                try self.ensureTopicMesh(gt);
+                const mp = self.mesh.getPtr(gt).?;
+                try mp.peers.put(sender, {});
             }
         }
         // Decode PRUNE with PX peer-info first; falls back to the legacy view if no PRUNE
@@ -1171,6 +1244,7 @@ pub const Gossipsub = struct {
         self.prunePullCache();
         self.pruneRecentSeen();
         self.pruneBackoff();
+        self.pruneTopicUnsubscribeCooldown();
 
         var sit = self.subs.iterator();
         while (sit.next()) |e| {
@@ -2513,6 +2587,116 @@ test "IDONTWANT cache expires after ttl" {
     g.setClockMs(3000);
     try std.testing.expect(!g.peerWantsNotPublish(peer, id));
     try std.testing.expectEqual(@as(usize, 0), g.idontwantCount());
+}
+
+// ---------------------------------------------------------------------------
+// Unsubscribe back-off (#83)
+// ---------------------------------------------------------------------------
+
+test "unsubscribe LEAVE emits PRUNE with unsubscribe_backoff and blocks resubscribe" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 2,
+        .mesh_n_high = 4,
+        .unsubscribe_backoff_ms = 10_000,
+        .prune_backoff_default_ms = 60_000,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const graft = try control.encodeGraft(a, "t");
+    defer a.free(graft);
+    const graft_rpc = try rpc.encodeControlOnlyRpc(a, graft);
+    defer a.free(graft_rpc);
+    try g.handleInboundRpc(peer, graft_rpc);
+    try std.testing.expectEqual(@as(?usize, 1), g.meshPeerCountForTopic("t"));
+
+    try g.unsubscribe("t");
+
+    var saw_unsub = false;
+    var saw_prune_unsub_backoff = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        const sub_views = try rpc.decodeSubscribes(a, d.wire);
+        defer rpc.freeSubscribeViews(a, sub_views);
+        for (sub_views) |sv| {
+            if (!sv.subscribe and std.mem.eql(u8, sv.topic, "t")) saw_unsub = true;
+        }
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if (try control.decodeFirstPrune(a, ctl)) |pv| {
+            var pvv = pv;
+            defer control.deinitPruneView(a, &pvv);
+            if (d.to != null and d.to.?.eql(&peer) and std.mem.eql(u8, pvv.topic, "t")) {
+                try std.testing.expectEqual(@as(?u64, 10), pvv.backoff_seconds);
+                saw_prune_unsub_backoff = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_unsub);
+    try std.testing.expect(saw_prune_unsub_backoff);
+    try std.testing.expectEqual(@as(?usize, null), g.meshPeerCountForTopic("t"));
+
+    try std.testing.expectError(error.TopicUnsubscribeBackoff, g.subscribe("t"));
+
+    g.setClockMs(10_000);
+    try g.subscribe("t");
+}
+
+test "inbound GRAFT during topic unsubscribe cooldown is refused (#83)" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .unsubscribe_backoff_ms = 10_000,
+    });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+    try g.unsubscribe("t");
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    g.setClockMs(2_000);
+    const graft = try control.encodeGraft(a, "t");
+    defer a.free(graft);
+    const graft_rpc = try rpc.encodeControlOnlyRpc(a, graft);
+    defer a.free(graft_rpc);
+    try g.handleInboundRpc(peer, graft_rpc);
+
+    try std.testing.expectEqual(@as(u64, 1), g.graftRefusedDuringBackoffCount());
+
+    const d_opt = g.popOutboxDelivery();
+    try std.testing.expect(d_opt != null);
+    const d = d_opt.?;
+    defer a.free(d.wire);
+    try std.testing.expect(d.to != null and d.to.?.eql(&peer));
+    const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer a.free(ctl);
+    const pv = (try control.decodeFirstPrune(a, ctl)) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    var pvv = pv;
+    defer control.deinitPruneView(a, &pvv);
+    try std.testing.expectEqualStrings("t", pvv.topic);
+    try std.testing.expect(pvv.backoff_seconds.? >= 7 and pvv.backoff_seconds.? <= 9);
 }
 
 // ---------------------------------------------------------------------------

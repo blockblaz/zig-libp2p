@@ -27,6 +27,7 @@ pub const ReqRespError = error{
 /// Gossipsub mesh/codec surface (#39); `PublishQueueFull` is returned when the runtime outbox exceeds config.
 pub const GossipsubError = error{
     TopicNotSubscribed,
+    TopicUnsubscribeBackoff,
     PayloadTooLarge,
     PublishQueueFull,
     InvalidFrame,
