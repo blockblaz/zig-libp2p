@@ -29,3 +29,7 @@ pub const prune_backoff_default_ms: i64 = 60_000;
 /// Upper bound applied to peer-supplied `backoff_seconds` to prevent griefing via
 /// abusive long back-offs that would lock us out of a peer indefinitely.
 pub const prune_backoff_cap_ms: i64 = 15 * 60_000;
+
+/// Back-off after local `unsubscribe` before the same topic may be subscribed again
+/// (libp2p gossipsub v1.1 `UnsubscribeBackoff`, default 10 s).
+pub const unsubscribe_backoff_ms: i64 = 10_000;

@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.1.5](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.4...v0.1.5) (2026-06-03)
+
+
+### Features
+
+* **transport:** zero-copy in-memory TLS PEM — `TlsPemSource.pem_bytes` now
+  threads bytes straight through to zquic v1.6.6's `ServerConfig.cert_pem` /
+  `key_pem` and `ClientConfig.client_cert_pem` / `client_key_pem` (see
+  [ch4r10t33r/zquic#129](https://github.com/ch4r10t33r/zquic/pull/129)) —
+  nothing is written to disk.
+
+
+### Behavior change (non-breaking)
+
+* In v0.1.4 the `.pem_bytes` arm of `TlsPemSource` materialized ephemeral
+  files under `/tmp/zlibp2p_runtime_{N}_{cert,key}.pem` and handed those
+  paths to zquic; on `QuicRuntime.destroy` they were unlinked. That broke
+  in containers without `/tmp` (e.g. `FROM scratch`). v0.1.5 removes the
+  temp-file dance entirely. Public API (`TlsPemSource` shape and the
+  `.paths` arm) is unchanged; only the `.pem_bytes` execution path moved
+  off-disk.
+
+
+### Dependencies
+
+* zquic bumped from v1.6.5 to **v1.6.6** for the new in-memory PEM config
+  fields.
+
 ## [0.1.4](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.3...v0.1.4) (2026-06-03)
 
 
