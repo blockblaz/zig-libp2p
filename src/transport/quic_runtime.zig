@@ -1431,6 +1431,19 @@ fn buildTestBundle(a: std.mem.Allocator, label: []const u8, seed: u8) !TestCertB
     };
 }
 
+test "appendInboundAccBounded rejects growth past cap" {
+    const a = std.testing.allocator;
+    var rt: QuicRuntime = undefined;
+    rt.allocator = a;
+
+    var acc = std.ArrayList(u8).empty;
+    defer acc.deinit(a);
+    const cap: usize = 64;
+    try acc.appendSlice(a, &[_]u8{0} ** (cap - 1));
+    try std.testing.expectError(error.PayloadTooLarge, rt.appendInboundAccBounded(&acc, &[_]u8{ 1, 2 }, cap));
+    try std.testing.expectEqual(cap - 1, acc.items.len);
+}
+
 test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.os.tag == .wasi) return error.SkipZigTest;

@@ -650,12 +650,119 @@ pub fn verifySignedPeerRecord(
     const envelope_peer = pid.PeerId.fromPublicKey(allocator, &pk) catch return error.BadSignature;
     if (!envelope_peer.eql(&transport_peer)) return error.SignedPeerRecordPeerIdMismatch;
 
-    const rec = try decodePeerRecord(allocator, env.payload);
+    var rec = try decodePeerRecord(allocator, env.payload);
+    errdefer rec.deinit(allocator);
+
     var transport_bytes: [128]u8 = undefined;
     const tb = transport_peer.toBytes(&transport_bytes) catch return error.SignedPeerRecordPeerIdMismatch;
     if (!std.mem.eql(u8, tb, rec.peer_id)) return error.SignedPeerRecordPeerIdMismatch;
 
     return rec;
+}
+
+fn encodeSignedPeerRecordTestWire(
+    allocator: std.mem.Allocator,
+    host_kp: std.crypto.sign.Ed25519.KeyPair,
+    peer_record_wire: []const u8,
+    opts: struct {
+        corrupt_signature: bool = false,
+    },
+) anyerror![]u8 {
+    const host_pub_proto = blk: {
+        var pk = pid.PublicKey{ .type = .ED25519, .data = &host_kp.public_key.bytes };
+        break :blk try pk.encode(allocator);
+    };
+    defer allocator.free(host_pub_proto);
+
+    var msg_buf: [96 * 1024]u8 = undefined;
+    const message = try signedEnvelopeVerifyMessage(
+        &msg_buf,
+        signed_envelope_domain,
+        peer_record_payload_type,
+        peer_record_wire,
+    );
+    const sig = host_kp.sign(message, null) catch return error.BadSignature;
+    var sig_bytes = sig.toBytes();
+    if (opts.corrupt_signature) sig_bytes[0] ^= 0xff;
+
+    var wire = std.ArrayList(u8).empty;
+    errdefer wire.deinit(allocator);
+    try proto.appendLengthDelimited(&wire, allocator, 1, host_pub_proto);
+    try proto.appendLengthDelimited(&wire, allocator, 2, peer_record_payload_type);
+    try proto.appendLengthDelimited(&wire, allocator, 3, peer_record_wire);
+    try proto.appendLengthDelimited(&wire, allocator, 5, &sig_bytes);
+    return try wire.toOwnedSlice(allocator);
+}
+
+fn encodePeerRecordTestWire(allocator: std.mem.Allocator, peer_id_bytes: []const u8, seq: u64) ![]u8 {
+    var wire = std.ArrayList(u8).empty;
+    errdefer wire.deinit(allocator);
+    try proto.appendLengthDelimited(&wire, allocator, 1, peer_id_bytes);
+    try proto.appendFieldKey(&wire, allocator, 2, .varint);
+    try proto.appendVarUInt64(&wire, allocator, seq);
+    return try wire.toOwnedSlice(allocator);
+}
+
+test "verifySignedPeerRecord rejects bad signature" {
+    const a = std.testing.allocator;
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0xA1);
+    const host_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var transport_pk = pid.PublicKey{ .type = .ED25519, .data = &host_kp.public_key.bytes };
+    const transport = try pid.PeerId.fromPublicKey(a, &transport_pk);
+
+    var peer_id_buf: [128]u8 = undefined;
+    const peer_id_bytes = try transport.toBytes(&peer_id_buf);
+    const rec_wire = try encodePeerRecordTestWire(a, peer_id_bytes, 1);
+    defer a.free(rec_wire);
+
+    const spr = try encodeSignedPeerRecordTestWire(a, host_kp, rec_wire, .{ .corrupt_signature = true });
+    defer a.free(spr);
+
+    try std.testing.expectError(error.BadSignature, verifySignedPeerRecord(a, spr, transport));
+}
+
+test "verifySignedPeerRecord rejects transport peer mismatch" {
+    const a = std.testing.allocator;
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0xA2);
+    const host_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var signing_pk = pid.PublicKey{ .type = .ED25519, .data = &host_kp.public_key.bytes };
+    const signing_peer = try pid.PeerId.fromPublicKey(a, &signing_pk);
+
+    var peer_id_buf: [128]u8 = undefined;
+    const peer_id_bytes = try signing_peer.toBytes(&peer_id_buf);
+    const rec_wire = try encodePeerRecordTestWire(a, peer_id_bytes, 1);
+    defer a.free(rec_wire);
+
+    const spr = try encodeSignedPeerRecordTestWire(a, host_kp, rec_wire, .{});
+    defer a.free(spr);
+
+    const other = try pid.PeerId.random();
+    try std.testing.expectError(
+        error.SignedPeerRecordPeerIdMismatch,
+        verifySignedPeerRecord(a, spr, other),
+    );
+}
+
+test "verifySignedPeerRecord rejects peer_id field mismatch" {
+    const a = std.testing.allocator;
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0xA3);
+    const host_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var transport_pk = pid.PublicKey{ .type = .ED25519, .data = &host_kp.public_key.bytes };
+    const transport = try pid.PeerId.fromPublicKey(a, &transport_pk);
+
+    const rec_wire = try encodePeerRecordTestWire(a, "wrong-peer-id-bytes", 1);
+    defer a.free(rec_wire);
+
+    const spr = try encodeSignedPeerRecordTestWire(a, host_kp, rec_wire, .{});
+    defer a.free(spr);
+
+    try std.testing.expectError(
+        error.SignedPeerRecordPeerIdMismatch,
+        verifySignedPeerRecord(a, spr, transport),
+    );
 }
 
 test "protocol_line ends with newline" {

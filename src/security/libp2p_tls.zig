@@ -432,6 +432,47 @@ test "missing extension" {
     try std.testing.expectError(error.MissingLibp2pExtension, peerIdFromCertificateUnverified(a, &[_]u8{ 0x30, 0x00 }));
 }
 
+test "verifiedPeerIdFromQuicLeafCertificate rejects expected_peer mismatch" {
+    const a = std.testing.allocator;
+    const libp2p_tls_cert = @import("libp2p_tls_cert.zig");
+    const Ed25519 = std.crypto.sign.Ed25519;
+
+    var host_seed: [32]u8 = undefined;
+    @memset(&host_seed, 0x11);
+    const host_kp = try Ed25519.KeyPair.generateDeterministic(host_seed);
+    const TestSigner = struct {
+        kp: Ed25519.KeyPair,
+        fn sign(ctx: ?*anyopaque, message: []const u8, out_sig: *[64]u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            out_sig.* = (try self.kp.sign(message, null)).toBytes();
+        }
+    };
+    var signer = TestSigner{ .kp = host_kp };
+
+    var cert_seed: [32]u8 = undefined;
+    @memset(&cert_seed, 0x22);
+    const now: i64 = 1_700_000_000;
+    var gen = try libp2p_tls_cert.generate(a, .{
+        .host_identity = .{
+            .ed25519 = .{
+                .public_key_bytes = host_kp.public_key.bytes,
+                .sign = TestSigner.sign,
+                .sign_ctx = &signer,
+            },
+        },
+        .not_before_sec = now - 3600,
+        .not_after_sec = now + 86_400,
+        .cert_key_seed = cert_seed,
+    });
+    defer gen.deinit(a);
+
+    const wrong = try peer_id.PeerId.random();
+    try std.testing.expectError(
+        error.PeerIdMismatch,
+        verifiedPeerIdFromQuicLeafCertificate(a, gen.cert_der, wrong, now),
+    );
+}
+
 test "QUIC TLS ALPN matches libp2p TLS spec string" {
     try std.testing.expectEqualStrings("libp2p", quic_application_layer_protocol);
 }

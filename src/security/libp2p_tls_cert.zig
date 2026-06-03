@@ -271,6 +271,25 @@ const ec_param_prime256v1_oid_tlv: [10]u8 = .{
     0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07,
 };
 
+/// Subject/Issuer name with libp2p OID TLV bytes embedded in the org PrintableString (trap for #120 tests).
+fn appendNameWithOidInPrintable(list: *ArrayList, a: std.mem.Allocator) std.mem.Allocator.Error!void {
+    const oid_o_tlv = [_]u8{ 0x06, 0x03, 0x55, 0x04, 0x0A };
+    var printable: [9 + libp2p_tls.extension_oid_tlv.len]u8 = undefined;
+    @memcpy(printable[0..9], "libp2p.io");
+    @memcpy(printable[9..], &libp2p_tls.extension_oid_tlv);
+
+    var atv = ArrayList.empty;
+    defer atv.deinit(a);
+    try atv.appendSlice(a, &oid_o_tlv);
+    try appendTLV(&atv, a, 0x13, printable[0..]);
+
+    const atv_tlv = try dupTLV(a, 0x30, atv.items);
+    defer a.free(atv_tlv);
+    const set_tlv = try dupTLV(a, 0x31, atv_tlv);
+    defer a.free(set_tlv);
+    try appendTLV(list, a, 0x30, set_tlv);
+}
+
 /// Issuer / subject Name: `SEQUENCE { SET { SEQUENCE { OID 2.5.4.10, PrintableString "libp2p.io" } } }`.
 fn appendNameLibp2pIo(list: *ArrayList, a: std.mem.Allocator) std.mem.Allocator.Error!void {
     // AttributeTypeAndValue: OID 2.5.4.10 (organizationName) + PrintableString "libp2p.io"
@@ -420,13 +439,14 @@ fn generateSecp256k1(
     options: GenerateOptions,
     host: @FieldType(HostIdentityKey, "secp256k1"),
 ) anyerror!GeneratedCertificate {
+    // Ephemeral cert key is ECDSA-P-256 (libp2p TLS spec vector 3); host identity stays secp256k1.
     const seed: [32]u8 = options.cert_key_seed;
-    const cert_kp = Secp256k1.KeyPair.generateDeterministic(seed) catch return error.InvalidSerial;
-    const cert_pub = cert_kp.public_key.toCompressedSec1();
+    const cert_kp = EcdsaP256.KeyPair.generateDeterministic(seed) catch return error.InvalidSerial;
+    const cert_pub_sec1 = cert_kp.public_key.toUncompressedSec1();
 
     var spki_buf = ArrayList.empty;
     defer spki_buf.deinit(allocator);
-    try appendSpkiSecp256k1(&spki_buf, allocator, cert_pub);
+    try appendSpkiEcdsaP256(&spki_buf, allocator, cert_pub_sec1);
     const spki_tlv = spki_buf.items;
 
     var sig_msg = ArrayList.empty;
@@ -450,7 +470,7 @@ fn generateSecp256k1(
     defer allocator.free(tbs_tlv);
 
     const cert_sig = cert_kp.sign(tbs_tlv, null) catch return error.InvalidSerial;
-    var cert_sig_der_buf: [Secp256k1.Signature.der_encoded_length_max]u8 = undefined;
+    var cert_sig_der_buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
     const cert_sig_der = cert_sig.toDer(&cert_sig_der_buf);
 
     var outer = ArrayList.empty;
@@ -468,7 +488,7 @@ fn generateSecp256k1(
     return .{
         .cert_der = cert_der,
         .cert_key_seed = seed,
-        .key_kind = .secp256k1,
+        .key_kind = .ecdsa_p256,
     };
 }
 
@@ -609,7 +629,7 @@ fn buildTbsCertificate(
     options: GenerateOptions,
     spki_tlv: []const u8,
     sig_algid_tlv: []const u8,
-    signed_key_der: []const u8,
+    signed_key_der: ?[]const u8,
 ) Error![]u8 {
     var tbs = ArrayList.empty;
     defer tbs.deinit(allocator);
@@ -639,13 +659,14 @@ fn buildTbsCertificate(
     // subjectPublicKeyInfo
     try tbs.appendSlice(allocator, spki_tlv);
 
-    // [3] EXPLICIT Extensions ::= SEQUENCE { libp2p extension }
-    var exts_payload = ArrayList.empty;
-    defer exts_payload.deinit(allocator);
-    try appendLibp2pExtension(&exts_payload, allocator, signed_key_der);
-    const exts_seq = try dupTLV(allocator, 0x30, exts_payload.items);
-    defer allocator.free(exts_seq);
-    try appendTLV(&tbs, allocator, 0xA3, exts_seq);
+    if (signed_key_der) |sk| {
+        var exts_payload = ArrayList.empty;
+        defer exts_payload.deinit(allocator);
+        try appendLibp2pExtension(&exts_payload, allocator, sk);
+        const exts_seq = try dupTLV(allocator, 0x30, exts_payload.items);
+        defer allocator.free(exts_seq);
+        try appendTLV(&tbs, allocator, 0xA3, exts_seq);
+    }
 
     return try dupTLV(allocator, 0x30, tbs.items);
 }
@@ -1094,4 +1115,115 @@ test "ecdsaP256SeedToPem produces parseable SEC1 EC PRIVATE KEY" {
     // The secret OCTET STRING (0x04, 0x20, <32 bytes>) appears after the
     // version INTEGER (0x02, 0x01, 0x01).
     try std.testing.expect(std.mem.indexOf(u8, der_buf[0..der_len], &expected_secret) != null);
+}
+
+// ---------------------------------------------------------------------------
+// secp256k1 tests (#127)
+// ---------------------------------------------------------------------------
+
+const TestSecp256k1Signer = struct {
+    kp: Secp256k1.KeyPair,
+    fn sign(ctx: ?*anyopaque, message: []const u8, out_sig: []u8, out_sig_len: *usize) anyerror!void {
+        const self: *TestSecp256k1Signer = @ptrCast(@alignCast(ctx.?));
+        const sig = try self.kp.sign(message, null);
+        var buf: [Secp256k1.Signature.der_encoded_length_max]u8 = undefined;
+        const der = sig.toDer(&buf);
+        if (der.len > out_sig.len) return error.NoSpaceLeft;
+        @memcpy(out_sig[0..der.len], der);
+        out_sig_len.* = der.len;
+    }
+};
+
+test "generate secp256k1 produces cert that verifies and round-trips PeerId" {
+    const a = std.testing.allocator;
+
+    var host_seed: [32]u8 = undefined;
+    fillTestSeed(&host_seed, @src().line);
+    const host_kp = try Secp256k1.KeyPair.generateDeterministic(host_seed);
+    var signer = TestSecp256k1Signer{ .kp = host_kp };
+    const host_pub = host_kp.public_key.toCompressedSec1();
+
+    var cert_seed: [32]u8 = undefined;
+    fillTestSeed(&cert_seed, @src().line);
+
+    const now: i64 = 1_700_000_000;
+    var gen = try generate(a, .{
+        .host_identity = .{
+            .secp256k1 = .{
+                .public_key_sec1_compressed = host_pub,
+                .sign = TestSecp256k1Signer.sign,
+                .sign_ctx = &signer,
+            },
+        },
+        .not_before_sec = now - 3600,
+        .not_after_sec = now + 86_400,
+        .serial = 0x534B31,
+        .cert_key_seed = cert_seed,
+    });
+    defer gen.deinit(a);
+
+    try std.testing.expectEqual(CertKeyKind.ecdsa_p256, gen.key_kind);
+
+    const host_pub_proto = try encodeSecp256k1PublicKeyProto(a, host_pub);
+    defer a.free(host_pub_proto);
+    const reader = try peer_id.PublicKeyReader.init(host_pub_proto);
+    const owned = try a.dupe(u8, reader.getData());
+    defer a.free(owned);
+    var expected_pk = peer_id.PublicKey{ .type = .SECP256K1, .data = owned };
+    const expected_id = try peer_id.PeerId.fromPublicKey(a, &expected_pk);
+
+    const got = try libp2p_tls.peerIdFromVerifiedCertificate(a, gen.cert_der, now);
+
+    var ebuf: [128]u8 = undefined;
+    var gbuf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try expected_id.toBase58(&ebuf),
+        try got.toBase58(&gbuf),
+    );
+}
+
+test "trap cert: libp2p OID in subject DN only is not an extension" {
+    const a = std.testing.allocator;
+    var seed: [32]u8 = undefined;
+    fillTestSeed(&seed, @src().line);
+    const cert_kp = try Ed25519.KeyPair.generateDeterministic(seed);
+    const cert_pub = cert_kp.public_key.bytes;
+
+    var spki_buf = ArrayList.empty;
+    defer spki_buf.deinit(a);
+    try appendSpki(&spki_buf, a, cert_pub);
+    const spki_tlv = spki_buf.items;
+
+    const now: i64 = 1_700_000_000;
+    var tbs = ArrayList.empty;
+    defer tbs.deinit(a);
+    try appendTLV(&tbs, a, 0xA0, &[_]u8{ 0x02, 0x01, 0x02 });
+    try appendInteger(&tbs, a, 1);
+    try tbs.appendSlice(a, &ed25519_algid_tlv);
+    try appendNameWithOidInPrintable(&tbs, a);
+    var validity_payload = ArrayList.empty;
+    defer validity_payload.deinit(a);
+    try appendTime(&validity_payload, a, now - 3600);
+    try appendTime(&validity_payload, a, now + 86_400);
+    try appendTLV(&tbs, a, 0x30, validity_payload.items);
+    try appendNameWithOidInPrintable(&tbs, a);
+    try tbs.appendSlice(a, spki_tlv);
+
+    const tbs_tlv = try dupTLV(a, 0x30, tbs.items);
+    defer a.free(tbs_tlv);
+
+    const cert_sig = try cert_kp.sign(tbs_tlv, null);
+    var outer = ArrayList.empty;
+    defer outer.deinit(a);
+    try outer.appendSlice(a, tbs_tlv);
+    try outer.appendSlice(a, &ed25519_algid_tlv);
+    var sig_bit_payload: [1 + 64]u8 = undefined;
+    sig_bit_payload[0] = 0;
+    @memcpy(sig_bit_payload[1..], &cert_sig.toBytes());
+    try appendTLV(&outer, a, 0x03, &sig_bit_payload);
+    const cert_der = try dupTLV(a, 0x30, outer.items);
+    defer a.free(cert_der);
+
+    try std.testing.expect(std.mem.indexOf(u8, cert_der, &libp2p_tls.extension_oid_tlv) != null);
+    try std.testing.expectError(error.MissingLibp2pExtension, libp2p_tls.findLibp2pExtensionExtValue(cert_der));
 }
