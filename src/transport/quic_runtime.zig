@@ -69,74 +69,37 @@ pub const TlsPemSource = union(enum) {
         cert_path: []const u8,
         key_path: []const u8,
     },
-    /// In-memory PEM. The runtime materializes ephemeral files for zquic and
-    /// unlinks them on [`QuicRuntime.destroy`]; bytes are borrowed until then.
+    /// In-memory PEM. As of zig-libp2p v0.1.5 the bytes are threaded straight
+    /// through to zquic v1.6.6's `ServerConfig.cert_pem` / `key_pem` and
+    /// `ClientConfig.client_cert_pem` / `client_key_pem` (ch4r10t33r/zquic#129)
+    /// — nothing is written to disk. Bytes are borrowed until
+    /// [`QuicRuntime.destroy`].
     pem_bytes: struct {
         cert_pem: []const u8,
         key_pem: []const u8,
     },
 };
 
-const MaterializedTlsPem = struct {
-    cert_path: []const u8,
-    key_path: []const u8,
-    owned_temp: ?struct {
-        cert_path: [:0]u8,
-        key_path: [:0]u8,
-    } = null,
-
-    fn deinit(self: *MaterializedTlsPem, a: std.mem.Allocator) void {
-        if (self.owned_temp) |*t| {
-            _ = std.c.unlink(t.cert_path.ptr);
-            _ = std.c.unlink(t.key_path.ptr);
-            a.free(t.cert_path);
-            a.free(t.key_path);
-            self.owned_temp = null;
-        }
-    }
+/// Internal resolution of a [`TlsPemSource`]: borrows the embedder's slices
+/// directly — paths for the `.paths` arm, PEM bytes for the `.pem_bytes` arm
+/// — and threads them straight to zquic's `ServerConfig` / `ClientConfig`
+/// `cert_path|key_path` or `cert_pem|key_pem` fields (zquic v1.6.6, see
+/// ch4r10t33r/zquic#129). Never touches disk for the bytes case.
+const ResolvedTlsPem = union(enum) {
+    paths: struct {
+        cert_path: []const u8,
+        key_path: []const u8,
+    },
+    bytes: struct {
+        cert_pem: []const u8,
+        key_pem: []const u8,
+    },
 };
 
-var next_tls_pem_temp_id: std.atomic.Value(u64) = .init(0);
-
-fn writePemFileSync(path: [:0]const u8, data: []const u8) !void {
-    var o: std.c.O = .{};
-    o.ACCMODE = .WRONLY;
-    o.CREAT = true;
-    o.TRUNC = true;
-    const fd = std.c.open(path.ptr, o, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
-    var off: usize = 0;
-    while (off < data.len) {
-        const n = std.c.write(fd, data[off..].ptr, data.len - off);
-        if (n <= 0) return error.WriteShort;
-        off += @intCast(n);
-    }
-}
-
-fn materializeTlsPemSource(a: std.mem.Allocator, src: TlsPemSource) !MaterializedTlsPem {
+fn resolveTlsPemSource(src: TlsPemSource) ResolvedTlsPem {
     return switch (src) {
-        .paths => |p| .{
-            .cert_path = p.cert_path,
-            .key_path = p.key_path,
-        },
-        .pem_bytes => |pb| blk: {
-            const id = next_tls_pem_temp_id.fetchAdd(1, .monotonic);
-            const cert_path = try std.fmt.allocPrintSentinel(a, "/tmp/zlibp2p_runtime_{d}_cert.pem", .{id}, 0);
-            errdefer a.free(cert_path);
-            const key_path = try std.fmt.allocPrintSentinel(a, "/tmp/zlibp2p_runtime_{d}_key.pem", .{id}, 0);
-            errdefer a.free(key_path);
-            try writePemFileSync(cert_path, pb.cert_pem);
-            try writePemFileSync(key_path, pb.key_pem);
-            break :blk .{
-                .cert_path = cert_path,
-                .key_path = key_path,
-                .owned_temp = .{
-                    .cert_path = cert_path,
-                    .key_path = key_path,
-                },
-            };
-        },
+        .paths => |p| .{ .paths = .{ .cert_path = p.cert_path, .key_path = p.key_path } },
+        .pem_bytes => |pb| .{ .bytes = .{ .cert_pem = pb.cert_pem, .key_pem = pb.key_pem } },
     };
 }
 
@@ -279,7 +242,7 @@ pub const QuicRuntime = struct {
     allocator: std.mem.Allocator,
     host: *host_mod.Host,
     opts: QuicRuntimeOptions,
-    tls_pem_material: MaterializedTlsPem,
+    tls_pem_resolved: ResolvedTlsPem,
 
     listener: *quic_endpoint.QuicListener,
     bound_port_v4: ?u16 = null,
@@ -326,16 +289,26 @@ pub const QuicRuntime = struct {
     pub fn create(opts: QuicRuntimeOptions) anyerror!*QuicRuntime {
         const a = opts.allocator;
 
-        var tls_pem_material = try materializeTlsPemSource(a, opts.tls_pem);
-        errdefer tls_pem_material.deinit(a);
+        const tls_pem_resolved = resolveTlsPemSource(opts.tls_pem);
 
         var listen_ma = try multiaddr.Multiaddr.fromString(a, opts.listen_multiaddr);
         defer listen_ma.deinit();
 
-        const listener = try quic_endpoint.QuicListener.listen(a, listen_ma, .{
-            .cert_path = tls_pem_material.cert_path,
-            .key_path = tls_pem_material.key_path,
-        });
+        // Build the listener TLS config: borrow paths for `.paths`, borrow
+        // PEM bytes for `.bytes` (zquic v1.6.6 parses bytes in memory; no
+        // temp file is written to disk).
+        var listen_opts: quic_v1.Libp2pZquicServerOptions = .{};
+        switch (tls_pem_resolved) {
+            .paths => |p| {
+                listen_opts.cert_path = p.cert_path;
+                listen_opts.key_path = p.key_path;
+            },
+            .bytes => |b| {
+                listen_opts.cert_pem = b.cert_pem;
+                listen_opts.key_pem = b.key_pem;
+            },
+        }
+        const listener = try quic_endpoint.QuicListener.listen(a, listen_ma, listen_opts);
         errdefer listener.deinit();
 
         const self = try a.create(QuicRuntime);
@@ -345,7 +318,7 @@ pub const QuicRuntime = struct {
             .allocator = a,
             .host = opts.host,
             .opts = opts,
-            .tls_pem_material = tls_pem_material,
+            .tls_pem_resolved = tls_pem_resolved,
             .listener = listener,
             .outbound_by_peer = PeerIdMap.init(a),
             .inbound_streams = .empty,
@@ -424,7 +397,8 @@ pub const QuicRuntime = struct {
         self.listener.lifecycle = .{};
 
         self.listener.deinit();
-        self.tls_pem_material.deinit(self.allocator);
+        // `tls_pem_resolved` borrows the embedder's TlsPemSource slices —
+        // nothing to free.
         self.allocator.destroy(self);
     }
 
@@ -789,10 +763,18 @@ pub const QuicRuntime = struct {
         };
         defer ma.deinit();
 
-        var outbound = quic_endpoint.QuicOutbound.dial(a, ma, .{
-            .client_cert_path = self.tls_pem_material.cert_path,
-            .client_key_path = self.tls_pem_material.key_path,
-        }) catch |err| {
+        var dial_opts: quic.Libp2pZquicClientDialOptions = .{};
+        switch (self.tls_pem_resolved) {
+            .paths => |p| {
+                dial_opts.client_cert_path = p.cert_path;
+                dial_opts.client_key_path = p.key_path;
+            },
+            .bytes => |b| {
+                dial_opts.client_cert_pem = b.cert_pem;
+                dial_opts.client_key_pem = b.key_pem;
+            },
+        }
+        var outbound = quic_endpoint.QuicOutbound.dial(a, ma, dial_opts) catch |err| {
             log.warn("quic_runtime: QuicOutbound.dial failed: {s}", .{@errorName(err)});
             self.failDial(expected_peer);
             return;
@@ -1478,7 +1460,11 @@ fn buildTestBundle(a: std.mem.Allocator, label: []const u8, seed: u8) !TestCertB
     };
 }
 
-test "QuicRuntime.create materializes in-memory PEM for zquic" {
+test "QuicRuntime.create threads in-memory PEM bytes straight to zquic (no /tmp)" {
+    // v0.1.4 wrote the PEM bytes to `/tmp/zlibp2p_runtime_*_{cert,key}.pem`
+    // and handed those paths to zquic — that broke in containers without
+    // `/tmp`. From v0.1.5 the runtime borrows the embedder's PEM bytes and
+    // routes them through zquic v1.6.6's `cert_pem` / `key_pem` (#129).
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -1508,8 +1494,96 @@ test "QuicRuntime.create materializes in-memory PEM for zquic" {
     });
     defer rt.destroy();
 
-    try testing.expect(rt.tls_pem_material.owned_temp != null);
+    // The resolved state is the `.bytes` arm and borrows the caller's slices
+    // (pointer + length equality, no copy).
+    switch (rt.tls_pem_resolved) {
+        .bytes => |b| {
+            try testing.expectEqual(bundle.cert_pem.ptr, b.cert_pem.ptr);
+            try testing.expectEqual(bundle.cert_pem.len, b.cert_pem.len);
+            try testing.expectEqual(bundle.key_pem.ptr, b.key_pem.ptr);
+            try testing.expectEqual(bundle.key_pem.len, b.key_pem.len);
+        },
+        .paths => return error.UnexpectedPathsArm,
+    }
+
+    // And the runtime still came up — bound an IPv4 UDP socket.
     try testing.expect(rt.boundUdpPortIpv4() != null);
+
+    // Belt-and-braces: no `/tmp/zlibp2p_runtime_*` file should exist whose
+    // contents match this runtime's PEM bytes. We can't enumerate `/tmp`
+    // portably, but we can probe the well-known names v0.1.4 used (ids
+    // start at 0 and increment monotonically); if any of them exist and
+    // their bytes match our cert PEM verbatim, this PR regressed.
+    if (builtin.os.tag != .windows) {
+        var i: u64 = 0;
+        while (i < 8) : (i += 1) {
+            var buf: [128]u8 = undefined;
+            const cert_p = std.fmt.bufPrintZ(&buf, "/tmp/zlibp2p_runtime_{d}_cert.pem", .{i}) catch break;
+            var o: std.c.O = .{};
+            o.ACCMODE = .RDONLY;
+            const fd = std.c.open(cert_p.ptr, o, @as(std.c.mode_t, 0));
+            if (fd < 0) continue;
+            defer _ = std.c.close(fd);
+            var rbuf: [4096]u8 = undefined;
+            const n = std.c.read(fd, &rbuf, rbuf.len);
+            if (n <= 0) continue;
+            const got = rbuf[0..@intCast(n)];
+            try testing.expect(!std.mem.startsWith(u8, bundle.cert_pem, got) or got.len < bundle.cert_pem.len);
+        }
+    }
+}
+
+test "QuicRuntime.create surfaces error for nonexistent .paths cert" {
+    // Sanity for the path-based arm: a path that doesn't exist must
+    // propagate as an error (proving the path loader is still in play
+    // for `.paths`, while `.pem_bytes` skips it entirely).
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    var bundle = try buildTestBundle(a, "pathneg", 0xE7);
+    defer bundle.deinit(a);
+
+    var host = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle.peer,
+        .gossipsub = .{ .local_peer_id = bundle.peer },
+    });
+    defer host.destroy();
+    try host.startBackground();
+    try testing.expect(host.waitUntilReady(5_000));
+
+    // Path that demonstrably does not exist — zquic's path loader should
+    // fail and propagate up through `QuicRuntime.create`.
+    const result = QuicRuntime.create(.{
+        .allocator = a,
+        .host = host,
+        .tls_pem = .{
+            .paths = .{
+                .cert_path = "/this/does/not/exist/cert.pem",
+                .key_path = "/this/does/not/exist/key.pem",
+            },
+        },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    try testing.expect(std.meta.isError(result));
+    if (result) |rt| rt.destroy() else |_| {}
+
+    // And the same identity via `.pem_bytes` must succeed without any
+    // disk access.
+    var rt_ok = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host,
+        .tls_pem = .{
+            .pem_bytes = .{
+                .cert_pem = bundle.cert_pem,
+                .key_pem = bundle.key_pem,
+            },
+        },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_ok.destroy();
+    try testing.expect(rt_ok.boundUdpPortIpv4() != null);
 }
 
 test "appendInboundAccBounded rejects growth past cap" {

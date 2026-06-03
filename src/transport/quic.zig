@@ -149,6 +149,11 @@ pub const Libp2pZquicClientDialOptions = struct {
     v2: bool = false,
     client_cert_path: []const u8 = "",
     client_key_path: []const u8 = "",
+    /// In-memory PEM-encoded client cert/key (zquic v1.6.6). When non-null
+    /// zquic parses these bytes and never reads the matching `*_path` from
+    /// disk. Borrowed for the duration of [`ZIo.Client.init`].
+    client_cert_pem: ?[]const u8 = null,
+    client_key_pem: ?[]const u8 = null,
 };
 
 /// Build a [`ZIo.Client`] for an IPv4 [`QuicV1Endpoint`] using the libp2p QUIC presets.
@@ -168,6 +173,8 @@ pub fn initLibp2pQuicClientFromEndpoint(
         .v2 = dial_options.v2,
         .client_cert_path = dial_options.client_cert_path,
         .client_key_path = dial_options.client_key_path,
+        .client_cert_pem = dial_options.client_cert_pem,
+        .client_key_pem = dial_options.client_key_pem,
     });
     return ZIo.Client.init(allocator, cfg);
 }
