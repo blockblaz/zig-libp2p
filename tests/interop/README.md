@@ -18,6 +18,10 @@ This directory is reserved for **rust-libp2p ↔ zig-libp2p** wire checks. Issue
 
 `zig build test` runs the full suite; `zig build fuzz` runs only the `wire fuzz …` tests (faster, fuzz-oriented).
 
+## unified-testing transport (Phase 1)
+
+`interop/` ships a `transport-interop` binary (`zig build interop`) and `interop/Dockerfile` for [libp2p/unified-testing](https://github.com/libp2p/unified-testing) TCP + TLS + Yamux ping. Tracking issue: [#137](https://github.com/ch4r10t33r/zig-libp2p/issues/137).
+
 ## Interop CI (#95)
 
 `.github/workflows/interop.yml` runs nightly and on manual dispatch:

@@ -149,4 +149,21 @@ pub fn build(b: *std.Build) void {
             prev_example_run = &exe.step;
         }
     }
+
+    const interop_mod = b.createModule(.{
+        .root_source_file = b.path("interop/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    interop_mod.addImport("zig_libp2p", mod);
+    interop_mod.addImport("multiaddr", multiaddr_dep.module("multiaddr"));
+
+    const interop_exe = b.addExecutable(.{
+        .name = "transport-interop",
+        .root_module = interop_mod,
+    });
+    b.installArtifact(interop_exe);
+    const interop_step = b.step("interop", "Build unified-testing transport interop binary");
+    interop_step.dependOn(&interop_exe.step);
 }
