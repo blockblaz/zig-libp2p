@@ -4,6 +4,11 @@ const std = @import("std");
 const pid = @import("peer_id");
 const keypair = @import("../../keypair.zig");
 const payload_mod = @import("payload.zig");
+const libp2p_tls_cert = @import("../libp2p_tls_cert.zig");
+const zquic_rsa = @import("zquic_rsa");
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const RsaPkcs1v15Sha256 = zquic_rsa.PKCS1v1_5(Sha256);
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const Secp256k1 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
@@ -107,10 +112,11 @@ fn verifySignature(host_type: pid.KeyType, key_data: []const u8, identity_sig: [
             const sig = EcdsaP256.Signature.fromDer(identity_sig) catch return error.BadSignature;
             sig.verify(msg, pk) catch return error.BadSignature;
         },
-        // RSA is allowed by the libp2p Noise spec but support is not wired in
-        // this implementation; the Zig stdlib does not expose an RSA verify
-        // primitive we can call here (#87, tracked for follow-up).
-        .RSA => return error.UnsupportedNoiseIdentityKeyType,
+        .RSA => {
+            const pk = zquic_rsa.PublicKey.fromDer(key_data) catch return error.InvalidIdentityKey;
+            const sig = RsaPkcs1v15Sha256.Signature{ .bytes = identity_sig };
+            sig.verify(msg, pk) catch return error.BadSignature;
+        },
         else => return error.InvalidIdentityKey,
     }
 }
@@ -337,9 +343,117 @@ test "sec1FromSubjectPublicKeyInfo rejects malformed input" {
     try std.testing.expectError(error.MalformedSpki, sec1FromSubjectPublicKeyInfo(&[_]u8{ 0x30, 0x02, 0x30, 0x00 }));
 }
 
-test "verifySignature rejects RSA host key as unsupported (#87)" {
-    try std.testing.expectError(
-        error.UnsupportedNoiseIdentityKeyType,
-        verifySignature(.RSA, "anything", "anything", "anything"),
-    );
+test "verifySignedPayload ECDSA-P256 host round-trip (#87)" {
+    const a = std.testing.allocator;
+    var mux = std.ArrayList([]const u8).empty;
+    defer mux.deinit(a);
+
+    var host_seed: [32]u8 = undefined;
+    @memset(&host_seed, 0x42);
+    const host_kp = EcdsaP256.KeyPair.generateDeterministic(host_seed) catch unreachable;
+    const sec1: [65]u8 = host_kp.public_key.toUncompressedSec1();
+
+    const id_key = try libp2p_tls_cert.encodeEcdsaPublicKeyProto(a, sec1);
+    defer a.free(id_key);
+
+    var noise_sk: [32]u8 = undefined;
+    @memset(&noise_sk, 0x77);
+    const noise_kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(noise_sk);
+    const sm = signingMessage(noise_kp.public_key);
+    const sig = host_kp.sign(&sm, null) catch unreachable;
+    var der_buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_der = sig.toDer(&der_buf);
+
+    const enc = try payload_mod.encode(a, id_key, sig_der, &.{"/yamux/1.0.0"});
+    defer a.free(enc);
+
+    const peer = try verifySignedPayload(a, enc, noise_kp.public_key, null, 16 * 1024, &mux);
+    const reader = try pid.PublicKeyReader.init(id_key);
+    var pk = pid.PublicKey{ .type = .ECDSA, .data = reader.getData() };
+    const expected = try pid.PeerId.fromPublicKey(a, &pk);
+    try std.testing.expect(peer.eql(&expected));
+}
+
+test "verifySignedPayload RSA host round-trip (#87)" {
+    const a = std.testing.allocator;
+    var mux = std.ArrayList([]const u8).empty;
+    defer mux.deinit(a);
+
+    const kp = try zquic_rsa.KeyPair.fromDer(@embedFile("../../vendor/zquic_rsa/testdata/id_rsa.der"));
+    const rsa_pkcs1 = try encodePkcs1RsaPublicKeyDer(a, kp.public);
+    defer a.free(rsa_pkcs1);
+
+    var libp2p_pk = pid.PublicKey{ .type = .RSA, .data = rsa_pkcs1 };
+    const id_key = try libp2p_pk.encode(a);
+    defer a.free(id_key);
+
+    var noise_sk: [32]u8 = undefined;
+    @memset(&noise_sk, 0x88);
+    const noise_kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(noise_sk);
+    const sm = signingMessage(noise_kp.public_key);
+
+    var sig_buf: [zquic_rsa.max_modulus_len]u8 = undefined;
+    const sig = try kp.signPkcsv1_5(Sha256, &sm, &sig_buf);
+
+    const enc = try payload_mod.encode(a, id_key, sig.bytes, &.{});
+    defer a.free(enc);
+
+    const peer = try verifySignedPayload(a, enc, noise_kp.public_key, null, 16 * 1024, &mux);
+    const expected = try pid.PeerId.fromPublicKey(a, &libp2p_pk);
+    try std.testing.expect(peer.eql(&expected));
+}
+
+/// PKCS#1 `RSAPublicKey` DER (`SEQUENCE { n INTEGER, e INTEGER }`) for libp2p `PublicKey.Type = RSA`.
+fn encodePkcs1RsaPublicKeyDer(allocator: std.mem.Allocator, pk: zquic_rsa.PublicKey) Error![]u8 {
+    var n_raw: [zquic_rsa.max_modulus_len]u8 = undefined;
+    const n_len = zquic_rsa.byteLen(pk.modulus.bits());
+    pk.modulus.v.toBytes(n_raw[0..n_len], .big) catch return error.InvalidIdentityKey;
+
+    var e_raw: [zquic_rsa.max_modulus_len]u8 = undefined;
+    const e_limbs = zquic_rsa.byteLen(pk.modulus.bits());
+    pk.public_exponent.toBytes(e_raw[0..e_limbs], .big) catch return error.InvalidIdentityKey;
+
+    var inner = std.ArrayList(u8).empty;
+    defer inner.deinit(allocator);
+    try appendDerIntegerTlv(&inner, allocator, n_raw[0..n_len]);
+    try appendDerIntegerTlv(&inner, allocator, e_raw[0..e_limbs]);
+    return dupDerTlv(allocator, 0x30, inner.items);
+}
+
+fn appendDerIntegerTlv(list: *std.ArrayList(u8), allocator: std.mem.Allocator, big_endian: []const u8) Error!void {
+    var start: usize = 0;
+    while (start < big_endian.len - 1 and big_endian[start] == 0) start += 1;
+    const needs_pad = (big_endian[start] & 0x80) != 0;
+    var payload: [zquic_rsa.max_modulus_len + 1]u8 = undefined;
+    const payload_len = if (needs_pad) blk: {
+        payload[0] = 0;
+        @memcpy(payload[1 .. 1 + big_endian.len - start], big_endian[start..]);
+        break :blk big_endian.len - start + 1;
+    } else blk: {
+        @memcpy(payload[0 .. big_endian.len - start], big_endian[start..]);
+        break :blk big_endian.len - start;
+    };
+    try appendDerTlv(list, allocator, 0x02, payload[0..payload_len]);
+}
+
+fn appendDerTlv(list: *std.ArrayList(u8), allocator: std.mem.Allocator, tag: u8, payload: []const u8) Error!void {
+    try list.append(allocator, tag);
+    if (payload.len < 128) {
+        try list.append(allocator, @intCast(payload.len));
+    } else if (payload.len < 256) {
+        try list.append(allocator, 0x81);
+        try list.append(allocator, @intCast(payload.len));
+    } else {
+        try list.append(allocator, 0x82);
+        try list.append(allocator, @intCast(payload.len >> 8));
+        try list.append(allocator, @intCast(payload.len & 0xff));
+    }
+    try list.appendSlice(allocator, payload);
+}
+
+fn dupDerTlv(allocator: std.mem.Allocator, tag: u8, body: []const u8) Error![]u8 {
+    var tmp = std.ArrayList(u8).empty;
+    defer tmp.deinit(allocator);
+    try appendDerTlv(&tmp, allocator, tag, body);
+    return try allocator.dupe(u8, tmp.items);
 }
