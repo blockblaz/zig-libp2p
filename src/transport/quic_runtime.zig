@@ -7,7 +7,8 @@
 //! Status: minimum-viable. Both the req/resp send/receive path and the
 //! gossipsub publish / receive path are implemented end-to-end — the
 //! corresponding loopback tests at the bottom of this file are the truth
-//! gate. Outbound publish opens one `/meshsub/1.1.0` stream per currently
+//! gate. TLS identity is configured via [`TlsPemSource`] (on-disk PEM paths or
+//! in-memory PEM bytes materialized for zquic on create; #129). Outbound publish opens one `/meshsub/1.1.0` stream per currently
 //! connected peer per message (per-message-stream pattern), runs the
 //! initiator multistream handshake, then writes one `uvarint(len) + RPC
 //! protobuf` frame and FINs the stream. Inbound `/meshsub/1.1.0` streams
@@ -61,17 +62,92 @@ const supported_protocols: [4][]const u8 = .{
     protocol_mod.status_v1,
 };
 
+/// TLS identity material for zquic (file paths or in-memory PEM). See #129.
+pub const TlsPemSource = union(enum) {
+    /// PEM files on disk. Paths are borrowed until [`QuicRuntime.destroy`].
+    paths: struct {
+        cert_path: []const u8,
+        key_path: []const u8,
+    },
+    /// In-memory PEM. The runtime materializes ephemeral files for zquic and
+    /// unlinks them on [`QuicRuntime.destroy`]; bytes are borrowed until then.
+    pem_bytes: struct {
+        cert_pem: []const u8,
+        key_pem: []const u8,
+    },
+};
+
+const MaterializedTlsPem = struct {
+    cert_path: []const u8,
+    key_path: []const u8,
+    owned_temp: ?struct {
+        cert_path: [:0]u8,
+        key_path: [:0]u8,
+    } = null,
+
+    fn deinit(self: *MaterializedTlsPem, a: std.mem.Allocator) void {
+        if (self.owned_temp) |*t| {
+            _ = std.c.unlink(t.cert_path.ptr);
+            _ = std.c.unlink(t.key_path.ptr);
+            a.free(t.cert_path);
+            a.free(t.key_path);
+            self.owned_temp = null;
+        }
+    }
+};
+
+var next_tls_pem_temp_id: std.atomic.Value(u64) = .init(0);
+
+fn writePemFileSync(path: [:0]const u8, data: []const u8) !void {
+    var o: std.c.O = .{};
+    o.ACCMODE = .WRONLY;
+    o.CREAT = true;
+    o.TRUNC = true;
+    const fd = std.c.open(path.ptr, o, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = std.c.write(fd, data[off..].ptr, data.len - off);
+        if (n <= 0) return error.WriteShort;
+        off += @intCast(n);
+    }
+}
+
+fn materializeTlsPemSource(a: std.mem.Allocator, src: TlsPemSource) !MaterializedTlsPem {
+    return switch (src) {
+        .paths => |p| .{
+            .cert_path = p.cert_path,
+            .key_path = p.key_path,
+        },
+        .pem_bytes => |pb| blk: {
+            const id = next_tls_pem_temp_id.fetchAdd(1, .monotonic);
+            const cert_path = try std.fmt.allocPrintSentinel(a, "/tmp/zlibp2p_runtime_{d}_cert.pem", .{id}, 0);
+            errdefer a.free(cert_path);
+            const key_path = try std.fmt.allocPrintSentinel(a, "/tmp/zlibp2p_runtime_{d}_key.pem", .{id}, 0);
+            errdefer a.free(key_path);
+            try writePemFileSync(cert_path, pb.cert_pem);
+            try writePemFileSync(key_path, pb.key_pem);
+            break :blk .{
+                .cert_path = cert_path,
+                .key_path = key_path,
+                .owned_temp = .{
+                    .cert_path = cert_path,
+                    .key_path = key_path,
+                },
+            };
+        },
+    };
+}
+
 pub const QuicRuntimeOptions = struct {
     allocator: std.mem.Allocator,
     /// Wired-up [`host_mod.Host`]. The runtime calls into
     /// `host.handleGossipRpc`, `host.registerInboundReqRespChannel`,
     /// `host.onConnectionEstablished`, `host.onDialFailure`, etc.
     host: *host_mod.Host,
-    /// PEM cert path passed to [`quic_v1.libp2pZquicServerConfig`] /
-    /// [`quic.Libp2pZquicClientDialOptions`]. Must exist before [`start`].
-    cert_path: []const u8,
-    /// PEM key path; same constraints as `cert_path`.
-    key_path: []const u8,
+    /// Server + client TLS PEM (paths on disk or in-memory bytes). #129
+    tls_pem: TlsPemSource,
     /// Listen multiaddr (e.g. `/ip4/0.0.0.0/udp/0/quic-v1`).
     listen_multiaddr: []const u8,
     /// Wall-clock millisecond getter; defaults to [`wall_time.milliTimestamp`].
@@ -203,6 +279,7 @@ pub const QuicRuntime = struct {
     allocator: std.mem.Allocator,
     host: *host_mod.Host,
     opts: QuicRuntimeOptions,
+    tls_pem_material: MaterializedTlsPem,
 
     listener: *quic_endpoint.QuicListener,
     bound_port_v4: ?u16 = null,
@@ -249,12 +326,15 @@ pub const QuicRuntime = struct {
     pub fn create(opts: QuicRuntimeOptions) anyerror!*QuicRuntime {
         const a = opts.allocator;
 
+        var tls_pem_material = try materializeTlsPemSource(a, opts.tls_pem);
+        errdefer tls_pem_material.deinit(a);
+
         var listen_ma = try multiaddr.Multiaddr.fromString(a, opts.listen_multiaddr);
         defer listen_ma.deinit();
 
         const listener = try quic_endpoint.QuicListener.listen(a, listen_ma, .{
-            .cert_path = opts.cert_path,
-            .key_path = opts.key_path,
+            .cert_path = tls_pem_material.cert_path,
+            .key_path = tls_pem_material.key_path,
         });
         errdefer listener.deinit();
 
@@ -265,6 +345,7 @@ pub const QuicRuntime = struct {
             .allocator = a,
             .host = opts.host,
             .opts = opts,
+            .tls_pem_material = tls_pem_material,
             .listener = listener,
             .outbound_by_peer = PeerIdMap.init(a),
             .inbound_streams = .empty,
@@ -343,6 +424,7 @@ pub const QuicRuntime = struct {
         self.listener.lifecycle = .{};
 
         self.listener.deinit();
+        self.tls_pem_material.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -708,8 +790,8 @@ pub const QuicRuntime = struct {
         defer ma.deinit();
 
         var outbound = quic_endpoint.QuicOutbound.dial(a, ma, .{
-            .client_cert_path = self.opts.cert_path,
-            .client_key_path = self.opts.key_path,
+            .client_cert_path = self.tls_pem_material.cert_path,
+            .client_key_path = self.tls_pem_material.key_path,
         }) catch |err| {
             log.warn("quic_runtime: QuicOutbound.dial failed: {s}", .{@errorName(err)});
             self.failDial(expected_peer);
@@ -1325,17 +1407,11 @@ const libp2p_tls_cert = @import("../security/libp2p_tls_cert.zig");
 const TestCertBundle = struct {
     cert_pem: []u8,
     key_pem: []u8,
-    cert_path: [:0]u8,
-    key_path: [:0]u8,
     peer: identity.PeerId,
 
     fn deinit(self: *TestCertBundle, a: std.mem.Allocator) void {
-        _ = std.c.unlink(self.cert_path.ptr);
-        _ = std.c.unlink(self.key_path.ptr);
         a.free(self.cert_pem);
         a.free(self.key_pem);
-        a.free(self.cert_path);
-        a.free(self.key_path);
     }
 };
 
@@ -1352,27 +1428,8 @@ const TestEcdsaHostSigner = struct {
     }
 };
 
-fn writeFileSync(path: [:0]const u8, data: []const u8) !void {
-    // Uses libc directly (`unit_tests.linkLibC()` in `build.zig` makes this
-    // cross-platform). Routing through `std.Io.Dir` would require plumbing an
-    // `Io` instance through the test, which the surrounding bring-up doesn't
-    // otherwise need.
-    var o: std.c.O = .{};
-    o.ACCMODE = .WRONLY;
-    o.CREAT = true;
-    o.TRUNC = true;
-    const fd = std.c.open(path.ptr, o, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
-    var off: usize = 0;
-    while (off < data.len) {
-        const n = std.c.write(fd, data[off..].ptr, data.len - off);
-        if (n <= 0) return error.WriteShort;
-        off += @intCast(n);
-    }
-}
-
 fn buildTestBundle(a: std.mem.Allocator, label: []const u8, seed: u8) !TestCertBundle {
+    _ = label;
     const host_seed = [_]u8{seed} ** 32;
     const cert_seed = [_]u8{seed +% 1} ** 32;
     const now_sec = @divTrunc(wall_time.milliTimestamp(), 1000);
@@ -1414,21 +1471,45 @@ fn buildTestBundle(a: std.mem.Allocator, label: []const u8, seed: u8) !TestCertB
     var host_pk = peer_id_pkg.PublicKey{ .type = .ECDSA, .data = spki_bytes };
     const peer = try peer_id_pkg.PeerId.fromPublicKey(a, &host_pk);
 
-    const cert_path = try std.fmt.allocPrintSentinel(a, "/tmp/zlibp2p_quic_runtime_{s}_cert.pem", .{label}, 0);
-    errdefer a.free(cert_path);
-    const key_path = try std.fmt.allocPrintSentinel(a, "/tmp/zlibp2p_quic_runtime_{s}_key.pem", .{label}, 0);
-    errdefer a.free(key_path);
-
-    try writeFileSync(cert_path, cert_pem);
-    try writeFileSync(key_path, key_pem);
-
     return .{
         .cert_pem = cert_pem,
         .key_pem = key_pem,
-        .cert_path = cert_path,
-        .key_path = key_path,
         .peer = peer,
     };
+}
+
+test "QuicRuntime.create materializes in-memory PEM for zquic" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    var bundle = try buildTestBundle(a, "pem", 0xC3);
+    defer bundle.deinit(a);
+
+    var host = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle.peer,
+        .gossipsub = .{ .local_peer_id = bundle.peer },
+    });
+    defer host.destroy();
+    try host.startBackground();
+    try testing.expect(host.waitUntilReady(5_000));
+
+    var rt = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host,
+        .tls_pem = .{
+            .pem_bytes = .{
+                .cert_pem = bundle.cert_pem,
+                .key_pem = bundle.key_pem,
+            },
+        },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt.destroy();
+
+    try testing.expect(rt.tls_pem_material.owned_temp != null);
+    try testing.expect(rt.boundUdpPortIpv4() != null);
 }
 
 test "appendInboundAccBounded rejects growth past cap" {
@@ -1467,8 +1548,12 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
     var rt_a = try QuicRuntime.create(.{
         .allocator = a,
         .host = host_a,
-        .cert_path = bundle_a.cert_path,
-        .key_path = bundle_a.key_path,
+        .tls_pem = .{
+            .pem_bytes = .{
+                .cert_pem = bundle_a.cert_pem,
+                .key_pem = bundle_a.key_pem,
+            },
+        },
         .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
     });
     defer rt_a.destroy();
@@ -1485,8 +1570,12 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
     var rt_b = try QuicRuntime.create(.{
         .allocator = a,
         .host = host_b,
-        .cert_path = bundle_b.cert_path,
-        .key_path = bundle_b.key_path,
+        .tls_pem = .{
+            .pem_bytes = .{
+                .cert_pem = bundle_b.cert_pem,
+                .key_pem = bundle_b.key_pem,
+            },
+        },
         .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
     });
     defer rt_b.destroy();
@@ -1642,8 +1731,12 @@ test "QuicRuntime: two instances exchange a gossipsub message over UDP loopback"
     var rt_a = try QuicRuntime.create(.{
         .allocator = a,
         .host = host_a,
-        .cert_path = bundle_a.cert_path,
-        .key_path = bundle_a.key_path,
+        .tls_pem = .{
+            .pem_bytes = .{
+                .cert_pem = bundle_a.cert_pem,
+                .key_pem = bundle_a.key_pem,
+            },
+        },
         .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
     });
     defer rt_a.destroy();
@@ -1660,8 +1753,12 @@ test "QuicRuntime: two instances exchange a gossipsub message over UDP loopback"
     var rt_b = try QuicRuntime.create(.{
         .allocator = a,
         .host = host_b,
-        .cert_path = bundle_b.cert_path,
-        .key_path = bundle_b.key_path,
+        .tls_pem = .{
+            .pem_bytes = .{
+                .cert_pem = bundle_b.cert_pem,
+                .key_pem = bundle_b.key_pem,
+            },
+        },
         .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
     });
     defer rt_b.destroy();
