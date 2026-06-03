@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.4](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.3...v0.1.4) (2026-06-03)
+
+
+### Features
+
+* **transport:** `QuicRuntime` accepts in-memory TLS PEM via `TlsPemSource` ([#129](https://github.com/ch4r10t33r/zig-libp2p/issues/129)) ([a318137](https://github.com/ch4r10t33r/zig-libp2p/commit/a31813773c4eef2843689611cebc12ba192bc8cf))
+
+
+### Security
+
+* address audit findings [#119](https://github.com/ch4r10t33r/zig-libp2p/issues/119)–[#127](https://github.com/ch4r10t33r/zig-libp2p/issues/127) ([#128](https://github.com/ch4r10t33r/zig-libp2p/issues/128)) ([d68171c](https://github.com/ch4r10t33r/zig-libp2p/commit/d68171c)):
+  * cap QUIC `req_acc` / `gossip_acc` growth, verify libp2p TLS before marking handshake done, drop streams on TLS / handshake failure;
+  * parse libp2p extension OID via TBSCertificate `[3] EXPLICIT Extensions` walk (not substring search);
+  * bounded snappy decompression with output budget;
+  * remove `firstUnaryResponseWireLen` O(n) trial decompress;
+  * verify inbound `signed_peer_record` on Identify pull/push and connection-established paths;
+  * remove `verify_libp2p_tls_peer` bypass — QUIC dial always verifies leaf;
+  * remove misleading `peerIdFromCertificate` alias;
+  * add `docs/SECURITY.md`;
+  * secp256k1 host identity in `libp2p_tls_cert` (ephemeral cert key is ECDSA-P-256 per spec vector 3).
+
 ## [0.1.3](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.2...v0.1.3) (2026-06-03)
 
 
