@@ -23,6 +23,7 @@ pub const input_buffer_len = zquic_tls.input_buffer_len;
 pub const output_buffer_len = zquic_tls.output_buffer_len;
 
 pub const UpgradeError = sm.StreamHandshakeError || libp2p_tls.QuicPeerIdentityError || error{
+    MissingPeerCertificate,
     TlsHandshakeFailed,
     TlsRecordOverflow,
     TlsIllegalParameter,
@@ -47,7 +48,11 @@ pub fn toTransportError(err: UpgradeError) (errors.TransportError || std.mem.All
         error.DialFailed => error.DialFailed,
         error.Unreachable => error.Unreachable,
         error.ProtocolNegotiationFailed => error.ProtocolNegotiationFailed,
-        error.SecurityUpgradeFailed, error.TlsHandshakeFailed => error.SecurityUpgradeFailed,
+        error.SecurityUpgradeFailed,
+        error.TlsHandshakeFailed,
+        error.MissingPeerCertificate,
+        error.PeerIdMismatch,
+        => error.SecurityUpgradeFailed,
         error.ReadFailed, error.WriteFailed => error.DialFailed,
         error.EndOfStream => error.DialFailed,
         else => error.SecurityUpgradeFailed,
@@ -185,17 +190,20 @@ pub const SecureChannel = struct {
 
 pub const HandshakeResult = struct {
     channel: SecureChannel,
-    /// Set on the TLS client after libp2p cert verification; optional on the server when the peer sends no client cert.
+    /// Verified remote PeerId (initiator: server cert; responder: client cert after mTLS).
     remote_peer_id: ?pid.PeerId = null,
 };
 
 /// Initiator: multistream `/tls/1.0.0`, TLS 1.3 + libp2p cert verification.
+///
+/// Pass `client_auth` when the responder requests a client certificate (libp2p mTLS).
 pub fn negotiateInitiator(
     allocator: std.mem.Allocator,
     r: *Io.Reader,
     w: *Io.Writer,
     now_sec: i64,
     expected_remote: ?pid.PeerId,
+    client_auth: ?*CertKeyPair,
 ) UpgradeError!HandshakeResult {
     try sm.initiatorHandshakeMultistream(r, w, libp2p_tls.multistream_protocol_id, allocator);
 
@@ -205,6 +213,7 @@ pub fn negotiateInitiator(
         .root_ca = Certificate.Bundle.empty,
         .insecure_skip_verify = true,
         .alpn = libp2p_tls.quic_application_layer_protocol,
+        .auth = client_auth,
         .cipher_suites = &[_]tls_config.CipherSuite{.CHACHA20_POLY1305_SHA256},
         .named_groups = &[_]zquic_tls.protocol.NamedGroup{.x25519},
     });
@@ -239,19 +248,26 @@ pub fn negotiateResponder(
     var nb = zquic_tls.nonblock.Server.init(.{
         .auth = auth,
         .alpn = libp2p_tls.quic_application_layer_protocol,
+        .client_auth = .{
+            .root_ca = Certificate.Bundle.empty,
+            .auth_type = .require,
+            .insecure_skip_verify = true,
+        },
     });
     try driveNonblockHandshake(&nb, r, w, allocator, &send_buf);
 
     const cipher = nb.cipher() orelse return error.TlsHandshakeFailed;
 
-    _ = expected_remote;
-    _ = now_sec;
+    const leaf = nb.peerLeafCertificateDer();
+    if (leaf.len == 0) return error.MissingPeerCertificate;
+    const remote = try libp2p_tls.verifiedPeerIdFromQuicLeafCertificate(allocator, leaf, expected_remote, now_sec);
+
     return .{
         .channel = .{
             .cipher = cipher,
             .recv_acc = std.ArrayList(u8).empty,
         },
-        .remote_peer_id = null,
+        .remote_peer_id = remote,
     };
 }
 
@@ -345,6 +361,7 @@ test "TLS 1.3 + multistream over TCP loopback" {
             io_inner: Io,
             auth: *CertKeyPair,
             now: i64,
+            expect: pid.PeerId,
         ) void {
             const st = tcp.acceptTuned(srv, io_inner, .{}) catch return;
             defer st.close(io_inner);
@@ -352,7 +369,7 @@ test "TLS 1.3 + multistream over TCP loopback" {
             var scratch_w: [65536]u8 = undefined;
             var r = net.Stream.reader(st, io_inner, &scratch_r);
             var w = net.Stream.writer(st, io_inner, &scratch_w);
-            var hs = negotiateResponder(a, &r.interface, &w.interface, auth, now, null) catch return;
+            var hs = negotiateResponder(a, &r.interface, &w.interface, auth, now, expect) catch return;
             defer hs.channel.deinit(a);
             var ct_buf: [input_buffer_len]u8 = undefined;
             var pt_buf: [4096]u8 = undefined;
@@ -361,7 +378,7 @@ test "TLS 1.3 + multistream over TCP loopback" {
         }
     };
 
-    const thr = try std.Thread.spawn(.{}, Server.run, .{ &server, io, &owned.pair, now_sec });
+    const thr = try std.Thread.spawn(.{}, Server.run, .{ &server, io, &owned.pair, now_sec, expected_remote });
     defer thr.join();
 
     const connect_addr: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
@@ -373,7 +390,7 @@ test "TLS 1.3 + multistream over TCP loopback" {
     var r = net.Stream.reader(client, io, &scratch_r);
     var w = net.Stream.writer(client, io, &scratch_w);
 
-    var hs = try negotiateInitiator(a, &r.interface, &w.interface, now_sec, expected_remote);
+    var hs = try negotiateInitiator(a, &r.interface, &w.interface, now_sec, expected_remote, &owned.pair);
     defer hs.channel.deinit(a);
     const remote = hs.remote_peer_id orelse return error.TestExpectedEqual;
     try std.testing.expect(remote.eql(&expected_remote));
