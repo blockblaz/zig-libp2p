@@ -497,18 +497,31 @@ fn generateEd25519(
     options: GenerateOptions,
     host: @FieldType(HostIdentityKey, "ed25519"),
 ) anyerror!GeneratedCertificate {
-    // 1. Ephemeral Ed25519 cert keypair from the caller-supplied seed.
-    const seed: [Ed25519.KeyPair.seed_length]u8 = options.cert_key_seed;
-    const cert_kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidSerial;
-    const cert_pub: [32]u8 = cert_kp.public_key.bytes;
+    // Cert key is ECDSA-P-256 even though the host identity is Ed25519.
+    // RFC 9525 / libp2p-TLS spec allows ANY cert key algorithm — only the
+    // SignedKey extension's `publicKey` field defines the libp2p host
+    // identity. Using ECDSA-P-256 here is what makes the resulting cert
+    // usable in TLS stacks whose private-key parser only handles
+    // RSA + ECDSA (notably zquic's vendored TLS lib — Ed25519 cert keys
+    // panic in `PrivateKey.parseDer` with `else => unreachable`).
+    //
+    // The PeerId derivation is unaffected: it depends solely on the
+    // Ed25519 host pubkey carried in the SignedKey extension, not on
+    // whatever ephemeral key the cert itself is signed by.
 
-    // 2. Build the SubjectPublicKeyInfo DER (we need its exact bytes to sign).
+    // 1. Ephemeral ECDSA-P-256 cert keypair from the caller-supplied seed.
+    //    `generateDeterministic` clamps/decodes the seed as a P-256 scalar.
+    const seed: [32]u8 = options.cert_key_seed;
+    const cert_kp = EcdsaP256.KeyPair.generateDeterministic(seed) catch return error.InvalidSerial;
+    const cert_pub_sec1: [65]u8 = cert_kp.public_key.toUncompressedSec1();
+
+    // 2. Build SPKI for the ECDSA-P-256 ephemeral cert key.
     var spki_buf = ArrayList.empty;
     defer spki_buf.deinit(allocator);
-    try appendSpki(&spki_buf, allocator, cert_pub);
+    try appendSpkiEcdsaP256(&spki_buf, allocator, cert_pub_sec1);
     const spki_tlv = spki_buf.items;
 
-    // 3. Host signs "libp2p-tls-handshake:" || SPKI_TLV.
+    // 3. Ed25519 host signs "libp2p-tls-handshake:" || SPKI_TLV.
     var sig_msg = ArrayList.empty;
     defer sig_msg.deinit(allocator);
     try sig_msg.appendSlice(allocator, libp2p_tls.handshake_signature_prefix);
@@ -517,7 +530,8 @@ fn generateEd25519(
     var host_sig: [64]u8 = undefined;
     host.sign(host.sign_ctx, sig_msg.items, &host_sig) catch return error.NotImplemented;
 
-    // 4. Encode libp2p PublicKey protobuf for the host identity.
+    // 4. Encode libp2p PublicKey protobuf for the Ed25519 host identity.
+    //    This is what defines the PeerId on the receiving side.
     const host_pub_proto = try encodeEd25519PublicKeyProto(allocator, host.public_key_bytes);
     defer allocator.free(host_pub_proto);
 
@@ -525,31 +539,36 @@ fn generateEd25519(
     const signed_key_der = try buildSignedKeyDer(allocator, host_pub_proto, &host_sig);
     defer allocator.free(signed_key_der);
 
-    // 6. Assemble TBSCertificate.
-    const tbs_tlv = try buildTbsCertificate(allocator, options, spki_tlv, &ed25519_algid_tlv, signed_key_der);
+    // 6. Assemble TBSCertificate (sigAlgo = ecdsa-with-SHA-256 since the
+    //    ephemeral cert key is P-256).
+    const tbs_tlv = try buildTbsCertificate(allocator, options, spki_tlv, &ecdsa_sha256_algid_tlv, signed_key_der);
     defer allocator.free(tbs_tlv);
 
-    // 7. Ephemeral key signs TBSCertificate DER (full TLV per RFC 5280).
+    // 7. Ephemeral P-256 key signs TBSCertificate DER.
     const cert_sig = cert_kp.sign(tbs_tlv, null) catch return error.InvalidSerial;
-    const cert_sig_bytes = cert_sig.toBytes();
+    var cert_sig_der_buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
+    const cert_sig_der = cert_sig.toDer(&cert_sig_der_buf);
 
     // 8. Outer Certificate SEQUENCE = TBSCertificate || sigAlgo || signatureValue.
     var outer = ArrayList.empty;
     defer outer.deinit(allocator);
     try outer.appendSlice(allocator, tbs_tlv);
-    try outer.appendSlice(allocator, &ed25519_algid_tlv);
-    // signatureValue: BIT STRING (1 unused-bits byte + signature)
-    var sig_bit_payload: [1 + 64]u8 = undefined;
-    sig_bit_payload[0] = 0;
-    @memcpy(sig_bit_payload[1..], &cert_sig_bytes);
-    try appendTLV(&outer, allocator, 0x03, &sig_bit_payload);
+    try outer.appendSlice(allocator, &ecdsa_sha256_algid_tlv);
+    // signatureValue: BIT STRING { 0x00 unused-bits || DER ECDSA-Sig-Value }
+    var sig_bit = ArrayList.empty;
+    defer sig_bit.deinit(allocator);
+    try sig_bit.append(allocator, 0);
+    try sig_bit.appendSlice(allocator, cert_sig_der);
+    try appendTLV(&outer, allocator, 0x03, sig_bit.items);
 
     const cert_der = try dupTLV(allocator, 0x30, outer.items);
 
     return .{
         .cert_der = cert_der,
         .cert_key_seed = seed,
-        .key_kind = .ed25519,
+        // ECDSA-P-256 cert key — the host_identity (Ed25519) is reported
+        // in the SignedKey extension, separately from the cert key.
+        .key_kind = .ecdsa_p256,
     };
 }
 

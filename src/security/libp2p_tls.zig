@@ -546,6 +546,74 @@ test "verifiedPeerIdFromQuicLeafCertificate accepts matching expected_peer (Peer
     try std.testing.expect(verified.eql(&expected));
 }
 
+// Regression test for the zeam-observed PeerIdMismatch on ECDSA-P-256 hosts:
+// the v0.1.6 test above covers the Ed25519 round-trip but ECDSA wraps the
+// pubkey in a PKIX SPKI DER inside the libp2p PublicKey protobuf's `.data`
+// field. This test mirrors zeam's exact init() formula for deriving `me`
+// (encodeEcdsaPublicKeyProto → PublicKeyReader → PublicKey{ECDSA, getData}
+// → fromPublicKey), mints a cert from the same host pubkey, and verifies
+// the same PeerId comes back.
+test "verifiedPeerIdFromQuicLeafCertificate accepts matching expected_peer (ECDSA-P-256, zeam-shape)" {
+    const a = std.testing.allocator;
+    const libp2p_tls_cert = @import("libp2p_tls_cert.zig");
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+    var host_seed: [32]u8 = undefined;
+    @memset(&host_seed, 0x55);
+    const host_kp = try EcdsaP256.KeyPair.generateDeterministic(host_seed);
+    const TestSigner = struct {
+        kp: EcdsaP256.KeyPair,
+        fn sign(
+            ctx: ?*anyopaque,
+            message: []const u8,
+            out_sig: []u8,
+            out_sig_len: *usize,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const sig = try self.kp.sign(message, null);
+            var der_buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
+            const der = sig.toDer(&der_buf);
+            if (der.len > out_sig.len) return error.NoSpaceLeft;
+            @memcpy(out_sig[0..der.len], der);
+            out_sig_len.* = der.len;
+        }
+    };
+    var signer = TestSigner{ .kp = host_kp };
+    const host_pub_sec1: [65]u8 = host_kp.public_key.toUncompressedSec1();
+
+    var cert_seed: [32]u8 = undefined;
+    @memset(&cert_seed, 0x66);
+    const now: i64 = 1_700_000_000;
+    var gen = try libp2p_tls_cert.generate(a, .{
+        .host_identity = .{
+            .ecdsa_p256 = .{
+                .public_key_sec1_uncompressed = host_pub_sec1,
+                .sign = TestSigner.sign,
+                .sign_ctx = &signer,
+            },
+        },
+        .not_before_sec = now - 3600,
+        .not_after_sec = now + 86_400,
+        .cert_key_seed = cert_seed,
+    });
+    defer gen.deinit(a);
+
+    // Compute expected PeerId via the EXACT chain zeam's init() uses:
+    // encodeEcdsaPublicKeyProto → PublicKeyReader.init → getData → PublicKey
+    // {ECDSA, that-data} → PeerId.fromPublicKey.
+    const host_pub_proto = try libp2p_tls_cert.encodeEcdsaPublicKeyProto(a, host_pub_sec1);
+    defer a.free(host_pub_proto);
+    const pk_reader = try peer_id.PublicKeyReader.init(host_pub_proto);
+    var host_pk = peer_id.PublicKey{
+        .type = .ECDSA,
+        .data = pk_reader.getData(),
+    };
+    const expected = try peer_id.PeerId.fromPublicKey(a, &host_pk);
+
+    const verified = try verifiedPeerIdFromQuicLeafCertificate(a, gen.cert_der, expected, now);
+    try std.testing.expect(verified.eql(&expected));
+}
+
 test "verified path rejects expired certificate" {
     const a = std.testing.allocator;
     // Same cert as spec vector 1 (Ed25519).
