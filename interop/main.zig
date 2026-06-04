@@ -84,17 +84,29 @@ const Identity = struct {
     }
 };
 
-fn randomBytes32(out: *[32]u8) void {
-    if (builtin.link_libc) {
+fn fillRandomBytes(out: []u8) !void {
+    switch (builtin.os.tag) {
+        .linux => {
+            var off: usize = 0;
+            while (off < out.len) {
+                const rc = std.os.linux.getrandom(out.ptr + off, out.len - off, 0);
+                if (@as(isize, @bitCast(rc)) < 0) return error.NoEntropy;
+                off += @intCast(rc);
+            }
+            return;
+        },
+        else => {},
+    }
+    if (builtin.link_libc and @TypeOf(std.c.arc4random_buf) != void) {
         std.c.arc4random_buf(out.ptr, out.len);
         return;
     }
-    @memset(out, 0x42);
+    std.crypto.random.bytes(out);
 }
 
 fn generateIdentity(allocator: std.mem.Allocator) !Identity {
     var seed: [32]u8 = undefined;
-    randomBytes32(&seed);
+    try fillRandomBytes(&seed);
     const host_kp = try Ed25519.KeyPair.generateDeterministic(seed);
 
     const HostSigner = struct {
@@ -107,7 +119,7 @@ fn generateIdentity(allocator: std.mem.Allocator) !Identity {
     var signer = HostSigner{ .kp = host_kp };
     const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
     var cert_seed: [32]u8 = undefined;
-    randomBytes32(&cert_seed);
+    try fillRandomBytes(&cert_seed);
 
     var gen = try libp2p_tls_cert.generate(allocator, .{
         .host_identity = .{

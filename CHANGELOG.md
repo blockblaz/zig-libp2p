@@ -10,9 +10,12 @@
   `/p2p/` from the listener multiaddr.
 * **tcp_tls:** initiator now offers all three RFC 8446 TLS 1.3 cipher suites
   (`CHACHA20_POLY1305_SHA256`, `AES_128_GCM_SHA256`, `AES_256_GCM_SHA384`) and
-  both `x25519` + `secp256r1` named groups instead of a single-element list,
-  enabling negotiation against rust-libp2p / go-libp2p peers regardless of
-  their preferred order.
+  `x25519` + `secp256r1` + `secp384r1` named groups instead of a single-element
+  list, enabling negotiation against rust-libp2p / go-libp2p peers regardless
+  of their preferred order.
+* **interop:** `fillRandomBytes` uses `getrandom` / `arc4random_buf` /
+  `std.crypto.random` instead of a deterministic `0x42` fallback when libc is
+  absent.
 
 ### Security
 

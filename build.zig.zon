@@ -23,8 +23,8 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.6#4ea247ac202d847bb1d16c881bac1b1661159ddc",
-            .hash = "zquic-1.6.6-2zRc1HlpEADS8WfkDtnPgM98Tr9Wmc5zCZoBn_SBouWC",
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=fix/quic-stream-credit-burst#a4cb1ae369aef01fdce314fd574df740c5cc21d9",
+            .hash = "zquic-1.6.6-2zRc1PppEADJc6kzjfRa068r59QCECglmy96yHlLaTun",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",

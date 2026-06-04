@@ -1287,6 +1287,12 @@ pub const QuicRuntime = struct {
 
     fn finishOutboundReq(self: *QuicRuntime, req: *OutboundRequest) void {
         req.finished = true;
+        // FIN the QUIC bidi stream so the local stream slot can be retired
+        // and the peer sees a clean close. Without this the OutboundRequest
+        // leaks the underlying stream into the local-bidi-stream credit pool
+        // and after enough requests dial→write fails with StreamLimitExceeded.
+        req.raw.client.sendRawStreamData(req.stream_id, req.raw.send_offset, &[_]u8{}, true);
+
         // Remove from map and free.
         if (self.outbound_requests.fetchRemove(req.request_id)) |kv| {
             self.allocator.free(kv.value.payload);
