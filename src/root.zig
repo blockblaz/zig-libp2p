@@ -136,6 +136,7 @@ test {
     //   - security/noise/stream_upgrade.zig
     //   - transport/quic_endpoint.zig
     //   - transport/tcp.zig
+    //   - transport/tcp_tls/stream_upgrade.zig (loopback; not force-discovered)
     //   - req_resp/wire_tcp.zig
     _ = @import("transport/tcp_tls.zig");
     _ = @import("transport/over_cap.zig");
