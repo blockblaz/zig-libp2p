@@ -52,6 +52,5 @@ test "verifyPeerLeafCertificate accepts spec vector 1 (Ed25519)" {
     );
 }
 
-test {
-    _ = stream_upgrade;
-}
+// `stream_upgrade.zig` loopback tests use Io.Threaded + tcp listen/dial and are
+// not force-discovered here (same exclusion as noise/stream_upgrade, tcp.zig).

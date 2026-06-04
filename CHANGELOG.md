@@ -165,9 +165,10 @@ clients; minimum Zig version 0.16.0.
   implemented (tracked in #91 / #92 / #93 / #94).
 - `std.Io` async swarm migration design landed in `docs/async-swarm.md`;
   the port itself is gated on Zig's `std.Io` API settling (#57).
-- Four loopback test modules (`security/noise/stream_upgrade.zig`,
+- Five loopback test modules (`security/noise/stream_upgrade.zig`,
   `transport/quic_endpoint.zig`, `transport/tcp.zig`,
-  `req_resp/wire_tcp.zig`) are excluded from CI test discovery to
+  `transport/tcp_tls/stream_upgrade.zig`, `req_resp/wire_tcp.zig`) are
+  excluded from CI test discovery to
   avoid an `Io.Threaded` + parallel accept/dial deadlock; their
   wire-level logic is exercised via sibling unit-test modules that
   don't open real sockets.
