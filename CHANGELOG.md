@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.1.8](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.7...v0.1.8) (2026-06-04)
 
 ### Features
 
