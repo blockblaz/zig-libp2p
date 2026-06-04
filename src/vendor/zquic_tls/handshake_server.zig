@@ -295,6 +295,12 @@ pub const Handshake = struct {
                                     else
                                         error.TlsDecodeError;
                                 if (crt_parser.leaf_cert_der.len > 0) {
+                                    // `common.dupe` asserts `buf.len >= data.len`. In ReleaseSafe
+                                    // an oversized cert aborts; in ReleaseFast the assert is gone
+                                    // and the copy overflows. Reject explicitly so the upper
+                                    // layer sees `TlsRecordOverflow` and can refuse the handshake.
+                                    if (crt_parser.leaf_cert_der.len > h.peer_leaf_cert_der_buf.len)
+                                        return error.TlsRecordOverflow;
                                     h.peer_leaf_cert_der = common.dupe(&h.peer_leaf_cert_der_buf, crt_parser.leaf_cert_der);
                                 }
                                 return;

@@ -8,6 +8,34 @@
   the libp2p extension (`negotiateResponder`); initiator accepts optional
   `client_auth` for mTLS (#86). Interop dialer sends client cert and enforces
   `/p2p/` from the listener multiaddr.
+* **tcp_tls:** initiator now offers all three RFC 8446 TLS 1.3 cipher suites
+  (`CHACHA20_POLY1305_SHA256`, `AES_128_GCM_SHA256`, `AES_256_GCM_SHA384`) and
+  both `x25519` + `secp256r1` named groups instead of a single-element list,
+  enabling negotiation against rust-libp2p / go-libp2p peers regardless of
+  their preferred order.
+
+### Security
+
+* **vendor/zquic_tls:** explicit size guard on the client-leaf-cert capture
+  in `handshake_server.zig`. Previously the 8 KiB stack buffer was filled via
+  `common.dupe` which `assert`s `buf.len >= data.len`: a hostile peer cert >
+  8 KiB would abort the process in ReleaseSafe or overflow the buffer in
+  ReleaseFast. Oversized certs now return `error.TlsRecordOverflow` from the
+  TLS handshake (mapped to `error.SecurityUpgradeFailed` upstream).
+
+### Tests
+
+* **tcp_tls:** two new negative loopback tests in `stream_upgrade.zig`:
+  * `negotiateResponder rejects when initiator omits client cert (mTLS required)`
+  * `negotiateResponder rejects when client peer-id != expected_remote`
+  These follow the same Darwin-skip / CI-not-force-discovered policy as the
+  existing TCP-TLS loopback test (see `root.zig` exclusions); they compile
+  in-tree and run when discovery is opted into locally.
+* **tcp_tls:** dropped a latent `std.process.hasEnvVar("CI")` call from the
+  existing loopback test — that symbol does not exist in Zig 0.16's
+  `std.process` and only stayed compilable because the file is excluded from
+  CI test discovery. Replaced with a comment pointing at the discovery
+  exclusion as the real CI gate.
 
 ## [0.1.5](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.4...v0.1.5) (2026-06-03)
 

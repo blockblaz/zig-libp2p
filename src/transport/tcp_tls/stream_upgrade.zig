@@ -22,6 +22,23 @@ const Certificate = std.crypto.Certificate;
 pub const input_buffer_len = zquic_tls.input_buffer_len;
 pub const output_buffer_len = zquic_tls.output_buffer_len;
 
+/// TLS 1.3 cipher suites offered to peers. All three RFC 8446 mandatory suites
+/// are advertised so we negotiate with rust-libp2p / go-libp2p regardless of
+/// their preferred order. AEAD-only; no TLS 1.2 fallback.
+const offered_cipher_suites: []const tls_config.CipherSuite = &[_]tls_config.CipherSuite{
+    .CHACHA20_POLY1305_SHA256,
+    .AES_128_GCM_SHA256,
+    .AES_256_GCM_SHA384,
+};
+
+/// Named groups offered to peers. `x25519` first (preferred by libp2p TLS
+/// vectors), `secp256r1` for compatibility with rust-libp2p installs that
+/// haven't enabled x25519.
+const offered_named_groups: []const zquic_tls.protocol.NamedGroup = &[_]zquic_tls.protocol.NamedGroup{
+    .x25519,
+    .secp256r1,
+};
+
 pub const UpgradeError = sm.StreamHandshakeError || libp2p_tls.QuicPeerIdentityError || error{
     MissingPeerCertificate,
     TlsHandshakeFailed,
@@ -214,8 +231,8 @@ pub fn negotiateInitiator(
         .insecure_skip_verify = true,
         .alpn = libp2p_tls.quic_application_layer_protocol,
         .auth = client_auth,
-        .cipher_suites = &[_]tls_config.CipherSuite{.CHACHA20_POLY1305_SHA256},
-        .named_groups = &[_]zquic_tls.protocol.NamedGroup{.x25519},
+        .cipher_suites = offered_cipher_suites,
+        .named_groups = offered_named_groups,
     });
     try driveNonblockHandshake(&nb, r, w, allocator, &send_buf);
 
@@ -288,8 +305,11 @@ test "TLS 1.3 + multistream over TCP loopback" {
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
     if (skipDarwinTcpLoopbackTls()) return error.SkipZigTest;
-    // GH Actions sets CI=1; Linux runners hang on Io.Threaded + parallel accept/dial.
-    if (std.process.hasEnvVar("CI")) return error.SkipZigTest;
+    // CI gate is enforced by NOT force-discovering this module from `tcp_tls.zig`
+    // (see comment in `root.zig`). The previous `std.process.hasEnvVar("CI")` call
+    // was a latent compile error — `hasEnvVar` does not exist in Zig 0.16's
+    // `std.process` — and is therefore removed; the discovery exclusion is the
+    // real CI gate.
 
     const a = std.testing.allocator;
     var io_impl = Io.Threaded.init(a, .{ .async_limit = Io.Limit.limited(8) });
@@ -397,4 +417,261 @@ test "TLS 1.3 + multistream over TCP loopback" {
 
     var wscratch: [output_buffer_len]u8 = undefined;
     try hs.channel.write(&w.interface, "tls-payload", &wscratch);
+}
+
+// ── negative tests ──────────────────────────────────────────────────────────
+//
+// Both run under the same Darwin / CI skip policy as the happy-path loopback
+// above — they spawn a TCP server thread and complete a real handshake.
+
+const NegativeTestSlot = struct {
+    err: ?anyerror = null,
+};
+
+test "negotiateResponder rejects when initiator omits client cert (mTLS required)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (skipDarwinTcpLoopbackTls()) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var io_impl = Io.Threaded.init(a, .{ .async_limit = Io.Limit.limited(8) });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var bundle = try setupEcdsaTestBundle(a, 0x60, 0x61);
+    defer bundle.deinit(a);
+
+    var bind_addr: net.IpAddress = .{ .ip4 = net.Ip4Address.unspecified(0) };
+    var server = try @import("../tcp.zig").listen(&bind_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    var slot = NegativeTestSlot{};
+
+    const Server = struct {
+        fn run(
+            srv: *net.Server,
+            io_inner: Io,
+            auth: *CertKeyPair,
+            now: i64,
+            out: *NegativeTestSlot,
+        ) void {
+            const st = @import("../tcp.zig").acceptTuned(srv, io_inner, .{}) catch |e| {
+                out.err = e;
+                return;
+            };
+            defer st.close(io_inner);
+            var scratch_r: [65536]u8 = undefined;
+            var scratch_w: [65536]u8 = undefined;
+            var r = net.Stream.reader(st, io_inner, &scratch_r);
+            var w = net.Stream.writer(st, io_inner, &scratch_w);
+            // No expected_remote on responder — the failure must come from the
+            // missing-cert path, not from peer-id matching.
+            const hs_or_err = negotiateResponder(a, &r.interface, &w.interface, auth, now, null);
+            if (hs_or_err) |hs_unused| {
+                var hs = hs_unused;
+                hs.channel.deinit(a);
+                out.err = error.UnexpectedHandshakeSuccess;
+            } else |e| {
+                out.err = e;
+            }
+        }
+    };
+
+    const thr = try std.Thread.spawn(.{}, Server.run, .{ &server, io, &bundle.owned.pair, bundle.now_sec, &slot });
+    defer thr.join();
+
+    const connect_addr: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var client = try @import("../tcp.zig").dial(&connect_addr, io, .{});
+    defer client.close(io);
+
+    var scratch_r: [65536]u8 = undefined;
+    var scratch_w: [65536]u8 = undefined;
+    var r = net.Stream.reader(client, io, &scratch_r);
+    var w = net.Stream.writer(client, io, &scratch_w);
+
+    // client_auth = null → server sees empty Certificate → TlsCertificateRequired
+    // inside the vendor, surfaced as TlsHandshakeFailed by driveNonblockHandshake.
+    _ = negotiateInitiator(a, &r.interface, &w.interface, bundle.now_sec, null, null) catch {};
+
+    thr.join();
+    // (defer thr.join() above will run again; join is idempotent on a finished thread.)
+
+    try std.testing.expect(slot.err != null);
+    try std.testing.expectEqual(@as(anyerror, error.TlsHandshakeFailed), slot.err.?);
+}
+
+test "negotiateResponder rejects when client peer-id != expected_remote" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (skipDarwinTcpLoopbackTls()) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var io_impl = Io.Threaded.init(a, .{ .async_limit = Io.Limit.limited(8) });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var bundle = try setupEcdsaTestBundle(a, 0x70, 0x71);
+    defer bundle.deinit(a);
+    // Independent host key → distinct PeerId the server will demand. The
+    // client connects with `bundle`'s identity, so verification must fail.
+    var wrong_seed: [32]u8 = undefined;
+    @memset(&wrong_seed, 0x7e);
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const wrong_kp = try EcdsaP256.KeyPair.generateDeterministic(wrong_seed);
+    const wrong_pub_sec1: [65]u8 = wrong_kp.public_key.toUncompressedSec1();
+    const libp2p_tls_cert = @import("../../security/libp2p_tls_cert.zig");
+    const peer_id_pkg = @import("peer_id");
+    const wrong_proto = try libp2p_tls_cert.encodeEcdsaPublicKeyProto(a, wrong_pub_sec1);
+    defer a.free(wrong_proto);
+    const wrong_reader = try peer_id_pkg.PublicKeyReader.init(wrong_proto);
+    var wrong_pk = peer_id_pkg.PublicKey{ .type = .ECDSA, .data = wrong_reader.getData() };
+    const wrong_remote = try peer_id_pkg.PeerId.fromPublicKey(a, &wrong_pk);
+
+    var bind_addr: net.IpAddress = .{ .ip4 = net.Ip4Address.unspecified(0) };
+    var server = try @import("../tcp.zig").listen(&bind_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    var slot = NegativeTestSlot{};
+
+    const Server = struct {
+        fn run(
+            srv: *net.Server,
+            io_inner: Io,
+            auth: *CertKeyPair,
+            now: i64,
+            expect: pid.PeerId,
+            out: *NegativeTestSlot,
+        ) void {
+            const st = @import("../tcp.zig").acceptTuned(srv, io_inner, .{}) catch |e| {
+                out.err = e;
+                return;
+            };
+            defer st.close(io_inner);
+            var scratch_r: [65536]u8 = undefined;
+            var scratch_w: [65536]u8 = undefined;
+            var r = net.Stream.reader(st, io_inner, &scratch_r);
+            var w = net.Stream.writer(st, io_inner, &scratch_w);
+            const hs_or_err = negotiateResponder(a, &r.interface, &w.interface, auth, now, expect);
+            if (hs_or_err) |hs_unused| {
+                var hs = hs_unused;
+                hs.channel.deinit(a);
+                out.err = error.UnexpectedHandshakeSuccess;
+            } else |e| {
+                out.err = e;
+            }
+        }
+    };
+
+    const thr = try std.Thread.spawn(.{}, Server.run, .{ &server, io, &bundle.owned.pair, bundle.now_sec, wrong_remote, &slot });
+    defer thr.join();
+
+    const connect_addr: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var client = try @import("../tcp.zig").dial(&connect_addr, io, .{});
+    defer client.close(io);
+
+    var scratch_r: [65536]u8 = undefined;
+    var scratch_w: [65536]u8 = undefined;
+    var r = net.Stream.reader(client, io, &scratch_r);
+    var w = net.Stream.writer(client, io, &scratch_w);
+
+    // Initiator presents bundle's own cert; server-side libp2p verify will
+    // see that the leaf's PeerId != wrong_remote and reject.
+    _ = negotiateInitiator(a, &r.interface, &w.interface, bundle.now_sec, null, &bundle.owned.pair) catch {};
+
+    thr.join();
+
+    try std.testing.expect(slot.err != null);
+    try std.testing.expectEqual(@as(anyerror, error.PeerIdMismatch), slot.err.?);
+}
+
+// ── test scaffolding ────────────────────────────────────────────────────────
+
+const EcdsaTestBundle = struct {
+    owned: OwnedCertKeyPair,
+    gen: @import("../../security/libp2p_tls_cert.zig").GeneratedCertificate,
+    expected_remote: @import("peer_id").PeerId,
+    cert_pem: []u8,
+    key_pem: []u8,
+    now_sec: i64,
+
+    fn deinit(self: *EcdsaTestBundle, allocator: std.mem.Allocator) void {
+        self.owned.deinit(allocator);
+        self.gen.deinit(allocator);
+        allocator.free(self.cert_pem);
+        allocator.free(self.key_pem);
+        self.* = undefined;
+    }
+};
+
+const TestSignerEcdsa = struct {
+    kp: std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair,
+    fn sign(ctx: ?*anyopaque, message: []const u8, out_sig: []u8, out_sig_len: *usize) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        const sig = try self.kp.sign(message, null);
+        var buf: [std.crypto.sign.ecdsa.EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+        const der = sig.toDer(&buf);
+        if (der.len > out_sig.len) return error.NoSpaceLeft;
+        @memcpy(out_sig[0..der.len], der);
+        out_sig_len.* = der.len;
+    }
+};
+
+/// Build a libp2p TLS cert + key + matching PeerId for tests. Caller frees via
+/// `bundle.deinit`. Two independent seed bytes let callers generate distinct
+/// bundles in the same test process.
+fn setupEcdsaTestBundle(
+    allocator: std.mem.Allocator,
+    host_seed_byte: u8,
+    cert_seed_byte: u8,
+) !EcdsaTestBundle {
+    const libp2p_tls_cert = @import("../../security/libp2p_tls_cert.zig");
+    const peer_id_pkg = @import("peer_id");
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const wall_time = @import("../../wall_time.zig");
+
+    const host_seed = [_]u8{host_seed_byte} ** 32;
+    const cert_seed = [_]u8{cert_seed_byte} ** 32;
+    const host_kp = try EcdsaP256.KeyPair.generateDeterministic(host_seed);
+    var signer = TestSignerEcdsa{ .kp = host_kp };
+    const host_pub_sec1: [65]u8 = host_kp.public_key.toUncompressedSec1();
+    const now_sec = @divTrunc(wall_time.milliTimestamp(), 1000);
+
+    var gen = try libp2p_tls_cert.generate(allocator, .{
+        .host_identity = .{
+            .ecdsa_p256 = .{
+                .public_key_sec1_uncompressed = host_pub_sec1,
+                .sign = TestSignerEcdsa.sign,
+                .sign_ctx = &signer,
+            },
+        },
+        .not_before_sec = now_sec - 3600,
+        .not_after_sec = now_sec + 365 * 24 * 3600,
+        .cert_key_seed = cert_seed,
+    });
+    errdefer gen.deinit(allocator);
+
+    const cert_pem = try libp2p_tls_cert.certDerToPem(allocator, gen.cert_der);
+    errdefer allocator.free(cert_pem);
+    const key_pem = try libp2p_tls_cert.ecdsaP256SeedToPem(allocator, gen.cert_key_seed);
+    errdefer allocator.free(key_pem);
+
+    var owned = try certKeyPairFromPem(allocator, cert_pem, key_pem, now_sec);
+    errdefer owned.deinit(allocator);
+
+    const host_pub_proto = try libp2p_tls_cert.encodeEcdsaPublicKeyProto(allocator, host_pub_sec1);
+    defer allocator.free(host_pub_proto);
+    const reader = try peer_id_pkg.PublicKeyReader.init(host_pub_proto);
+    var host_pk = peer_id_pkg.PublicKey{ .type = .ECDSA, .data = reader.getData() };
+    const expected_remote = try peer_id_pkg.PeerId.fromPublicKey(allocator, &host_pk);
+
+    return .{
+        .owned = owned,
+        .gen = gen,
+        .expected_remote = expected_remote,
+        .cert_pem = cert_pem,
+        .key_pem = key_pem,
+        .now_sec = now_sec,
+    };
 }
