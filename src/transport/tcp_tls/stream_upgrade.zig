@@ -32,11 +32,11 @@ const offered_cipher_suites: []const tls_config.CipherSuite = &[_]tls_config.Cip
 };
 
 /// Named groups offered to peers. `x25519` first (preferred by libp2p TLS
-/// vectors), `secp256r1` for compatibility with rust-libp2p installs that
-/// haven't enabled x25519.
+/// vectors), NIST curves for rust-libp2p / go-libp2p peers that prefer them.
 const offered_named_groups: []const zquic_tls.protocol.NamedGroup = &[_]zquic_tls.protocol.NamedGroup{
     .x25519,
     .secp256r1,
+    .secp384r1,
 };
 
 pub const UpgradeError = sm.StreamHandshakeError || libp2p_tls.QuicPeerIdentityError || error{
