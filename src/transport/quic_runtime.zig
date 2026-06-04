@@ -1303,11 +1303,13 @@ pub const QuicRuntime = struct {
 
     fn finishOutboundReq(self: *QuicRuntime, req: *OutboundRequest) void {
         req.finished = true;
-        // FIN the QUIC bidi stream so the local stream slot can be retired
-        // and the peer sees a clean close. Without this the OutboundRequest
-        // leaks the underlying stream into the local-bidi-stream credit pool
-        // and after enough requests dial→write fails with StreamLimitExceeded.
-        req.raw.client.sendRawStreamData(req.stream_id, req.raw.send_offset, &[_]u8{}, true);
+        // NOTE: the FIN-on-finish that lived here regressed zeam↔zeam
+        // protocol negotiation — sending an empty-data + FIN STREAM frame on
+        // the bidi stream broke the responder's reading of the same stream,
+        // so status RPC times out from the very first attempt and gossip
+        // stops after slot 2.  Reverted while we diagnose the right place
+        // to FIN.  Stream-credit accounting is still backed by the zquic-side
+        // MAX_STREAMS replenishment from #130 + the cap from #133.
 
         // Remove from map and free.
         if (self.outbound_requests.fetchRemove(req.request_id)) |kv| {
