@@ -46,6 +46,10 @@ pub const ClientAuth = struct {
 
     auth_type: Type = .require,
 
+    /// When true, skip X.509 chain validation (libp2p verifies the leaf via the
+    /// custom extension instead of PKIX trust anchors).
+    insecure_skip_verify: bool = false,
+
     pub const Type = enum {
         /// Client certificate will be requested during the handshake, but does
         /// not require that the client send any certificates.
@@ -79,6 +83,10 @@ pub const Handshake = struct {
 
     cipher: Cipher = undefined,
     transcript: Transcript = .{},
+
+    /// Client leaf certificate DER after mutual TLS (empty until [`readClientFlight2`] succeeds).
+    peer_leaf_cert_der_buf: [8192]u8 = undefined,
+    peer_leaf_cert_der: []const u8 = &.{},
 
     const Self = @This();
 
@@ -216,7 +224,11 @@ pub const Handshake = struct {
         var handshake_state: proto.Handshake = .finished;
         var crt_parser: CertificateParser = undefined;
         if (opt.client_auth) |client_auth| {
-            crt_parser = .{ .root_ca = client_auth.root_ca, .host = "" };
+            crt_parser = .{
+                .root_ca = client_auth.root_ca,
+                .host = "",
+                .skip_verify = client_auth.insecure_skip_verify,
+            };
             handshake_state = .certificate;
         }
 
@@ -282,6 +294,9 @@ pub const Handshake = struct {
                                         error.TlsDecryptError
                                     else
                                         error.TlsDecodeError;
+                                if (crt_parser.leaf_cert_der.len > 0) {
+                                    h.peer_leaf_cert_der = common.dupe(&h.peer_leaf_cert_der_buf, crt_parser.leaf_cert_der);
+                                }
                                 return;
                             },
                             else => return error.TlsUnexpectedMessage,
@@ -646,5 +661,10 @@ pub const NonBlock = struct {
     /// Cipher produced in handshake, null until successful handshake.
     pub fn cipher(self: Self) ?Cipher {
         return if (self.done()) self.inner.cipher else null;
+    }
+
+    /// Client leaf certificate DER after mutual TLS (empty before handshake completes).
+    pub fn peerLeafCertificateDer(self: Self) []const u8 {
+        return self.inner.peer_leaf_cert_der;
     }
 };

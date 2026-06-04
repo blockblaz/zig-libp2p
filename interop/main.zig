@@ -170,7 +170,7 @@ fn runListener(allocator: std.mem.Allocator, io: Io, env: Env, id: *Identity) !v
     while (zl.wall_time.milliTimestamp() < deadline_ms) {
         const st = tcp.acceptTuned(&server, io, .{}) catch continue;
         defer st.close(io);
-        _ = try handleConn(allocator, io, st, id, .responder, deadline_ms);
+        _ = try handleConn(allocator, io, st, id, null, .responder, deadline_ms);
         return;
     }
     return error.Timeout;
@@ -194,7 +194,15 @@ fn runDialer(allocator: std.mem.Allocator, io: Io, env: Env, id: *Identity) !voi
     var client = try tcp.dial(&dial_addr.addr, io, .{});
     defer client.close(io);
 
-    const ping_rtt_ms = try handleConn(allocator, io, client, id, .initiator, handshake_start_ms + @as(i64, @intCast(env.timeout_secs * 1000)));
+    const ping_rtt_ms = try handleConn(
+        allocator,
+        io,
+        client,
+        id,
+        dial_addr.expected_peer,
+        .initiator,
+        handshake_start_ms + @as(i64, @intCast(env.timeout_secs * 1000)),
+    );
     const handshake_plus_one_rtt_ms = @as(f64, @floatFromInt(zl.wall_time.milliTimestamp() - handshake_start_ms));
 
     std.debug.print("latency:\n", .{});
@@ -208,6 +216,7 @@ fn handleConn(
     io: Io,
     stream: net.Stream,
     id: *Identity,
+    expected_remote: ?zl.peer_id.PeerId,
     role: enum { initiator, responder },
     deadline_ms: i64,
 ) !u64 {
@@ -217,8 +226,22 @@ fn handleConn(
     var w = net.Stream.writer(stream, io, &scratch_w);
 
     var hs = switch (role) {
-        .initiator => try tcp_tls.negotiateInitiator(allocator, &r.interface, &w.interface, id.now_sec, null),
-        .responder => try tcp_tls.negotiateResponder(allocator, &r.interface, &w.interface, &id.owned_cert.pair, id.now_sec, null),
+        .initiator => try tcp_tls.negotiateInitiator(
+            allocator,
+            &r.interface,
+            &w.interface,
+            id.now_sec,
+            expected_remote,
+            &id.owned_cert.pair,
+        ),
+        .responder => try tcp_tls.negotiateResponder(
+            allocator,
+            &r.interface,
+            &w.interface,
+            &id.owned_cert.pair,
+            id.now_sec,
+            expected_remote,
+        ),
     };
     var link = mux_link.Link{
         .allocator = allocator,

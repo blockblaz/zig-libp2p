@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* **tcp_tls:** TCP TLS responder requests a client certificate and verifies
+  the libp2p extension (`negotiateResponder`); initiator accepts optional
+  `client_auth` for mTLS (#86). Interop dialer sends client cert and enforces
+  `/p2p/` from the listener multiaddr.
+
 ## [0.1.5](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.4...v0.1.5) (2026-06-03)
 
 
