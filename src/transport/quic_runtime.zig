@@ -992,8 +992,17 @@ pub const QuicRuntime = struct {
                 // is byte-at-a-time and `error.ProtocolNegotiationFailed`
                 // is unrecoverable mid-stream once it consumes any bytes.
                 const have = ist.raw.unreadRecvLen();
-                if (have < 2) continue;
-                const buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse continue;
+                if (have < 2) {
+                    // Not enough buffered yet — move to the next stream
+                    // instead of busy-looping. The outer driver will pump
+                    // more bytes via listener.drive() and we'll retry.
+                    i += 1;
+                    continue;
+                }
+                const buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse {
+                    i += 1;
+                    continue;
+                };
                 const tail = buf[ist.raw.read_cursor..];
                 // need at least two '\n' bytes in the buffered region.
                 var newlines: u32 = 0;
@@ -1001,7 +1010,10 @@ pub const QuicRuntime = struct {
                     if (b == '\n') newlines += 1;
                     if (newlines >= 2) break;
                 }
-                if (newlines < 2) continue;
+                if (newlines < 2) {
+                    i += 1;
+                    continue;
+                }
 
                 var r = ist.raw.reader();
                 var w = ist.raw.writer();
@@ -1164,6 +1176,7 @@ pub const QuicRuntime = struct {
                     const now_ms = self.opts.now_ms_fn();
                     const channel_id = self.host.registerInboundReqRespChannel(sender_peer, proto, stream_rid, now_ms) catch |err| {
                         log.warn("quic_runtime: registerInboundReqRespChannel failed: {s}", .{@errorName(err)});
+                        i += 1;
                         continue;
                     };
                     ist.channel_id = channel_id;
@@ -1171,7 +1184,10 @@ pub const QuicRuntime = struct {
                     self.channel_to_inbound.put(channel_id, ist) catch {};
 
                     // Hand the request payload to the embedder via swarm.
-                    const payload_dup = a.dupe(u8, req_ssz) catch continue;
+                    const payload_dup = a.dupe(u8, req_ssz) catch {
+                        i += 1;
+                        continue;
+                    };
                     self.host.swarm.queueEvent(.{ .rpc_request = .{
                         .peer = sender_peer,
                         .protocol = proto,
