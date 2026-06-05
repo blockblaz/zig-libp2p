@@ -23,8 +23,8 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=master#cf58c2313611942f8ace9d131721791bcc60344a",
-            .hash = "zquic-1.6.6-2zRc1LsMEQCCcr31gupnh3z4Ai9N5WSgoY7kx4R2lFYt",
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=master#50ec138d3b0297517694c28ef505bb12b9ec4960",
+            .hash = "zquic-1.6.6-2zRc1ODwEADzBwHH-p9UGg5-g6KyhS7SXs8FDn5aTy8V",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",
