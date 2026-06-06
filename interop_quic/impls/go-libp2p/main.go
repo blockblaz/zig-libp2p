@@ -463,6 +463,16 @@ func runReqRespServer(ctx context.Context, h host.Host) (int, error) {
 	case <-ctx.Done():
 		return 1, ctx.Err()
 	}
+	// CI race: returning here triggers main's `defer h.Close()` which
+	// tears down the QUIC conn before the client has finished its
+	// io.ReadFull on the echo. Under fast local runs this completes
+	// before the close lands; on slow CI runners it produces a tail
+	// `Application error 0x0 (remote)` on the client side. A brief
+	// settle is the simplest cure — give the client time to drain.
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+	}
 	fmt.Printf("go_libp2p_interop[server]: reqresp ok (%d bytes)\n", plen)
 	return 0, nil
 }
