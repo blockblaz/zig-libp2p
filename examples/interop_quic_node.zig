@@ -23,11 +23,15 @@
 //!                    must produce a matching libp2p peer id (cross-impl
 //!                    interop with go-libp2p). Unset → legacy dial path.
 //!
+//! gossipsub-specific:
+//!   GS_TOPIC       — pubsub topic both sides subscribe to (default "/interop/b3")
+//!   GS_COUNT       — number of messages the server publishes (default 5)
+//!   GS_PAYLOAD_LEN — bytes per message; deterministic content
+//!
 //! Exit codes:
 //!   0  success
 //!   1  failure (timeout / decode / mismatch)
 //!   2  bad config (unknown ROLE / TESTCASE)
-//!   3  testcase not yet implemented on this side (B3 zig gossipsub stub)
 
 const std = @import("std");
 const zl = @import("zig_libp2p");
@@ -47,6 +51,12 @@ const stream_multistream = zl.transport.stream_multistream;
 const ping = zl.ping;
 const wall_time = zl.wall_time;
 const Io = std.Io;
+
+const Host = zl.host.Host;
+const QuicRuntime = zl.transport.quic_runtime.QuicRuntime;
+const libp2p_tls_cert = zl.security.libp2p_tls_cert;
+const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const swarm_mod = zl.swarm;
 
 const default_listen_port: u16 = 4001;
 const default_deadline_ms: i64 = 30_000;
@@ -86,15 +96,8 @@ pub fn main() !u8 {
 
     std.debug.print("interop_quic_node: role={s} testcase={s}\n", .{ role, testcase });
 
-    // The B3 gossipsub testcase needs the QUIC inbound-stream pipeline
-    // to dispatch /meshsub/1.1.0 frames through `Host.handleGossipRpc`;
-    // wiring isn't in this binary yet (tracked as a follow-up to land the
-    // same path zeam-network's EthLibp2pV2 will use). For now return
-    // exit code 3 (distinct from 1 / 2) so the matrix runner can report
-    // a TAP "skip" without confusing it with a real failure.
     if (std.mem.eql(u8, testcase, "gossipsub")) {
-        std.debug.print("interop_quic_node[{s}]: gossipsub testcase not yet wired on zig side; skipping\n", .{role});
-        return 3;
+        return runGossipsubInterop(a, role, cert_path, key_path, deadline_ms);
     }
 
     if (std.mem.eql(u8, role, "server")) {
@@ -513,5 +516,283 @@ fn clientOnePingInitiator(
     }
 
     std.debug.print("interop_quic_node[client]: ping ok\n", .{});
+    return 0;
+}
+
+// ── B3 gossipsub testcase ─────────────────────────────────────────────────
+//
+// Wired on Host + QuicRuntime. Both sides:
+//   - mint a Host with `local_peer_id` derived from SEED_HEX (same scheme
+//     gen-libp2p-cert uses to mint the cert), so the peer-id on the wire
+//     matches what the matrix runner exported as REMOTE_PEER_ID;
+//   - spin up a QuicRuntime which owns the QUIC listener, multistream-
+//     select for `/meshsub/1.1.0`, and the bidirectional pump between
+//     QUIC streams and `Host.gossipsub`.
+//
+// Server:
+//   1. Subscribe to GS_TOPIC.
+//   2. Wait for a peer-connected event from the swarm event channel.
+//   3. Publish GS_COUNT deterministic payloads via `host.publish`.
+//   4. Stay alive briefly so the client can drain the mesh.
+//
+// Client:
+//   1. registerKnownPeer with the server multiaddr (this is what the
+//      ConnectionManager turns into a swarm `.dial` → QuicRuntime hook
+//      → outbound connection).
+//   2. Subscribe to GS_TOPIC.
+//   3. Drain swarm events; count `gossip_message` events with payloads
+//      that match the deterministic set the server publishes.
+
+const gs_default_topic: []const u8 = "/interop/b3";
+const gs_default_count: usize = 5;
+const gs_default_payload_len: usize = 64;
+
+fn gsPayload(buf: []u8, idx: usize) void {
+    var header_buf: [32]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "msg-{d:0>5}:", .{idx}) catch unreachable;
+    // Fill with 0x2A then overlay the header — same scheme as the go and
+    // rust impls so all three speak identical bytes.
+    @memset(buf, 0x2A);
+    const n = @min(header.len, buf.len);
+    @memcpy(buf[0..n], header[0..n]);
+}
+
+/// Derive the libp2p PeerId from a PEM cert on disk (this binary's own
+/// CERT_PATH). The cert was minted with the libp2p RFC 0001 extension
+/// (`gen-libp2p-cert`), so the embedded host-key signature recovers a
+/// canonical peer-id. Using the cert as the source of truth means both
+/// the Host's `local_peer_id` and what the matrix runner exports as
+/// REMOTE_PEER_ID agree without threading SEED_HEX through every step.
+fn derivePeerFromCert(a: std.mem.Allocator, cert_path: []const u8) !zl.peer_id.PeerId {
+    const pem = try readFileAlloc(a, cert_path);
+    defer a.free(pem);
+    const der = try pemFirstCertDer(a, pem);
+    defer a.free(der);
+    const now_sec = @divTrunc(wall_time.milliTimestamp(), 1000);
+    return try zl.security.libp2p_tls.peerIdFromVerifiedCertificate(a, der, now_sec);
+}
+
+fn readFileAlloc(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    // std 0.16 moved fs.cwd().readFileAlloc behind Io.Threaded — fall
+    // back to libc open/read so this binary stays small.
+    var path_buf: [1024]u8 = undefined;
+    const z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+    const mode: std.c.mode_t = 0;
+    const fd = std.c.open(z.ptr, .{ .ACCMODE = .RDONLY }, mode);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(a);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &chunk, chunk.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try buf.appendSlice(a, chunk[0..@intCast(n)]);
+    }
+    return try buf.toOwnedSlice(a);
+}
+
+fn pemFirstCertDer(a: std.mem.Allocator, pem: []const u8) ![]u8 {
+    const begin = std.mem.indexOf(u8, pem, "-----BEGIN CERTIFICATE-----") orelse
+        return error.PemNoBegin;
+    const after_begin = begin + "-----BEGIN CERTIFICATE-----".len;
+    const end_rel = std.mem.indexOf(u8, pem[after_begin..], "-----END CERTIFICATE-----") orelse
+        return error.PemNoEnd;
+    const b64_block = pem[after_begin .. after_begin + end_rel];
+    const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    const upper = decoder.calcSizeUpperBound(b64_block.len);
+    const out = try a.alloc(u8, upper);
+    errdefer a.free(out);
+    const n = try decoder.decode(out, b64_block);
+    return try a.realloc(out, n);
+}
+
+fn runGossipsubInterop(
+    a: std.mem.Allocator,
+    role: []const u8,
+    cert_path: []const u8,
+    key_path: []const u8,
+    deadline_ms: i64,
+) !u8 {
+    const topic = envOr("GS_TOPIC", gs_default_topic);
+    const count = envInt(usize, "GS_COUNT", gs_default_count);
+    const plen = envInt(usize, "GS_PAYLOAD_LEN", gs_default_payload_len);
+    const is_server = std.mem.eql(u8, role, "server");
+    const is_client = std.mem.eql(u8, role, "client");
+    if (!is_server and !is_client) {
+        std.debug.print("interop_quic_node: unknown ROLE={s}\n", .{role});
+        return 2;
+    }
+
+    const me = try derivePeerFromCert(a, cert_path);
+    var me_b58_buf: [128]u8 = undefined;
+    const me_b58 = try me.toBase58(&me_b58_buf);
+    std.debug.print("interop_quic_node[{s}]: gossipsub local_peer={s}\n", .{ role, me_b58 });
+
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+    });
+    defer host.destroy();
+    try host.startBackground();
+    if (!host.waitUntilReady(5_000)) {
+        std.debug.print("interop_quic_node[{s}]: gossipsub host not ready\n", .{role});
+        return 1;
+    }
+
+    // Listen on the configured port (server) or ephemeral (client) so
+    // both sides can use QuicRuntime's accept + dial path uniformly.
+    const listen_port: u16 = if (is_server)
+        envInt(u16, "LISTEN_PORT", default_listen_port)
+    else
+        0;
+    const listen_ma = try std.fmt.allocPrint(a, "/ip4/0.0.0.0/udp/{d}/quic-v1", .{listen_port});
+    defer a.free(listen_ma);
+
+    var rt = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host,
+        .tls_pem = .{ .paths = .{ .cert_path = cert_path, .key_path = key_path } },
+        .listen_multiaddr = listen_ma,
+    });
+    defer rt.destroy();
+    try rt.start();
+
+    try host.subscribe(topic);
+
+    const dl = wall_time.milliTimestamp() + deadline_ms;
+
+    if (is_client) {
+        // Dial via ConnectionManager → swarm.dial → QuicRuntime hook.
+        const server_host = envOr("SERVER_HOST", "127.0.0.1");
+        const server_port = envInt(u16, "SERVER_PORT", default_listen_port);
+        const remote_pid_str = getEnv("REMOTE_PEER_ID") orelse {
+            std.debug.print("interop_quic_node[client]: gossipsub requires REMOTE_PEER_ID\n", .{});
+            return 2;
+        };
+        const remote_pid = try zl.peer_id.PeerId.fromBase58(a, remote_pid_str);
+        const server_ma_str = try std.fmt.allocPrint(
+            a,
+            "/ip4/{s}/udp/{d}/quic-v1/p2p/{s}",
+            .{ server_host, server_port, remote_pid_str },
+        );
+        defer a.free(server_ma_str);
+        var server_ma = try multiaddr.Multiaddr.fromString(a, server_ma_str);
+        defer server_ma.deinit();
+        try rt.registerKnownPeer(&server_ma, remote_pid);
+    }
+
+    // Role split, asymmetric vs. the go-libp2p impl:
+    //
+    //   QuicRuntime's `onPublishCommand` fans publishes out to every
+    //   currently *outbound* peer (the dialed side of each conn). The
+    //   listener side has no outbound peers and so `host.publish` from
+    //   that role produces no wire traffic. To exercise gossipsub
+    //   end-to-end against this codebase today, the dialer publishes
+    //   and the listener subscribes. Cross-impl with go-libp2p stays
+    //   gated behind the upstream zquic TLS gaps anyway, so the
+    //   role-swap doesn't change today's CI surface; tracked in
+    //   src/transport/quic_runtime.zig as a follow-up (let publishes
+    //   reach inbound peers via `listener.server` stream open).
+    //
+    //   ROLE=server → subscribe, count gossip_message events, exit 0
+    //   ROLE=client → subscribe, dial, wait for peer-connected +
+    //                 gossipsub heartbeat, publish N msgs, exit 0
+    const payload_buf = try a.alloc(u8, plen);
+    defer a.free(payload_buf);
+
+    if (is_client) {
+        // Wait for the outbound conn to land before publishing — otherwise
+        // QuicRuntime has no outbound_by_peer entry yet and the publish
+        // fans out to an empty set.
+        var saw_peer = false;
+        while (wall_time.milliTimestamp() < dl and !saw_peer) {
+            var ev = host.nextEvent(100) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return 1,
+            };
+            defer ev.deinit(a);
+            if (std.meta.activeTag(ev) == .peer_connected) saw_peer = true;
+        }
+        if (!saw_peer) {
+            std.debug.print("interop_quic_node[client]: gossipsub: no peer connected before deadline\n", .{});
+            return 1;
+        }
+        // Let the gossipsub heartbeat run a couple cycles so the GRAFT
+        // exchange finishes and we have a mesh edge before publishing.
+        const settle_until = wall_time.milliTimestamp() + 2_000;
+        while (wall_time.milliTimestamp() < settle_until) {
+            var ev = host.nextEvent(100) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return 1,
+            };
+            ev.deinit(a);
+        }
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            gsPayload(payload_buf, i);
+            host.publish(topic, payload_buf) catch |err| {
+                std.debug.print("interop_quic_node[client]: gossipsub publish #{d} err={s}\n", .{ i, @errorName(err) });
+                return 1;
+            };
+        }
+        std.debug.print("interop_quic_node[client]: gossipsub published {d} msgs on {s}\n", .{ count, topic });
+        // Stay alive long enough for the server to drain the mesh.
+        const drain_until = wall_time.milliTimestamp() + 3_000;
+        while (wall_time.milliTimestamp() < drain_until) {
+            var ev = host.nextEvent(100) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return 1,
+            };
+            ev.deinit(a);
+        }
+        std.debug.print("interop_quic_node[client]: gossipsub ok\n", .{});
+        return 0;
+    }
+
+    // Server path: drain swarm events, count gossip_message arrivals
+    // whose data matches one of the deterministic payloads the client
+    // sends. The matcher tracks which indices have been observed to
+    // tolerate dup deliveries from the gossipsub forwarding layer.
+    var seen = try a.alloc(bool, count);
+    defer a.free(seen);
+    @memset(seen, false);
+    var seen_count: usize = 0;
+
+    while (wall_time.milliTimestamp() < dl and seen_count < count) {
+        var ev = host.nextEvent(200) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return 1,
+        };
+        defer ev.deinit(a);
+        switch (ev) {
+            .gossip_message => |m| {
+                if (!std.mem.eql(u8, m.topic, topic)) continue;
+                if (m.data.len != plen) continue;
+                // Find which index this is by reconstructing payloads.
+                var idx: usize = 0;
+                while (idx < count) : (idx += 1) {
+                    gsPayload(payload_buf, idx);
+                    if (std.mem.eql(u8, payload_buf, m.data)) {
+                        if (!seen[idx]) {
+                            seen[idx] = true;
+                            seen_count += 1;
+                        }
+                        break;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    if (seen_count < count) {
+        std.debug.print("interop_quic_node[server]: gossipsub got {d}/{d} msgs\n", .{ seen_count, count });
+        return 1;
+    }
+    std.debug.print("interop_quic_node[server]: gossipsub got {d}/{d} msgs\n", .{ seen_count, count });
+    std.debug.print("interop_quic_node[server]: gossipsub ok\n", .{});
     return 0;
 }
