@@ -2217,3 +2217,473 @@ test "QuicRuntime: 3-node gossipsub propagation under sustained publishes" {
     try testing.expect(counter_b.count() >= expected);
     try testing.expect(counter_c.count() >= expected);
 }
+
+// ============================================================================
+// Interop test suite — extends the 3-node baseline with mesh-scale + workload-
+// shape coverage that matches zeam's deployment pattern.  Each test builds a
+// small all-to-all QuicRuntime mesh, runs a focused traffic shape, and asserts
+// the outcome.  Helpers (`buildTestBundle`, `Drainer`, `GossipCounter`) are
+// reused from the tests above.
+// ============================================================================
+
+/// Minimal cluster scaffold: bring up `n` Hosts + QuicRuntimes, wire them in a
+/// full all-to-all outbound mesh, return the slices.  Caller drives, polls,
+/// and tears down.  Hard-coded for n ≤ 8 because each host needs its own
+/// deterministic test bundle seed.
+const ClusterCfg = struct {
+    n: usize,
+    /// Per-host topic_validator.  Same fn for all hosts.  Null = no validator.
+    topic_validator: ?*const fn (?*anyopaque, []const u8, []const u8) gossipsub_runtime_pkg.ValidationResult = null,
+    /// Per-host validator contexts.  Slice length must equal `n`.  Each entry
+    /// is passed verbatim to that host's gossipsub config.
+    validator_ctxs: ?[]const ?*anyopaque = null,
+};
+
+const ClusterHost = struct {
+    bundle: TestCertBundle,
+    host: *host_mod.Host,
+    rt: *QuicRuntime,
+};
+
+fn buildCluster(a: std.mem.Allocator, cfg: ClusterCfg) ![]ClusterHost {
+    const seeds = [_]u8{ 0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87 };
+    if (cfg.n > seeds.len) return error.ClusterTooLarge;
+    if (cfg.validator_ctxs) |c| if (c.len != cfg.n) return error.CtxLenMismatch;
+
+    var out = try a.alloc(ClusterHost, cfg.n);
+    errdefer a.free(out);
+    var built: usize = 0;
+    errdefer for (out[0..built]) |*h| {
+        h.rt.destroy();
+        h.host.destroy();
+        h.bundle.deinit(a);
+    };
+
+    for (0..cfg.n) |i| {
+        out[i].bundle = try buildTestBundle(a, "cluster", seeds[i]);
+        const validator_ctx = if (cfg.validator_ctxs) |c| c[i] else null;
+        out[i].host = try host_mod.Host.create(.{
+            .allocator = a,
+            .local_peer = out[i].bundle.peer,
+            .gossipsub = .{
+                .local_peer_id = out[i].bundle.peer,
+                .topic_validator = cfg.topic_validator,
+                .validator_ctx = validator_ctx,
+            },
+        });
+        try out[i].host.startBackground();
+        if (!out[i].host.waitUntilReady(5_000)) return error.HostNotReady;
+        out[i].rt = try QuicRuntime.create(.{
+            .allocator = a,
+            .host = out[i].host,
+            .tls_pem = .{ .pem_bytes = .{ .cert_pem = out[i].bundle.cert_pem, .key_pem = out[i].bundle.key_pem } },
+            .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+        });
+        try out[i].rt.start();
+        built += 1;
+    }
+
+    // Wire the all-to-all outbound mesh.  Each host registers every other
+    // host's multiaddr as a known peer, which the connection_manager
+    // background dials.
+    for (out) |*hi| {
+        for (out) |*hj| {
+            if (hi.bundle.peer.eql(&hj.bundle.peer)) continue;
+            const port = hj.rt.boundUdpPortIpv4() orelse return error.NoBoundPort;
+            var b58: [128]u8 = undefined;
+            const s = try hj.bundle.peer.toBase58(&b58);
+            const ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ port, s });
+            defer a.free(ma_str);
+            var ma = try multiaddr.Multiaddr.fromString(a, ma_str);
+            defer ma.deinit();
+            try hi.rt.registerKnownPeer(&ma, hj.bundle.peer);
+        }
+    }
+    return out;
+}
+
+fn destroyCluster(a: std.mem.Allocator, cluster: []ClusterHost) void {
+    for (cluster) |*h| {
+        h.rt.destroy();
+        h.host.destroy();
+        h.bundle.deinit(a);
+    }
+    a.free(cluster);
+}
+
+/// Block until every host in the cluster has every other host in its
+/// `outbound_by_peer` map, or the deadline elapses.
+fn waitMeshConverged(cluster: []ClusterHost, deadline_ms: i64) bool {
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        var all_ok = true;
+        for (cluster) |*hi| {
+            for (cluster) |*hj| {
+                if (hi.bundle.peer.eql(&hj.bundle.peer)) continue;
+                if (hi.rt.outbound_by_peer.get(hj.bundle.peer) == null) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (!all_ok) break;
+        }
+        if (all_ok) return true;
+        var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+    return false;
+}
+
+const ClusterDrainer = struct {
+    fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+        const dl = wall_time.milliTimestamp() + 120_000;
+        while (wall_time.milliTimestamp() < dl) {
+            if (done.load(.acquire)) return;
+            var ev = h.nextEvent(100) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return,
+            };
+            ev.deinit(h.allocator);
+        }
+    }
+};
+
+test "QuicRuntime: 5-node gossipsub mesh under sustained publishes" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const n: usize = 5;
+
+    // Per-host validator counters so we can assert delivery per receiver.
+    var counters: [n]*GossipCounter = undefined;
+    for (0..n) |i| {
+        counters[i] = try a.create(GossipCounter);
+        counters[i].* = .{};
+    }
+    defer for (counters) |c| a.destroy(c);
+
+    var ctx_storage: [n]?*anyopaque = undefined;
+    for (0..n) |i| ctx_storage[i] = @as(*anyopaque, @ptrCast(counters[i]));
+
+    const cluster = try buildCluster(a, .{
+        .n = n,
+        .topic_validator = gossipCountValidator,
+        .validator_ctxs = ctx_storage[0..],
+    });
+    defer destroyCluster(a, cluster);
+
+    // Drainers for all hosts.
+    var drain_done = std.atomic.Value(bool).init(false);
+    var threads = std.ArrayList(std.Thread).empty;
+    defer threads.deinit(a);
+    defer {
+        drain_done.store(true, .release);
+        for (threads.items) |th| th.join();
+    }
+    for (cluster) |*ch| {
+        const th = try std.Thread.spawn(.{}, ClusterDrainer.run, .{ ch.host, &drain_done });
+        try threads.append(a, th);
+    }
+
+    try testing.expect(waitMeshConverged(cluster, wall_time.milliTimestamp() + 20_000));
+
+    for (cluster) |*ch| try ch.host.subscribe("interop/topic");
+
+    // Publish 20 messages from each of the first 3 hosts.  Gossipsub does
+    // NOT fire the local validator on the publisher's own publishes (the
+    // sender already has the message), so receiver counts differ between
+    // publishers and pure listeners:
+    //   - hosts 0..n_publishers (each is also a publisher) see
+    //     (n_publishers - 1) × pubs_per_host messages from the *other*
+    //     publishers
+    //   - hosts n_publishers..n see all n_publishers × pubs_per_host
+    const pubs_per_host: usize = 20;
+    const n_publishers: usize = 3;
+    for (cluster[0..n_publishers], 0..) |*ch, p| {
+        for (0..pubs_per_host) |i| {
+            var buf: [32]u8 = undefined;
+            const payload = try std.fmt.bufPrint(&buf, "h{d}-m{d}", .{ p, i });
+            try ch.host.publish("interop/topic", payload);
+            var req = std.c.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+    }
+
+    const expected_pub: usize = (n_publishers - 1) * pubs_per_host;
+    const expected_listener: usize = n_publishers * pubs_per_host;
+    const dl = wall_time.milliTimestamp() + 30_000;
+    while (wall_time.milliTimestamp() < dl) {
+        var all = true;
+        for (counters, 0..) |c, i| {
+            const exp = if (i < n_publishers) expected_pub else expected_listener;
+            if (c.count() < exp) {
+                all = false;
+                break;
+            }
+        }
+        if (all) break;
+        var req = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    for (counters, 0..) |c, i| {
+        const exp = if (i < n_publishers) expected_pub else expected_listener;
+        if (c.count() < exp) {
+            std.debug.print("5-node mesh: host[{d}] got {d}/{d}\n", .{ i, c.count(), exp });
+        }
+        try testing.expect(c.count() >= exp);
+    }
+}
+
+test "QuicRuntime: req-resp burst — multiple inflight requests per peer" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+
+    const cluster = try buildCluster(a, .{ .n = 2 });
+    defer destroyCluster(a, cluster);
+
+    var drain_done = std.atomic.Value(bool).init(false);
+    // B is the requester — only drain A (responder); we manually loop B's
+    // events in the test thread to observe response chunks.
+    var a_drainer = try std.Thread.spawn(.{}, struct {
+        fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+            const dl = wall_time.milliTimestamp() + 60_000;
+            while (wall_time.milliTimestamp() < dl) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(100) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                defer ev.deinit(h.allocator);
+                switch (ev) {
+                    .rpc_request => |r| {
+                        h.sendResponseChunk(r.channel_id, "OK", wall_time.milliTimestamp()) catch {};
+                        h.finishResponseStream(r.channel_id) catch {};
+                    },
+                    else => {},
+                }
+            }
+        }
+    }.run, .{ cluster[0].host, &drain_done });
+    defer {
+        drain_done.store(true, .release);
+        a_drainer.join();
+    }
+
+    try testing.expect(waitMeshConverged(cluster, wall_time.milliTimestamp() + 20_000));
+
+    // Fire 16 status requests back-to-back from B → A without waiting for
+    // each response.  Exercises req-resp's multi-inflight bookkeeping.
+    const n_req: usize = 16;
+    for (0..n_req) |_| {
+        _ = try cluster[1].host.sendRequest(cluster[0].bundle.peer, .status, "REQ", 15_000);
+    }
+
+    var ends: usize = 0;
+    var chunks: usize = 0;
+    const dl = wall_time.milliTimestamp() + 30_000;
+    while (wall_time.milliTimestamp() < dl and ends < n_req) {
+        var ev = cluster[1].host.nextEvent(500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        defer ev.deinit(a);
+        switch (ev) {
+            .rpc_response_chunk => chunks += 1,
+            .rpc_response_end => ends += 1,
+            else => {},
+        }
+    }
+
+    try testing.expectEqual(@as(usize, n_req), ends);
+    try testing.expect(chunks >= n_req); // at least one chunk per request
+}
+
+test "QuicRuntime: mixed gossipsub pub + req-resp on same hosts" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const n: usize = 3;
+
+    var counters: [n]*GossipCounter = undefined;
+    for (0..n) |i| {
+        counters[i] = try a.create(GossipCounter);
+        counters[i].* = .{};
+    }
+    defer for (counters) |c| a.destroy(c);
+    var ctx: [n]?*anyopaque = undefined;
+    for (0..n) |i| ctx[i] = @as(*anyopaque, @ptrCast(counters[i]));
+
+    const cluster = try buildCluster(a, .{
+        .n = n,
+        .topic_validator = gossipCountValidator,
+        .validator_ctxs = ctx[0..],
+    });
+    defer destroyCluster(a, cluster);
+
+    // All hosts respond to incoming req-resp + drain events.
+    var drain_done = std.atomic.Value(bool).init(false);
+    const Responder = struct {
+        fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+            const dl = wall_time.milliTimestamp() + 60_000;
+            while (wall_time.milliTimestamp() < dl) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(100) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                defer ev.deinit(h.allocator);
+                switch (ev) {
+                    .rpc_request => |r| {
+                        h.sendResponseChunk(r.channel_id, "RR-OK", wall_time.milliTimestamp()) catch {};
+                        h.finishResponseStream(r.channel_id) catch {};
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+    var threads = std.ArrayList(std.Thread).empty;
+    defer threads.deinit(a);
+    defer {
+        drain_done.store(true, .release);
+        for (threads.items) |th| th.join();
+    }
+    for (cluster) |*ch| {
+        const th = try std.Thread.spawn(.{}, Responder.run, .{ ch.host, &drain_done });
+        try threads.append(a, th);
+    }
+
+    try testing.expect(waitMeshConverged(cluster, wall_time.milliTimestamp() + 20_000));
+    for (cluster) |*ch| try ch.host.subscribe("mixed/topic");
+
+    // Interleave 10 publishes from host 0 with 10 status requests from host 0
+    // to host 1.  Exercises both paths running concurrently on shared
+    // connection state.
+    const n_iter: usize = 10;
+    for (0..n_iter) |i| {
+        var buf: [32]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&buf, "mix-{d}", .{i});
+        try cluster[0].host.publish("mixed/topic", payload);
+        _ = try cluster[0].host.sendRequest(cluster[1].bundle.peer, .status, "REQ", 15_000);
+        var req = std.c.timespec{ .sec = 0, .nsec = 30 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    // Publisher (host 0) does NOT fire its own validator on its publishes,
+    // so only hosts 1..n should have the full count.
+    const dl = wall_time.milliTimestamp() + 20_000;
+    while (wall_time.milliTimestamp() < dl) {
+        var ok = true;
+        for (counters[1..]) |c| if (c.count() < n_iter) {
+            ok = false;
+            break;
+        };
+        if (ok) break;
+        var req = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    for (counters[1..], 1..) |c, i| {
+        if (c.count() < n_iter) {
+            std.debug.print("mixed: host[{d}] got {d}/{d}\n", .{ i, c.count(), n_iter });
+        }
+        try testing.expect(c.count() >= n_iter);
+    }
+}
+
+test "QuicRuntime: long-running sustained gossipsub (60s)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    // Long-running soak: skipped by default to keep `zig build test` fast.
+    // Flip `enable` to true locally or in a dedicated CI job to run.
+    const enable: bool = false;
+    if (!enable) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const n: usize = 3;
+
+    var counters: [n]*GossipCounter = undefined;
+    for (0..n) |i| {
+        counters[i] = try a.create(GossipCounter);
+        counters[i].* = .{};
+    }
+    defer for (counters) |c| a.destroy(c);
+    var ctx: [n]?*anyopaque = undefined;
+    for (0..n) |i| ctx[i] = @as(*anyopaque, @ptrCast(counters[i]));
+
+    const cluster = try buildCluster(a, .{
+        .n = n,
+        .topic_validator = gossipCountValidator,
+        .validator_ctxs = ctx[0..],
+    });
+    defer destroyCluster(a, cluster);
+
+    var drain_done = std.atomic.Value(bool).init(false);
+    var threads = std.ArrayList(std.Thread).empty;
+    defer threads.deinit(a);
+    defer {
+        drain_done.store(true, .release);
+        for (threads.items) |th| th.join();
+    }
+    for (cluster) |*ch| {
+        const th = try std.Thread.spawn(.{}, ClusterDrainer.run, .{ ch.host, &drain_done });
+        try threads.append(a, th);
+    }
+
+    try testing.expect(waitMeshConverged(cluster, wall_time.milliTimestamp() + 20_000));
+    for (cluster) |*ch| try ch.host.subscribe("soak/topic");
+
+    // 60-second window, one publish from host 0 every 200 ms ≈ 300 publishes.
+    // Asserts no slow-leak / state drift over time.
+    const soak_ms: i64 = 60_000;
+    const interval_ms: i64 = 200;
+    const start = wall_time.milliTimestamp();
+    var sent: usize = 0;
+    var next_at = start;
+    while (wall_time.milliTimestamp() - start < soak_ms) {
+        const now = wall_time.milliTimestamp();
+        if (now >= next_at) {
+            var buf: [32]u8 = undefined;
+            const payload = try std.fmt.bufPrint(&buf, "soak-{d}", .{sent});
+            try cluster[0].host.publish("soak/topic", payload);
+            sent += 1;
+            next_at = now + interval_ms;
+        }
+        var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    // After a short settle window every receiver should have all `sent`
+    // payloads.  Tolerate slack of up to 5 missing under heavy timing
+    // jitter — the failure surface we care about is total stall, not single
+    // dropped msgs.
+    const settle_dl = wall_time.milliTimestamp() + 10_000;
+    while (wall_time.milliTimestamp() < settle_dl) {
+        var ok = true;
+        for (counters) |c| if (c.count() + 5 < sent) {
+            ok = false;
+            break;
+        };
+        if (ok) break;
+        var req = std.c.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    for (counters, 0..) |c, i| {
+        if (c.count() + 5 < sent) {
+            std.debug.print("soak: host[{d}] got {d}/{d}\n", .{ i, c.count(), sent });
+        }
+        try testing.expect(c.count() + 5 >= sent);
+    }
+}
