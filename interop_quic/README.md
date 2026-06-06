@@ -11,7 +11,7 @@ QUIC + libp2p interop harness, separate from the existing `interop/` directory
 | B2 | libp2p TLS cert minter, peer-id wiring, `go-libp2p` impl container, matrix runner, nightly cross-impl workflow. |
 | B3 | Gossipsub pub/sub testcase. Go side fully wired; zig side stubbed (skip) pending the `/meshsub/1.1.0` QUIC-stream pipeline. |
 | B4 | Req/resp testcase. Fully wired on both impls over `/interop/b4/echo/1.0.0` — same multistream-select + raw-app-stream path as ping. |
-| B5 | `rust-libp2p` impl container. Full matrix expansion. |
+| B5 | `rust-libp2p` impl container. handshake + ping + reqresp pass; gossipsub skipped pending mesh-formation timing fix. Matrix runner extended to 3-corner. |
 
 ## Binary
 

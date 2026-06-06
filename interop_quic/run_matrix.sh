@@ -55,6 +55,13 @@ elif [[ -x "./interop_quic/impls/go-libp2p/interop-quic-node-go" ]]; then
     GO_BIN="./interop_quic/impls/go-libp2p/interop-quic-node-go"
 fi
 
+# rust-libp2p
+if command -v interop-quic-node-rust >/dev/null 2>&1; then
+    RUST_BIN="$(command -v interop-quic-node-rust)"
+elif [[ -x "./interop_quic/impls/rust-libp2p/target/release/interop-quic-node-rust" ]]; then
+    RUST_BIN="./interop_quic/impls/rust-libp2p/target/release/interop-quic-node-rust"
+fi
+
 require_zig() {
     if [[ -z "${ZIG_BIN:-}" || -z "${ZIG_CERT_BIN:-}" ]]; then
         echo "matrix: missing zig binaries (interop-quic-node + gen-libp2p-cert)" >&2
@@ -67,6 +74,12 @@ require_go() {
         exit 2
     fi
 }
+require_rust() {
+    if [[ -z "${RUST_BIN:-}" ]]; then
+        echo "matrix: missing rust-libp2p binary (interop-quic-node-rust)" >&2
+        exit 2
+    fi
+}
 
 # Validate everything we'll need up front so we fail fast rather than
 # mid-matrix.
@@ -74,6 +87,7 @@ for impl in "${IMPLS[@]}"; do
     case "${impl}" in
         zig) require_zig ;;
         go-libp2p) require_go ;;
+        rust-libp2p) require_rust ;;
         *) echo "matrix: unknown impl=${impl}" >&2; exit 2 ;;
     esac
 done
@@ -126,6 +140,19 @@ start_server() {
             done
             SERVER_PEER_ID=$(awk -F= '/peer_id=/{print $2}' "${SERVER_LOG}" | head -1)
             ;;
+        rust-libp2p)
+            ROLE=server TESTCASE="${testcase}" LISTEN_PORT="${port}" \
+                SEED_HEX="${seed}" DEADLINE_MS="${DEADLINE_MS}" \
+                "${RUST_BIN}" > "${SERVER_LOG}" 2>&1 &
+            SERVER_PID=$!
+            local tries=0
+            while ! grep -q 'peer_id=' "${SERVER_LOG}" 2>/dev/null; do
+                tries=$((tries + 1))
+                if [[ ${tries} -gt 60 ]]; then break; fi
+                sleep 0.05
+            done
+            SERVER_PEER_ID=$(awk -F= '/peer_id=/{print $2}' "${SERVER_LOG}" | head -1)
+            ;;
     esac
 }
 
@@ -152,6 +179,13 @@ run_client() {
                 DEADLINE_MS="${DEADLINE_MS}" \
                 "${GO_BIN}"
             ;;
+        rust-libp2p)
+            ROLE=client TESTCASE="${testcase}" \
+                SERVER_HOST="${host}" SERVER_PORT="${port}" \
+                REMOTE_PEER_ID="${remote_pid}" \
+                DEADLINE_MS="${DEADLINE_MS}" \
+                "${RUST_BIN}"
+            ;;
     esac
 }
 
@@ -169,6 +203,7 @@ skipped=0
 skip_reason_for() {
     case "$1:$2" in
         zig:gossipsub) echo "gossipsub testcase not yet wired on zig side" ;;
+        rust-libp2p:gossipsub) echo "gossipsub mesh formation race on rust side; tracked as follow-up" ;;
         *) echo "" ;;
     esac
 }
