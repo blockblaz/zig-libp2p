@@ -1,17 +1,12 @@
-# Phase B2 — QUIC cross-impl interop matrix.
+# Phase B2 — QUIC interop matrix.
 #
-# Runs interop_quic/run_matrix.sh across {zig, go-libp2p} for both
-# handshake and ping testcases. Each (server_impl x client_impl x tc)
-# pair is reported in TAP form so failures are easy to scan in CI logs.
+# Split into two trigger surfaces so day-to-day PRs only see the
+# green baseline; cross-impl rows run on cron + manual dispatch only,
+# where their TAP `not ok` lines are the canary for upstream zquic
+# interop gaps and aren't expected to be green yet.
 #
-# Trigger surface is intentionally narrow:
-#   - workflow_dispatch — manual runs from the Actions tab.
-#   - schedule (nightly) — periodic regression catch.
-#   - pull_request — only when the matrix runner or impl containers
-#     themselves change, so day-to-day PRs don't pay the docker build
-#     cost. Cross-impl gaps in upstream zquic land tracked separately;
-#     pairs that hit those gaps will fail and that's intentional — the
-#     matrix output is the canary.
+#   pull_request          → same-impl only (must be green).
+#   schedule / dispatch   → full matrix incl. cross-impl.
 name: Interop QUIC (cross-impl)
 
 on:
@@ -26,15 +21,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  matrix:
-    name: ${{ matrix.tests }}
+  # Same-impl: zig↔zig and go↔go for handshake + ping. Both pass
+  # locally; required green on every PR. Runs on every trigger so a
+  # cron failure here is a real regression, not an upstream gap.
+  same-impl:
+    name: same-impl baseline
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        tests:
-          - same-impl
-          - cross-impl
     steps:
       - uses: actions/checkout@v4
 
@@ -55,21 +47,42 @@ jobs:
         working-directory: interop_quic/impls/go-libp2p
         run: go build -trimpath -o interop-quic-node-go .
 
-      # Same-impl is the green baseline: zig↔zig and go↔go. Both have
-      # passed locally for handshake + ping at the time of B2 PR.
-      - name: Matrix — same-impl baseline
-        if: matrix.tests == 'same-impl'
-        run: |
-          set -e
-          bash interop_quic/run_matrix.sh zig handshake,ping
-          bash interop_quic/run_matrix.sh go-libp2p handshake,ping
+      - name: Matrix — zig ↔ zig
+        run: bash interop_quic/run_matrix.sh zig handshake,ping
 
-      # Cross-impl currently exercises zquic TLS gaps that are tracked
-      # in upstream zquic issues; once those land + a zquic bump goes
-      # through, this job flips green without further changes here.
-      # We set continue-on-error so the cross-impl row is informational
-      # on PRs that aren't themselves about the matrix runner.
-      - name: Matrix — cross-impl (zig <-> go-libp2p)
-        if: matrix.tests == 'cross-impl'
+      - name: Matrix — go-libp2p ↔ go-libp2p
+        run: bash interop_quic/run_matrix.sh go-libp2p handshake,ping
+
+  # Cross-impl: zig ↔ go-libp2p in both directions × {handshake, ping}.
+  # Currently exercises outstanding zquic ↔ quic-go TLS gaps; once those
+  # land in upstream zquic + this repo bumps the dep, this job flips
+  # green without further changes here. NOT gated on pull_request — the
+  # `not ok` lines clutter PR reviews and don't reflect anything the PR
+  # author can fix locally.
+  cross-impl:
+    name: cross-impl (zig ↔ go-libp2p)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build zig binaries
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Build go-libp2p binary
+        working-directory: interop_quic/impls/go-libp2p
+        run: go build -trimpath -o interop-quic-node-go .
+
+      - name: Matrix — zig ↔ go-libp2p
         continue-on-error: true
         run: bash interop_quic/run_matrix.sh zig,go-libp2p handshake,ping
