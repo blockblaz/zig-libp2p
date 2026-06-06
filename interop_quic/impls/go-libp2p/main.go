@@ -1,18 +1,23 @@
-// go-libp2p side of the zig-libp2p QUIC interop runner (Phase B2).
+// go-libp2p side of the zig-libp2p QUIC interop runner (Phases B2 + B3).
 //
 // Same environment contract as examples/interop_quic_node.zig on the zig
 // side, so the matrix runner can wire either impl into either role:
 //
 //	ROLE        — "server" | "client"
-//	TESTCASE    — "handshake" | "ping"
+//	TESTCASE    — "handshake" | "ping" | "gossipsub"
 //	LISTEN_PORT — UDP port on which the server listens (default 4001)
 //	SERVER_HOST — IPv4 to dial (default 127.0.0.1)
 //	SERVER_PORT — UDP port to dial (default 4001)
 //	DEADLINE_MS — overall test deadline (default 30000)
 //	SEED_HEX    — 32-byte hex; deterministic ed25519 identity. When unset,
 //	              a random keypair is used.
-//	REMOTE_PEER_ID — client only; required for ping testcase, optional for
-//	              handshake (TLS leaf check via libp2p RFC 0001 either way).
+//	REMOTE_PEER_ID — client only; required for ping/gossipsub testcases.
+//
+// gossipsub-specific:
+//
+//	GS_TOPIC       — pubsub topic both sides subscribe to (default "/interop/b3")
+//	GS_COUNT       — number of messages the server publishes (default 5)
+//	GS_PAYLOAD_LEN — bytes per message payload, deterministic content (default 64)
 //
 // Stdout includes `go_libp2p_peer_id: peer_id=<base58btc>` on both roles so
 // the matrix runner can capture it without launching the binary twice.
@@ -35,6 +40,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/multiformats/go-multiaddr"
@@ -164,6 +170,9 @@ func runServer(ctx context.Context, testcase string) (int, error) {
 		fmt.Println("go_libp2p_interop[server]: ping ok")
 		return 0, nil
 
+	case "gossipsub":
+		return runGossipsubServer(ctx, h)
+
 	default:
 		return 2, fmt.Errorf("unknown TESTCASE=%s", testcase)
 	}
@@ -218,9 +227,141 @@ func runClient(ctx context.Context, testcase string) (int, error) {
 			return 1, ctx.Err()
 		}
 
+	case "gossipsub":
+		return runGossipsubClient(ctx, h, pi.ID)
+
 	default:
 		return 2, fmt.Errorf("unknown TESTCASE=%s", testcase)
 	}
+}
+
+// ── Gossipsub testcase (B3) ────────────────────────────────────────────────
+//
+// Server: subscribe to the topic, wait for a peer, publish N deterministic
+// messages, then exit. Client: subscribe, wait until N matching messages
+// have been received, then exit.
+//
+// Deterministic payload (`msg-%05d: <pad>`) is what makes the assertion
+// safe under message reordering and lets the next zig-side impl validate
+// against the same wire content.
+
+const (
+	defaultGsTopic      = "/interop/b3"
+	defaultGsCount      = 5
+	defaultGsPayloadLen = 64
+)
+
+func gsTopic() string  { return envOr("GS_TOPIC", defaultGsTopic) }
+func gsCount() int     { return envInt("GS_COUNT", defaultGsCount) }
+func gsPayLen() int    { return envInt("GS_PAYLOAD_LEN", defaultGsPayloadLen) }
+
+func gsPayload(idx, length int) []byte {
+	out := make([]byte, length)
+	header := []byte(fmt.Sprintf("msg-%05d:", idx))
+	if len(header) > length {
+		return header[:length]
+	}
+	copy(out, header)
+	// Pad the remainder with a fixed byte so the content is fully
+	// deterministic across runs / impls.
+	for i := len(header); i < length; i++ {
+		out[i] = 0x2A
+	}
+	return out
+}
+
+func runGossipsubServer(ctx context.Context, h host.Host) (int, error) {
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		return 1, fmt.Errorf("NewGossipSub: %w", err)
+	}
+	topic, err := ps.Join(gsTopic())
+	if err != nil {
+		return 1, fmt.Errorf("Join: %w", err)
+	}
+	// Subscribing on the server side keeps it as a mesh participant so
+	// the client's GRAFT lands and the topic-mesh forms.
+	sub, err := topic.Subscribe()
+	if err != nil {
+		return 1, fmt.Errorf("Subscribe: %w", err)
+	}
+	defer sub.Cancel()
+
+	if err := waitForInbound(ctx, h); err != nil {
+		return 1, err
+	}
+	// Give gossipsub time to form a mesh edge after the conn lands.
+	// pubsub.GossipSubHeartbeatInterval defaults to 1s; one full cycle
+	// is enough for the GRAFT to land on most networks. CI noise is
+	// the reason this isn't shorter.
+	select {
+	case <-time.After(1500 * time.Millisecond):
+	case <-ctx.Done():
+		return 1, ctx.Err()
+	}
+
+	count := gsCount()
+	plen := gsPayLen()
+	for i := 0; i < count; i++ {
+		if err := topic.Publish(ctx, gsPayload(i, plen)); err != nil {
+			return 1, fmt.Errorf("Publish #%d: %w", i, err)
+		}
+	}
+	fmt.Printf("go_libp2p_interop[server]: gossipsub published %d msgs on %q\n", count, gsTopic())
+
+	// Stay alive long enough for the client to drain the mesh.
+	select {
+	case <-time.After(3 * time.Second):
+	case <-ctx.Done():
+	}
+	fmt.Println("go_libp2p_interop[server]: gossipsub ok")
+	return 0, nil
+}
+
+func runGossipsubClient(ctx context.Context, h host.Host, peerID peer.ID) (int, error) {
+	_ = peerID // identified via the open conn; pubsub picks it up from h's network
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		return 1, fmt.Errorf("NewGossipSub: %w", err)
+	}
+	topic, err := ps.Join(gsTopic())
+	if err != nil {
+		return 1, fmt.Errorf("Join: %w", err)
+	}
+	sub, err := topic.Subscribe()
+	if err != nil {
+		return 1, fmt.Errorf("Subscribe: %w", err)
+	}
+	defer sub.Cancel()
+
+	count := gsCount()
+	plen := gsPayLen()
+	seen := make(map[string]struct{}, count)
+	want := make(map[string]struct{}, count)
+	for i := 0; i < count; i++ {
+		want[string(gsPayload(i, plen))] = struct{}{}
+	}
+
+	for len(seen) < count {
+		msg, err := sub.Next(ctx)
+		if err != nil {
+			return 1, fmt.Errorf("Next at %d/%d: %w", len(seen), count, err)
+		}
+		// Skip the local-loopback echo of our own subscription (none,
+		// since the client doesn't publish, but pubsub may forward
+		// duplicates).
+		key := string(msg.Data)
+		if _, ok := want[key]; !ok {
+			// Unexpected content — flag and keep going; the matrix
+			// will surface the total drift if anything is missing.
+			fmt.Printf("go_libp2p_interop[client]: gossipsub unexpected msg len=%d\n", len(msg.Data))
+			continue
+		}
+		seen[key] = struct{}{}
+	}
+	fmt.Printf("go_libp2p_interop[client]: gossipsub got %d/%d msgs\n", len(seen), count)
+	fmt.Println("go_libp2p_interop[client]: gossipsub ok")
+	return 0, nil
 }
 
 func waitForInbound(ctx context.Context, h host.Host) error {
