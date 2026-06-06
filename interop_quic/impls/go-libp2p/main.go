@@ -4,7 +4,7 @@
 // side, so the matrix runner can wire either impl into either role:
 //
 //	ROLE        — "server" | "client"
-//	TESTCASE    — "handshake" | "ping" | "gossipsub"
+//	TESTCASE    — "handshake" | "ping" | "gossipsub" | "reqresp"
 //	LISTEN_PORT — UDP port on which the server listens (default 4001)
 //	SERVER_HOST — IPv4 to dial (default 127.0.0.1)
 //	SERVER_PORT — UDP port to dial (default 4001)
@@ -19,6 +19,13 @@
 //	GS_COUNT       — number of messages the server publishes (default 5)
 //	GS_PAYLOAD_LEN — bytes per message payload, deterministic content (default 64)
 //
+// reqresp-specific:
+//
+//	RR_PAYLOAD_LEN — bytes per request+response (default 256). Wire format is
+//	                 a raw byte run; length is known to both sides via env.
+//	                 Protocol id is "/interop/b4/echo/1.0.0", pinned in the
+//	                 source so both impls reference the same string.
+//
 // Stdout includes `go_libp2p_peer_id: peer_id=<base58btc>` on both roles so
 // the matrix runner can capture it without launching the binary twice.
 //
@@ -31,6 +38,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"time"
@@ -41,10 +49,16 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/multiformats/go-multiaddr"
 )
+
+// B4 reqresp protocol id — pinned here so both impls agree on the same
+// string. See examples/interop_quic_node.zig:reqresp_protocol_id.
+const reqrespProtocolID protocol.ID = "/interop/b4/echo/1.0.0"
+const defaultRRPayloadLen = 256
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -173,6 +187,9 @@ func runServer(ctx context.Context, testcase string) (int, error) {
 	case "gossipsub":
 		return runGossipsubServer(ctx, h)
 
+	case "reqresp":
+		return runReqRespServer(ctx, h)
+
 	default:
 		return 2, fmt.Errorf("unknown TESTCASE=%s", testcase)
 	}
@@ -229,6 +246,9 @@ func runClient(ctx context.Context, testcase string) (int, error) {
 
 	case "gossipsub":
 		return runGossipsubClient(ctx, h, pi.ID)
+
+	case "reqresp":
+		return runReqRespClient(ctx, h, pi.ID)
 
 	default:
 		return 2, fmt.Errorf("unknown TESTCASE=%s", testcase)
@@ -386,4 +406,92 @@ func (n *connNotifier) Connected(_ network.Network, _ network.Conn) {
 	case n.ready <- struct{}{}:
 	default:
 	}
+}
+
+// ── Reqresp testcase (B4) ─────────────────────────────────────────────────
+//
+// Single-shot echo over /interop/b4/echo/1.0.0:
+//   - Server registers a stream handler that reads RR_PAYLOAD_LEN bytes
+//     then writes them back.
+//   - Client opens the stream, sends RR_PAYLOAD_LEN deterministic bytes
+//     (low-byte counter `i & 0xff` — matches the zig impl), reads the
+//     echo, asserts equality.
+
+func rrPayloadLen() int { return envInt("RR_PAYLOAD_LEN", defaultRRPayloadLen) }
+
+func rrRequestPayload(length int) []byte {
+	out := make([]byte, length)
+	for i := range out {
+		out[i] = byte(i & 0xff)
+	}
+	return out
+}
+
+func runReqRespServer(ctx context.Context, h host.Host) (int, error) {
+	plen := rrPayloadLen()
+	done := make(chan error, 1)
+
+	h.SetStreamHandler(reqrespProtocolID, func(s network.Stream) {
+		defer s.Close()
+		buf := make([]byte, plen)
+		if _, err := io.ReadFull(s, buf); err != nil {
+			done <- fmt.Errorf("read: %w", err)
+			return
+		}
+		if _, err := s.Write(buf); err != nil {
+			done <- fmt.Errorf("write: %w", err)
+			return
+		}
+		// CloseWrite signals EOF to the dialer so it can drain cleanly
+		// rather than waiting on the deadline.
+		if err := s.CloseWrite(); err != nil {
+			done <- fmt.Errorf("close-write: %w", err)
+			return
+		}
+		done <- nil
+	})
+
+	if err := waitForInbound(ctx, h); err != nil {
+		return 1, err
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return 1, err
+		}
+	case <-ctx.Done():
+		return 1, ctx.Err()
+	}
+	fmt.Printf("go_libp2p_interop[server]: reqresp ok (%d bytes)\n", plen)
+	return 0, nil
+}
+
+func runReqRespClient(ctx context.Context, h host.Host, peerID peer.ID) (int, error) {
+	plen := rrPayloadLen()
+	s, err := h.NewStream(ctx, peerID, reqrespProtocolID)
+	if err != nil {
+		return 1, fmt.Errorf("NewStream: %w", err)
+	}
+	defer s.Close()
+
+	req := rrRequestPayload(plen)
+	if _, err := s.Write(req); err != nil {
+		return 1, fmt.Errorf("write: %w", err)
+	}
+	if err := s.CloseWrite(); err != nil {
+		return 1, fmt.Errorf("close-write: %w", err)
+	}
+
+	resp := make([]byte, plen)
+	if _, err := io.ReadFull(s, resp); err != nil {
+		return 1, fmt.Errorf("read: %w", err)
+	}
+	for i, b := range resp {
+		if b != req[i] {
+			return 1, fmt.Errorf("reqresp mismatch at byte %d: got %02x want %02x", i, b, req[i])
+		}
+	}
+	fmt.Printf("go_libp2p_interop[client]: reqresp ok (%d bytes)\n", plen)
+	return 0, nil
 }

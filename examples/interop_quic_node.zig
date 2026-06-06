@@ -7,7 +7,11 @@
 //! Environment variables:
 //!
 //!   ROLE           — "server" (listen) or "client" (dial)
-//!   TESTCASE       — "handshake", "ping", or "gossipsub" (B3 stub on zig side)
+//!   TESTCASE       — "handshake", "ping", "gossipsub" (B3 stub on zig side),
+//!                    or "reqresp" (B4 — echo over a libp2p stream)
+//!   RR_PAYLOAD_LEN — bytes per request/response on the reqresp testcase
+//!                    (default 256). Length is known to both sides via env;
+//!                    on the wire it's a raw byte run, no length prefix.
 //!   LISTEN_PORT    — UDP port for server (default 4001)
 //!   SERVER_HOST    — dial target IPv4 dotted-decimal (default "127.0.0.1")
 //!   SERVER_PORT    — dial target port for client (default 4001)
@@ -46,6 +50,12 @@ const Io = std.Io;
 
 const default_listen_port: u16 = 4001;
 const default_deadline_ms: i64 = 30_000;
+
+/// B4 req-resp testcase protocol id.  Pinned here so both impls reference
+/// the same string and the env contract stays tight; no version skew across
+/// runners.
+const reqresp_protocol_id: []const u8 = "/interop/b4/echo/1.0.0";
+const default_reqresp_payload_len: usize = 256;
 
 fn getEnv(key: []const u8) ?[]const u8 {
     // zig 0.16 dropped std.posix.getenv; use C getenv directly.  Always
@@ -148,8 +158,91 @@ fn runServer(
         return serveOnePingResponder(a, listener, accepted.?, &recv_buf, dl);
     }
 
+    if (std.mem.eql(u8, testcase, "reqresp")) {
+        const payload_len = envInt(usize, "RR_PAYLOAD_LEN", default_reqresp_payload_len);
+        return serveOneReqRespResponder(a, listener, accepted.?, &recv_buf, dl, payload_len);
+    }
+
     std.debug.print("interop_quic_node[server]: unknown TESTCASE={s}\n", .{testcase});
     return 2;
+}
+
+/// B4 server: accept one inbound stream, multistream-select
+/// `/interop/b4/echo/1.0.0`, read RR_PAYLOAD_LEN bytes, echo them back.
+fn serveOneReqRespResponder(
+    a: std.mem.Allocator,
+    listener: *QuicListener,
+    conn: *ZIoConnState,
+    recv_buf: *[65536]u8,
+    deadline_ms: i64,
+    payload_len: usize,
+) !u8 {
+    const Ctx = struct {
+        sid: ?u64 = null,
+        fn cb(self_op: ?*anyopaque, _: *QuicListener, _: usize, _: *ZIoConnState, sid: u64) void {
+            const ctx_p: *@This() = @ptrCast(@alignCast(self_op.?));
+            if (ctx_p.sid == null) ctx_p.sid = sid;
+        }
+    };
+    var ctx = Ctx{};
+    listener.lifecycle.ctx = &ctx;
+    listener.lifecycle.on_inbound_stream_ready = Ctx.cb;
+
+    while (wall_time.milliTimestamp() < deadline_ms and ctx.sid == null) {
+        listener.drive(recv_buf, 5) catch {};
+    }
+    const sid = ctx.sid orelse {
+        std.debug.print("interop_quic_node[server]: reqresp: stream timeout\n", .{});
+        return 1;
+    };
+    std.debug.print("interop_quic_node[server]: reqresp: got stream sid={d}\n", .{sid});
+
+    var raw = RawAppBidiServer{
+        .server = listener.server,
+        .conn = conn,
+        .stream_id = sid,
+    };
+
+    const init_wlen = try stream_multistream.initiatorFirstWriteWireLen(reqresp_protocol_id);
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        listener.drive(recv_buf, 5) catch {};
+        if (raw.unreadRecvLen() >= init_wlen) break;
+    } else return 1;
+
+    {
+        var r = raw.reader();
+        var w = raw.writer();
+        try stream_multistream.responderHandshakeMultistream(&r, &w, reqresp_protocol_id, a);
+    }
+
+    // Drain RR_PAYLOAD_LEN request bytes — allocate on heap since this is
+    // a runtime-size buffer (ping has a comptime fixed 32).
+    const buf = try a.alloc(u8, payload_len);
+    defer a.free(buf);
+
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        listener.drive(recv_buf, 5) catch {};
+        if (raw.unreadRecvLen() >= payload_len) break;
+    } else return 1;
+
+    {
+        var r = raw.reader();
+        try Io.Reader.readSliceAll(&r, buf);
+    }
+
+    // Echo back the exact same bytes; matches the deterministic payload
+    // the client builds (see `clientOneReqRespInitiator`).
+    {
+        var w = raw.writer();
+        Io.Writer.writeAll(&w, buf) catch return 1;
+        Io.Writer.flush(&w) catch return 1;
+    }
+
+    const flush_until = wall_time.milliTimestamp() + 500;
+    while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
+
+    std.debug.print("interop_quic_node[server]: reqresp ok ({d} bytes)\n", .{payload_len});
+    return 0;
 }
 
 fn serveOnePingResponder(
@@ -286,8 +379,82 @@ fn runClient(
         return clientOnePingInitiator(a, &outbound, &recv_buf, dl);
     }
 
+    if (std.mem.eql(u8, testcase, "reqresp")) {
+        const payload_len = envInt(usize, "RR_PAYLOAD_LEN", default_reqresp_payload_len);
+        return clientOneReqRespInitiator(a, &outbound, &recv_buf, dl, payload_len);
+    }
+
     std.debug.print("interop_quic_node[client]: unknown TESTCASE={s}\n", .{testcase});
     return 2;
+}
+
+/// B4 client: open one bidi stream, multistream-select
+/// `/interop/b4/echo/1.0.0`, send RR_PAYLOAD_LEN deterministic bytes,
+/// read echo, assert match.
+fn clientOneReqRespInitiator(
+    a: std.mem.Allocator,
+    outbound: *QuicOutbound,
+    recv_buf: *[65536]u8,
+    deadline_ms: i64,
+    payload_len: usize,
+) !u8 {
+    const sid = try outbound.nextLocalBidiStream();
+    var raw = RawAppBidiClient{
+        .client = outbound.client,
+        .stream_id = sid,
+    };
+
+    {
+        var pre = std.ArrayList(u8).empty;
+        defer pre.deinit(a);
+        try stream_multistream.appendFirstStreamInitiatorHandshake(&pre, a, reqresp_protocol_id);
+        var w = raw.writer();
+        Io.Writer.writeAll(&w, pre.items) catch return 1;
+        Io.Writer.flush(&w) catch return 1;
+    }
+
+    const resp_wlen = try stream_multistream.responderSuccessReplyWireLen(reqresp_protocol_id);
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        outbound.drive(recv_buf, 5) catch {};
+        if (raw.unreadRecvLen() >= resp_wlen) break;
+    } else return 1;
+
+    {
+        var r = raw.reader();
+        var w = raw.writer();
+        try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, reqresp_protocol_id, a);
+    }
+
+    // Deterministic payload: low-byte counter so any impl can mint the
+    // same bytes for assertion. Keeps the wire byte-stable across runs.
+    const req = try a.alloc(u8, payload_len);
+    defer a.free(req);
+    for (req, 0..) |*b, i| b.* = @intCast(i & 0xff);
+
+    {
+        var w = raw.writer();
+        Io.Writer.writeAll(&w, req) catch return 1;
+        Io.Writer.flush(&w) catch return 1;
+    }
+
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        outbound.drive(recv_buf, 5) catch {};
+        if (raw.unreadRecvLen() >= payload_len) break;
+    } else return 1;
+
+    const echo = try a.alloc(u8, payload_len);
+    defer a.free(echo);
+    {
+        var r = raw.reader();
+        try Io.Reader.readSliceAll(&r, echo);
+    }
+    if (!std.mem.eql(u8, req, echo)) {
+        std.debug.print("interop_quic_node[client]: reqresp payload mismatch\n", .{});
+        return 1;
+    }
+
+    std.debug.print("interop_quic_node[client]: reqresp ok ({d} bytes)\n", .{payload_len});
+    return 0;
 }
 
 fn clientOnePingInitiator(
