@@ -970,6 +970,13 @@ pub const QuicRuntime = struct {
 
     fn removeInboundStreamAt(self: *QuicRuntime, index: usize) void {
         const ist = self.inbound_streams.items[index];
+        // Release the zquic-side raw_app slot so the connection's 64-slot
+        // table doesn't fill up.  Without this, the libp2p
+        // per-message-stream gossipsub pattern (each publish opens a fresh
+        // /meshsub/1.1.0 stream and FINs) exhausts all slots within ~30 s
+        // of normal traffic and every subsequent inbound STREAM frame is
+        // silently dropped by zquic.  See ch4r10t33r/zquic#149.
+        _ = ZIo.releaseRawAppStream(ist.conn, ist.stream_id, self.allocator);
         if (ist.channel_id) |cid| _ = self.channel_to_inbound.remove(cid);
         ist.req_acc.deinit(self.allocator);
         ist.gossip_acc.deinit(self.allocator);
@@ -1117,6 +1124,18 @@ pub const QuicRuntime = struct {
                             std.mem.copyForwards(u8, ist.gossip_acc.items[0..remaining], ist.gossip_acc.items[consumed..]);
                         }
                         ist.gossip_acc.shrinkRetainingCapacity(remaining);
+                    }
+                    // libp2p gossipsub publishes use the per-message-stream
+                    // pattern: open stream → one length-prefixed RPC frame →
+                    // FIN.  When zquic has seen the FIN and we've drained the
+                    // accumulator down to nothing, the stream is done — drop
+                    // it so the zquic 64-slot raw-app table can take the
+                    // next inbound stream (see ch4r10t33r/zquic#149).
+                    if (ist.gossip_acc.items.len == 0 and
+                        ZIo.rawAppStreamFinReceived(ist.conn, ist.stream_id))
+                    {
+                        self.removeInboundStreamAt(i);
+                        continue;
                     }
                 },
                 else => |idx| {
