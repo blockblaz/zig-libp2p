@@ -13,6 +13,7 @@ const examples: []const struct {
     .{ .exe_name = "example-req-resp-tcp-status", .root = "examples/req_resp_tcp_status.zig" },
     .{ .exe_name = "example-quic-ping-loopback", .root = "examples/quic_ping_loopback.zig" },
     .{ .exe_name = "example-host-quic-node", .root = "examples/host_quic_node.zig" },
+    .{ .exe_name = "interop-quic-node", .root = "examples/interop_quic_node.zig" },
 };
 
 pub fn build(b: *std.Build) void {
@@ -134,6 +135,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         ex_mod.addImport("zig_libp2p", mod);
+        // interop-quic-node needs multiaddr + zquic directly: it builds the
+        // dial multiaddr itself and references zquic's ConnState type for
+        // the QuicListener inbound-stream lifecycle hook.
+        if (std.mem.eql(u8, ex.exe_name, "interop-quic-node")) {
+            ex_mod.addImport("multiaddr", multiaddr_dep.module("multiaddr"));
+            ex_mod.addImport("zquic", zquic_mod);
+        }
 
         const exe = b.addExecutable(.{
             .name = ex.exe_name,
@@ -145,7 +153,8 @@ pub fn build(b: *std.Build) void {
         exe.step.dependOn(&run_unit_tests.step);
         if (prev_example_run) |prev| exe.step.dependOn(prev);
 
-        const smoke_run = !std.mem.eql(u8, ex.exe_name, "example-req-resp-tcp-status");
+        const smoke_run = !std.mem.eql(u8, ex.exe_name, "example-req-resp-tcp-status") and
+            !std.mem.eql(u8, ex.exe_name, "interop-quic-node");
         if (smoke_run) {
             const run_ex = b.addRunArtifact(exe);
             run_ex.step.dependOn(&exe.step);
