@@ -10,7 +10,7 @@ QUIC + libp2p interop harness, separate from the existing `interop/` directory
 | B1 | This dir. `interop-quic-node` binary, Dockerfile, self-test, GH workflow. zig-libp2p ↔ zig-libp2p only. |
 | B2 | libp2p TLS cert minter, peer-id wiring, `go-libp2p` impl container, matrix runner, nightly cross-impl workflow. |
 | B3 | Gossipsub pub/sub testcase. Go side fully wired; zig side stubbed (skip) pending the `/meshsub/1.1.0` QUIC-stream pipeline. |
-| B4 | Req/resp testcase. |
+| B4 | Req/resp testcase. Fully wired on both impls over `/interop/b4/echo/1.0.0` — same multistream-select + raw-app-stream path as ping. |
 | B5 | `rust-libp2p` impl container. Full matrix expansion. |
 
 ## Binary
@@ -21,10 +21,11 @@ Single binary; role and testcase come from environment.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `ROLE` | `server` | `server` (listen) or `client` (dial) |
-| `TESTCASE` | `handshake` | `handshake` (QUIC handshake only), `ping` (handshake + `/ipfs/ping/1.0.0`), or `gossipsub` (B3 — zig side currently returns exit 3 / TAP skip) |
+| `TESTCASE` | `handshake` | `handshake` (QUIC handshake only), `ping` (handshake + `/ipfs/ping/1.0.0`), `gossipsub` (B3 — zig side currently returns exit 3 / TAP skip), or `reqresp` (B4 — echo over `/interop/b4/echo/1.0.0`) |
 | `GS_TOPIC` | `/interop/b3` | gossipsub topic both sides subscribe to |
 | `GS_COUNT` | `5` | gossipsub: number of messages the server publishes |
 | `GS_PAYLOAD_LEN` | `64` | gossipsub: bytes per message; payload is deterministic (`msg-NNNNN:` + 0x2A padding) so multiple impls assert on identical bytes |
+| `RR_PAYLOAD_LEN` | `256` | reqresp: bytes per request+response. Client mints a low-byte counter (`i & 0xff`); server echoes verbatim so the wire byte sequence is fully deterministic. |
 | `LISTEN_PORT` | `4001` | server bind port |
 | `SERVER_HOST` | `127.0.0.1` | client dial target (IPv4 dotted-decimal) |
 | `SERVER_PORT` | `4001` | client dial port |
