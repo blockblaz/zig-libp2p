@@ -202,7 +202,6 @@ skipped=0
 # instead of an associative array because macOS still ships bash 3.2.
 skip_reason_for() {
     case "$1:$2" in
-        zig:gossipsub) echo "gossipsub testcase not yet wired on zig side" ;;
         rust-libp2p:gossipsub) echo "gossipsub mesh formation race on rust side; tracked as follow-up" ;;
         *) echo "" ;;
     esac
