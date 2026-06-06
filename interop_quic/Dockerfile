@@ -32,16 +32,16 @@ RUN zig build -Doptimize=ReleaseFast
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates openssl \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/zig-out/bin/interop-quic-node /usr/local/bin/interop-quic-node
+COPY --from=builder /build/zig-out/bin/gen-libp2p-cert /usr/local/bin/gen-libp2p-cert
 COPY interop_quic/run_endpoint.sh /usr/local/bin/run_endpoint.sh
 COPY interop_quic/self_test.sh /usr/local/bin/self_test.sh
-COPY interop_quic/gen_certs.sh /usr/local/bin/gen_certs.sh
 RUN chmod +x /usr/local/bin/run_endpoint.sh \
               /usr/local/bin/interop-quic-node \
-              /usr/local/bin/self_test.sh \
-              /usr/local/bin/gen_certs.sh
+              /usr/local/bin/gen-libp2p-cert \
+              /usr/local/bin/self_test.sh
 
 ENTRYPOINT ["/usr/local/bin/run_endpoint.sh"]

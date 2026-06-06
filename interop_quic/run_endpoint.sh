@@ -13,9 +13,10 @@ CERT_PATH="${CERT_PATH:-/certs/cert.pem}"
 KEY_PATH="${KEY_PATH:-/certs/key.pem}"
 
 if [[ ! -s "${CERT_PATH}" || ! -s "${KEY_PATH}" ]]; then
-    echo "run_endpoint: generating self-signed cert pair at ${CERT_PATH} / ${KEY_PATH}" >&2
+    echo "run_endpoint: minting libp2p TLS cert at ${CERT_PATH} / ${KEY_PATH}" >&2
     mkdir -p "$(dirname "${CERT_PATH}")"
-    /usr/local/bin/gen_certs.sh "${CERT_PATH}" "${KEY_PATH}"
+    CERT_PATH="${CERT_PATH}" KEY_PATH="${KEY_PATH}" \
+        /usr/local/bin/gen-libp2p-cert
 fi
 
 echo "run_endpoint: ROLE=${ROLE} TESTCASE=${TESTCASE}"

@@ -14,6 +14,7 @@ const examples: []const struct {
     .{ .exe_name = "example-quic-ping-loopback", .root = "examples/quic_ping_loopback.zig" },
     .{ .exe_name = "example-host-quic-node", .root = "examples/host_quic_node.zig" },
     .{ .exe_name = "interop-quic-node", .root = "examples/interop_quic_node.zig" },
+    .{ .exe_name = "gen-libp2p-cert", .root = "examples/gen_libp2p_cert.zig" },
 };
 
 pub fn build(b: *std.Build) void {
@@ -154,7 +155,8 @@ pub fn build(b: *std.Build) void {
         if (prev_example_run) |prev| exe.step.dependOn(prev);
 
         const smoke_run = !std.mem.eql(u8, ex.exe_name, "example-req-resp-tcp-status") and
-            !std.mem.eql(u8, ex.exe_name, "interop-quic-node");
+            !std.mem.eql(u8, ex.exe_name, "interop-quic-node") and
+            !std.mem.eql(u8, ex.exe_name, "gen-libp2p-cert");
         if (smoke_run) {
             const run_ex = b.addRunArtifact(exe);
             run_ex.step.dependOn(&exe.step);

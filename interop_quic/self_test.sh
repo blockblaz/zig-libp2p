@@ -16,13 +16,10 @@ PORT="${PORT:-14242}"
 DEADLINE_MS="${DEADLINE_MS:-15000}"
 
 mkdir -p "${CERT_DIR}"
-if [[ ! -s "${CERT}" || ! -s "${KEY}" ]]; then
-    "$(dirname "$0")/gen_certs.sh" "${CERT}" "${KEY}"
-fi
 
-# Pick the binary: in the docker image it's at /usr/local/bin/interop-quic-node.
-# When running on a dev host, it's at ./zig-out/bin/interop-quic-node relative
-# to the repo root.
+# Pick the interop binary + the cert-mint binary. In the docker image they're
+# at /usr/local/bin/*; on a dev host they're at ./zig-out/bin/* relative to
+# the repo root.
 if command -v interop-quic-node >/dev/null 2>&1; then
     BIN="$(command -v interop-quic-node)"
 elif [[ -x "./zig-out/bin/interop-quic-node" ]]; then
@@ -30,6 +27,18 @@ elif [[ -x "./zig-out/bin/interop-quic-node" ]]; then
 else
     echo "self_test: cannot find interop-quic-node binary" >&2
     exit 2
+fi
+if command -v gen-libp2p-cert >/dev/null 2>&1; then
+    CERT_BIN="$(command -v gen-libp2p-cert)"
+elif [[ -x "./zig-out/bin/gen-libp2p-cert" ]]; then
+    CERT_BIN="./zig-out/bin/gen-libp2p-cert"
+else
+    echo "self_test: cannot find gen-libp2p-cert binary" >&2
+    exit 2
+fi
+
+if [[ ! -s "${CERT}" || ! -s "${KEY}" ]]; then
+    CERT_PATH="${CERT}" KEY_PATH="${KEY}" "${CERT_BIN}"
 fi
 
 # Start server in background.

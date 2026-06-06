@@ -6,14 +6,18 @@
 //!
 //! Environment variables:
 //!
-//!   ROLE        — "server" (listen) or "client" (dial)
-//!   TESTCASE    — "handshake" or "ping"
-//!   LISTEN_PORT — UDP port for server (default 4001)
-//!   SERVER_HOST — dial target IPv4 dotted-decimal (default "127.0.0.1")
-//!   SERVER_PORT — dial target port for client (default 4001)
-//!   CERT_PATH   — PEM cert path (default /certs/cert.pem)
-//!   KEY_PATH    — PEM EC key path (default /certs/key.pem)
-//!   DEADLINE_MS — overall test deadline (default 30000)
+//!   ROLE           — "server" (listen) or "client" (dial)
+//!   TESTCASE       — "handshake" or "ping"
+//!   LISTEN_PORT    — UDP port for server (default 4001)
+//!   SERVER_HOST    — dial target IPv4 dotted-decimal (default "127.0.0.1")
+//!   SERVER_PORT    — dial target port for client (default 4001)
+//!   CERT_PATH      — PEM cert path (default /certs/cert.pem)
+//!   KEY_PATH       — PEM EC key path (default /certs/key.pem)
+//!   DEADLINE_MS    — overall test deadline (default 30000)
+//!   REMOTE_PEER_ID — base58btc-encoded peer id of the dial target. When set
+//!                    on the client, dialExtended is used and the TLS leaf
+//!                    must produce a matching libp2p peer id (cross-impl
+//!                    interop with go-libp2p). Unset → legacy dial path.
 //!
 //! Exit codes:
 //!   0  success
@@ -29,6 +33,9 @@ const ZIoConnState = zquic.transport.io.ConnState;
 
 const QuicListener = zl.transport.quic_endpoint.QuicListener;
 const QuicOutbound = zl.transport.quic_endpoint.QuicOutbound;
+const dialExtended = zl.transport.quic_endpoint.dialExtended;
+const QuicOutboundDialOptions = zl.transport.quic_endpoint.QuicOutboundDialOptions;
+const PeerId = zl.peer_id.PeerId;
 const RawAppBidiClient = zl.transport.quic_raw_stream_io.RawAppBidiClient;
 const RawAppBidiServer = zl.transport.quic_raw_stream_io.RawAppBidiServer;
 const stream_multistream = zl.transport.stream_multistream;
@@ -210,23 +217,51 @@ fn runClient(
     var ma = try multiaddr.Multiaddr.fromString(a, ma_str);
     defer ma.deinit();
 
-    var outbound = try QuicOutbound.dial(a, ma, .{
-        .client_cert_path = cert_path,
-        .client_key_path = key_path,
-    });
-    defer outbound.deinit();
+    const remote_peer_str = getEnv("REMOTE_PEER_ID");
+    var expected_peer: ?PeerId = null;
+    if (remote_peer_str) |s| {
+        expected_peer = try PeerId.fromBase58(a, s);
+        std.debug.print("interop_quic_node[client]: expecting remote peer={s}\n", .{s});
+    }
 
     std.debug.print("interop_quic_node[client]: dialing {s}:{d}\n", .{ host, port });
 
     var recv_buf: [65536]u8 = undefined;
     const dl = wall_time.milliTimestamp() + deadline_ms;
-    while (wall_time.milliTimestamp() < dl) {
-        outbound.drive(&recv_buf, 5) catch {};
-        if (outbound.client.conn.phase == .connected) break;
-    }
-    if (outbound.client.conn.phase != .connected) {
-        std.debug.print("interop_quic_node[client]: connect timeout\n", .{});
+
+    var outbound = if (expected_peer != null) blk: {
+        // dialExtended pumps to .connected internally + runs TLS leaf
+        // verification against expected_peer (libp2p RFC 0001).
+        const dial_opts = QuicOutboundDialOptions{
+            .libp2p = .{
+                .client_cert_path = cert_path,
+                .client_key_path = key_path,
+            },
+            .connect_timeout_ms = @intCast(deadline_ms),
+            .expected_peer = expected_peer,
+        };
+        break :blk dialExtended(a, ma, dial_opts) catch |err| {
+            std.debug.print("interop_quic_node[client]: dialExtended err={s}\n", .{@errorName(err)});
+            return 1;
+        };
+    } else QuicOutbound.dial(a, ma, .{
+        .client_cert_path = cert_path,
+        .client_key_path = key_path,
+    }) catch |err| {
+        std.debug.print("interop_quic_node[client]: dial err={s}\n", .{@errorName(err)});
         return 1;
+    };
+    defer outbound.deinit();
+
+    if (expected_peer == null) {
+        while (wall_time.milliTimestamp() < dl) {
+            outbound.drive(&recv_buf, 5) catch {};
+            if (outbound.client.conn.phase == .connected) break;
+        }
+        if (outbound.client.conn.phase != .connected) {
+            std.debug.print("interop_quic_node[client]: connect timeout\n", .{});
+            return 1;
+        }
     }
     std.debug.print("interop_quic_node[client]: connected\n", .{});
 
