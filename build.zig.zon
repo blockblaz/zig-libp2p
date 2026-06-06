@@ -23,12 +23,10 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            // Pinned to ch4r10t33r/zquic#164 branch HEAD: server-side
-            // arbitrary-ALPN echo fix (required for go-libp2p QUIC interop
-            // — pre-fix, our server returned EncryptedExtensions with no
-            // ALPN and go-libp2p rejected the handshake). Bump back to a
-            // tagged master release once #164 lands.
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=interop/quic-arbitrary-alpn#c09d4c85c062041b311a728fc59a6f4912655682",
+            // Master SHA post ch4r10t33r/zquic#164 (server-side arbitrary-
+            // ALPN echo + RFC 9000 quic_transport_parameters codepoint).
+            // Both are required to reach the cross-impl TLS layer at all.
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=master#6bce9dcd9ea1789e6258df6d004cc06e0d016521",
             .hash = "zquic-1.6.6-2zRc1JC3EgCe3Kh1YHkmDRwOw6kJxrUaiLdfnUAX5PSs",
         },
         .zig_varint = .{
