@@ -1970,3 +1970,250 @@ test "QuicRuntime: two instances exchange a gossipsub message over UDP loopback"
     }
     try testing.expect(saw_payload);
 }
+
+/// Validator-context that just counts how many distinct payloads arrived,
+/// so the 3-node test below can assert "B+C each received N publishes from
+/// A" — i.e. the libp2p per-message-stream gossipsub pattern survives
+/// sustained traffic, not just a one-off publish.
+const GossipCounter = struct {
+    received: std.atomic.Value(usize) = .init(0),
+
+    fn record(self: *GossipCounter) void {
+        _ = self.received.fetchAdd(1, .monotonic);
+    }
+
+    fn count(self: *const GossipCounter) usize {
+        return self.received.load(.acquire);
+    }
+};
+
+fn gossipCountValidator(ctx: ?*anyopaque, topic: []const u8, data: []const u8) gossipsub_runtime_pkg.ValidationResult {
+    _ = topic;
+    _ = data;
+    const c: *GossipCounter = @ptrCast(@alignCast(ctx.?));
+    c.record();
+    return .accept;
+}
+
+test "QuicRuntime: 3-node gossipsub propagation under sustained publishes" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+
+    // Three hosts: A, B, C.  Each gets a GossipCounter validator so we can
+    // assert how many publishes each side delivered.  Counters are
+    // heap-allocated so they outlive the test's stack scope while the QUIC
+    // drive threads still hold pointers to them.
+    var bundle_a = try buildTestBundle(a, "ga", 0xC3);
+    defer bundle_a.deinit(a);
+    var bundle_b = try buildTestBundle(a, "gb", 0xD4);
+    defer bundle_b.deinit(a);
+    var bundle_c = try buildTestBundle(a, "gc", 0xE5);
+    defer bundle_c.deinit(a);
+
+    const counter_a = try a.create(GossipCounter);
+    defer a.destroy(counter_a);
+    counter_a.* = .{};
+    const counter_b = try a.create(GossipCounter);
+    defer a.destroy(counter_b);
+    counter_b.* = .{};
+    const counter_c = try a.create(GossipCounter);
+    defer a.destroy(counter_c);
+    counter_c.* = .{};
+
+    // Bring up host_a + rt_a.
+    var host_a = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_a.peer,
+        .gossipsub = .{
+            .local_peer_id = bundle_a.peer,
+            .topic_validator = gossipCountValidator,
+            .validator_ctx = counter_a,
+        },
+    });
+    defer host_a.destroy();
+    try host_a.startBackground();
+    try testing.expect(host_a.waitUntilReady(5_000));
+    var rt_a = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_a,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_a.cert_pem, .key_pem = bundle_a.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_a.destroy();
+
+    var host_b = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_b.peer,
+        .gossipsub = .{
+            .local_peer_id = bundle_b.peer,
+            .topic_validator = gossipCountValidator,
+            .validator_ctx = counter_b,
+        },
+    });
+    defer host_b.destroy();
+    try host_b.startBackground();
+    try testing.expect(host_b.waitUntilReady(5_000));
+    var rt_b = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_b,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_b.cert_pem, .key_pem = bundle_b.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_b.destroy();
+
+    var host_c = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_c.peer,
+        .gossipsub = .{
+            .local_peer_id = bundle_c.peer,
+            .topic_validator = gossipCountValidator,
+            .validator_ctx = counter_c,
+        },
+    });
+    defer host_c.destroy();
+    try host_c.startBackground();
+    try testing.expect(host_c.waitUntilReady(5_000));
+    var rt_c = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_c,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_c.cert_pem, .key_pem = bundle_c.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_c.destroy();
+
+    try rt_a.start();
+    try rt_b.start();
+    try rt_c.start();
+
+    // Each non-A host dials A; C also dials B so the mesh ends up full
+    // (A↔B, A↔C, B↔C).  zeam's runtime config does similar wiring.
+    const a_port = rt_a.boundUdpPortIpv4() orelse return error.NoBoundPort;
+    const b_port = rt_b.boundUdpPortIpv4() orelse return error.NoBoundPort;
+
+    const c_port = rt_c.boundUdpPortIpv4() orelse return error.NoBoundPort;
+
+    var peer_b58: [128]u8 = undefined;
+    // Build a multiaddr for each host and have every other host register it.
+    // Models zeam where each node dials every configured bootnode (so each
+    // peer ends up in everyone else's outbound_by_peer table).
+    {
+        const s = try bundle_a.peer.toBase58(&peer_b58);
+        const ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ a_port, s });
+        defer a.free(ma_str);
+        var ma = try multiaddr.Multiaddr.fromString(a, ma_str);
+        defer ma.deinit();
+        try rt_b.registerKnownPeer(&ma, bundle_a.peer);
+        try rt_c.registerKnownPeer(&ma, bundle_a.peer);
+    }
+    {
+        const s = try bundle_b.peer.toBase58(&peer_b58);
+        const ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ b_port, s });
+        defer a.free(ma_str);
+        var ma = try multiaddr.Multiaddr.fromString(a, ma_str);
+        defer ma.deinit();
+        try rt_a.registerKnownPeer(&ma, bundle_b.peer);
+        try rt_c.registerKnownPeer(&ma, bundle_b.peer);
+    }
+    {
+        const s = try bundle_c.peer.toBase58(&peer_b58);
+        const ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ c_port, s });
+        defer a.free(ma_str);
+        var ma = try multiaddr.Multiaddr.fromString(a, ma_str);
+        defer ma.deinit();
+        try rt_a.registerKnownPeer(&ma, bundle_c.peer);
+        try rt_b.registerKnownPeer(&ma, bundle_c.peer);
+    }
+
+    // Drain events on all hosts so internal rings don't back up.
+    const Drainer = struct {
+        fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+            const dl = wall_time.milliTimestamp() + 60_000;
+            while (wall_time.milliTimestamp() < dl) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(100) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                ev.deinit(h.allocator);
+            }
+        }
+    };
+    var drain_done = std.atomic.Value(bool).init(false);
+    var da = try std.Thread.spawn(.{}, Drainer.run, .{ host_a, &drain_done });
+    defer da.join();
+    var db = try std.Thread.spawn(.{}, Drainer.run, .{ host_b, &drain_done });
+    defer db.join();
+    var dc = try std.Thread.spawn(.{}, Drainer.run, .{ host_c, &drain_done });
+    defer dc.join();
+    defer drain_done.store(true, .release);
+
+    // Wait for the full 6-edge outbound mesh: each node has dialed the
+    // other two.  Models zeam where every node has every other node in its
+    // outbound_by_peer table.
+    {
+        const dl = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < dl) {
+            const ab = rt_a.outbound_by_peer.get(bundle_b.peer) != null;
+            const ac = rt_a.outbound_by_peer.get(bundle_c.peer) != null;
+            const ba = rt_b.outbound_by_peer.get(bundle_a.peer) != null;
+            const bc = rt_b.outbound_by_peer.get(bundle_c.peer) != null;
+            const ca = rt_c.outbound_by_peer.get(bundle_a.peer) != null;
+            const cb = rt_c.outbound_by_peer.get(bundle_b.peer) != null;
+            if (ab and ac and ba and bc and ca and cb) break;
+            var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+        try testing.expect(rt_a.outbound_by_peer.get(bundle_b.peer) != null);
+        try testing.expect(rt_a.outbound_by_peer.get(bundle_c.peer) != null);
+        try testing.expect(rt_b.outbound_by_peer.get(bundle_a.peer) != null);
+        try testing.expect(rt_b.outbound_by_peer.get(bundle_c.peer) != null);
+        try testing.expect(rt_c.outbound_by_peer.get(bundle_a.peer) != null);
+        try testing.expect(rt_c.outbound_by_peer.get(bundle_b.peer) != null);
+    }
+
+    // All subscribe so the gossipsub mesh forms on the common topic.
+    try host_a.subscribe("test/topic");
+    try host_b.subscribe("test/topic");
+    try host_c.subscribe("test/topic");
+
+    // Publish a stream of messages from A.  Each publish opens a fresh
+    // /meshsub/1.1.0 stream — this is the per-message pattern that exhausts
+    // the 64-slot raw_app_streams table on the receiver in production.  We
+    // pace publishes lightly so the receiver's drive loop has cycles to
+    // release slots.
+    const total_publishes: usize = 30;
+    for (0..total_publishes) |i| {
+        var payload_buf: [32]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&payload_buf, "msg-{d}", .{i});
+        try host_a.publish("test/topic", payload);
+        // 50ms between publishes — sustained but not bursty.
+        var req = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    // Poll until each receiver's counter reaches `total_publishes` (or time
+    // out).  gossipsub dedups so each peer sees each message once.
+    const expected: usize = total_publishes;
+    const deadline = wall_time.milliTimestamp() + 20_000;
+    while (wall_time.milliTimestamp() < deadline) {
+        if (counter_b.count() >= expected and counter_c.count() >= expected) break;
+        var req = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    // Diagnostic on failure: print received counts so we can see how far
+    // delivery got.  Use std.debug.print so this lands in test output.
+    if (counter_b.count() < expected or counter_c.count() < expected) {
+        std.debug.print(
+            "\n3-node gossipsub: B={d}/{d} C={d}/{d}\n",
+            .{ counter_b.count(), expected, counter_c.count(), expected },
+        );
+    }
+    try testing.expect(counter_b.count() >= expected);
+    try testing.expect(counter_c.count() >= expected);
+}
