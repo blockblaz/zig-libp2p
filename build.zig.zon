@@ -23,8 +23,13 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=master#40819b6500dee5b1d54b001e6dd199bc0a784e16",
-            .hash = "zquic-1.6.6-2zRc1GqUEgAHb0l__5-eEEZiz70c5MAsnICcs-TEkeyg",
+            // Pinned to ch4r10t33r/zquic#164 branch HEAD: server-side
+            // arbitrary-ALPN echo fix (required for go-libp2p QUIC interop
+            // — pre-fix, our server returned EncryptedExtensions with no
+            // ALPN and go-libp2p rejected the handshake). Bump back to a
+            // tagged master release once #164 lands.
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=interop/quic-arbitrary-alpn#c09d4c85c062041b311a728fc59a6f4912655682",
+            .hash = "zquic-1.6.6-2zRc1JC3EgCe3Kh1YHkmDRwOw6kJxrUaiLdfnUAX5PSs",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",
