@@ -7,7 +7,7 @@
 //! Environment variables:
 //!
 //!   ROLE           — "server" (listen) or "client" (dial)
-//!   TESTCASE       — "handshake" or "ping"
+//!   TESTCASE       — "handshake", "ping", or "gossipsub" (B3 stub on zig side)
 //!   LISTEN_PORT    — UDP port for server (default 4001)
 //!   SERVER_HOST    — dial target IPv4 dotted-decimal (default "127.0.0.1")
 //!   SERVER_PORT    — dial target port for client (default 4001)
@@ -23,6 +23,7 @@
 //!   0  success
 //!   1  failure (timeout / decode / mismatch)
 //!   2  bad config (unknown ROLE / TESTCASE)
+//!   3  testcase not yet implemented on this side (B3 zig gossipsub stub)
 
 const std = @import("std");
 const zl = @import("zig_libp2p");
@@ -74,6 +75,17 @@ pub fn main() !u8 {
     const deadline_ms = envInt(i64, "DEADLINE_MS", default_deadline_ms);
 
     std.debug.print("interop_quic_node: role={s} testcase={s}\n", .{ role, testcase });
+
+    // The B3 gossipsub testcase needs the QUIC inbound-stream pipeline
+    // to dispatch /meshsub/1.1.0 frames through `Host.handleGossipRpc`;
+    // wiring isn't in this binary yet (tracked as a follow-up to land the
+    // same path zeam-network's EthLibp2pV2 will use). For now return
+    // exit code 3 (distinct from 1 / 2) so the matrix runner can report
+    // a TAP "skip" without confusing it with a real failure.
+    if (std.mem.eql(u8, testcase, "gossipsub")) {
+        std.debug.print("interop_quic_node[{s}]: gossipsub testcase not yet wired on zig side; skipping\n", .{role});
+        return 3;
+    }
 
     if (std.mem.eql(u8, role, "server")) {
         const port = envInt(u16, "LISTEN_PORT", default_listen_port);

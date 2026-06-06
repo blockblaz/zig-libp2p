@@ -161,6 +161,18 @@ total=0
 failed=0
 PORT="${PORT_START}"
 
+skipped=0
+
+# Pairs an impl doesn't yet support — TAP "skip" rather than "not ok" so
+# a partial impl doesn't fail the matrix. Implemented as a case statement
+# instead of an associative array because macOS still ships bash 3.2.
+skip_reason_for() {
+    case "$1:$2" in
+        zig:gossipsub) echo "gossipsub testcase not yet wired on zig side" ;;
+        *) echo "" ;;
+    esac
+}
+
 for server in "${IMPLS[@]}"; do
     for client in "${IMPLS[@]}"; do
         for tc in "${TESTS[@]}"; do
@@ -168,6 +180,15 @@ for server in "${IMPLS[@]}"; do
             PORT=$((PORT + 1))
             seed="$(derive_seed "${PORT}")"
             echo "--- matrix: server=${server} client=${client} testcase=${tc} port=${PORT} ---"
+            skip_reason="$(skip_reason_for "${server}" "${tc}")"
+            if [[ -z "${skip_reason}" ]]; then
+                skip_reason="$(skip_reason_for "${client}" "${tc}")"
+            fi
+            if [[ -n "${skip_reason}" ]]; then
+                echo "ok ${total} - server=${server} client=${client} ${tc} # skip ${skip_reason}"
+                skipped=$((skipped + 1))
+                continue
+            fi
             SERVER_PID=""
             SERVER_PEER_ID=""
             start_server "${server}" "${tc}" "${PORT}" "${seed}"
@@ -211,7 +232,11 @@ done
 
 echo "1..${total}"
 if [[ "${failed}" -ne 0 ]]; then
-    echo "matrix: ${failed}/${total} pairs FAILED"
+    echo "matrix: ${failed}/${total} pairs FAILED (${skipped} skipped)"
     exit 1
 fi
-echo "matrix: ${total}/${total} pairs OK"
+if [[ "${skipped}" -ne 0 ]]; then
+    echo "matrix: $((total - skipped))/${total} pairs OK (${skipped} skipped)"
+else
+    echo "matrix: ${total}/${total} pairs OK"
+fi

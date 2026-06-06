@@ -48,10 +48,13 @@ jobs:
         run: go build -trimpath -o interop-quic-node-go .
 
       - name: Matrix — zig ↔ zig
-        run: bash interop_quic/run_matrix.sh zig handshake,ping
+        # gossipsub is included so the runner exercises the skip path on
+        # the zig side; the case statement in run_matrix.sh marks it as
+        # TAP `skip`, not `not ok`.
+        run: bash interop_quic/run_matrix.sh zig handshake,ping,gossipsub
 
       - name: Matrix — go-libp2p ↔ go-libp2p
-        run: bash interop_quic/run_matrix.sh go-libp2p handshake,ping
+        run: bash interop_quic/run_matrix.sh go-libp2p handshake,ping,gossipsub
 
   # Cross-impl: zig ↔ go-libp2p in both directions × {handshake, ping}.
   # Currently exercises outstanding zquic ↔ quic-go TLS gaps; once those
@@ -85,4 +88,4 @@ jobs:
 
       - name: Matrix — zig ↔ go-libp2p
         continue-on-error: true
-        run: bash interop_quic/run_matrix.sh zig,go-libp2p handshake,ping
+        run: bash interop_quic/run_matrix.sh zig,go-libp2p handshake,ping,gossipsub

@@ -9,7 +9,7 @@ QUIC + libp2p interop harness, separate from the existing `interop/` directory
 |----|------|
 | B1 | This dir. `interop-quic-node` binary, Dockerfile, self-test, GH workflow. zig-libp2p ↔ zig-libp2p only. |
 | B2 | libp2p TLS cert minter, peer-id wiring, `go-libp2p` impl container, matrix runner, nightly cross-impl workflow. |
-| B3 | Gossipsub pub/sub testcase. |
+| B3 | Gossipsub pub/sub testcase. Go side fully wired; zig side stubbed (skip) pending the `/meshsub/1.1.0` QUIC-stream pipeline. |
 | B4 | Req/resp testcase. |
 | B5 | `rust-libp2p` impl container. Full matrix expansion. |
 
@@ -21,7 +21,10 @@ Single binary; role and testcase come from environment.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `ROLE` | `server` | `server` (listen) or `client` (dial) |
-| `TESTCASE` | `handshake` | `handshake` (QUIC handshake only) or `ping` (handshake + `/ipfs/ping/1.0.0`) |
+| `TESTCASE` | `handshake` | `handshake` (QUIC handshake only), `ping` (handshake + `/ipfs/ping/1.0.0`), or `gossipsub` (B3 — zig side currently returns exit 3 / TAP skip) |
+| `GS_TOPIC` | `/interop/b3` | gossipsub topic both sides subscribe to |
+| `GS_COUNT` | `5` | gossipsub: number of messages the server publishes |
+| `GS_PAYLOAD_LEN` | `64` | gossipsub: bytes per message; payload is deterministic (`msg-NNNNN:` + 0x2A padding) so multiple impls assert on identical bytes |
 | `LISTEN_PORT` | `4001` | server bind port |
 | `SERVER_HOST` | `127.0.0.1` | client dial target (IPv4 dotted-decimal) |
 | `SERVER_PORT` | `4001` | client dial port |
@@ -30,7 +33,7 @@ Single binary; role and testcase come from environment.
 | `REMOTE_PEER_ID` | (unset) | client-only; when set, dialExtended runs the libp2p TLS leaf check against this base58btc peer id |
 | `DEADLINE_MS` | `30000` | overall test deadline |
 
-Exit codes: `0` success, `1` failure (timeout / mismatch), `2` bad config.
+Exit codes: `0` success, `1` failure (timeout / mismatch), `2` bad config, `3` testcase recognized but not yet implemented on this side (B3 zig gossipsub stub).
 
 ### Cert generation
 
