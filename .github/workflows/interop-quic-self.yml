@@ -1,0 +1,52 @@
+# Phase B1 — QUIC interop self-test.
+#
+# Runs the interop-quic-node binary against itself for `handshake` and `ping`
+# testcases.  Proves the binary builds, certs work, basic handshake completes,
+# and a multistream + ping round-trip lands.  Cross-impl matrix lands in B2
+# (interop-quic-cross.yml).
+name: Interop QUIC (self)
+
+on:
+  pull_request:
+    paths:
+      - "examples/interop_quic_node.zig"
+      - "interop_quic/**"
+      - "src/transport/**"
+      - "src/ping.zig"
+      - "src/multistream*.zig"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/interop-quic-self.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  self-test:
+    name: zig-libp2p self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build interop binary
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Install openssl
+        run: sudo apt-get install -y openssl
+
+      - name: Self-test handshake
+        run: interop_quic/self_test.sh handshake
+        env:
+          PORT: "14242"
+          DEADLINE_MS: "20000"
+
+      - name: Self-test ping
+        run: interop_quic/self_test.sh ping
+        env:
+          PORT: "14243"
+          DEADLINE_MS: "20000"
