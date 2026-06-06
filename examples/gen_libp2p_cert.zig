@@ -9,15 +9,22 @@
 //! cross-impl interop requires this.
 //!
 //! Environment:
-//!   CERT_PATH — output cert PEM path (default /certs/cert.pem)
-//!   KEY_PATH  — output key PEM path  (default /certs/key.pem)
-//!   SEED_HEX  — optional 32-byte hex; deterministic identity when set.
-//!               Default = OS random.
+//!   CERT_PATH      — output cert PEM path (default /certs/cert.pem)
+//!   KEY_PATH       — output key PEM path  (default /certs/key.pem)
+//!   SEED_HEX       — optional 32-byte hex; deterministic identity when set.
+//!                    Default = OS random.
+//!   PEER_ID_PATH   — optional path: when set, host peer-id (base58btc) is
+//!                    written here for the matrix runner to share with the
+//!                    dialing side (REMOTE_PEER_ID).
+//!
+//! Stdout: always prints `gen_libp2p_cert: peer_id=<base58btc>` for ad-hoc
+//! capture in shell scripts (`PEER_ID=$(./gen-libp2p-cert | awk -F= …)`).
 
 const std = @import("std");
 const zl = @import("zig_libp2p");
 
 const libp2p_tls_cert = zl.security.libp2p_tls_cert;
+const peer_id_mod = zl.peer_id;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 fn getEnv(key: []const u8) ?[]const u8 {
@@ -115,6 +122,24 @@ pub fn main() !u8 {
     try writeFile(cert_path, cert_pem);
     try writeFile(key_path, key_pem);
 
+    // Derive PeerId from the ECDSA-P-256 host pubkey via the protobuf
+    // PublicKey { type=ECDSA, data=PKIX-SPKI } encoding (RFC 0001 spec).
+    const pk_proto = try libp2p_tls_cert.encodeEcdsaPublicKeyProto(a, host_pub);
+    defer a.free(pk_proto);
+    const reader = try peer_id_mod.PublicKeyReader.init(pk_proto);
+    const data_copy = try a.dupe(u8, reader.getData());
+    defer a.free(data_copy);
+    var pk = peer_id_mod.PublicKey{ .type = .ECDSA, .data = data_copy };
+    const pid = try peer_id_mod.PeerId.fromPublicKey(a, &pk);
+    var pid_buf: [128]u8 = undefined;
+    const pid_b58 = try pid.toBase58(&pid_buf);
+
+    if (getEnv("PEER_ID_PATH")) |p| {
+        try ensureParentDir(p);
+        try writeFile(p, pid_b58);
+    }
+    // Stdout line is the contract with shell runners — keep stable.
+    std.debug.print("gen_libp2p_cert: peer_id={s}\n", .{pid_b58});
     std.debug.print("gen_libp2p_cert: wrote cert={s} key={s}\n", .{ cert_path, key_path });
     return 0;
 }
