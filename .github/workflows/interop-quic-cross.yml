@@ -40,12 +40,19 @@ jobs:
         with:
           go-version: "1.22"
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Build zig binaries
         run: zig build -Doptimize=ReleaseFast
 
       - name: Build go-libp2p binary
         working-directory: interop_quic/impls/go-libp2p
         run: go build -trimpath -o interop-quic-node-go .
+
+      - name: Build rust-libp2p binary
+        working-directory: interop_quic/impls/rust-libp2p
+        run: cargo build --release --locked
 
       - name: Matrix — zig ↔ zig
         # gossipsub is included so the runner exercises the skip path on
@@ -56,6 +63,11 @@ jobs:
 
       - name: Matrix — go-libp2p ↔ go-libp2p
         run: bash interop_quic/run_matrix.sh go-libp2p handshake,ping,gossipsub,reqresp
+
+      - name: Matrix — rust-libp2p ↔ rust-libp2p
+        # gossipsub on rust hits an InsufficientPeers race today; skipped
+        # via skip_reason_for in run_matrix.sh. Other three pass cleanly.
+        run: bash interop_quic/run_matrix.sh rust-libp2p handshake,ping,gossipsub,reqresp
 
   # Cross-impl: zig ↔ go-libp2p in both directions × {handshake, ping}.
   # Currently exercises outstanding zquic ↔ quic-go TLS gaps; once those
@@ -80,6 +92,9 @@ jobs:
         with:
           go-version: "1.22"
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Build zig binaries
         run: zig build -Doptimize=ReleaseFast
 
@@ -87,6 +102,10 @@ jobs:
         working-directory: interop_quic/impls/go-libp2p
         run: go build -trimpath -o interop-quic-node-go .
 
-      - name: Matrix — zig ↔ go-libp2p
+      - name: Build rust-libp2p binary
+        working-directory: interop_quic/impls/rust-libp2p
+        run: cargo build --release --locked
+
+      - name: Matrix — zig ↔ go-libp2p ↔ rust-libp2p
         continue-on-error: true
-        run: bash interop_quic/run_matrix.sh zig,go-libp2p handshake,ping,gossipsub,reqresp
+        run: bash interop_quic/run_matrix.sh zig,go-libp2p,rust-libp2p handshake,ping,gossipsub,reqresp
