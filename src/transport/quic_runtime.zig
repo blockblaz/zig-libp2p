@@ -1087,6 +1087,16 @@ pub const QuicRuntime = struct {
                         ist.raw.read_cursor = recv_buf.len;
                     }
                     if (ist.gossip_acc.items.len == 0) {
+                        // Nothing pending in the accumulator.  If the peer
+                        // has already FIN'd, the stream is done — release
+                        // the zquic raw-app slot now so the 64-slot table
+                        // can absorb the next inbound per-message stream.
+                        // Without this, finned-and-drained streams stay in
+                        // inbound_streams forever and the slot table fills.
+                        if (ZIo.rawAppStreamFinReceived(ist.conn, ist.stream_id)) {
+                            self.removeInboundStreamAt(i);
+                            continue;
+                        }
                         i += 1;
                         continue;
                     }
