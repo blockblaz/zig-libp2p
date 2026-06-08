@@ -185,4 +185,17 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(interop_exe);
     const interop_step = b.step("interop", "Build unified-testing transport interop binary");
     interop_step.dependOn(&interop_exe.step);
+
+    const interop_matrix_cmd = b.addSystemCommand(&.{
+        "bash",
+        "interop_quic/run_matrix.sh",
+        "zig,go-libp2p",
+        "handshake,ping",
+    });
+    interop_matrix_cmd.step.dependOn(b.getInstallStep());
+    const interop_matrix_step = b.step(
+        "interop-matrix",
+        "Run QUIC cross-impl matrix (requires interop-quic-node-go under interop_quic/impls/go-libp2p/)",
+    );
+    interop_matrix_step.dependOn(&interop_matrix_cmd.step);
 }
