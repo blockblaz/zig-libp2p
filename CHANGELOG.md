@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.10](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.9...v0.1.10) (2026-06-08)
+
+### Features
+
+* **interop_quic:** full zig↔go-libp2p **ping** matrix (8/8 green) — preserve
+  go MSSelect coalesced payload after multistream-select; inbound Identify on
+  handshake server path.
+* **transport/stream_multistream:** optional `tail` out-parameter on
+  `responderHandshakeMultistreamAmong` for application bytes read ahead during
+  negotiation.
+* **ping:** `handleInboundPrefixed` for echo when part of the payload already
+  arrived with the multistream handshake.
+
+### Dependencies
+
+* zquic bumped to **v1.6.12** — ignore quic-go `RETIRE_CONNECTION_ID` seq 0
+  (RFC violation) so go-libp2p client → zig server ping completes.
+
 ## [0.1.9](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.8...v0.1.9) (2026-06-08)
 
 ### Features
@@ -16,12 +34,6 @@
 
 * zquic bumped to **v1.6.11** — TLS `CertificateRequest` `signature_algorithms` list
   length prefix fix (cross-impl mutual-TLS handshake with go-libp2p / rust-libp2p).
-
-### Known gaps
-
-* QUIC cross-impl ping: **go-libp2p client → zig server** still fails when quic-go
-  sends `RETIRE_CONNECTION_ID` seq 0 after Identify; requires a zquic upstream fix.
-  All handshake pairs and the other seven ping pairs pass locally.
 
 ## [0.1.8](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.7...v0.1.8) (2026-06-04)
 

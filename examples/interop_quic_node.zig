@@ -131,7 +131,7 @@ fn respondInboundIdentifyStreamsClient(
             var done = false;
             while (wall_time.milliTimestamp() < until) {
                 outbound.drive(recv_buf, 5) catch {};
-                _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &cands, a) catch |err| {
+                _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &cands, a, null) catch |err| {
                     switch (err) {
                         error.DialFailed => continue,
                         else => break,
@@ -143,6 +143,64 @@ fn respondInboundIdentifyStreamsClient(
                 break;
             }
             if (done) return;
+        }
+    }
+}
+
+/// Answer go-libp2p server-initiated identify streams until `until_ms`.
+fn serveInboundIdentifyUntil(
+    a: std.mem.Allocator,
+    listener: *QuicListener,
+    conn: *ZIoConnState,
+    recv_buf: *[65536]u8,
+    until_ms: i64,
+    cert_path: []const u8,
+) !void {
+    const identify_payload = try buildDelimitedIdentifyPayload(a, cert_path);
+    defer a.free(identify_payload);
+
+    const Ctx = struct {
+        a: std.mem.Allocator,
+        pending: std.ArrayList(u64),
+        fn cb(self_op: ?*anyopaque, _: *QuicListener, _: usize, _: *ZIoConnState, sid: u64) void {
+            const ctx_p: *@This() = @ptrCast(@alignCast(self_op.?));
+            ctx_p.pending.append(ctx_p.a, sid) catch {};
+        }
+    };
+    var ctx = Ctx{ .a = a, .pending = .empty };
+    defer ctx.pending.deinit(a);
+    listener.lifecycle.ctx = &ctx;
+    listener.lifecycle.on_inbound_stream_ready = Ctx.cb;
+
+    const cands = [_][]const u8{go_identify_protocol_id};
+
+    while (wall_time.milliTimestamp() < until_ms) {
+        while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < until_ms) {
+            listener.drive(recv_buf, 5) catch {};
+        }
+        if (ctx.pending.items.len == 0) continue;
+        const sid = ctx.pending.orderedRemove(0);
+
+        var raw = RawAppBidiServer{
+            .server = listener.server,
+            .conn = conn,
+            .stream_id = sid,
+        };
+
+        var r = raw.reader();
+        var w = raw.writer();
+        negotiate: while (wall_time.milliTimestamp() < until_ms) {
+            listener.drive(recv_buf, 5) catch {};
+            _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &cands, a, null) catch |err| {
+                switch (err) {
+                    error.DialFailed => continue,
+                    else => break :negotiate,
+                }
+            };
+            raw.writeAllFin(identify_payload);
+            const flush_until = wall_time.milliTimestamp() + 200;
+            while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
+            break;
         }
     }
 }
@@ -231,8 +289,8 @@ fn runServer(
     std.debug.print("interop_quic_node[server]: connection accepted\n", .{});
 
     if (std.mem.eql(u8, testcase, "handshake")) {
-        const settle = wall_time.milliTimestamp() + 1_000;
-        while (wall_time.milliTimestamp() < settle) listener.drive(&recv_buf, 5) catch {};
+        const settle = wall_time.milliTimestamp() + 2_000;
+        try serveInboundIdentifyUntil(a, listener, accepted.?, &recv_buf, settle, cert_path);
         std.debug.print("interop_quic_node[server]: handshake ok\n", .{});
         return 0;
     }
@@ -368,13 +426,15 @@ fn serveOnePingResponder(
             .stream_id = sid,
         };
 
+        var tail = std.ArrayList(u8).empty;
+        defer tail.deinit(a);
         {
             var r = raw.reader();
             var w = raw.writer();
             var matched: ?usize = null;
             negotiate: while (wall_time.milliTimestamp() < deadline_ms) {
                 listener.drive(recv_buf, 5) catch {};
-                matched = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &ping_cands, a) catch |err| {
+                matched = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &ping_cands, a, &tail) catch |err| {
                     switch (err) {
                         error.DialFailed => continue,
                         error.ProtocolNegotiationFailed => {
@@ -398,13 +458,13 @@ fn serveOnePingResponder(
 
         while (wall_time.milliTimestamp() < deadline_ms) {
             listener.drive(recv_buf, 5) catch {};
-            if (raw.unreadRecvLen() >= ping.payload_len) break;
+            if (tail.items.len + raw.unreadRecvLen() >= ping.payload_len) break;
         } else return 1;
 
         {
             var r = raw.reader();
             var w = raw.writer();
-            try ping.handleInbound(&r, &w);
+            ping.handleInboundPrefixed(tail.items, &r, &w) catch return 1;
         }
 
         const flush_until = wall_time.milliTimestamp() + 500;

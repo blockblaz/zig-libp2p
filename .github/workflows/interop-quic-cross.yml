@@ -86,8 +86,7 @@ jobs:
       - name: Matrix — zig ↔ go-libp2p (handshake)
         run: bash interop_quic/run_matrix.sh zig,go-libp2p handshake
 
-      - name: Matrix — zig ↔ go-libp2p (ping, informational)
-        continue-on-error: true
+      - name: Matrix — zig ↔ go-libp2p (ping)
         run: bash interop_quic/run_matrix.sh zig,go-libp2p ping
 
   # Full matrix on cron / manual only (rust cross-impl still evolving).

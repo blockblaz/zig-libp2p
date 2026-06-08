@@ -501,7 +501,7 @@ fn quicLoopbackOnePingOnStream(
                 "/meshsub/1.1.0",
                 ping.multistream_protocol_id,
             };
-            const ix = try stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, allocator);
+            const ix = try stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, allocator, null);
             if (ix != 1) return error.InvalidData;
         } else {
             try stream_multistream.responderHandshakeMultistream(&r, &w, ping.multistream_protocol_id, allocator);

@@ -70,7 +70,7 @@ QUIC UDP pumping: [`transport.quic_endpoint`](../src/transport/quic_endpoint.zig
 |-------------|----------------|
 | Zig | **0.16.0** (`minimum_zig_version` in `build.zig.zon`) |
 | QUIC stack | **zquic 1.6.11** (pinned in `build.zig.zon`; re-exported as `zig_libp2p.zquic`) |
-| QUIC cross-impl (Phase B) | In progress | [#166](https://github.com/ch4r10t33r/zig-libp2p/issues/166) — handshake green zig↔go; ping 7/8; harness in [`interop_quic/`](../interop_quic/) |
+| QUIC cross-impl (Phase B) | Done | [#166](https://github.com/ch4r10t33r/zig-libp2p/issues/166) — handshake + ping green zig↔go (8/8); harness in [`interop_quic/`](../interop_quic/) |
 
 ## Development
 

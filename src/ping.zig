@@ -68,8 +68,19 @@ pub fn readPayload(r: *Io.Reader, payload_out: *[payload_len]u8) WireError!void 
 
 /// Responder: read one payload and write it back (echo).
 pub fn handleInbound(r: *Io.Reader, w: *Io.Writer) WireError!void {
+    try handleInboundPrefixed(&.{}, r, w);
+}
+
+/// Like [`handleInbound`], but the first bytes of the payload may already sit in `prefix`
+/// (e.g. read ahead during multistream-select when the peer flushes handshake + data).
+pub fn handleInboundPrefixed(prefix: []const u8, r: *Io.Reader, w: *Io.Writer) WireError!void {
     var buf: [payload_len]u8 = undefined;
-    try readPayload(r, &buf);
+    if (prefix.len >= payload_len) {
+        @memcpy(buf[0..payload_len], prefix[0..payload_len]);
+    } else {
+        @memcpy(buf[0..prefix.len], prefix);
+        Io.Reader.readSliceAll(r, buf[prefix.len..]) catch |e| return mapReaderErr(e);
+    }
     try writePayload(w, &buf);
 }
 

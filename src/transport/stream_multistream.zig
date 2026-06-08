@@ -56,6 +56,35 @@ fn notePeerFraming(framing: *?neg.Framing, acc: []const u8) void {
     if (framing.* == null and acc.len > 0) framing.* = neg.detectFraming(acc[0]);
 }
 
+/// On success, move any unread bytes still in the handshake accumulator to `tail` (e.g. go
+/// MSSelect may flush multistream tokens and application data in one write).
+fn finishAmongWithTail(
+    acc: *std.ArrayList(u8),
+    r: *Io.Reader,
+    allocator: std.mem.Allocator,
+    tail: ?*std.ArrayList(u8),
+) StreamHandshakeError!void {
+    if (tail == null) return;
+    try drainReaderTail(acc, r, allocator);
+    finishAmongWithTailMove(acc, tail.?);
+}
+
+fn drainReaderTail(acc: *std.ArrayList(u8), r: *Io.Reader, allocator: std.mem.Allocator) StreamHandshakeError!void {
+    while (true) {
+        if (acc.items.len >= handshake_accum_cap) return error.ProtocolNegotiationFailed;
+        var byte: [1]u8 = undefined;
+        const n = r.readSliceShort(&byte) catch break;
+        if (n == 0) break;
+        try acc.appendSlice(allocator, &byte);
+        if (acc.items.len > handshake_accum_cap) return error.ProtocolNegotiationFailed;
+    }
+}
+
+fn finishAmongWithTailMove(acc: *std.ArrayList(u8), tail: *std.ArrayList(u8)) void {
+    tail.* = acc.*;
+    acc.* = .empty;
+}
+
 fn readMoreHandshake(acc: *std.ArrayList(u8), r: *Io.Reader, allocator: std.mem.Allocator) StreamHandshakeError!void {
     if (acc.items.len >= handshake_accum_cap) return error.ProtocolNegotiationFailed;
     // `readSliceShort` keeps pulling until the slice is full or the stream ends. For finite
@@ -233,6 +262,7 @@ pub fn responderHandshakeMultistreamAmong(
     w: *Io.Writer,
     candidates: []const []const u8,
     allocator: std.mem.Allocator,
+    tail: ?*std.ArrayList(u8),
 ) StreamHandshakeError!usize {
     if (candidates.len == 0) return error.ProtocolNegotiationFailed;
 
@@ -275,6 +305,7 @@ pub fn responderHandshakeMultistreamAmong(
             try compactConsumed(&acc, allocator, rem_probe);
             Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
             Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+            try finishAmongWithTail(&acc, r, allocator, tail);
             return picked orelse return terr.fromMultistreamStreamLayer(error.ProtocolNotSupported);
         }
         const pulled = try tryReadMoreHandshake(&acc, r, allocator);
@@ -308,6 +339,7 @@ pub fn responderHandshakeMultistreamAmong(
         };
         Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
         Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+        try finishAmongWithTail(&acc, r, allocator, tail);
         return picked orelse return terr.fromMultistreamStreamLayer(error.ProtocolNotSupported);
     }
 }
@@ -321,7 +353,7 @@ test "responderHandshakeMultistreamAmong matches second candidate" {
     defer aw.deinit();
 
     const cands: []const []const u8 = &.{ "/meshsub/1.1.0", ping_mod.multistream_protocol_id };
-    const ix = try responderHandshakeMultistreamAmong(&r, &aw.writer, cands, a);
+    const ix = try responderHandshakeMultistreamAmong(&r, &aw.writer, cands, a, null);
     try std.testing.expectEqual(@as(usize, 1), ix);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), ping_mod.multistream_protocol_id) != null);
 }
@@ -334,5 +366,28 @@ test "responderHandshakeMultistreamAmong na for unknown protocol" {
     defer aw.deinit();
 
     const cands: []const []const u8 = &.{"/meshsub/1.1.0"};
-    try std.testing.expectError(error.ProtocolNegotiationFailed, responderHandshakeMultistreamAmong(&r, &aw.writer, cands, a));
+    try std.testing.expectError(error.ProtocolNegotiationFailed, responderHandshakeMultistreamAmong(&r, &aw.writer, cands, a, null));
+}
+
+test "responderHandshakeMultistreamAmong preserves trailing app bytes (go MSSelect)" {
+    const a = std.testing.allocator;
+    const ping_mod = @import("../ping.zig");
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(a);
+    try neg.initiatorSendMultistreamHeaderFramed(&wire, a, .delimited);
+    try neg.initiatorSendProtocolFramed(&wire, a, ping_mod.multistream_protocol_id, .delimited);
+    const payload = [_]u8{0x11} ** ping_mod.payload_len;
+    try wire.appendSlice(a, &payload);
+
+    var r = Io.Reader.fixed(wire.items);
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    var tail = std.ArrayList(u8).empty;
+    defer tail.deinit(a);
+    const cands: []const []const u8 = &.{ "/meshsub/1.1.0", ping_mod.multistream_protocol_id };
+    const ix = try responderHandshakeMultistreamAmong(&r, &aw.writer, cands, a, &tail);
+    try std.testing.expectEqual(@as(usize, 1), ix);
+    try std.testing.expectEqual(payload.len, tail.items.len);
+    try std.testing.expectEqualSlices(u8, &payload, tail.items);
 }

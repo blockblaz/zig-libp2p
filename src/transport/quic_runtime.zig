@@ -1039,7 +1039,7 @@ pub const QuicRuntime = struct {
                 var r = ist.raw.reader();
                 var w = ist.raw.writer();
                 const cands: []const []const u8 = &supported_protocols;
-                const ix = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, a) catch |err| {
+                const ix = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, a, null) catch |err| {
                     log.warn("quic_runtime: inbound responder handshake failed: {s}", .{@errorName(err)});
                     self.removeInboundStreamAt(i);
                     continue;

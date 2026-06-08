@@ -59,6 +59,6 @@ docker build -t go-libp2p:interop-quic -f interop_quic/impls/go-libp2p/Dockerfil
 | Workflow | Trigger | Gate |
 |----------|---------|--------|
 | [`interop-quic-self.yml`](../.github/workflows/interop-quic-self.yml) | every PR | zig ↔ zig handshake + ping |
-| [`interop-quic-cross.yml`](../.github/workflows/interop-quic-cross.yml) | PR / nightly / manual | Same-impl baseline (required); cross-impl **handshake** required; cross-impl **ping** reported (`continue-on-error` until zquic/quic-go CID issue fixed) |
+| [`interop-quic-cross.yml`](../.github/workflows/interop-quic-cross.yml) | PR / nightly / manual | Same-impl baseline (required); cross-impl **handshake** and **ping** required (zig↔go-libp2p 8/8) |
 
 Impl sources: [`impls/go-libp2p/`](impls/go-libp2p/), [`impls/rust-libp2p/`](impls/rust-libp2p/).
