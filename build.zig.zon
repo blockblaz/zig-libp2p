@@ -23,9 +23,13 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            // v1.6.10 — quinn mux interop (#162), issue #138 P1 parity, Client.initInPlace.
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.10#3f8c8669758bbe57da72017b5db5fd30863e8369",
-            .hash = "zquic-1.6.10-2zRc1Il1EwC1WAXVszicLjgivbbHOM8b0yQgvdNYwEyb",
+            // v1.6.11 — TLS CertificateRequest signature_algorithms wire fix
+            // (cross-impl TLS handshake interop with rust-libp2p / go-libp2p
+            // / cpp-libp2p — pre-fix the SignatureSchemeList was missing its
+            // inner u16 list_len, so every compliant TLS parser rejected the
+            // CertificateRequest, blocking every cross-impl mutual-TLS dial).
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.11#ead1f7dd134210d260be1dcdfe28b3accd333ecc",
+            .hash = "zquic-1.6.11-2zRc1HZ6EwCT1-TwepltOO0EmAWrzkYNNl3bF9Ko423W",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",
