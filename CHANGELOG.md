@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.9](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.8...v0.1.9) (2026-06-08)
+
+### Features
+
+* **interop_quic:** go-libp2p cross-impl over QUIC — delimited multistream-select
+  (go-multistream v0.5), Identify responder stub on `/ipfs/id/1.0.0`, pending-stream
+  ping server, and `zig build interop-matrix` (#166).
+* **transport/multistream:** auto-detect peer framing (legacy `\n` vs uvarint-delimited
+  tokens); mirror framing on responder replies.
+* **transport/quic_raw_stream_io:** `writeAllFin` for half-closing raw app streams after
+  Identify (go-libp2p reads delimited protobuf until EOF).
+
+### Dependencies
+
+* zquic bumped to **v1.6.11** — TLS `CertificateRequest` `signature_algorithms` list
+  length prefix fix (cross-impl mutual-TLS handshake with go-libp2p / rust-libp2p).
+
+### Known gaps
+
+* QUIC cross-impl ping: **go-libp2p client → zig server** still fails when quic-go
+  sends `RETIRE_CONNECTION_ID` seq 0 after Identify; requires a zquic upstream fix.
+  All handshake pairs and the other seven ping pairs pass locally.
+
 ## [0.1.8](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.7...v0.1.8) (2026-06-04)
 
 ### Features

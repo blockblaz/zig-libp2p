@@ -2,16 +2,16 @@
 
 Pure-Zig building blocks for **libp2p-style** networking: length-prefixed req/resp, gossipsub protobuf, multistream-select, TCP/QUIC transport helpers, Noise and TLS profiles, and re-exports for `peer_id`, `multiaddr`, and Snappy stacks.
 
-**Zeam** (feature checklist, pins, CI/release notes): [docs/zeam-parity.md](docs/zeam-parity.md). The [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31) libp2p-glue replacement checklist is **library-complete**; use [`host.Host`](./src/host.zig) (alias `zig_libp2p.Node`) plus transport wiring — see [examples/host_quic_node.zig](examples/host_quic_node.zig).
+**Zeam** integration checklist and CI/release notes: [docs/zeam-parity.md](docs/zeam-parity.md). The [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31) libp2p-glue replacement checklist is **library-complete**; wire [`host.Host`](./src/host.zig) (alias `zig_libp2p.Node`) plus transport — see [examples/host_quic_node.zig](examples/host_quic_node.zig).
 
 ## Security
 
-Lean/Eth2 devnets use gossipsub **StrictNoSign** (signatures on SSZ payloads, not on gossipsub envelopes). Transport auth, Identify signed peer records, and DoS limits are documented in [docs/SECURITY.md](docs/SECURITY.md).
+Lean/Eth2 devnets use gossipsub **StrictNoSign** (signatures on SSZ payloads, not on gossipsub envelopes). Transport auth, Identify signed peer records, and DoS limits: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Requirements
 
 - **Zig** 0.16.0 (`minimum_zig_version` in `build.zig.zon`)
-- **zquic** ≥ 1.6.4 for QUIC examples and `zig_libp2p.zquic` (see `build.zig.zon`)
+- **zquic** **1.6.11** (pinned in `build.zig.zon`; re-exported as `zig_libp2p.zquic`)
 
 ## Usage
 
@@ -25,119 +25,59 @@ const zig_libp2p = b.dependency("zig_libp2p", .{
 exe.root_module.addImport("zig_libp2p", zig_libp2p.module("zig_libp2p"));
 ```
 
-Application code: `@import("zig_libp2p")` — public API matches [`src/root.zig`](./src/root.zig).
+Application code: `@import("zig_libp2p")` — public API in [`src/root.zig`](./src/root.zig).
+
+Pin this repo by git tag (e.g. `v0.1.9`) in your `build.zig.zon` URL.
 
 ## Examples
 
-Programs live under [`examples/`](./examples/). `zig build` installs them to `zig-out/bin/`; `zig build examples` compiles only.
+Programs under [`examples/`](./examples/). `zig build` installs to `zig-out/bin/`; `zig build examples` compiles only. Build/CI details: [examples/README.md](examples/README.md).
 
 | Binary | Source | Description |
 |--------|--------|-------------|
-| `example-varint` | [varint.zig](examples/varint.zig) | Varint `encodeToScratch` / `decode` round trip |
-| `example-addr-list-csv` | [addr_list_csv.zig](examples/addr_list_csv.zig) | Multiaddr CSV `parseCsv` / `freeList` |
-| `example-multistream-negotiate` | [multistream_negotiate.zig](examples/multistream_negotiate.zig) | Buffer-only multistream-select for `/quic-v1` |
-| `example-gossipsub-mesh` | [gossipsub_mesh.zig](examples/gossipsub_mesh.zig) | `Gossipsub.subscribe`, inbound GRAFT, mesh size |
-| `example-ping-membuf` | [ping_membuf.zig](examples/ping_membuf.zig) | Ping 1.0.0 `handleInbound` with in-memory `Io.Reader` / `Writer` |
-| `example-swarm-tick` | [swarm_tick.zig](examples/swarm_tick.zig) | `Swarm.tick` / `nextEvent` without background threads (Wasi-friendly) |
-| `example-req-resp-tcp-status` | [req_resp_tcp_status.zig](examples/req_resp_tcp_status.zig) | Req/resp status unary over TCP loopback (`wire_tcp`); **compile-only** in `zig build test` to avoid CI hangs |
-| `example-quic-ping-loopback` | [quic_ping_loopback.zig](examples/quic_ping_loopback.zig) | QUIC + TLS + multistream + ping via `quic_endpoint.loopbackPingOnce` (needs [`test/fixtures/quic_loopback/`](./test/fixtures/quic_loopback/) PEMs from repo root) |
-| `example-host-quic-node` | [host_quic_node.zig](examples/host_quic_node.zig) | `Host` + QUIC lifecycle hooks (compile-only; needs TLS PEMs to run) |
+| `example-varint` | [varint.zig](examples/varint.zig) | Varint encode/decode round trip |
+| `example-addr-list-csv` | [addr_list_csv.zig](examples/addr_list_csv.zig) | Multiaddr CSV parse/free |
+| `example-multistream-negotiate` | [multistream_negotiate.zig](examples/multistream_negotiate.zig) | Buffer-only multistream-select |
+| `example-gossipsub-mesh` | [gossipsub_mesh.zig](examples/gossipsub_mesh.zig) | Gossipsub subscribe + mesh |
+| `example-ping-membuf` | [ping_membuf.zig](examples/ping_membuf.zig) | Ping 1.0.0 over in-memory I/O |
+| `example-swarm-tick` | [swarm_tick.zig](examples/swarm_tick.zig) | `Swarm.tick` without background threads |
+| `example-req-resp-tcp-status` | [req_resp_tcp_status.zig](examples/req_resp_tcp_status.zig) | Req/resp over TCP (compile-only in CI) |
+| `example-quic-ping-loopback` | [quic_ping_loopback.zig](examples/quic_ping_loopback.zig) | QUIC loopback ping via `quic_endpoint` |
+| `example-host-quic-node` | [host_quic_node.zig](examples/host_quic_node.zig) | `Host` + QUIC lifecycle hooks |
+| `interop-quic-node` | [interop_quic_node.zig](examples/interop_quic_node.zig) | QUIC interop endpoint (env-driven; see below) |
+| `gen-libp2p-cert` | [gen_libp2p_cert.zig](examples/gen_libp2p_cert.zig) | Mint libp2p TLS cert + peer id for interop |
 
-Build/CI behaviour for examples: [examples/README.md](examples/README.md).
+## QUIC cross-impl interop
+
+[`interop_quic/`](interop_quic/) runs zig ↔ go-libp2p ↔ rust-libp2p matrix tests over QUIC + libp2p TLS (Phase B). Quick start:
+
+```sh
+zig build -Doptimize=ReleaseFast
+(cd interop_quic/impls/go-libp2p && go build -o interop-quic-node-go .)
+interop_quic/run_matrix.sh zig,go-libp2p handshake,ping   # or: zig build interop-matrix
+```
+
+**Current matrix (v0.1.9):** all **handshake** pairs pass (TLS + peer-id verify). **Ping** passes 7/8 zig↔go pairs; `go-libp2p` client → `zig` server ping still fails pending a [zquic](https://github.com/ch4r10t33r/zquic) fix for quic-go `RETIRE_CONNECTION_ID` seq 0. Same-impl and go→zig ping are green. Full harness docs: [interop_quic/README.md](interop_quic/README.md).
 
 ## API overview
 
-Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.varint`, `zig_libp2p.gossipsub.control`).
+Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.gossipsub.runtime`, `zig_libp2p.transport.quic_runtime`).
 
-### Top-level modules
+| Area | Modules |
+|------|---------|
+| Core | `host` / `Node`, `swarm`, `connection_manager`, `errors`, `metrics`, `layer_events`, `peer_events` |
+| Protocols | `protocol`, `ping`, `identify`, `gossip`, `gossipsub.*`, `req_resp.*` |
+| Wire | `varint`, `multistream`, `protobuf.wire`, `addr_list` |
+| Transport | `transport.quic_*`, `transport.tcp`, `transport.tcp_tls`, `transport.stream_multistream`, `transport.multistream_negotiate`, `transport.yamux`, `transport.mplex` |
+| Security | `security.libp2p_tls`, `security.libp2p_tls_cert`, `security.noise` |
+| Identity / codecs | `peer_id`, `identity`, `keypair`, `snappyz`, `snappyframesz` |
+| QUIC stack | `zquic` (full re-export) |
 
-| Module | Role |
-|--------|------|
-| `errors` | Layered errors: `ReqRespError`, `GossipsubError`, `TransportError`; `setLastErrorMessage` / `lastErrorMessage` / `clearLastErrorMessage` |
-| `metrics` | `Metrics`: mesh and swarm counters; `writePrometheusText`, `snapshot` |
-| `layer_events` | Event carriers: `ReqRespFailure`, `GossipsubFailure`, `TransportFailure` (discriminate on `kind`) |
-| `peer_events` | Connection events: `Direction`, `DisconnectReason`, `ConnectionFailureResult`, connected / disconnected / failed payloads |
-| `connection_manager` | Known-peer dial scheduling, reconnect backoff, refcount + peer events; optional `setReqResp` |
-| `host` / `Node` | Bundles `Swarm` + `Gossipsub` + `ReqResp` + `ConnectionManager`; `nextEvent`, subscribe/publish helpers; transport still embedder-owned |
-| `swarm` | Bounded `submit` / `nextEvent`, `queueEvent`, `shutdown`; `SwarmConfig`, `tick`, `startBackground` / `run` |
-| `protocol` | Lean req/resp protocol ids; `LeanSupportedProtocol` |
-| `varint` | Unsigned varint `encodeToScratch` / `decode` |
-| `addr_list` | Multiaddr CSV `parseCsv`, `freeList` |
-| `multistream` | Multistream-select 1.0.0 line I/O: `multistream_1_0_0`, `writeProtocolLine`, `trimNegotiationLine` |
-| `ping` | Ping 1.0.0 wire helpers and round-trip timing |
-| `ping_wire_quic` | Ping over QUIC raw bidi stream (multistream + echo); needs zquic UDP pumping |
-| `identify` | Identify 1.0.0 `encode` / `decodeOwned` |
-| `peer_id` | Re-export of `peer-id` |
-| `identity` | `PeerId`, `ParseError` aliases |
-| `keypair` | PEM → `KeyPair`; `peerIdFromKeyPair` |
-| `snappyz` | Re-export of block Snappy |
-| `snappyframesz` | Re-export of stream Snappy framing |
-| `zquic` | Full zquic library (QUIC/TLS) |
-
-### Metrics
-
-Share one [`metrics.Metrics`](./src/metrics.zig) via [`SwarmConfig.metrics`](./src/swarm.zig) and [`GossipsubConfig.metrics`](./src/gossipsub/runtime.zig). Set `network_id` so mesh gauge and swarm drop counters share labels. Mesh gauge updates on subscribe/unsubscribe/disconnect/control/heartbeat. See [`metrics.zig`](./src/metrics.zig) for `setMeshPeers`, `recordSwarmCommandDropped`, exporters.
-
-### `gossip`
-
-| Submodule | Role |
-|-----------|------|
-| `gossip.topic` | `GossipTopic`, `LeanNetworkTopic`, `GossipEncoding`, `GossipTopicKind`, `SubnetId` |
-
-### `gossipsub`
-
-| Submodule | Role |
-|-----------|------|
-| `gossipsub.config` | Mesh and heartbeat constants, gossip lazy, transmit limits |
-| `gossipsub.message_id` | Wire message id: SHA256-based 20-byte id |
-| `gossipsub.duplicate_cache` | TTL duplicate cache `(topic, id)` |
-| `gossipsub.runtime` | `Gossipsub`, `GossipsubConfig`, outbox caps, behaviour scores, lazy IHAVE / IWANT |
-| `gossipsub.rpc` | RPC envelope encode/decode, subscribe/publish/control helpers |
-| `gossipsub.control` | IHave, IWant, IDontWant, graft, prune; `ControlExtensions` |
-| `gossipsub.message` | `Message` protobuf: `MessageView`, `MessageOwned`, `encode`, `decode` |
-
-### `protobuf`
-
-| Submodule | Role |
-|-----------|------|
-| `protobuf.wire` | Proto2 wire: varints, field keys, length-delimited append/scan, bounded length-delimited decode |
-
-### `req_resp`
-
-| Submodule | Role |
-|-----------|------|
-| `req_resp.frame` | Length-prefixed framing, `parseRequestHeader` / `parseResponseHeader`, append helpers |
-| `req_resp.stream` | Incremental scan: `peekRpcUnary*`, `scanComplete*`, `consumePrefix(list, allocator, n)`, `InboundBuffer` |
-| `req_resp.snappy_wire` | Snappy compress/decompress and framed req/resp wire |
-| `req_resp.runtime` | `ReqResp`, sessions, streaming responses, timeouts, `onPeerDisconnected` |
-| `req_resp.wire_framing` | Unary ssz_snappy read/write on `Io.Reader` / `Writer` |
-| `req_resp.wire_tcp` | Unary exchange over TCP + multistream |
-| `req_resp.wire_quic` | Same over QUIC raw streams + multistream |
-
-### `transport`
-
-| Submodule | Role |
-|-----------|------|
-| `transport.quic_v1` | QUIC v1 labels, ALPN, `libp2pZquicServerConfig` / `libp2pZquicClientConfig`, first-stream multistream preamble |
-| `transport.quic` | `parseQuicV1Endpoint`, `initLibp2pQuicServerFromMultiaddr`, client init helpers, `bindUdpSocket` |
-| `transport.quic_endpoint` | `QuicListener`, `QuicOutbound`, `dialExtended` / `dialMultiaddr`, TLS peer verification options, loopback ping helpers |
-| `transport.quic_runtime` | `QuicRuntime`: gossipsub + req/resp on QUIC streams; `TlsPemSource` `.paths` or `.pem_bytes` ([#129](https://github.com/ch4r10t33r/zig-libp2p/issues/129)) |
-| `transport.quic_peer_identity` | `verifiedPeerIdFromLibp2pQuicClient`, `verifiedPeerIdFromLibp2pQuicServerConn` (libp2p TLS + optional expected `PeerId`) |
-| `transport.transport_error` | Map I/O, multistream, TLS, Noise, zquic errors into `TransportError` |
-| `transport.stream_multistream` | Per-stream multistream on `Io.Reader` / `Writer`, including `responderHandshakeMultistreamAmong` |
-| `transport.tcp` | TCP listen/dial/accept with multistream protocol id |
-| `transport.multistream_negotiate` | Bounded byte-cursor multistream-select 1.0.0 |
-
-### `security`
-
-| Submodule | Role |
-|-----------|------|
-| `security.libp2p_tls` | libp2p TLS 1.3: ALPN, extension OID, certificate → `PeerId`, full verify path |
-| `security.noise` | Noise XX, libp2p payloads, `SecureChannel`, TCP stream upgrade |
+Per-module detail lives in source doc comments and [`src/root.zig`](./src/root.zig).
 
 ## Development
 
-Tests, fuzz, CI, and release workflow: [docs/zeam-parity.md#development](docs/zeam-parity.md#development).
+`zig fmt --check .`, `zig build test`, `zig build fuzz`, CI workflows, and release-please: [docs/zeam-parity.md#development](docs/zeam-parity.md#development).
 
 ## Repository
 

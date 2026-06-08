@@ -40,10 +40,9 @@ All behaviour layers listed in #31 are implemented in this repo (see **Surface c
 | TCP transport | Done | [#35](https://github.com/ch4r10t33r/zig-libp2p/issues/35) |
 | QUIC /quic-v1 transport (listen, dial, UDP drive, accept) | Done | [#15](https://github.com/ch4r10t33r/zig-libp2p/issues/15) — [`transport.quic_endpoint`](../src/transport/quic_endpoint.zig) + zquic |
 | QUIC multiaddr + per-stream negotiate | Done | [#37](https://github.com/ch4r10t33r/zig-libp2p/issues/37) — `listenMultiaddr` / `dialMultiaddr` / `dialExtended`, `QuicLifecycleHooks`, `popNextUnreportedPeerBidiStream`, per-stream [`stream_multistream.responderHandshakeMultistreamAmong`](../src/transport/stream_multistream.zig); two-stream loopback test. Outbound server PeerId: [`quic_peer_identity`](../src/transport/quic_peer_identity.zig). |
-| libp2p TLS on QUIC (ALPN, peer auth) | Done | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — zquic **1.6.4+** sends TLS `CertificateRequest` on libp2p listeners; dialers set `Libp2pZquicClientDialOptions.client_cert_path` / `client_key_path`. [`quic_peer_identity`](../src/transport/quic_peer_identity.zig): `verifiedPeerIdFromLibp2pQuicClient`, `verifiedPeerIdFromLibp2pQuicServerConn`. |
+| libp2p TLS on QUIC (ALPN, peer auth) | Done | [#16](https://github.com/ch4r10t33r/zig-libp2p/issues/16) — zquic **1.6.11** (TLS `CertificateRequest` wire fix); [`quic_peer_identity`](../src/transport/quic_peer_identity.zig). |
 | `QuicRuntime` in-memory TLS PEM | Done | [#129](https://github.com/ch4r10t33r/zig-libp2p/issues/129) — [`TlsPemSource`](../src/transport/quic_runtime.zig) `.paths` or `.pem_bytes` (ephemeral files for zquic, unlinked on `destroy`) |
-| Gossipsub PRUNE backoff (60 s default) | Done | [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) — `recordBackoff`, inbound `backoff_seconds`, heartbeat GRAFT skip; see `gossipsub/runtime.zig` tests |
-| Gossipsub `unsubscribe_backoff` | Open | [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) (remaining spec bullet) |
+| Gossipsub PRUNE backoff (60 s default) | Done | [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) |
 | Ping behaviour (`/ipfs/ping/1.0.0`) | Done | [#42](https://github.com/ch4r10t33r/zig-libp2p/issues/42) |
 | KeyPair / PEM → PeerId | Done | [#47](https://github.com/ch4r10t33r/zig-libp2p/issues/47) |
 | Swarm / network runtime | Done | [#34](https://github.com/ch4r10t33r/zig-libp2p/issues/34) — `std.Io.Threaded` command queue (8192) + event channel, 256 cmd/tick, `Swarm.initWithConfig` / `Swarm.tick`, `Swarm.startBackground` / `Swarm.run`; dial command carries optional `expected_peer`; transport still embedder-owned |
@@ -51,8 +50,8 @@ All behaviour layers listed in #31 are implemented in this repo (see **Surface c
 | libp2p TLS on TCP (`/tls/1.0.0`) | Done | [#86](https://github.com/ch4r10t33r/zig-libp2p/issues/86) — [`transport.tcp_tls`](../src/transport/tcp_tls.zig) / [`stream_upgrade`](../src/transport/tcp_tls/stream_upgrade.zig): multistream + TLS 1.3 (ALPN `libp2p`) via vendored `zquic_tls` `nonblock` handshake; libp2p cert verify on client; TCP loopback test (Darwin skipped); rust-libp2p interop manual |
 | Noise RSA + ECDSA-P256 identities | Done | [#87](https://github.com/ch4r10t33r/zig-libp2p/issues/87) — `identity.verifySignature` for `.RSA` (PKCS#1 v1.5 / SHA-256) and `.ECDSA` (SPKI-wrapped P-256); round-trip tests in `identity.zig` |
 | Connection manager | Done | [#38](https://github.com/ch4r10t33r/zig-libp2p/issues/38) — `connection_manager` + `peer_events` (`Direction.unknown`), dial string without `/p2p`, reconnect backoff, refcount + events, optional `setReqResp`; embedder wires transport → `tick` / `onDialFailure` / `onConnectionEstablished` / `onConnectionClosed` |
-| Gossipsub mesh runtime | Done | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) — `gossipsub.runtime`: mesh + heartbeat, lazy IHAVE, IWANT → pull cache, `max_transmit_size_bytes`, global + per-peer outbox caps, `setPeerBehaviourScore` / `peerBehaviourScore` for GRAFT / PRUNE / lazy ordering |
-| Gossipsub PRUNE + unsubscribe backoff | Done | [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) — `recordBackoff`, inbound `backoff_seconds`, heartbeat GRAFT skip, `leaveTopicMesh` on `unsubscribe` with `unsubscribe_backoff_ms` (10 s), `TopicUnsubscribeBackoff` on early resubscribe |
+| Gossipsub mesh runtime | Done | [#39](https://github.com/ch4r10t33r/zig-libp2p/issues/39) |
+| Gossipsub PRUNE + unsubscribe backoff | Done | [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) |
 | Req/resp behaviour | Done | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) — `req_resp.runtime` (timeouts, `channel_id`, `onPeerDisconnected`); `wire_framing`, `wire_tcp`, `wire_quic`; `connection_manager.setReqResp` notifies `ReqResp` on last session close; end-to-end on live streams remains embedder transport + `swarm` |
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
 | Metrics (Prometheus-style) | Done | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) — [`metrics`](../src/metrics.zig), [`SwarmConfig`](../src/swarm.zig), [`GossipsubConfig`](../src/gossipsub/runtime.zig) |
@@ -70,7 +69,8 @@ QUIC UDP pumping: [`transport.quic_endpoint`](../src/transport/quic_endpoint.zig
 | Requirement | Version / note |
 |-------------|----------------|
 | Zig | **0.16.0** (`minimum_zig_version` in `build.zig.zon`) |
-| QUIC stack | **zquic ≥ 1.6.4** (pinned in `build.zig.zon`; re-exported as `zig_libp2p.zquic`) |
+| QUIC stack | **zquic 1.6.11** (pinned in `build.zig.zon`; re-exported as `zig_libp2p.zquic`) |
+| QUIC cross-impl (Phase B) | In progress | [#166](https://github.com/ch4r10t33r/zig-libp2p/issues/166) — handshake green zig↔go; ping 7/8; harness in [`interop_quic/`](../interop_quic/) |
 
 ## Development
 
@@ -81,8 +81,6 @@ QUIC UDP pumping: [`transport.quic_endpoint`](../src/transport/quic_endpoint.zig
 
 ## Roadmap / hygiene
 
-[#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31) is closed (library-complete). Active work: [#86](https://github.com/ch4r10t33r/zig-libp2p/issues/86) TCP `/tls/1.0.0`, [#87](https://github.com/ch4r10t33r/zig-libp2p/issues/87) Noise RSA/ECDSA, [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) `unsubscribe_backoff`, [#57](https://github.com/ch4r10t33r/zig-libp2p/issues/57) async swarm.
+[#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31) is closed (library-complete). Active: [#166](https://github.com/ch4r10t33r/zig-libp2p/issues/166) QUIC cross-impl (last ping pair), [#57](https://github.com/ch4r10t33r/zig-libp2p/issues/57) async swarm.
 
-**Examples contract:** new public APIs should add or extend an `examples/` program that exits 0 under `zig build test` (smoke-run after unit tests), unless documented as compile-only (e.g. TCP + `Io.Threaded` demos). Avoid a second `addTest` root on the same `zig_libp2p` module (Zig 0.16 type identity).
-
-**Experimental:** **ControlExtensions.partialMessages** wire helpers live in `gossipsub.control`.
+**Examples contract:** new public APIs should add or extend an `examples/` program that exits 0 under `zig build test`, unless documented as compile-only. Avoid a second `addTest` root on the same `zig_libp2p` module (Zig 0.16 type identity).

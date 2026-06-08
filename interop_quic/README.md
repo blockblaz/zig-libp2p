@@ -1,118 +1,64 @@
 # QUIC interop (Phase B)
 
-QUIC + libp2p interop harness, separate from the existing `interop/` directory
-(which targets the libp2p `unified-testing` matrix on TCP + TLS + Yamux).
+QUIC + libp2p interop harness (separate from [`interop/`](../interop/), which targets the libp2p unified-testing matrix on TCP + TLS + Yamux).
 
-## Phase B layout
+## Status
 
-| PR | Adds |
-|----|------|
-| B1 | This dir. `interop-quic-node` binary, Dockerfile, self-test, GH workflow. zig-libp2p ↔ zig-libp2p only. |
-| B2 | libp2p TLS cert minter, peer-id wiring, `go-libp2p` impl container, matrix runner, nightly cross-impl workflow. |
-| B3 | Gossipsub pub/sub testcase. Go side fully wired; zig side now wired via `Host` + `QuicRuntime` (dialer-publishes pattern — `QuicRuntime.onPublishCommand` only fans out to outbound peers today). |
-| B4 | Req/resp testcase. Fully wired on both impls over `/interop/b4/echo/1.0.0` — same multistream-select + raw-app-stream path as ping. |
-| B5 | `rust-libp2p` impl container. handshake + ping + reqresp pass; gossipsub skipped pending mesh-formation timing fix. Matrix runner extended to 3-corner. |
+| Scope | handshake | ping | gossipsub | reqresp |
+|-------|-----------|------|-----------|---------|
+| zig ↔ zig | pass | pass | pass | pass |
+| go ↔ go | pass | pass | pass | pass |
+| rust ↔ rust | pass | pass | skip* | pass |
+| zig ↔ go | **pass** | **7/8**† | pass (zig publishes) | pass |
+| full 3-corner (cron) | varies | varies | varies | varies |
+
+\* rust gossipsub skipped pending mesh timing.  
+† Failing pair: **go-libp2p client → zig server ping** — go opens identify on stream 0; zig answers with delimited Identify + FIN; quic-go then emits `RETIRE_CONNECTION_ID` seq 0 and zquic closes the connection (RFC violation). Tracked upstream in zquic; all other cross-impl ping directions pass.
 
 ## Binary
 
-`examples/interop_quic_node.zig` builds to `zig-out/bin/interop-quic-node`.
-Single binary; role and testcase come from environment.
+`examples/interop_quic_node.zig` → `zig-out/bin/interop-quic-node`. Role and testcase from environment:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `ROLE` | `server` | `server` (listen) or `client` (dial) |
-| `TESTCASE` | `handshake` | `handshake` (QUIC handshake only), `ping` (handshake + `/ipfs/ping/1.0.0`), `gossipsub` (B3 — on the zig impl the dialer publishes and the listener counts inbound, opposite of go-libp2p; see B3 row in the layout table), or `reqresp` (B4 — echo over `/interop/b4/echo/1.0.0`) |
-| `GS_TOPIC` | `/interop/b3` | gossipsub topic both sides subscribe to |
-| `GS_COUNT` | `5` | gossipsub: number of messages the server publishes |
-| `GS_PAYLOAD_LEN` | `64` | gossipsub: bytes per message; payload is deterministic (`msg-NNNNN:` + 0x2A padding) so multiple impls assert on identical bytes |
-| `RR_PAYLOAD_LEN` | `256` | reqresp: bytes per request+response. Client mints a low-byte counter (`i & 0xff`); server echoes verbatim so the wire byte sequence is fully deterministic. |
-| `LISTEN_PORT` | `4001` | server bind port |
-| `SERVER_HOST` | `127.0.0.1` | client dial target (IPv4 dotted-decimal) |
-| `SERVER_PORT` | `4001` | client dial port |
-| `CERT_PATH` | `/certs/cert.pem` | TLS cert (X.509 PEM, **with libp2p extension**, see below) |
-| `KEY_PATH` | `/certs/key.pem` | TLS key (SEC1 EC PRIVATE KEY PEM) |
-| `REMOTE_PEER_ID` | (unset) | client-only; when set, dialExtended runs the libp2p TLS leaf check against this base58btc peer id |
-| `DEADLINE_MS` | `30000` | overall test deadline |
+| `ROLE` | `server` | `server` or `client` |
+| `TESTCASE` | `handshake` | `handshake`, `ping`, `gossipsub`, `reqresp` |
+| `LISTEN_PORT` / `SERVER_HOST` / `SERVER_PORT` | 4001 / 127.0.0.1 / 4001 | UDP bind / dial |
+| `CERT_PATH` / `KEY_PATH` | `/certs/*.pem` | libp2p-extension TLS PEM (zig side) |
+| `REMOTE_PEER_ID` | (unset) | Client: base58btc peer id → `dialExtended` + TLS verify |
+| `DEADLINE_MS` | `30000` | Overall deadline |
+| `GS_*` / `RR_PAYLOAD_LEN` | see source | Gossipsub / reqresp testcase sizes |
 
-Exit codes: `0` success, `1` failure (timeout / mismatch), `2` bad config.
+Exit codes: `0` ok, `1` failure, `2` bad config.
 
 ### Cert generation
 
-`examples/gen_libp2p_cert.zig` builds to `zig-out/bin/gen-libp2p-cert`. It
-mints a libp2p-extension cert (RFC 0001) over an ECDSA-P-256 host identity:
+`zig-out/bin/gen-libp2p-cert` mints RFC 0001 certs (`SEED_HEX` for deterministic peer ids). Stdout: `gen_libp2p_cert: peer_id=<base58btc>`.
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `CERT_PATH` | `/certs/cert.pem` | output cert path |
-| `KEY_PATH` | `/certs/key.pem` | output key path |
-| `SEED_HEX` | random | 32-byte hex; deterministic identity when set |
-| `PEER_ID_PATH` | (unset) | when set, the base58btc peer id is written here |
-
-Stdout always carries `gen_libp2p_cert: peer_id=<base58btc>` for shell capture.
-This replaces the openssl `gen_certs.sh` script that shipped in B1 — the bare
-self-signed cert is rejected by every cross-impl libp2p verifier.
-
-## Run
-
-### Local self-test (zig ↔ zig)
+## Run locally
 
 ```sh
 zig build -Doptimize=ReleaseFast
-interop_quic/self_test.sh handshake
-interop_quic/self_test.sh ping
-```
-
-### Local cross-impl matrix (zig ↔ go-libp2p)
-
-```sh
-# 1. Build zig binaries.
-zig build -Doptimize=ReleaseFast
-
-# 2. Build the go-libp2p side. The binary is dropped next to its source so
-#    run_matrix.sh can discover it without an install step.
+interop_quic/self_test.sh ping                    # zig ↔ zig
 (cd interop_quic/impls/go-libp2p && go build -o interop-quic-node-go .)
-
-# 3. Run the matrix. First arg is impls (CSV), second is testcases.
 interop_quic/run_matrix.sh zig,go-libp2p handshake,ping
+zig build interop-matrix                          # shorthand: zig,go-libp2p handshake+ping
 ```
 
-Output is TAP-like (`ok N - server=… client=… …` per pair, summary at end).
-Same-impl pairs (zig↔zig and go↔go) are the green baseline. Cross-impl pairs
-currently exercise outstanding zquic ↔ go-libp2p TLS gaps (handshake message
-encoding); the runner reports them as `not ok` rather than masking the
-mismatch so the regression is visible.
+Output is TAP-like (`ok N - server=… client=…`).
 
-### Docker image (zig impl)
+### Docker
 
 ```sh
 docker build -t zig-libp2p:interop-quic -f interop_quic/Dockerfile .
-docker run --rm --net=host -e ROLE=server -e TESTCASE=ping zig-libp2p:interop-quic
-docker run --rm --net=host -e ROLE=client -e TESTCASE=ping -e SERVER_HOST=127.0.0.1 \
-           -e REMOTE_PEER_ID=<peer-id-of-server> zig-libp2p:interop-quic
+docker build -t go-libp2p:interop-quic -f interop_quic/impls/go-libp2p/Dockerfile interop_quic/impls/go-libp2p
 ```
 
-### Docker image (go-libp2p impl)
+## CI
 
-```sh
-docker build -t go-libp2p:interop-quic -f interop_quic/impls/go-libp2p/Dockerfile \
-             interop_quic/impls/go-libp2p
-```
+| Workflow | Trigger | Gate |
+|----------|---------|--------|
+| [`interop-quic-self.yml`](../.github/workflows/interop-quic-self.yml) | every PR | zig ↔ zig handshake + ping |
+| [`interop-quic-cross.yml`](../.github/workflows/interop-quic-cross.yml) | PR / nightly / manual | Same-impl baseline (required); cross-impl **handshake** required; cross-impl **ping** reported (`continue-on-error` until zquic/quic-go CID issue fixed) |
 
-### CI
-
-| Workflow | Trigger | Scope |
-|----------|---------|-------|
-| `.github/workflows/interop-quic-self.yml` | every PR | zig ↔ zig handshake + ping |
-| `.github/workflows/interop-quic-cross.yml` | PR (when matrix-runner files change), nightly cron, manual | zig ↔ zig + go ↔ go (required green) + zig ↔ go (informational, gated behind upstream zquic interop work) |
-
-## Open questions for B3+
-
-- **Cross-impl TLS gaps.** Independent of the libp2p extension, zquic's TLS
-  handshake still trips upstream verifiers on a few fronts (post-ALPN /
-  post-quic_transport_params extension type fix). Tracked in zquic upstream;
-  once green there + a zquic bump here, the cross-impl matrix flips green
-  without further changes in this dir.
-- **Gossipsub/req-resp testcases.** B3 and B4 add the actual streaming
-  protocols. Shared multiaddr discovery is still TBD — probably a Redis pub
-  envelope in line with the existing libp2p interop suite.
-- **rust-libp2p impl.** B5 adds a third corner of the matrix.
+Impl sources: [`impls/go-libp2p/`](impls/go-libp2p/), [`impls/rust-libp2p/`](impls/rust-libp2p/).
