@@ -181,6 +181,12 @@ fn build_swarm() -> Result<Swarm<Behaviour>, Box<dyn std::error::Error>> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
+    // Wire RUST_LOG / RUST_LOG_FILTER through tracing-subscriber so quinn /
+    // libp2p-tls errors surface in cross-impl debugging. Default off.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
     let role = env_or("ROLE", "server");
     let testcase = env_or("TESTCASE", "handshake");
     let deadline_ms: u64 = env_int("DEADLINE_MS", 30_000);

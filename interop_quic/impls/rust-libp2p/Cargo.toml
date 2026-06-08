@@ -5,6 +5,14 @@ edition = "2021"
 
 [dependencies]
 libp2p = { version = "0.54", default-features = false, features = [
+    "ecdsa",      # gen-libp2p-cert mints ECDSA-P-256 host identities by default;
+                  # without this feature libp2p-identity's try_decode_protobuf
+                  # returns "cargo feature `ecdsa` is not enabled" and the
+                  # libp2p-tls verifier maps that to UnknownIssuer, killing
+                  # every cross-impl handshake against a zig libp2p server.
+    "secp256k1",  # zeam-network / ethlibp2p_v2 uses secp256k1 host identities
+                  # (matches the lean ecosystem ENR secp256k1 convention);
+                  # same UnknownIssuer trap without this feature.
     "ed25519",
     "gossipsub",
     "macros",
@@ -18,6 +26,7 @@ futures = "0.3"
 hex = "0.4"
 rand = "0.8"
 async-trait = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 lto = "thin"
