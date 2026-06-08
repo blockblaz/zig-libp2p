@@ -156,12 +156,14 @@ pub const Libp2pZquicClientDialOptions = struct {
     client_key_pem: ?[]const u8 = null,
 };
 
-/// Build a [`ZIo.Client`] for an IPv4 [`QuicV1Endpoint`] using the libp2p QUIC presets.
-pub fn initLibp2pQuicClientFromEndpoint(
+/// Build a [`ZIo.Client`] in `out` for an IPv4 [`QuicV1Endpoint`] using the libp2p QUIC presets.
+/// Writes in-place so callers heap-allocating `*ZIo.Client` avoid a stack-sized return copy.
+pub fn initLibp2pQuicClientInPlace(
     allocator: std.mem.Allocator,
     ep: QuicV1Endpoint,
     dial_options: Libp2pZquicClientDialOptions,
-) !ZIo.Client {
+    out: *ZIo.Client,
+) !void {
     var host_buf: [15]u8 = undefined;
     const host = try formatZquicDialHost(ep.address, &host_buf);
     const cfg = quic_v1.libp2pZquicClientConfig(.{
@@ -176,7 +178,18 @@ pub fn initLibp2pQuicClientFromEndpoint(
         .client_cert_pem = dial_options.client_cert_pem,
         .client_key_pem = dial_options.client_key_pem,
     });
-    return ZIo.Client.init(allocator, cfg);
+    try ZIo.Client.initInPlace(allocator, cfg, out);
+}
+
+/// Build a [`ZIo.Client`] for an IPv4 [`QuicV1Endpoint`] using the libp2p QUIC presets.
+pub fn initLibp2pQuicClientFromEndpoint(
+    allocator: std.mem.Allocator,
+    ep: QuicV1Endpoint,
+    dial_options: Libp2pZquicClientDialOptions,
+) !ZIo.Client {
+    var client: ZIo.Client = undefined;
+    try initLibp2pQuicClientInPlace(allocator, ep, dial_options, &client);
+    return client;
 }
 
 /// Same as [`initLibp2pQuicClientFromEndpoint`] after [`parseQuicV1Endpoint`]. Symmetric with [`initLibp2pQuicServerFromMultiaddr`].

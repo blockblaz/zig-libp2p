@@ -311,7 +311,8 @@ pub const QuicOutbound = struct {
         const client = blk: {
             const p = try allocator.create(ZIo.Client);
             errdefer allocator.destroy(p);
-            p.* = try quic.initLibp2pQuicClientFromMultiaddr(allocator, ma, dial_opts);
+            const ep = try quic.parseQuicV1Endpoint(ma);
+            try quic.initLibp2pQuicClientInPlace(allocator, ep, dial_opts, p);
             break :blk p;
         };
         errdefer {
