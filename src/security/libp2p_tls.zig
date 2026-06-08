@@ -251,7 +251,22 @@ pub fn peerIdFromVerifiedCertificate(
         return error.CertificateTrailingData;
 
     const x509 = X509{ .buffer = cert_der, .index = 0 };
-    try X509.verify(x509, x509, now_sec);
+    const parsed = try x509.parse();
+
+    // RFC 5280 §4.1.2.5.1 validity check. We do NOT use the time comparison
+    // baked into `std.crypto.Certificate.verify`: its UTCTime parser maps every
+    // two-digit year via `2000 + YY`, so a notBefore of `750101…Z` (rcgen's
+    // default 1975-01-01, also the libp2p spec test vectors) is read as 2075 and
+    // every real-world `now` trips `CertificateNotYetValid`. We re-derive the
+    // window here with the correct 19xx/20xx pivot.
+    try verifyValidityWindow(cert_der, parsed, now_sec);
+
+    // Re-use std's issuer + self-signature verification, but neutralise its
+    // (buggy) time comparison by handing it a timestamp inside the window it
+    // parsed. libp2p/rcgen certs use a far-future notAfter (GeneralizedTime
+    // 4096), so the parsed notBefore is always a safe in-window value.
+    const std_neutral_now: i64 = @intCast(parsed.validity.not_before);
+    try parsed.verify(parsed, std_neutral_now);
 
     const spki = try subjectPublicKeyInfoTlv(cert_der);
     const msg_len = handshake_signature_prefix.len + spki.len;
@@ -277,6 +292,85 @@ pub fn peerIdFromVerifiedCertificate(
         .data = owned,
     };
     return peer_id.PeerId.fromPublicKey(allocator, &pk) catch return error.InvalidPublicKeyProtobuf;
+}
+
+/// RFC 5280 §4.1.2.5 validity-window check that handles UTCTime two-digit years
+/// correctly (`YY >= 50` → `19YY`, `YY < 50` → `20YY`).
+///
+/// `std.crypto.Certificate.parseTime` always computes `2000 + YY`, which is wrong
+/// for the very common notBefore of `1975-01-01` emitted by rcgen (rust-libp2p)
+/// and used by the libp2p TLS spec test vectors — it gets read as 2075 and any
+/// present-day `now_sec` fails with `CertificateNotYetValid`. We locate the
+/// validity element via the already-parsed issuer slice (validity sits between
+/// issuer and subject in a TBSCertificate) and re-parse both bounds here.
+fn verifyValidityWindow(
+    cert_der: []const u8,
+    parsed: X509.Parsed,
+    now_sec: i64,
+) (X509.ParseError || X509.Parsed.VerifyError)!void {
+    const validity = try X509.der.Element.parse(cert_der, parsed.issuer_slice.end);
+    const not_before_elem = try X509.der.Element.parse(cert_der, validity.slice.start);
+    const not_after_elem = try X509.der.Element.parse(cert_der, not_before_elem.slice.end);
+
+    const not_before = try asn1TimeToUnixSeconds(cert_der, not_before_elem);
+    const not_after = try asn1TimeToUnixSeconds(cert_der, not_after_elem);
+
+    if (now_sec < not_before) return error.CertificateNotYetValid;
+    if (now_sec > not_after) return error.CertificateExpired;
+}
+
+/// Parse an ASN.1 `UTCTime` or `GeneralizedTime` element to seconds since the
+/// Unix epoch, applying the RFC 5280 two-digit-year pivot for `UTCTime`.
+fn asn1TimeToUnixSeconds(cert_der: []const u8, elem: X509.der.Element) X509.ParseError!i64 {
+    const bytes = cert_der[elem.slice.start..elem.slice.end];
+    var year: i64 = undefined;
+    var i: usize = 0;
+    switch (elem.identifier.tag) {
+        .utc_time => {
+            // "YYMMDDHHMMSSZ"
+            if (bytes.len != 13 or bytes[12] != 'Z') return error.CertificateTimeInvalid;
+            const yy = try asn1TwoDigits(bytes[0..2]);
+            year = if (yy >= 50) 1900 + @as(i64, yy) else 2000 + @as(i64, yy);
+            i = 2;
+        },
+        .generalized_time => {
+            // "YYYYMMDDHHMMSSZ" (fractional seconds / offsets unused by libp2p certs)
+            if (bytes.len < 15) return error.CertificateTimeInvalid;
+            const hi = try asn1TwoDigits(bytes[0..2]);
+            const lo = try asn1TwoDigits(bytes[2..4]);
+            year = @as(i64, hi) * 100 + @as(i64, lo);
+            i = 4;
+        },
+        else => return error.CertificateFieldHasWrongDataType,
+    }
+
+    const month = try asn1TwoDigits(bytes[i..][0..2]);
+    const day = try asn1TwoDigits(bytes[i + 2 ..][0..2]);
+    const hour = try asn1TwoDigits(bytes[i + 4 ..][0..2]);
+    const minute = try asn1TwoDigits(bytes[i + 6 ..][0..2]);
+    const second = try asn1TwoDigits(bytes[i + 8 ..][0..2]);
+    if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60)
+        return error.CertificateTimeInvalid;
+
+    const days = daysFromCivil(year, @intCast(month), @intCast(day));
+    return days * 86_400 + @as(i64, hour) * 3_600 + @as(i64, minute) * 60 + @as(i64, second);
+}
+
+fn asn1TwoDigits(b: *const [2]u8) X509.ParseError!u8 {
+    if (b[0] < '0' or b[0] > '9' or b[1] < '0' or b[1] > '9') return error.CertificateTimeInvalid;
+    return (b[0] - '0') * 10 + (b[1] - '0');
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`). Valid for any year; handles leap years and centuries.
+fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
+    const y = if (month <= 2) year - 1 else year;
+    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe = y - era * 400; // [0, 399]
+    const mp = @mod(month + 9, 12); // Mar=0 … Feb=11
+    const doy = @divTrunc(153 * mp + 2, 5) + day - 1; // [0, 365]
+    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy; // [0, 146096]
+    return era * 146_097 + doe - 719_468;
 }
 
 /// Derive [`PeerId`] from a **single** leaf certificate’s libp2p extension (Ed25519, ECDSA, Secp256k1, … per protobuf).
@@ -360,11 +454,13 @@ pub fn peerIdFromCertificateUnverified(allocator: std.mem.Allocator, cert_der: [
     return peer_id.PeerId.fromPublicKey(allocator, &pk) catch return error.InvalidPublicKeyProtobuf;
 }
 
-fn tlsVectorValidityMidpointSec(cert_der: []const u8) X509.ParseError!i64 {
-    const c = X509{ .buffer = cert_der, .index = 0 };
-    const p = try c.parse();
-    return @intCast((p.validity.not_before + p.validity.not_after) / 2);
-}
+/// A real present-day timestamp (2023-11-14T22:13:20Z) used to exercise the
+/// verified path against the libp2p spec vectors, whose validity window is
+/// 1975-01-01..4096-01-01. Using a genuine `now` (rather than the midpoint of
+/// std's mis-parsed window) is the regression guard for the UTCTime two-digit
+/// year bug: before the fix, this value sits below the mis-read 2075 notBefore
+/// and the verified path fails with `CertificateNotYetValid`.
+const spec_vector_now_sec: i64 = 1_700_000_000;
 
 test "libp2p TLS spec vector 1 (Ed25519) peer id" {
     const a = std.testing.allocator;
@@ -380,7 +476,7 @@ test "libp2p TLS spec vector 1 (Ed25519) peer id" {
     const s = try id.toBase58(&b58);
     try std.testing.expectEqualStrings("12D3KooWM6CgA9iBFZmcYAHA6A2qvbAxqfkmrYiRQuz3XEsk4Ksv", s);
 
-    const now = try tlsVectorValidityMidpointSec(cert);
+    const now = spec_vector_now_sec;
     const id_v = try peerIdFromVerifiedCertificate(a, cert, now);
     var b58_v: [128]u8 = undefined;
     const s_v = try id_v.toBase58(&b58_v);
@@ -400,7 +496,7 @@ test "libp2p TLS spec vector 2 (ECDSA) peer id" {
     const s = try id.toBase58(&b58);
     try std.testing.expectEqualStrings("QmfXbAwNjJLXfesgztEHe8HwgVDCMMpZ9Eax1HYq6hn9uE", s);
 
-    const now = try tlsVectorValidityMidpointSec(cert);
+    const now = spec_vector_now_sec;
     const id_v = try peerIdFromVerifiedCertificate(a, cert, now);
     var b58_v: [128]u8 = undefined;
     const s_v = try id_v.toBase58(&b58_v);
@@ -420,7 +516,7 @@ test "libp2p TLS spec vector 3 (secp256k1) peer id" {
     const s = try id.toBase58(&b58);
     try std.testing.expectEqualStrings("16Uiu2HAkutTMoTzDw1tCvSRtu6YoixJwS46S1ZFxW8hSx9fWHiPs", s);
 
-    const now = try tlsVectorValidityMidpointSec(cert);
+    const now = spec_vector_now_sec;
     const id_v = try peerIdFromVerifiedCertificate(a, cert, now);
     var b58_v: [128]u8 = undefined;
     const s_v = try id_v.toBase58(&b58_v);
@@ -435,7 +531,7 @@ test "libp2p TLS spec vector 4 (invalid) rejected after verify" {
     var buf: [512]u8 = undefined;
     const cert_slice = try std.fmt.hexToBytes(&buf, hex);
     const cert = cert_slice;
-    const now = try tlsVectorValidityMidpointSec(cert);
+    const now = spec_vector_now_sec;
     try std.testing.expectError(error.SignedKeySignatureInvalid, peerIdFromVerifiedCertificate(a, cert, now));
 }
 
@@ -630,6 +726,37 @@ test "verified path rejects expired certificate" {
     try std.testing.expectError(error.CertificateNotYetValid, peerIdFromVerifiedCertificate(a, cert, way_before));
 }
 
+test "verified path accepts rcgen UTCTime notBefore (1975) at present time" {
+    const a = std.testing.allocator;
+    // Spec vector 1 cert: notBefore = UTCTime "750101130000Z" (1975-01-01),
+    // notAfter = GeneralizedTime "40960101130000Z". This is the exact shape
+    // rust-libp2p/rcgen emits. std's UTCTime parser reads "75" as 2075, so the
+    // verified path used to reject every present-day handshake with
+    // CertificateNotYetValid. Verify a real 2023/2024-era timestamp is accepted.
+    const hex =
+        \\308201ae30820156a0030201020204499602d2300a06082a8648ce3d040302302031123010060355040a13096c69627032702e696f310a300806035504051301313020170d3735303130313133303030305a180f34303936303130313133303030305a302031123010060355040a13096c69627032702e696f310a300806035504051301313059301306072a8648ce3d020106082a8648ce3d030107034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569ea37c307a3078060a2b0601040183a25a0101046a3068042408011220a77f1d92fedb59dddaea5a1c4abd1ac2fbde7d7b879ed364501809923d7c11b90440d90d2769db992d5e6195dbb08e706b6651e024fda6cfb8846694a435519941cac215a8207792e42849cccc6cd8136c6e4bde92a58c5e08cfd4206eb5fe0bf909300a06082a8648ce3d0403020346003043021f50f6b6c52711a881778718238f650c9fb48943ae6ee6d28427dc6071ae55e702203625f116a7a454db9c56986c82a25682f7248ea1cb764d322ea983ed36a31b77
+    ;
+    var buf: [512]u8 = undefined;
+    const cert = try std.fmt.hexToBytes(&buf, hex);
+
+    // 2023-11-14T22:13:20Z: comfortably inside [1975, 4096], but below the
+    // mis-parsed 2075 notBefore — i.e. the value that exposed the bug.
+    const present_now: i64 = 1_700_000_000;
+    const id = try peerIdFromVerifiedCertificate(a, cert, present_now);
+    var b58: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "12D3KooWM6CgA9iBFZmcYAHA6A2qvbAxqfkmrYiRQuz3XEsk4Ksv",
+        try id.toBase58(&b58),
+    );
+}
+
+test "daysFromCivil matches known epochs" {
+    try std.testing.expectEqual(@as(i64, 0), daysFromCivil(1970, 1, 1));
+    try std.testing.expectEqual(@as(i64, 10_957), daysFromCivil(2000, 1, 1));
+    // 1975-01-01 is 1826 days after the epoch (4 common years + 1 leap year).
+    try std.testing.expectEqual(@as(i64, 1826), daysFromCivil(1975, 1, 1));
+}
+
 test "unverified path returns same PeerId as verified for valid spec vector" {
     const a = std.testing.allocator;
     const hex =
@@ -640,7 +767,7 @@ test "unverified path returns same PeerId as verified for valid spec vector" {
     const cert = cert_slice;
 
     const id_unverified = try peerIdFromCertificateUnverified(a, cert);
-    const now = try tlsVectorValidityMidpointSec(cert);
+    const now = spec_vector_now_sec;
     const id_verified = try peerIdFromVerifiedCertificate(a, cert, now);
 
     var b1: [128]u8 = undefined;

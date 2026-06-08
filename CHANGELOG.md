@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.14](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.13...v0.1.14) (2026-06-08)
+
+### Fixed
+
+* **security/libp2p_tls:** stop rejecting rust-libp2p/rcgen certificates with
+  `CertificateNotYetValid`. `std.crypto.Certificate` parses every two-digit
+  UTCTime year as `2000 + YY`, so rcgen's default `notBefore` of `1975-01-01`
+  (also the libp2p TLS spec test vectors) was read as **2075** and every
+  present-day handshake failed. We now verify the validity window per RFC 5280
+  §4.1.2.5.1 (`YY >= 50` → `19YY`) and reuse std only for issuer + self-signature
+  checks. This unblocks QUIC/TLS peering with quinn-based clients (ethlambda).
+
 ## [0.1.13](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.12...v0.1.13) (2026-06-08)
 
 ### Fixed
