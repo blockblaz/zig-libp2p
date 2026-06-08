@@ -808,6 +808,20 @@ pub const QuicRuntime = struct {
         }
 
         if (!connected) {
+            // No log here previously: the drive loop walked away silently and
+            // upstream (`peer connection failed: result=error_`) had no idea
+            // whether the conn even started or what phase it died at. Emit
+            // one warn with the stalled phase so packet captures / zquic
+            // logs aren't the only signal for cross-impl TLS gaps.
+            var peer_buf: [128]u8 = undefined;
+            const peer_str: []const u8 = if (expected_peer) |p|
+                (p.toBase58(&peer_buf) catch "<peer-id-format-err>")
+            else
+                "<unknown>";
+            log.warn(
+                "quic_runtime: dial drive-loop timed out after 20s; peer={s} stalled_phase={s}",
+                .{ peer_str, @tagName(slot.outbound.client.conn.phase) },
+            );
             slot.outbound.deinit();
             a.destroy(slot);
             self.failDial(expected_peer);
