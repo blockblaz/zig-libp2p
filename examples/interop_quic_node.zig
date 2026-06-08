@@ -49,6 +49,8 @@ const RawAppBidiClient = zl.transport.quic_raw_stream_io.RawAppBidiClient;
 const RawAppBidiServer = zl.transport.quic_raw_stream_io.RawAppBidiServer;
 const stream_multistream = zl.transport.stream_multistream;
 const ping = zl.ping;
+const identify_mod = zl.identify;
+const libp2p_tls = zl.security.libp2p_tls;
 const wall_time = zl.wall_time;
 const Io = std.Io;
 
@@ -66,6 +68,84 @@ const default_deadline_ms: i64 = 30_000;
 /// runners.
 const reqresp_protocol_id: []const u8 = "/interop/b4/echo/1.0.0";
 const default_reqresp_payload_len: usize = 256;
+
+/// go-libp2p runs identify (`/ipfs/id/1.0.0`) on every new connection before app streams.
+const go_identify_protocol_id: []const u8 = std.mem.trimEnd(u8, identify_mod.protocol_line, "\n");
+
+fn appendProtobufDelimited(a: std.mem.Allocator, msg: []const u8) ![]u8 {
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(a);
+    var v: u64 = @intCast(msg.len);
+    while (v >= 0x80) {
+        try list.append(a, @truncate((v & 0x7f) | 0x80));
+        v >>= 7;
+    }
+    try list.append(a, @truncate(v));
+    try list.appendSlice(a, msg);
+    return try list.toOwnedSlice(a);
+}
+
+fn hostPublicKeyProtoFromCert(a: std.mem.Allocator, cert_path: []const u8) ![]const u8 {
+    const pem = try readFileAlloc(a, cert_path);
+    defer a.free(pem);
+    const der = try pemFirstCertDer(a, pem);
+    defer a.free(der);
+    const ext = try libp2p_tls.findLibp2pExtensionExtValue(der);
+    const sk = try libp2p_tls.parseSignedKey(ext);
+    return try a.dupe(u8, sk.public_key_pb);
+}
+
+fn buildDelimitedIdentifyPayload(a: std.mem.Allocator, cert_path: []const u8) ![]u8 {
+    const host_pk = try hostPublicKeyProtoFromCert(a, cert_path);
+    defer a.free(host_pk);
+    const protos = [_][]const u8{ go_identify_protocol_id, ping.multistream_protocol_id };
+    const msg = identify_mod.MessageView{
+        .public_key = host_pk,
+        .protocols = &protos,
+    };
+    const raw = try identify_mod.encode(a, msg);
+    defer a.free(raw);
+    return try appendProtobufDelimited(a, raw);
+}
+
+/// go-libp2p opens identify on server-initiated bidi streams (1, 5, …) after we dial.
+fn respondInboundIdentifyStreamsClient(
+    outbound: *QuicOutbound,
+    recv_buf: *[65536]u8,
+    skip_sid: u64,
+    deadline_ms: i64,
+    a: std.mem.Allocator,
+    identify_payload: []const u8,
+) void {
+    const until = @min(deadline_ms, wall_time.milliTimestamp() + 2_000);
+    const server_bidi_sids = [_]u64{ 1, 5, 9, 13, 17, 21, 25, 29 };
+    const cands = [_][]const u8{go_identify_protocol_id};
+    while (wall_time.milliTimestamp() < until) {
+        outbound.drive(recv_buf, 5) catch {};
+        for (server_bidi_sids) |sid| {
+            if (sid == skip_sid) continue;
+            if (outbound.client.rawAppRecvBuffer(sid) == null) continue;
+            var raw = RawAppBidiClient{ .client = outbound.client, .stream_id = sid };
+            var r = raw.reader();
+            var w = raw.writer();
+            var done = false;
+            while (wall_time.milliTimestamp() < until) {
+                outbound.drive(recv_buf, 5) catch {};
+                _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &cands, a) catch |err| {
+                    switch (err) {
+                        error.DialFailed => continue,
+                        else => break,
+                    }
+                };
+                raw.writeAllFin(identify_payload);
+                outbound.drive(recv_buf, 5) catch {};
+                done = true;
+                break;
+            }
+            if (done) return;
+        }
+    }
+}
 
 fn getEnv(key: []const u8) ?[]const u8 {
     // zig 0.16 dropped std.posix.getenv; use C getenv directly.  Always
@@ -158,7 +238,7 @@ fn runServer(
     }
 
     if (std.mem.eql(u8, testcase, "ping")) {
-        return serveOnePingResponder(a, listener, accepted.?, &recv_buf, dl);
+        return serveOnePingResponder(a, listener, accepted.?, &recv_buf, dl, cert_path);
     }
 
     if (std.mem.eql(u8, testcase, "reqresp")) {
@@ -254,61 +334,87 @@ fn serveOnePingResponder(
     conn: *ZIoConnState,
     recv_buf: *[65536]u8,
     deadline_ms: i64,
+    cert_path: []const u8,
 ) !u8 {
+    const identify_payload = try buildDelimitedIdentifyPayload(a, cert_path);
+    defer a.free(identify_payload);
+
     const Ctx = struct {
-        sid: ?u64 = null,
+        a: std.mem.Allocator,
+        pending: std.ArrayList(u64),
         fn cb(self_op: ?*anyopaque, _: *QuicListener, _: usize, _: *ZIoConnState, sid: u64) void {
             const ctx_p: *@This() = @ptrCast(@alignCast(self_op.?));
-            if (ctx_p.sid == null) ctx_p.sid = sid;
+            ctx_p.pending.append(ctx_p.a, sid) catch {};
         }
     };
-    var ctx = Ctx{};
+    var ctx = Ctx{ .a = a, .pending = .empty };
+    defer ctx.pending.deinit(a);
     listener.lifecycle.ctx = &ctx;
     listener.lifecycle.on_inbound_stream_ready = Ctx.cb;
 
-    while (wall_time.milliTimestamp() < deadline_ms and ctx.sid == null) {
-        listener.drive(recv_buf, 5) catch {};
+    const ping_cands = [_][]const u8{ go_identify_protocol_id, ping.multistream_protocol_id };
+
+    stream_loop: while (wall_time.milliTimestamp() < deadline_ms) {
+        while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+        }
+        if (ctx.pending.items.len == 0) break;
+        const sid = ctx.pending.orderedRemove(0);
+        std.debug.print("interop_quic_node[server]: ping: got stream sid={d}\n", .{sid});
+
+        var raw = RawAppBidiServer{
+            .server = listener.server,
+            .conn = conn,
+            .stream_id = sid,
+        };
+
+        {
+            var r = raw.reader();
+            var w = raw.writer();
+            var matched: ?usize = null;
+            negotiate: while (wall_time.milliTimestamp() < deadline_ms) {
+                listener.drive(recv_buf, 5) catch {};
+                matched = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &ping_cands, a) catch |err| {
+                    switch (err) {
+                        error.DialFailed => continue,
+                        error.ProtocolNegotiationFailed => {
+                            std.debug.print("interop_quic_node[server]: ping: skip sid={d} (not ping/identify)\n", .{sid});
+                            continue :stream_loop;
+                        },
+                        else => return 1,
+                    }
+                };
+                break :negotiate;
+            } else continue :stream_loop;
+
+            if (matched.? == 0) {
+                raw.writeAllFin(identify_payload);
+                const flush_until = wall_time.milliTimestamp() + 200;
+                while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
+                std.debug.print("interop_quic_node[server]: ping: answered identify on sid={d}\n", .{sid});
+                continue :stream_loop;
+            }
+        }
+
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+            if (raw.unreadRecvLen() >= ping.payload_len) break;
+        } else return 1;
+
+        {
+            var r = raw.reader();
+            var w = raw.writer();
+            try ping.handleInbound(&r, &w);
+        }
+
+        const flush_until = wall_time.milliTimestamp() + 500;
+        while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
+
+        std.debug.print("interop_quic_node[server]: ping ok\n", .{});
+        return 0;
     }
-    const sid = ctx.sid orelse {
-        std.debug.print("interop_quic_node[server]: ping: stream timeout\n", .{});
-        return 1;
-    };
-    std.debug.print("interop_quic_node[server]: ping: got stream sid={d}\n", .{sid});
-
-    var raw = RawAppBidiServer{
-        .server = listener.server,
-        .conn = conn,
-        .stream_id = sid,
-    };
-
-    const init_wlen = try stream_multistream.initiatorFirstWriteWireLen(ping.multistream_protocol_id);
-    while (wall_time.milliTimestamp() < deadline_ms) {
-        listener.drive(recv_buf, 5) catch {};
-        if (raw.unreadRecvLen() >= init_wlen) break;
-    } else return 1;
-
-    {
-        var r = raw.reader();
-        var w = raw.writer();
-        try stream_multistream.responderHandshakeMultistream(&r, &w, ping.multistream_protocol_id, a);
-    }
-
-    while (wall_time.milliTimestamp() < deadline_ms) {
-        listener.drive(recv_buf, 5) catch {};
-        if (raw.unreadRecvLen() >= ping.payload_len) break;
-    } else return 1;
-
-    {
-        var r = raw.reader();
-        var w = raw.writer();
-        try ping.handleInbound(&r, &w);
-    }
-
-    const flush_until = wall_time.milliTimestamp() + 500;
-    while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
-
-    std.debug.print("interop_quic_node[server]: ping ok\n", .{});
-    return 0;
+    std.debug.print("interop_quic_node[server]: ping: deadline waiting for ping stream\n", .{});
+    return 1;
 }
 
 fn runClient(
@@ -379,12 +485,14 @@ fn runClient(
     }
 
     if (std.mem.eql(u8, testcase, "ping")) {
-        return clientOnePingInitiator(a, &outbound, &recv_buf, dl);
+        const cross_impl = expected_peer != null;
+        return clientOnePingInitiator(a, &outbound, &recv_buf, dl, cert_path, cross_impl);
     }
 
     if (std.mem.eql(u8, testcase, "reqresp")) {
         const payload_len = envInt(usize, "RR_PAYLOAD_LEN", default_reqresp_payload_len);
-        return clientOneReqRespInitiator(a, &outbound, &recv_buf, dl, payload_len);
+        const cross_impl = expected_peer != null;
+        return clientOneReqRespInitiator(a, &outbound, &recv_buf, dl, payload_len, cross_impl);
     }
 
     std.debug.print("interop_quic_node[client]: unknown TESTCASE={s}\n", .{testcase});
@@ -400,6 +508,7 @@ fn clientOneReqRespInitiator(
     recv_buf: *[65536]u8,
     deadline_ms: i64,
     payload_len: usize,
+    cross_impl: bool,
 ) !u8 {
     const sid = try outbound.nextLocalBidiStream();
     var raw = RawAppBidiClient{
@@ -410,23 +519,28 @@ fn clientOneReqRespInitiator(
     {
         var pre = std.ArrayList(u8).empty;
         defer pre.deinit(a);
-        try stream_multistream.appendFirstStreamInitiatorHandshake(&pre, a, reqresp_protocol_id);
+        if (cross_impl) {
+            try stream_multistream.appendFirstStreamInitiatorHandshakeFramed(&pre, a, reqresp_protocol_id, zl.transport.multistream_negotiate.Framing.delimited);
+        } else {
+            try stream_multistream.appendFirstStreamInitiatorHandshake(&pre, a, reqresp_protocol_id);
+        }
         var w = raw.writer();
         Io.Writer.writeAll(&w, pre.items) catch return 1;
         Io.Writer.flush(&w) catch return 1;
     }
 
-    const resp_wlen = try stream_multistream.responderSuccessReplyWireLen(reqresp_protocol_id);
     while (wall_time.milliTimestamp() < deadline_ms) {
         outbound.drive(recv_buf, 5) catch {};
-        if (raw.unreadRecvLen() >= resp_wlen) break;
-    } else return 1;
-
-    {
         var r = raw.reader();
         var w = raw.writer();
-        try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, reqresp_protocol_id, a);
-    }
+        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, reqresp_protocol_id, a) catch |err| {
+            switch (err) {
+                error.ProtocolNegotiationFailed, error.DialFailed => continue,
+                else => return 1,
+            }
+        };
+        break;
+    } else return 1;
 
     // Deterministic payload: low-byte counter so any impl can mint the
     // same bytes for assertion. Keeps the wire byte-stable across runs.
@@ -465,8 +579,14 @@ fn clientOnePingInitiator(
     outbound: *QuicOutbound,
     recv_buf: *[65536]u8,
     deadline_ms: i64,
+    cert_path: []const u8,
+    cross_impl: bool,
 ) !u8 {
+    const identify_payload = try buildDelimitedIdentifyPayload(a, cert_path);
+    defer a.free(identify_payload);
+
     const sid = try outbound.nextLocalBidiStream();
+    respondInboundIdentifyStreamsClient(outbound, recv_buf, sid, deadline_ms, a, identify_payload);
     var raw = RawAppBidiClient{
         .client = outbound.client,
         .stream_id = sid,
@@ -475,22 +595,35 @@ fn clientOnePingInitiator(
     {
         var pre = std.ArrayList(u8).empty;
         defer pre.deinit(a);
-        try stream_multistream.appendFirstStreamInitiatorHandshake(&pre, a, ping.multistream_protocol_id);
+        if (cross_impl) {
+            try stream_multistream.appendFirstStreamInitiatorHandshakeFramed(&pre, a, ping.multistream_protocol_id, zl.transport.multistream_negotiate.Framing.delimited);
+        } else {
+            try stream_multistream.appendFirstStreamInitiatorHandshake(&pre, a, ping.multistream_protocol_id);
+        }
         var w = raw.writer();
         Io.Writer.writeAll(&w, pre.items) catch return 1;
         Io.Writer.flush(&w) catch return 1;
     }
+    outbound.drive(recv_buf, 5) catch {};
 
-    const resp_wlen = try stream_multistream.responderSuccessReplyWireLen(ping.multistream_protocol_id);
     while (wall_time.milliTimestamp() < deadline_ms) {
         outbound.drive(recv_buf, 5) catch {};
-        if (raw.unreadRecvLen() >= resp_wlen) break;
-    } else return 1;
-
-    {
+        respondInboundIdentifyStreamsClient(outbound, recv_buf, sid, deadline_ms, a, identify_payload);
         var r = raw.reader();
         var w = raw.writer();
-        try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, a);
+        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, a) catch |err| {
+            switch (err) {
+                error.ProtocolNegotiationFailed, error.DialFailed => continue,
+                else => {
+                    std.debug.print("interop_quic_node[client]: ping multistream ack parse failed: {s}\n", .{@errorName(err)});
+                    return 1;
+                },
+            }
+        };
+        break;
+    } else {
+        std.debug.print("interop_quic_node[client]: ping multistream ack timeout\n", .{});
+        return 1;
     }
 
     var pay: [ping.payload_len]u8 = undefined;

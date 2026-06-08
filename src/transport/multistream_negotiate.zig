@@ -5,6 +5,18 @@
 
 const std = @import("std");
 const ms = @import("../multistream.zig");
+const proto_wire = @import("../protobuf/wire.zig");
+
+/// go-multistream v0.5+ length-prefixes each token as `uvarint(len+1) + token + '\n'`.
+/// Legacy libp2p stacks use bare `token + '\n'` lines only.
+pub const Framing = enum {
+    legacy,
+    delimited,
+};
+
+pub fn detectFraming(first_byte: u8) Framing {
+    return if (first_byte == '/') .legacy else .delimited;
+}
 
 /// Default maximum negotiation line body length (bytes before `\n`). Same as `multistream.max_protocol_id_body_bytes`.
 pub const default_max_body_len: usize = ms.max_protocol_id_body_bytes;
@@ -46,6 +58,54 @@ pub fn readNegotiationLine(remaining: *[]const u8, max_body_len: usize) Negotiat
     return error.MissingNewline;
 }
 
+fn readDelimitedToken(remaining: *[]const u8, max_body_len: usize) NegotiateError![]const u8 {
+    const len_dec = proto_wire.decodeVarUInt64(remaining.*) catch return error.InvalidProtocolLine;
+    remaining.* = remaining.*[len_dec.len..];
+    const total_len = len_dec.value;
+    if (total_len == 0) return error.InvalidProtocolLine;
+    if (total_len > max_body_len + 1) return error.LineTooLong;
+    if (remaining.len < total_len) return error.MissingNewline;
+    const chunk = remaining.*[0..total_len];
+    remaining.* = remaining.*[total_len..];
+    if (chunk[chunk.len - 1] != '\n') return error.MissingNewline;
+    const body = chunk[0 .. chunk.len - 1];
+    if (body.len > max_body_len) return error.LineTooLong;
+    return ms.trimNegotiationLine(body);
+}
+
+/// Read one negotiation token using legacy or go-multistream delimited framing.
+pub fn readNegotiationToken(remaining: *[]const u8, max_body_len: usize) NegotiateError![]const u8 {
+    if (remaining.*.len == 0) return error.MissingNewline;
+    // Legacy lines start with `/`; legacy `na` rejections start with `na`.
+    if (remaining.*[0] == '/' or std.mem.startsWith(u8, remaining.*, "na")) {
+        return readNegotiationLine(remaining, max_body_len);
+    }
+    return readDelimitedToken(remaining, max_body_len);
+}
+
+fn appendDelimitedToken(
+    write: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    token: []const u8,
+) (NegotiateError || std.mem.Allocator.Error)!void {
+    try validateProtocolId(token);
+    try proto_wire.appendVarUInt64(write, allocator, token.len + 1);
+    try write.appendSlice(allocator, token);
+    try write.append(allocator, '\n');
+}
+
+fn appendNegotiationToken(
+    write: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    token: []const u8,
+    framing: Framing,
+) (NegotiateError || std.mem.Allocator.Error)!void {
+    return switch (framing) {
+        .legacy => appendProtocolLine(write, allocator, token),
+        .delimited => appendDelimitedToken(write, allocator, token),
+    };
+}
+
 fn appendMultistreamHeader(write: *std.ArrayList(u8), allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
     try write.appendSlice(allocator, ms.multistream_1_0_0);
 }
@@ -56,26 +116,43 @@ fn appendProtocolLine(write: *std.ArrayList(u8), allocator: std.mem.Allocator, p
     try write.append(allocator, '\n');
 }
 
-/// Append the initiator's first message: `/multistream/1.0.0\n`.
+/// Append the initiator's first message: `/multistream/1.0.0\n` (legacy) or delimited equivalent.
 pub fn initiatorSendMultistreamHeader(write: *std.ArrayList(u8), allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
     try appendMultistreamHeader(write, allocator);
 }
 
+pub fn initiatorSendMultistreamHeaderFramed(
+    write: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    framing: Framing,
+) (NegotiateError || std.mem.Allocator.Error)!void {
+    try appendNegotiationToken(write, allocator, multistreamVersionLine(), framing);
+}
+
 /// After the peer's multistream header is available in `remaining`, verify it and consume it.
 pub fn initiatorReadPeerMultistream(remaining: *[]const u8, max_body_len: usize) NegotiateError!void {
-    const line = try readNegotiationLine(remaining, max_body_len);
+    const line = try readNegotiationToken(remaining, max_body_len);
     if (!std.mem.eql(u8, line, multistreamVersionLine())) return error.InvalidMultistreamVersion;
 }
 
-/// Append the desired protocol id (with `\n`).
+/// Append the desired protocol id (with `\n` or delimited framing).
 pub fn initiatorSendProtocol(write: *std.ArrayList(u8), allocator: std.mem.Allocator, protocol_id: []const u8) (NegotiateError || std.mem.Allocator.Error)!void {
     try appendProtocolLine(write, allocator, protocol_id);
+}
+
+pub fn initiatorSendProtocolFramed(
+    write: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    protocol_id: []const u8,
+    framing: Framing,
+) (NegotiateError || std.mem.Allocator.Error)!void {
+    try appendNegotiationToken(write, allocator, protocol_id, framing);
 }
 
 /// Read the responder's answer: same protocol id, or `na` (not available).
 pub fn initiatorReadProtocolAck(remaining: *[]const u8, expected_protocol: []const u8, max_body_len: usize) NegotiateError!void {
     try validateProtocolId(expected_protocol);
-    const line = try readNegotiationLine(remaining, max_body_len);
+    const line = try readNegotiationToken(remaining, max_body_len);
     if (std.mem.eql(u8, line, "na")) return error.ProtocolNotSupported;
     if (!std.mem.eql(u8, line, expected_protocol)) return error.ProtocolNotSupported;
 }
@@ -84,18 +161,26 @@ pub fn initiatorReadProtocolAck(remaining: *[]const u8, expected_protocol: []con
 
 /// Read initiator's `/multistream/1.0.0\n` and consume it.
 pub fn responderReadMultistreamOffer(remaining: *[]const u8, max_body_len: usize) NegotiateError!void {
-    const line = try readNegotiationLine(remaining, max_body_len);
+    const line = try readNegotiationToken(remaining, max_body_len);
     if (!std.mem.eql(u8, line, multistreamVersionLine())) return error.InvalidMultistreamVersion;
 }
 
-/// Respond with `/multistream/1.0.0\n`.
+/// Respond with `/multistream/1.0.0\n` (legacy) or delimited equivalent.
 pub fn responderSendMultistreamHeader(write: *std.ArrayList(u8), allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
     try appendMultistreamHeader(write, allocator);
 }
 
+pub fn responderSendMultistreamHeaderFramed(
+    write: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    framing: Framing,
+) (NegotiateError || std.mem.Allocator.Error)!void {
+    try appendNegotiationToken(write, allocator, multistreamVersionLine(), framing);
+}
+
 /// Read the protocol the initiator requests.
 pub fn responderReadProtocolOffer(remaining: *[]const u8, max_body_len: usize) NegotiateError![]const u8 {
-    const line = try readNegotiationLine(remaining, max_body_len);
+    const line = try readNegotiationToken(remaining, max_body_len);
     try validateProtocolId(line);
     return line;
 }
@@ -134,6 +219,59 @@ pub fn responderReplyProtocolAmong(
     }
     try write.appendSlice(allocator, "na\n");
     return null;
+}
+
+pub fn responderReplyProtocolFramed(
+    write: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    offered: []const u8,
+    supported: []const u8,
+    framing: Framing,
+) (NegotiateError || std.mem.Allocator.Error)!void {
+    try validateProtocolId(offered);
+    try validateProtocolId(supported);
+    if (std.mem.eql(u8, offered, supported)) {
+        try appendNegotiationToken(write, allocator, offered, framing);
+    } else {
+        try appendNegotiationToken(write, allocator, "na", framing);
+    }
+}
+
+pub fn responderReplyProtocolAmongFramed(
+    write: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    offered: []const u8,
+    candidates: []const []const u8,
+    framing: Framing,
+) (NegotiateError || std.mem.Allocator.Error)!?usize {
+    try validateProtocolId(offered);
+    for (candidates, 0..) |p, i| {
+        try validateProtocolId(p);
+        if (std.mem.eql(u8, offered, p)) {
+            try appendNegotiationToken(write, allocator, offered, framing);
+            return i;
+        }
+    }
+    try appendNegotiationToken(write, allocator, "na", framing);
+    return null;
+}
+
+test "readDelimitedToken go-multistream wire" {
+    // uvarint(19) + "/multistream/1.0.0" + '\n' — go-libp2p v0.5 framing.
+    const wire = [_]u8{ 0x13, '/', 'm', 'u', 'l', 't', 'i', 's', 't', 'r', 'e', 'a', 'm', '/', '1', '.', '0', '.', '0', '\n' };
+    var rem: []const u8 = &wire;
+    const tok = try readDelimitedToken(&rem, default_max_body_len);
+    try std.testing.expectEqualStrings("/multistream/1.0.0", tok);
+    try std.testing.expect(rem.len == 0);
+}
+
+test "responderReplyProtocolAmongFramed delimited" {
+    const a = std.testing.allocator;
+    var w = std.ArrayList(u8).empty;
+    defer w.deinit(a);
+    const cands: []const []const u8 = &.{ "/ipfs/id/1.0.0", "/ipfs/ping/1.0.0" };
+    try std.testing.expectEqual(@as(?usize, 0), try responderReplyProtocolAmongFramed(&w, a, "/ipfs/id/1.0.0", cands, .delimited));
+    try std.testing.expectEqual(@as(usize, 0x0f), w.items[0]); // uvarint(15) for "/ipfs/id/1.0.0\n"
 }
 
 test "responderReplyProtocolAmong picks first match" {

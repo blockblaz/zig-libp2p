@@ -161,6 +161,23 @@ pub const RawAppBidiClient = struct {
         const buf = self.client.rawAppRecvBuffer(self.stream_id) orelse return 0;
         return buf.len - self.read_cursor;
     }
+
+    /// Send `data` on the raw stream with FIN set on the last chunk (go-libp2p identify expects EOF).
+    pub fn writeAllFin(self: *RawAppBidiClient, data: []const u8) void {
+        if (data.len == 0) {
+            self.client.sendRawStreamData(self.stream_id, self.send_offset, &[_]u8{}, true);
+            return;
+        }
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = @min(raw_stream_send_chunk_len, data.len - off);
+            const chunk = data[off..][0..n];
+            off += n;
+            const fin = off >= data.len;
+            self.client.sendRawStreamData(self.stream_id, self.send_offset, chunk, fin);
+            self.send_offset += @intCast(chunk.len);
+        }
+    }
 };
 
 /// Multistream-select I/O for a raw bidi stream on [`ZIo.Server`] + [`ZIo.ConnState`].
@@ -194,5 +211,22 @@ pub const RawAppBidiServer = struct {
     pub fn unreadRecvLen(self: *const RawAppBidiServer) usize {
         const buf = ZIo.rawAppRecvBuffer(self.conn, self.stream_id) orelse return 0;
         return buf.len - self.read_cursor;
+    }
+
+    /// Send `data` on the raw stream with FIN set on the last chunk (go-libp2p identify expects EOF).
+    pub fn writeAllFin(self: *RawAppBidiServer, data: []const u8) void {
+        if (data.len == 0) {
+            self.server.sendRawStreamData(self.conn, self.stream_id, self.send_offset, &[_]u8{}, true);
+            return;
+        }
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = @min(raw_stream_send_chunk_len, data.len - off);
+            const chunk = data[off..][0..n];
+            off += n;
+            const fin = off >= data.len;
+            self.server.sendRawStreamData(self.conn, self.stream_id, self.send_offset, chunk, fin);
+            self.send_offset += @intCast(chunk.len);
+        }
     }
 };

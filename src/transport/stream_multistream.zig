@@ -22,6 +22,17 @@ pub fn appendFirstStreamInitiatorHandshake(
     try neg.initiatorSendProtocol(write, allocator, protocol_id);
 }
 
+/// Like [`appendFirstStreamInitiatorHandshake`] but uses go-multistream v0.5 delimited tokens.
+pub fn appendFirstStreamInitiatorHandshakeFramed(
+    write: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    protocol_id: []const u8,
+    framing: neg.Framing,
+) (neg.NegotiateError || std.mem.Allocator.Error)!void {
+    try neg.initiatorSendMultistreamHeaderFramed(write, allocator, framing);
+    try neg.initiatorSendProtocolFramed(write, allocator, protocol_id, framing);
+}
+
 /// Wire size of [`appendFirstStreamInitiatorHandshake`] output for length-based QUIC pumping.
 pub fn initiatorFirstWriteWireLen(protocol_id: []const u8) neg.NegotiateError!usize {
     try neg.validateProtocolId(protocol_id);
@@ -39,6 +50,10 @@ pub const StreamHandshakeError = errors.TransportError || std.mem.Allocator.Erro
 fn compactConsumed(acc: *std.ArrayList(u8), allocator: std.mem.Allocator, rem: []const u8) std.mem.Allocator.Error!void {
     const consumed = acc.items.len - rem.len;
     try acc.replaceRange(allocator, 0, consumed, &.{});
+}
+
+fn notePeerFraming(framing: *?neg.Framing, acc: []const u8) void {
+    if (framing.* == null and acc.len > 0) framing.* = neg.detectFraming(acc[0]);
 }
 
 fn readMoreHandshake(acc: *std.ArrayList(u8), r: *Io.Reader, allocator: std.mem.Allocator) StreamHandshakeError!void {
@@ -132,6 +147,7 @@ pub fn responderHandshakeMultistream(
 ) StreamHandshakeError!void {
     var acc = std.ArrayList(u8).empty;
     defer acc.deinit(allocator);
+    var peer_framing: ?neg.Framing = null;
 
     while (true) {
         var rem: []const u8 = acc.items;
@@ -139,10 +155,14 @@ pub fn responderHandshakeMultistream(
             try compactConsumed(&acc, allocator, rem);
             break;
         } else |err| switch (err) {
-            error.MissingNewline => try readMoreHandshake(&acc, r, allocator),
+            error.MissingNewline => {
+                try readMoreHandshake(&acc, r, allocator);
+                notePeerFraming(&peer_framing, acc.items);
+            },
             else => return terr.fromMultistreamStreamLayer(err),
         }
     }
+    const framing = peer_framing orelse .legacy;
 
     // After the multistream offer line, `acc` often holds only that line: the protocol
     // id may still sit in the QUIC recv buffer. Pull bytes until we can parse the
@@ -158,8 +178,11 @@ pub fn responderHandshakeMultistream(
             // `offered` borrows from `acc`; build the wire reply before `compactConsumed` mutates `acc`.
             var out = std.ArrayList(u8).empty;
             defer out.deinit(allocator);
-            try neg.responderSendMultistreamHeader(&out, allocator);
-            neg.responderReplyProtocol(&out, allocator, offered, supported_protocol_id) catch |e| switch (e) {
+            neg.responderSendMultistreamHeaderFramed(&out, allocator, framing) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => |err| return terr.fromMultistreamStreamLayer(err),
+            };
+            neg.responderReplyProtocolFramed(&out, allocator, offered, supported_protocol_id, framing) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => |err| return terr.fromMultistreamStreamLayer(err),
             };
@@ -169,12 +192,16 @@ pub fn responderHandshakeMultistream(
             return;
         }
         const pulled = try tryReadMoreHandshake(&acc, r, allocator);
-        if (!pulled) break;
+        if (!pulled) return error.DialFailed;
+        notePeerFraming(&peer_framing, acc.items);
     }
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
-    try neg.responderSendMultistreamHeader(&out, allocator);
+    neg.responderSendMultistreamHeaderFramed(&out, allocator, framing) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => |err| return terr.fromMultistreamStreamLayer(err),
+    };
     Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
     Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
 
@@ -189,7 +216,7 @@ pub fn responderHandshakeMultistream(
         };
         try compactConsumed(&acc, allocator, rem);
         out.clearRetainingCapacity();
-        neg.responderReplyProtocol(&out, allocator, offered, supported_protocol_id) catch |e| switch (e) {
+        neg.responderReplyProtocolFramed(&out, allocator, offered, supported_protocol_id, framing) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |err| return terr.fromMultistreamStreamLayer(err),
         };
@@ -211,6 +238,7 @@ pub fn responderHandshakeMultistreamAmong(
 
     var acc = std.ArrayList(u8).empty;
     defer acc.deinit(allocator);
+    var peer_framing: ?neg.Framing = null;
 
     while (true) {
         var rem: []const u8 = acc.items;
@@ -218,10 +246,14 @@ pub fn responderHandshakeMultistreamAmong(
             try compactConsumed(&acc, allocator, rem);
             break;
         } else |err| switch (err) {
-            error.MissingNewline => try readMoreHandshake(&acc, r, allocator),
+            error.MissingNewline => {
+                try readMoreHandshake(&acc, r, allocator);
+                notePeerFraming(&peer_framing, acc.items);
+            },
             else => return terr.fromMultistreamStreamLayer(err),
         }
     }
+    const framing = peer_framing orelse .legacy;
 
     while (true) {
         var rem_probe: []const u8 = acc.items;
@@ -232,8 +264,11 @@ pub fn responderHandshakeMultistreamAmong(
         if (offered_prefetch) |offered| {
             var out = std.ArrayList(u8).empty;
             defer out.deinit(allocator);
-            try neg.responderSendMultistreamHeader(&out, allocator);
-            const picked = neg.responderReplyProtocolAmong(&out, allocator, offered, candidates) catch |e| switch (e) {
+            neg.responderSendMultistreamHeaderFramed(&out, allocator, framing) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => |err| return terr.fromMultistreamStreamLayer(err),
+            };
+            const picked = neg.responderReplyProtocolAmongFramed(&out, allocator, offered, candidates, framing) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => |err| return terr.fromMultistreamStreamLayer(err),
             };
@@ -243,12 +278,16 @@ pub fn responderHandshakeMultistreamAmong(
             return picked orelse return terr.fromMultistreamStreamLayer(error.ProtocolNotSupported);
         }
         const pulled = try tryReadMoreHandshake(&acc, r, allocator);
-        if (!pulled) break;
+        if (!pulled) return error.DialFailed;
+        notePeerFraming(&peer_framing, acc.items);
     }
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
-    try neg.responderSendMultistreamHeader(&out, allocator);
+    neg.responderSendMultistreamHeaderFramed(&out, allocator, framing) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => |err| return terr.fromMultistreamStreamLayer(err),
+    };
     Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
     Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
 
@@ -263,7 +302,7 @@ pub fn responderHandshakeMultistreamAmong(
         };
         try compactConsumed(&acc, allocator, rem);
         out.clearRetainingCapacity();
-        const picked = neg.responderReplyProtocolAmong(&out, allocator, offered, candidates) catch |e| switch (e) {
+        const picked = neg.responderReplyProtocolAmongFramed(&out, allocator, offered, candidates, framing) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |err| return terr.fromMultistreamStreamLayer(err),
         };
