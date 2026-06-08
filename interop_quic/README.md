@@ -9,11 +9,10 @@ QUIC + libp2p interop harness (separate from [`interop/`](../interop/), which ta
 | zig ↔ zig | pass | pass | pass | pass |
 | go ↔ go | pass | pass | pass | pass |
 | rust ↔ rust | pass | pass | skip* | pass |
-| zig ↔ go | **pass** | **7/8**† | pass (zig publishes) | pass |
+| zig ↔ go | **pass** | **pass** | **pass** | pass |
 | full 3-corner (cron) | varies | varies | varies | varies |
 
-\* rust gossipsub skipped pending mesh timing.  
-† Failing pair: **go-libp2p client → zig server ping** — go opens identify on stream 0; zig answers with delimited Identify + FIN; quic-go then emits `RETIRE_CONNECTION_ID` seq 0 and zquic closes the connection (RFC violation). Tracked upstream in zquic; all other cross-impl ping directions pass.
+\* rust gossipsub skipped pending mesh timing.
 
 ## Binary
 

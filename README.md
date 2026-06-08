@@ -11,7 +11,7 @@ Lean/Eth2 devnets use gossipsub **StrictNoSign** (signatures on SSZ payloads, no
 ## Requirements
 
 - **Zig** 0.16.0 (`minimum_zig_version` in `build.zig.zon`)
-- **zquic** **1.6.12** (pinned in `build.zig.zon`; re-exported as `zig_libp2p.zquic`)
+- **zquic** **1.6.13** (pinned in `build.zig.zon`; re-exported as `zig_libp2p.zquic`)
 
 ## Usage
 
@@ -27,7 +27,7 @@ exe.root_module.addImport("zig_libp2p", zig_libp2p.module("zig_libp2p"));
 
 Application code: `@import("zig_libp2p")` — public API in [`src/root.zig`](./src/root.zig).
 
-Pin this repo by git tag (e.g. `v0.1.10`) in your `build.zig.zon` URL.
+Pin this repo by git tag (e.g. `v0.1.11`) in your `build.zig.zon` URL.
 
 ## Examples
 
@@ -57,7 +57,7 @@ zig build -Doptimize=ReleaseFast
 interop_quic/run_matrix.sh zig,go-libp2p handshake,ping   # or: zig build interop-matrix
 ```
 
-**Current matrix (v0.1.10):** all **handshake** and **ping** pairs pass for zig↔zig and zig↔go-libp2p (8/8). Full harness docs: [interop_quic/README.md](interop_quic/README.md).
+**Current matrix (v0.1.11):** all **handshake**, **ping**, and **gossipsub** pairs pass for zig↔zig and zig↔go-libp2p. Full harness docs: [interop_quic/README.md](interop_quic/README.md).
 
 ## API overview
 

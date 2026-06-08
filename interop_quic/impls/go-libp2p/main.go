@@ -257,13 +257,13 @@ func runClient(ctx context.Context, testcase string) (int, error) {
 
 // ── Gossipsub testcase (B3) ────────────────────────────────────────────────
 //
-// Server: subscribe to the topic, wait for a peer, publish N deterministic
-// messages, then exit. Client: subscribe, wait until N matching messages
-// have been received, then exit.
+// Matches the zig `interop_quic_node` role split: the dialer (client)
+// publishes; the listener (server) subscribes and counts arrivals. This
+// aligns with QuicRuntime's outbound-only publish fan-out today.
 //
 // Deterministic payload (`msg-%05d: <pad>`) is what makes the assertion
-// safe under message reordering and lets the next zig-side impl validate
-// against the same wire content.
+// safe under message reordering and lets cross-impl pairs validate the
+// same wire content.
 
 const (
 	defaultGsTopic      = "/interop/b3"
@@ -299,8 +299,6 @@ func runGossipsubServer(ctx context.Context, h host.Host) (int, error) {
 	if err != nil {
 		return 1, fmt.Errorf("Join: %w", err)
 	}
-	// Subscribing on the server side keeps it as a mesh participant so
-	// the client's GRAFT lands and the topic-mesh forms.
 	sub, err := topic.Subscribe()
 	if err != nil {
 		return 1, fmt.Errorf("Subscribe: %w", err)
@@ -310,49 +308,6 @@ func runGossipsubServer(ctx context.Context, h host.Host) (int, error) {
 	if err := waitForInbound(ctx, h); err != nil {
 		return 1, err
 	}
-	// Give gossipsub time to form a mesh edge after the conn lands.
-	// pubsub.GossipSubHeartbeatInterval defaults to 1s; one full cycle
-	// is enough for the GRAFT to land on most networks. CI noise is
-	// the reason this isn't shorter.
-	select {
-	case <-time.After(1500 * time.Millisecond):
-	case <-ctx.Done():
-		return 1, ctx.Err()
-	}
-
-	count := gsCount()
-	plen := gsPayLen()
-	for i := 0; i < count; i++ {
-		if err := topic.Publish(ctx, gsPayload(i, plen)); err != nil {
-			return 1, fmt.Errorf("Publish #%d: %w", i, err)
-		}
-	}
-	fmt.Printf("go_libp2p_interop[server]: gossipsub published %d msgs on %q\n", count, gsTopic())
-
-	// Stay alive long enough for the client to drain the mesh.
-	select {
-	case <-time.After(3 * time.Second):
-	case <-ctx.Done():
-	}
-	fmt.Println("go_libp2p_interop[server]: gossipsub ok")
-	return 0, nil
-}
-
-func runGossipsubClient(ctx context.Context, h host.Host, peerID peer.ID) (int, error) {
-	_ = peerID // identified via the open conn; pubsub picks it up from h's network
-	ps, err := pubsub.NewGossipSub(ctx, h)
-	if err != nil {
-		return 1, fmt.Errorf("NewGossipSub: %w", err)
-	}
-	topic, err := ps.Join(gsTopic())
-	if err != nil {
-		return 1, fmt.Errorf("Join: %w", err)
-	}
-	sub, err := topic.Subscribe()
-	if err != nil {
-		return 1, fmt.Errorf("Subscribe: %w", err)
-	}
-	defer sub.Cancel()
 
 	count := gsCount()
 	plen := gsPayLen()
@@ -367,19 +322,54 @@ func runGossipsubClient(ctx context.Context, h host.Host, peerID peer.ID) (int, 
 		if err != nil {
 			return 1, fmt.Errorf("Next at %d/%d: %w", len(seen), count, err)
 		}
-		// Skip the local-loopback echo of our own subscription (none,
-		// since the client doesn't publish, but pubsub may forward
-		// duplicates).
 		key := string(msg.Data)
 		if _, ok := want[key]; !ok {
-			// Unexpected content — flag and keep going; the matrix
-			// will surface the total drift if anything is missing.
-			fmt.Printf("go_libp2p_interop[client]: gossipsub unexpected msg len=%d\n", len(msg.Data))
+			fmt.Printf("go_libp2p_interop[server]: gossipsub unexpected msg len=%d\n", len(msg.Data))
 			continue
 		}
 		seen[key] = struct{}{}
 	}
-	fmt.Printf("go_libp2p_interop[client]: gossipsub got %d/%d msgs\n", len(seen), count)
+	fmt.Printf("go_libp2p_interop[server]: gossipsub got %d/%d msgs\n", len(seen), count)
+	fmt.Println("go_libp2p_interop[server]: gossipsub ok")
+	return 0, nil
+}
+
+func runGossipsubClient(ctx context.Context, h host.Host, peerID peer.ID) (int, error) {
+	_ = peerID
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		return 1, fmt.Errorf("NewGossipSub: %w", err)
+	}
+	topic, err := ps.Join(gsTopic())
+	if err != nil {
+		return 1, fmt.Errorf("Join: %w", err)
+	}
+	sub, err := topic.Subscribe()
+	if err != nil {
+		return 1, fmt.Errorf("Subscribe: %w", err)
+	}
+	defer sub.Cancel()
+
+	// Let the gossipsub heartbeat run so GRAFT lands before we publish.
+	select {
+	case <-time.After(2 * time.Second):
+	case <-ctx.Done():
+		return 1, ctx.Err()
+	}
+
+	count := gsCount()
+	plen := gsPayLen()
+	for i := 0; i < count; i++ {
+		if err := topic.Publish(ctx, gsPayload(i, plen)); err != nil {
+			return 1, fmt.Errorf("Publish #%d: %w", i, err)
+		}
+	}
+	fmt.Printf("go_libp2p_interop[client]: gossipsub published %d msgs on %q\n", count, gsTopic())
+
+	select {
+	case <-time.After(3 * time.Second):
+	case <-ctx.Done():
+	}
 	fmt.Println("go_libp2p_interop[client]: gossipsub ok")
 	return 0, nil
 }

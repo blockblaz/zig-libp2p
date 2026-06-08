@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.11](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.10...v0.1.11) (2026-06-08)
+
+### Features
+
+* **interop_quic:** gossipsub cross-impl green (4/4 zig↔go) — align go-libp2p
+  role split with zig (client publishes, server receives).
+
+### Dependencies
+
+* zquic bumped to **v1.6.13** — fix AppAckTracker duplicate ACK ranges that
+  panicked zig server under go-libp2p gossipsub traffic.
+
 ## [0.1.10](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.9...v0.1.10) (2026-06-08)
 
 ### Features

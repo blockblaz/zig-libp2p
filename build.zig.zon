@@ -1,7 +1,7 @@
 .{
     .name = .zig_libp2p,
     // x-release-please-start-version
-    .version = "0.1.10",
+    .version = "0.1.11",
     // x-release-please-end
     .fingerprint = 0x6e2dd2ac84762996,
     .minimum_zig_version = "0.16.0",
@@ -23,10 +23,11 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            // v1.6.12 — ignore quic-go RETIRE_CONNECTION_ID seq 0 (ping interop);
+            // v1.6.13 — AppAckTracker duplicate-range fix (gossipsub interop);
+            // v1.6.12 — ignore quic-go RETIRE_CONNECTION_ID seq 0;
             // v1.6.11 — TLS CertificateRequest signature_algorithms wire fix.
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.12#6c727de292a4d0d68c9659052d97613e2b6f1ae6",
-            .hash = "zquic-1.6.12-2zRc1D97EwC6aY76qpF8ynNbmjapgyJtqjQY1CL2tBYS",
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.13#6cb9d72a325d3f13960167cdd341dc6a3ec0b7dd",
+            .hash = "zquic-1.6.13-2zRc1BB8EwDqAID5wcnSzhInkD_kuPArGzagjsqCGgzY",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",
