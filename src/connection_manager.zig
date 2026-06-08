@@ -141,6 +141,10 @@ pub const ConnectionManager = struct {
         return self.peer_active.get(peer) orelse 0;
     }
 
+    pub fn hasActiveConnection(self: *ConnectionManager, peer: identity.PeerId) bool {
+        return self.peerActiveCount(peer) > 0;
+    }
+
     /// Inferred from [`multiaddrDialString`] plus the local error tags. The dependency's
     /// `ProtocolIterator.next` error set drifted in Zig 0.16, so we let the compiler
     /// infer it rather than spell out every transitively-added variant.

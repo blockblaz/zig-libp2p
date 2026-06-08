@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.13](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.12...v0.1.13) (2026-06-08)
+
+### Fixed
+
+* **transport/quic_runtime:** gossipsub publish over inbound QUIC connections
+  (server-initiated streams on accepted conns) so zeam can reach ethlambda when
+  only the reverse dial succeeds; skip redundant outbound dials and dial-failure
+  events when the peer is already connected inbound.
+
+### Dependencies
+
+* zquic bumped to **v1.6.15** — client Handshake CRYPTO reassembly for quinn
+  outbound dials.
+
 ## [0.1.11](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.10...v0.1.11) (2026-06-08)
 
 ### Features

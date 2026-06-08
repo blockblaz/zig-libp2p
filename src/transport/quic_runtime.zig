@@ -131,6 +131,12 @@ const PeerIdContext = struct {
 };
 
 const PeerIdMap = std.HashMap(identity.PeerId, *OutboundConn, PeerIdContext, std.hash_map.default_max_load_percentage);
+const InboundPeerMap = std.HashMap(identity.PeerId, InboundConnRef, PeerIdContext, std.hash_map.default_max_load_percentage);
+
+const InboundConnRef = struct {
+    slot: usize,
+    conn: *ZIo.ConnState,
+};
 
 /// Tracked outbound connection: one QUIC connection per (remote peer).
 const OutboundConn = struct {
@@ -179,13 +185,47 @@ const OutboundRequest = struct {
     resp_acc: std.ArrayList(u8) = .empty,
 };
 
-/// In-flight gossipsub publish on a `/meshsub/1.1.0` stream. One per outbound
-/// stream (`per-message stream` pattern — open, multistream-select, write one
+/// Multistream I/O for a locally opened `/meshsub/1.1.0` publish stream.
+const PublishBidiStream = union(enum) {
+    outbound: quic_raw_stream_io.RawAppBidiClient,
+    inbound: quic_raw_stream_io.RawAppBidiServer,
+
+    fn reader(self: *PublishBidiStream) std.Io.Reader {
+        return switch (self.*) {
+            .outbound => |*c| c.reader(),
+            .inbound => |*s| s.reader(),
+        };
+    }
+
+    fn writer(self: *PublishBidiStream) std.Io.Writer {
+        return switch (self.*) {
+            .outbound => |*c| c.writer(),
+            .inbound => |*s| s.writer(),
+        };
+    }
+
+    fn unreadRecvLen(self: *const PublishBidiStream) usize {
+        return switch (self.*) {
+            .outbound => |*c| c.unreadRecvLen(),
+            .inbound => |*s| s.unreadRecvLen(),
+        };
+    }
+
+    fn finStream(self: *PublishBidiStream) void {
+        switch (self.*) {
+            .outbound => |*c| c.client.sendRawStreamData(c.stream_id, c.send_offset, &[_]u8{}, true),
+            .inbound => |*s| s.server.sendRawStreamData(s.conn, s.stream_id, s.send_offset, &[_]u8{}, true),
+        }
+    }
+};
+
+/// In-flight gossipsub publish on a `/meshsub/1.1.0` stream. One per peer per
+/// message (`per-message stream` pattern — open, multistream-select, write one
 /// length-prefixed RPC frame, close).
 const OutboundPublish = struct {
     peer: identity.PeerId,
     stream_id: u64,
-    raw: quic_raw_stream_io.RawAppBidiClient,
+    raw: PublishBidiStream,
     handshake_sent: bool = false,
     handshake_done: bool = false,
     frame_written: bool = false,
@@ -248,6 +288,8 @@ pub const QuicRuntime = struct {
     bound_port_v4: ?u16 = null,
 
     outbound_by_peer: PeerIdMap,
+    /// Verified inbound QUIC connections keyed by remote peer id.
+    inbound_by_peer: InboundPeerMap,
     /// Inbound streams keyed by an internal monotonic id; supports lookup by
     /// (slot, stream_id) for incoming-stream callbacks.
     inbound_streams: std.ArrayList(*InboundStream),
@@ -321,6 +363,7 @@ pub const QuicRuntime = struct {
             .tls_pem_resolved = tls_pem_resolved,
             .listener = listener,
             .outbound_by_peer = PeerIdMap.init(a),
+            .inbound_by_peer = InboundPeerMap.init(a),
             .inbound_streams = .empty,
             .outbound_requests = std.AutoHashMap(u64, *OutboundRequest).init(a),
             .outbound_publishes = std.AutoHashMap(u64, *OutboundPublish).init(a),
@@ -364,6 +407,7 @@ pub const QuicRuntime = struct {
             self.allocator.destroy(v.*);
         }
         self.outbound_by_peer.deinit();
+        self.inbound_by_peer.deinit();
 
         // Free inbound streams.
         for (self.inbound_streams.items) |s| {
@@ -532,6 +576,7 @@ pub const QuicRuntime = struct {
             self.host.onConnectionClosed(now_ms, cid, peer, .remote_close) catch |e| {
                 log.warn("quic_runtime: onConnectionClosed failed: {s}", .{@errorName(e)});
             };
+            _ = self.inbound_by_peer.remove(peer);
         }
         self.inbound_conn_notified[slot] = false;
         self.inbound_conn_peer[slot] = null;
@@ -667,17 +712,16 @@ pub const QuicRuntime = struct {
 
     /// Outbound gossipsub publish path.
     ///
+    fn peerHasActiveConnection(self: *QuicRuntime, peer: identity.PeerId) bool {
+        return self.host.connection_manager.hasActiveConnection(peer);
+    }
+
     /// The swarm's `.publish` command carries raw `(topic, payload)` — the
     /// payload is the application data, not the gossipsub RPC frame.  We
     /// build the RPC protobuf here (`Message{topic, data}` wrapped in
     /// `RPC.publish[]`), length-prefix it with an unsigned varint per the
     /// libp2p gossipsub wire spec, and open a fresh `/meshsub/1.1.0` stream
-    /// to every currently connected outbound peer.  The mesh-peer set is
-    /// `outbound_by_peer.keys()` because gossipsub's own outbox uses
-    /// broadcast semantics for `publish` (`to = null`) and we do not yet
-    /// run the SUBSCRIBE / GRAFT wire flow that would let us narrow to a
-    /// real mesh.  Each publish gets its own stream (per-message stream
-    /// pattern, one of two legal libp2p gossipsub send shapes).
+    /// to every currently connected peer (outbound dials and inbound accepts).
     fn onPublishCommand(self: *QuicRuntime, topic: []const u8, payload: []const u8) void {
         const a = self.allocator;
 
@@ -719,6 +763,11 @@ pub const QuicRuntime = struct {
         while (it.next()) |e| {
             peers.append(a, e.key_ptr.*) catch return;
         }
+        var iit = self.inbound_by_peer.iterator();
+        while (iit.next()) |e| {
+            if (self.outbound_by_peer.contains(e.key_ptr.*)) continue;
+            peers.append(a, e.key_ptr.*) catch return;
+        }
 
         if (peers.items.len == 0) {
             log.debug("quic_runtime: publish on \"{s}\": no connected peers", .{topic});
@@ -727,10 +776,17 @@ pub const QuicRuntime = struct {
 
         for (peers.items) |peer| {
             const wire_dup = a.dupe(u8, wire_buf.items) catch continue;
-            self.startOutboundPublish(peer, wire_dup) catch |err| {
-                log.warn("quic_runtime: startOutboundPublish failed: {s}", .{@errorName(err)});
-                a.free(wire_dup);
-            };
+            if (self.outbound_by_peer.contains(peer)) {
+                self.startOutboundPublish(peer, wire_dup) catch |err| {
+                    log.warn("quic_runtime: startOutboundPublish failed: {s}", .{@errorName(err)});
+                    a.free(wire_dup);
+                };
+            } else {
+                self.startInboundPublish(peer, wire_dup) catch |err| {
+                    log.warn("quic_runtime: startInboundPublish failed: {s}", .{@errorName(err)});
+                    a.free(wire_dup);
+                };
+            }
         }
     }
 
@@ -744,10 +800,30 @@ pub const QuicRuntime = struct {
         op.* = .{
             .peer = peer,
             .stream_id = sid,
-            .raw = .{
+            .raw = .{ .outbound = .{
                 .client = slot.outbound.client,
                 .stream_id = sid,
-            },
+            } },
+            .wire = wire,
+        };
+        try self.outbound_publishes.put(pub_id, op);
+    }
+
+    fn startInboundPublish(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) !void {
+        const ic = self.inbound_by_peer.get(peer) orelse return error.NotConnected;
+        const sid = try ZIo.rawAllocateNextLocalBidiStream(ic.conn);
+        const pub_id = self.next_publish_id;
+        self.next_publish_id += 1;
+
+        const op = try self.allocator.create(OutboundPublish);
+        op.* = .{
+            .peer = peer,
+            .stream_id = sid,
+            .raw = .{ .inbound = .{
+                .server = self.listener.server,
+                .conn = ic.conn,
+                .stream_id = sid,
+            } },
             .wire = wire,
         };
         try self.outbound_publishes.put(pub_id, op);
@@ -755,6 +831,11 @@ pub const QuicRuntime = struct {
 
     fn handleDial(self: *QuicRuntime, addr_str: []const u8, expected_peer: ?identity.PeerId) void {
         const a = self.allocator;
+
+        if (expected_peer) |ep| {
+            if (self.outbound_by_peer.contains(ep)) return;
+            if (self.peerHasActiveConnection(ep)) return;
+        }
 
         var ma = multiaddr.Multiaddr.fromString(a, addr_str) catch |err| {
             log.warn("quic_runtime: parse dial multiaddr failed: {s}", .{@errorName(err)});
@@ -824,6 +905,9 @@ pub const QuicRuntime = struct {
             );
             slot.outbound.deinit();
             a.destroy(slot);
+            if (expected_peer) |ep| {
+                if (self.peerHasActiveConnection(ep)) return;
+            }
             self.failDial(expected_peer);
             return;
         }
@@ -1064,6 +1148,7 @@ pub const QuicRuntime = struct {
                 if (!self.inbound_conn_notified[ist.slot]) {
                     self.inbound_conn_notified[ist.slot] = true;
                     self.inbound_conn_peer[ist.slot] = sender;
+                    self.inbound_by_peer.put(sender, .{ .slot = ist.slot, .conn = ist.conn }) catch {};
                     const cid = self.inbound_conn_ids[ist.slot];
                     self.host.onConnectionEstablished(cid, sender, .inbound) catch |err| {
                         log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
@@ -1422,7 +1507,7 @@ pub const QuicRuntime = struct {
                 // FIN: per-message-stream pattern signals end of publish by
                 // closing the stream. The peer's reader treats EOF after a
                 // complete frame as a clean handoff.
-                op.raw.client.sendRawStreamData(op.stream_id, op.raw.send_offset, &[_]u8{}, true);
+                op.raw.finStream();
                 op.finished = true;
                 try to_remove.append(a, e.key_ptr.*);
             }

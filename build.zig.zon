@@ -1,7 +1,7 @@
 .{
     .name = .zig_libp2p,
     // x-release-please-start-version
-    .version = "0.1.12",
+    .version = "0.1.13",
     // x-release-please-end
     .fingerprint = 0x6e2dd2ac84762996,
     .minimum_zig_version = "0.16.0",
@@ -23,10 +23,10 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            // v1.6.14 — server Initial retransmit replay (quinn UnsolicitedEncryptedExtension);
-            // v1.6.13 — AppAckTracker duplicate-range fix (gossipsub interop).
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.14#5fec36ac25382eceac8b4496404d2acc8fa320e5",
-            .hash = "zquic-1.6.14-2zRc1DR9EwBBrT7vDg_GhHjvNZhzErmiLkxdZTKTrapB",
+            // v1.6.15 — client Handshake CRYPTO reassembly (quinn outbound dial);
+            // v1.6.14 — server Initial retransmit replay.
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.15#62a99573860ba4b63014748eb4abc03292581546",
+            .hash = "zquic-1.6.15-2zRc1IyCEwCSIIIQJWbaOo7-7BwcCdSjiA5tIpEduh4f",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",
