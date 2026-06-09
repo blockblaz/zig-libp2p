@@ -301,9 +301,12 @@ async fn server_handshake(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn st
 
 async fn server_ping(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
     // libp2p::ping::Behaviour auto-replies to inbound pings. Wait for the
-    // first event indicating a round-trip then exit.
+    // first event indicating a round-trip, then keep the swarm alive briefly
+    // so we can also answer the remote's outbound ping — cross-impl pairs
+    // where the client opens its own ping stream rely on this (#174).
     let _ = wait_first_conn(swarm).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_ok = false;
     loop {
         tokio::select! {
             biased;
@@ -312,13 +315,27 @@ async fn server_ping(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::er
                 if let Some(SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
                     result: Ok(_), ..
                 }))) = event {
-                    println!("rust_libp2p_interop[server]: ping ok");
-                    return Ok(0);
+                    saw_ok = true;
+                    break;
                 }
             }
         }
     }
-    Err("ping deadline".into())
+    if !saw_ok {
+        return Err("ping deadline".into());
+    }
+    // Keep the swarm running so any in-flight inbound /ipfs/ping/1.0.0 from
+    // the remote can be answered before we shut down.
+    let drain_until = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(drain_until) => break,
+            _ = swarm.next() => {}
+        }
+    }
+    println!("rust_libp2p_interop[server]: ping ok");
+    Ok(0)
 }
 
 async fn client_ping(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
@@ -347,6 +364,12 @@ fn gs_payload(idx: usize, length: usize) -> Vec<u8> {
     out[..copy_len].copy_from_slice(&header[..copy_len]);
     out
 }
+
+// Role convention (rust impl): SERVER publishes after the remote subscribes;
+// CLIENT subscribes and counts arrivals. Mirrors the rust↔rust conformance
+// test in libp2p-spec. Cross-impl mismatch with the dialer-publishes
+// convention used by go-libp2p / zig is handled via the asymmetric
+// `skip_reason_for_pair` table in `run_matrix.sh` (#177).
 
 async fn server_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
     let topic = IdentTopic::new(gs_topic());
@@ -379,12 +402,9 @@ async fn server_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn st
     let plen = gs_payload_len();
     for i in 0..count {
         let payload = gs_payload(i, plen);
-        // Drive the swarm so backpressure events get processed between
-        // publishes; otherwise large bursts can hit the per-peer queue.
         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload) {
             return Err(format!("publish #{i}: {e:?}").into());
         }
-        // Quick yield so the swarm task can run.
         tokio::task::yield_now().await;
     }
     println!(
@@ -392,7 +412,6 @@ async fn server_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn st
         count,
         gs_topic()
     );
-    // Stay alive long enough for delivery.
     let drain_until = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
         tokio::select! {
