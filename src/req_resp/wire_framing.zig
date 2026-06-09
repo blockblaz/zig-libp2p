@@ -9,7 +9,7 @@ const frame = @import("frame.zig");
 const snappy_wire = @import("snappy_wire.zig");
 
 pub const ExchangeLimits = struct {
-    max_accumulated: usize = 16 * 1024 * 1024,
+    max_accumulated: usize = frame.max_stream_accumulated_bytes,
     read_chunk: usize = 4096,
 };
 

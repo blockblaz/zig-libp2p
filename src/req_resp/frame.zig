@@ -10,7 +10,14 @@ const std = @import("std");
 const varint = @import("../varint.zig");
 const errors = @import("../errors.zig");
 
-pub const max_rpc_message_size: usize = 4 * 1024 * 1024;
+/// Maximum uncompressed SSZ payload for one Lean req/resp message (request or
+/// response body). Hash-sig blocks and `blocks_by_root` / `blocks_by_range`
+/// responses can exceed the old 4 MiB cap.
+pub const max_rpc_message_size: usize = 32 * 1024 * 1024;
+
+/// Upper bound on bytes buffered on one inbound req/resp stream while
+/// assembling framed snappy payloads (may span header + body before decode).
+pub const max_stream_accumulated_bytes: usize = 64 * 1024 * 1024;
 
 /// Back-compat alias; use [`errors.ReqRespError`] in new code.
 pub const FrameError = errors.ReqRespError;

@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.15](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.14...v0.1.15) (2026-06-09)
+
+### Fixed
+
+* **transport/quic_runtime:** skip oversize gossipsub frames instead of dropping
+  the entire inbound QUIC stream when a declared frame length exceeds the accept
+  cap. One bad publish no longer tears down the peer's gossip path.
+
+### Changed
+
+* **gossipsub/wire_limits:** raise gossip RPC frame cap to **16 MiB** (from 4 MiB)
+  for hash-sig Lean blocks and aggregates; add **128 MiB** absolute declared-length
+  griefing cap.
+* **req_resp/frame:** raise single-message uncompressed SSZ cap to **32 MiB** and
+  per-stream accumulator to **64 MiB** for `blocks_by_root` / `blocks_by_range`.
+
 ## [0.1.14](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.13...v0.1.14) (2026-06-08)
 
 ### Fixed

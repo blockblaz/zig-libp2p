@@ -1202,25 +1202,33 @@ pub const QuicRuntime = struct {
 
                     // Drain every complete frame from the accumulator.
                     // The buffer can contain a partial frame on the tail; if
-                    // varint decode or length check fails, we leave the bytes
-                    // alone and try again next loop.
+                    // varint decode fails we leave the bytes alone and try again
+                    // next loop. Oversized-but-under-absolute-max frames are
+                    // skipped (consumed, not passed to handleGossipRpc) so one
+                    // bad publish does not tear down the whole QUIC stream.
                     var consumed: usize = 0;
                     var drop_stream = false;
                     while (consumed < ist.gossip_acc.items.len) {
                         const tail = ist.gossip_acc.items[consumed..];
                         const dec = varint.decode(tail) catch break; // need more bytes
-                        if (dec.value > gossipsub_wire_limits.max_rpc_length_delimited_bytes) {
-                            log.warn("quic_runtime: gossipsub frame length too large: {d}", .{dec.value});
+                        if (dec.value > gossipsub_wire_limits.max_gossip_frame_declared_absolute_bytes) {
+                            log.warn("quic_runtime: gossipsub frame declared length abusive ({d}), dropping inbound stream", .{dec.value});
                             drop_stream = true;
                             break;
                         }
                         const frame_len: usize = @intCast(dec.value);
-                        if (tail.len < dec.len + frame_len) break; // partial frame
+                        const frame_total = dec.len + frame_len;
+                        if (tail.len < frame_total) break; // partial frame
+                        if (dec.value > gossipsub_wire_limits.max_rpc_length_delimited_bytes) {
+                            log.warn("quic_runtime: gossipsub frame length too large ({d}), skipping frame", .{dec.value});
+                            consumed += frame_total;
+                            continue;
+                        }
                         const frame_bytes = tail[dec.len .. dec.len + frame_len];
                         self.host.handleGossipRpc(sender_peer, frame_bytes) catch |err| {
                             log.warn("quic_runtime: handleGossipRpc failed: {s}", .{@errorName(err)});
                         };
-                        consumed += dec.len + frame_len;
+                        consumed += frame_total;
                     }
                     if (drop_stream) {
                         self.removeInboundStreamAt(i);
@@ -1749,6 +1757,48 @@ test "appendInboundAccBounded rejects growth past cap" {
     try acc.appendSlice(a, &[_]u8{0} ** (cap - 1));
     try std.testing.expectError(error.PayloadTooLarge, rt.appendInboundAccBounded(&acc, &[_]u8{ 1, 2 }, cap));
     try std.testing.expectEqual(cap - 1, acc.items.len);
+}
+
+test "gossip inbound drain skips oversize frame without drop_stream" {
+    const a = std.testing.allocator;
+    const max_accept = gossipsub_wire_limits.max_rpc_length_delimited_bytes;
+    const absolute_max = gossipsub_wire_limits.max_gossip_frame_declared_absolute_bytes;
+
+    var acc_buf: std.ArrayList(u8) = .empty;
+    defer acc_buf.deinit(a);
+
+    const oversize_decl = max_accept + 1;
+    try varint.append(&acc_buf, a, oversize_decl);
+    try acc_buf.appendNTimes(a, 0, oversize_decl);
+
+    const small_inner = [_]u8{0xAB};
+    try varint.append(&acc_buf, a, small_inner.len);
+    try acc_buf.appendSlice(a, &small_inner);
+
+    var consumed: usize = 0;
+    var drop_stream = false;
+    var handled: usize = 0;
+    while (consumed < acc_buf.items.len) {
+        const tail = acc_buf.items[consumed..];
+        const dec = varint.decode(tail) catch break;
+        if (dec.value > absolute_max) {
+            drop_stream = true;
+            break;
+        }
+        const frame_len: usize = @intCast(dec.value);
+        const frame_total = dec.len + frame_len;
+        if (tail.len < frame_total) break;
+        if (dec.value > max_accept) {
+            consumed += frame_total;
+            continue;
+        }
+        handled += 1;
+        consumed += frame_total;
+    }
+
+    try std.testing.expect(!drop_stream);
+    try std.testing.expectEqual(@as(usize, 1), handled);
+    try std.testing.expectEqual(acc_buf.items.len, consumed);
 }
 
 test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
