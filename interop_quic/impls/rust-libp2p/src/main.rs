@@ -352,8 +352,28 @@ async fn server_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn st
     let topic = IdentTopic::new(gs_topic());
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     let _ = wait_first_conn(swarm).await?;
-    // Let the mesh form.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Wait for the remote peer to announce SUBSCRIBE on our topic before
+    // publishing. Fixed sleeps were racy; gossipsub::Event::Subscribed is the
+    // spec-correct signal that the mesh peer accepts this topic. Bounded by a
+    // deadline so we fail loud rather than hang if the SUBSCRIBE never arrives.
+    let topic_hash = topic.hash();
+    let sub_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(sub_deadline) => {
+                return Err("gossipsub: timed out waiting for remote SUBSCRIBE".into());
+            }
+            event = swarm.next() => match event {
+                Some(SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                    gossipsub::Event::Subscribed { topic: t, .. },
+                ))) if t == topic_hash => break,
+                Some(_) => {}
+                None => return Err("swarm stream ended before remote SUBSCRIBE".into()),
+            }
+        }
+    }
 
     let count = gs_count();
     let plen = gs_payload_len();
