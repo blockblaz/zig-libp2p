@@ -130,6 +130,30 @@ fn seedReaderBuffered(acc: *std.ArrayList(u8), initial_recv: []const u8, allocat
     try acc.appendSlice(allocator, initial_recv);
 }
 
+/// Read whatever bytes are currently available (at least one), without waiting
+/// to fill a fixed-size buffer.
+///
+/// `Io.Reader.readSliceShort` loops internally until the destination buffer is
+/// full or the stream ends, so handing it a multi-KiB scratch buffer blocks
+/// until that many bytes arrive. TLS records (and any half-duplex protocol)
+/// arrive in small bursts and the peer then waits for our reply, so over-reading
+/// deadlocks both sides. This returns after a single underlying read, draining
+/// any already-buffered bytes first without an extra syscall. Returns 0 on EOF.
+fn readSomeAvailable(r: *Io.Reader, dst: []u8) UpgradeError!usize {
+    const have = r.buffered();
+    if (have.len > 0) {
+        const take = @min(have.len, dst.len);
+        @memcpy(dst[0..take], have[0..take]);
+        r.toss(take);
+        return take;
+    }
+    var data: [1][]u8 = .{dst};
+    return r.readVec(&data) catch |e| switch (e) {
+        error.EndOfStream => 0,
+        error.ReadFailed => error.ReadFailed,
+    };
+}
+
 fn driveNonblockHandshake(
     nb: anytype,
     r: *Io.Reader,
@@ -154,7 +178,7 @@ fn driveNonblockHandshake(
         }
         if (!nb.done() and res.recv_pos == 0) {
             var chunk: [4096]u8 = undefined;
-            const n = r.readSliceShort(&chunk) catch return error.ReadFailed;
+            const n = try readSomeAvailable(r, &chunk);
             if (n == 0) return error.EndOfStream;
             try recv_acc.appendSlice(allocator, chunk[0..n]);
         }
@@ -173,13 +197,11 @@ pub const SecureChannel = struct {
 
     pub fn write(self: *SecureChannel, w: *Io.Writer, plaintext: []const u8, scratch: []u8) UpgradeError!void {
         if (plaintext.len > scratch.len - 256) return error.FrameTooLarge;
-        const ct = self.cipher.encrypt(scratch, .application_data, plaintext) catch return error.TlsHandshakeFailed;
-        var hdr: [5]u8 = undefined;
-        hdr[0] = @intFromEnum(zquic_tls.protocol.ContentType.application_data);
-        std.mem.writeInt(u16, hdr[1..3], 0x0303, .big);
-        std.mem.writeInt(u16, hdr[3..5], @intCast(ct.len), .big);
-        try w.writeAll(&hdr);
-        try w.writeAll(ct);
+        // `Cipher.encrypt` already returns a complete TLS record
+        // (header | ciphertext | auth_tag); writing an extra header here would
+        // double-frame the record and the peer would fail to decrypt it.
+        const record_bytes = self.cipher.encrypt(scratch, .application_data, plaintext) catch return error.TlsHandshakeFailed;
+        try w.writeAll(record_bytes);
         try w.flush();
     }
 
@@ -195,17 +217,19 @@ pub const SecureChannel = struct {
             const rec = Record.read(&fr) catch |e| switch (e) {
                 error.InputBufferUndersize, error.EndOfStream => {
                     var chunk: [4096]u8 = undefined;
-                    const n = r.readSliceShort(&chunk) catch return error.ReadFailed;
+                    const n = try readSomeAvailable(r, &chunk);
                     if (n == 0) return error.EndOfStream;
                     try self.recv_acc.appendSlice(allocator, chunk[0..n]);
                     continue;
                 },
                 else => return e,
             };
+            // Decrypt before dropping the consumed bytes: `rec.payload` aliases
+            // `recv_acc`, and `replaceRange` shifts the buffer in place, which
+            // would corrupt the ciphertext mid-read.
+            const content_type, const cleartext = self.cipher.decrypt(plaintext_buf, rec) catch return error.TlsDecryptError;
             const consumed = fr.seek;
             try self.recv_acc.replaceRange(allocator, 0, consumed, &.{});
-
-            const content_type, const cleartext = self.cipher.decrypt(plaintext_buf, rec) catch return error.TlsDecryptError;
             if (content_type != .application_data) continue;
             if (cleartext.len > ciphertext_buf.len) return error.FrameTooLarge;
             return cleartext;

@@ -318,9 +318,9 @@ fn handleConn(
 
     return switch (role) {
         .initiator => try link.runDialerPing(deadline_ms),
-        .responder => {
+        .responder => blk: {
             try link.runListenerPing(deadline_ms);
-            return 0;
+            break :blk 0;
         },
     };
 }

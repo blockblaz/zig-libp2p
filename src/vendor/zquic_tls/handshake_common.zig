@@ -390,10 +390,16 @@ pub fn dupeMin(buf: []u8, data: []const u8) []u8 {
 
 /// Build the EncryptedExtensions handshake payload (extensions block only).
 pub fn writeEncryptedExtensions(w: *record.Writer, alpn: ?[]const u8) !void {
+    // Reserve the handshake message header (type + u24 length); back-filled below
+    // once the body length is known. Without it the peer reads a header-less
+    // EncryptedExtensions and mis-frames the rest of the server flight.
+    const hdr_pos = try w.skip(4);
     const ext_len_pos = try w.skip(2);
     if (alpn) |proto_name| try w.applicationLayerProtocolNegotiation(proto_name);
     var ew = w.writerAt(ext_len_pos);
     try ew.int(u16, w.pos() - ext_len_pos - 2);
+    var hw = w.writerAt(hdr_pos);
+    try hw.handshakeRecordHeader(.encrypted_extensions, w.pos() - hdr_pos - 4);
 }
 
 pub const DhKeyPair = struct {
