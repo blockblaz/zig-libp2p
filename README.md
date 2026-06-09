@@ -8,18 +8,20 @@ Pure-Zig implementation of the **lean-consensus / Eth2 libp2p subset**: QUIC + l
 
 | Spec | Module | Cross-impl interop |
 |------|--------|--------------------|
-| QUIC v1 (RFC 9000/9001) | `transport.quic_*` + `zquic` | zig ↔ go-libp2p ✅ |
-| libp2p TLS 1.3 on QUIC (RFC 0001) | `security.libp2p_tls` + `security.libp2p_tls_cert` | zig ↔ go-libp2p ✅ |
+| QUIC v1 (RFC 9000/9001) | `transport.quic_*` + `zquic` | zig ↔ go-libp2p ✅, zig ↔ rust-libp2p ✅ |
+| libp2p TLS 1.3 on QUIC (RFC 0001) | `security.libp2p_tls` + `security.libp2p_tls_cert` | zig ↔ go-libp2p ✅, zig ↔ rust-libp2p ✅ |
 | libp2p TLS on TCP (`/tls/1.0.0`) | `transport.tcp_tls` | manual |
 | TCP transport | `transport.tcp` | — |
 | Noise XX (`/noise`) | `security.noise` (RSA, ECDSA-P256, secp256k1, ed25519) | manual |
 | Yamux + Mplex muxing | `transport.yamux`, `transport.mplex` | — |
 | Multistream-select (delimited) | `transport.stream_multistream`, `transport.multistream_negotiate` | ✅ |
-| `/ipfs/ping/1.0.0` | `ping` | zig ↔ go-libp2p ✅ (8/8) |
+| `/ipfs/ping/1.0.0` | `ping` | zig ↔ go-libp2p ✅, zig ↔ rust-libp2p ✅ |
 | `/ipfs/id/1.0.0` (Identify) | `identify` | responder stub ✅ |
 | RFC 0002 signed peer record | `identify.verifySignedPeerRecord` | ✅ |
-| Gossipsub v1.1 — StrictNoSign | `gossipsub.*` | zig ↔ go-libp2p ✅ |
-| Length-prefixed req/resp + SSZ-snappy | `req_resp.*` | zig ↔ zig ✅ |
+| Gossipsub v1.1 — StrictNoSign | `gossipsub.*` | zig ↔ go-libp2p ✅, zig ↔ rust-libp2p ½ ([#183](https://github.com/ch4r10t33r/zig-libp2p/issues/183)) |
+| Length-prefixed req/resp + SSZ-snappy | `req_resp.*` | zig ↔ zig ✅, zig ↔ rust/go ½ ([#184](https://github.com/ch4r10t33r/zig-libp2p/issues/184)) |
+| AutoNAT v1/v2 | `autonat` | in-memory smoke ✅ |
+| Kademlia DHT | `kad_dht` | in-memory smoke ✅ |
 | Host / Swarm / Connection manager / metrics | `host`, `swarm`, `connection_manager`, `metrics` | — |
 
 Live cross-impl matrix: [interop_quic/README.md](interop_quic/README.md). Threat model + wire caps: [docs/SECURITY.md](docs/SECURITY.md).
@@ -30,15 +32,13 @@ Out of scope for the lean/Eth2 surface. PRs welcome on the linked issues.
 
 | Spec | Status | Issue |
 |------|--------|-------|
-| Kademlia DHT | not planned for 1.0 | [#93](https://github.com/ch4r10t33r/zig-libp2p/issues/93) |
 | Circuit Relay v2 + DCUtR hole punching | not planned for 1.0 | [#91](https://github.com/ch4r10t33r/zig-libp2p/issues/91) |
-| AutoNAT | not planned for 1.0 | [#92](https://github.com/ch4r10t33r/zig-libp2p/issues/92) |
 | WebSocket / WebTransport / WebRTC | not planned for 1.0 | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
 | Resource manager (rcmgr scope-based) | planned | [#169](https://github.com/ch4r10t33r/zig-libp2p/issues/169) |
 | PSK / pnet (private networks) | planned | [#171](https://github.com/ch4r10t33r/zig-libp2p/issues/171) |
 | Async swarm (`std.Io.Threaded` → async) | planned | [#57](https://github.com/ch4r10t33r/zig-libp2p/issues/57) |
 | Third-party security audit + disclosure | planned | [#170](https://github.com/ch4r10t33r/zig-libp2p/issues/170) |
-| zig ↔ rust-libp2p cross-impl matrix row | in progress | [#166](https://github.com/ch4r10t33r/zig-libp2p/issues/166) |
+| zig ↔ rust-libp2p remaining cross-impl gaps | in progress | [#166](https://github.com/ch4r10t33r/zig-libp2p/issues/166), [#183](https://github.com/ch4r10t33r/zig-libp2p/issues/183), [#184](https://github.com/ch4r10t33r/zig-libp2p/issues/184) |
 | 1.0-RC API freeze | planned | [#172](https://github.com/ch4r10t33r/zig-libp2p/issues/172) |
 
 Spec-compliance umbrella: [#80](https://github.com/ch4r10t33r/zig-libp2p/issues/80).
@@ -69,6 +69,7 @@ Under [`examples/`](./examples/). `zig build` installs to `zig-out/bin/`. Notabl
 - `example-host-quic-node` — `Host` + QUIC lifecycle hooks (production wiring shape).
 - `interop-quic-node` — env-driven interop endpoint used by the cross-impl matrix.
 - `gen-libp2p-cert` — mint a libp2p TLS cert + peer id.
+- `example-autonat-membuf`, `example-kad-dht-membuf` — in-memory smoke for AutoNAT (#92) and kad-dht (#93).
 - `example-quic-ping-loopback`, `example-gossipsub-mesh`, `example-swarm-tick`, `example-ping-membuf`, `example-req-resp-tcp-status`, `example-multistream-negotiate` — focused single-protocol demos.
 
 Build details: [examples/README.md](examples/README.md).

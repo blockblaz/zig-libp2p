@@ -301,9 +301,12 @@ async fn server_handshake(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn st
 
 async fn server_ping(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
     // libp2p::ping::Behaviour auto-replies to inbound pings. Wait for the
-    // first event indicating a round-trip then exit.
+    // first event indicating a round-trip, then keep the swarm alive briefly
+    // so we can also answer the remote's outbound ping — cross-impl pairs
+    // where the client opens its own ping stream rely on this (#174).
     let _ = wait_first_conn(swarm).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_ok = false;
     loop {
         tokio::select! {
             biased;
@@ -312,13 +315,27 @@ async fn server_ping(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::er
                 if let Some(SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
                     result: Ok(_), ..
                 }))) = event {
-                    println!("rust_libp2p_interop[server]: ping ok");
-                    return Ok(0);
+                    saw_ok = true;
+                    break;
                 }
             }
         }
     }
-    Err("ping deadline".into())
+    if !saw_ok {
+        return Err("ping deadline".into());
+    }
+    // Keep the swarm running so any in-flight inbound /ipfs/ping/1.0.0 from
+    // the remote can be answered before we shut down.
+    let drain_until = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(drain_until) => break,
+            _ = swarm.next() => {}
+        }
+    }
+    println!("rust_libp2p_interop[server]: ping ok");
+    Ok(0)
 }
 
 async fn client_ping(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
@@ -348,46 +365,15 @@ fn gs_payload(idx: usize, length: usize) -> Vec<u8> {
     out
 }
 
+// Role convention (all impls agree): the DIALER publishes N deterministic
+// msgs after a 2 s settle; the LISTENER subscribes and counts arrivals.
+// Aligns rust-libp2p with the go-libp2p and zig conventions and removes the
+// asymmetric-skip dance that #177 needed.
+
 async fn server_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
     let topic = IdentTopic::new(gs_topic());
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     let _ = wait_first_conn(swarm).await?;
-    // Let the mesh form.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
-    let count = gs_count();
-    let plen = gs_payload_len();
-    for i in 0..count {
-        let payload = gs_payload(i, plen);
-        // Drive the swarm so backpressure events get processed between
-        // publishes; otherwise large bursts can hit the per-peer queue.
-        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload) {
-            return Err(format!("publish #{i}: {e:?}").into());
-        }
-        // Quick yield so the swarm task can run.
-        tokio::task::yield_now().await;
-    }
-    println!(
-        "rust_libp2p_interop[server]: gossipsub published {} msgs on {:?}",
-        count,
-        gs_topic()
-    );
-    // Stay alive long enough for delivery.
-    let drain_until = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(drain_until) => break,
-            _ = swarm.next() => {}
-        }
-    }
-    println!("rust_libp2p_interop[server]: gossipsub ok");
-    Ok(0)
-}
-
-async fn client_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
-    let topic = IdentTopic::new(gs_topic());
-    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     let count = gs_count();
     let plen = gs_payload_len();
@@ -403,7 +389,7 @@ async fn client_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn st
                     seen.insert(message.data);
                 } else {
                     eprintln!(
-                        "rust_libp2p_interop[client]: gossipsub unexpected msg len={}",
+                        "rust_libp2p_interop[server]: gossipsub unexpected msg len={}",
                         message.data.len()
                     );
                 }
@@ -413,10 +399,57 @@ async fn client_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn st
         }
     }
     println!(
-        "rust_libp2p_interop[client]: gossipsub got {}/{} msgs",
+        "rust_libp2p_interop[server]: gossipsub got {}/{} msgs",
         seen.len(),
         count
     );
+    println!("rust_libp2p_interop[server]: gossipsub ok");
+    Ok(0)
+}
+
+async fn client_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
+    let topic = IdentTopic::new(gs_topic());
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+    // `run_client` already drove `wait_connected` so the connection is up;
+    // we just need to let the gossipsub heartbeat lay the mesh edge.
+
+    // Fixed 4 s settle. Long enough that the zig peer's SUBSCRIBE RPC
+    // (sent on its first gossipsub heartbeat, ~1 s after connection)
+    // reaches us before we try to publish, so rust's gossipsub treats
+    // zig as a known subscriber and not as `InsufficientPeers`.
+    // `Event::Subscribed` only fires on the listener side in libp2p-0.54,
+    // so we can't wait on it from the dialer.
+    let settle_until = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(settle_until) => break,
+            _ = swarm.next() => {}
+        }
+    }
+
+    let count = gs_count();
+    let plen = gs_payload_len();
+    for i in 0..count {
+        let payload = gs_payload(i, plen);
+        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload) {
+            return Err(format!("publish #{i}: {e:?}").into());
+        }
+        tokio::task::yield_now().await;
+    }
+    println!(
+        "rust_libp2p_interop[client]: gossipsub published {} msgs on {:?}",
+        count,
+        gs_topic()
+    );
+    let drain_until = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(drain_until) => break,
+            _ = swarm.next() => {}
+        }
+    }
     println!("rust_libp2p_interop[client]: gossipsub ok");
     Ok(0)
 }

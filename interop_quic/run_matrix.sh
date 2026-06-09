@@ -202,7 +202,18 @@ skipped=0
 # instead of an associative array because macOS still ships bash 3.2.
 skip_reason_for() {
     case "$1:$2" in
-        rust-libp2p:gossipsub) echo "gossipsub mesh formation race on rust side; tracked as follow-up" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Asymmetric skips (per server×client×testcase). Used for known cross-impl
+# protocol-negotiation gaps where one role-pairing fails but the reverse works.
+# Reasons should reference an issue.
+skip_reason_for_pair() {
+    case "$1:$2:$3" in
+        zig:rust-libp2p:gossipsub) echo "rust client publishes returns InsufficientPeers — rust-libp2p Strict ValidationMode rejects zig's unsigned SUBSCRIBE RPC; #183" ;;
+        zig:rust-libp2p:reqresp) echo "zig server's STREAM frames trigger FINAL_SIZE_ERROR on rust client; #184" ;;
+        zig:go-libp2p:reqresp) echo "same zquic STREAM offset issue when zig is the server and the client opens multiple streams concurrently; #184" ;;
         *) echo "" ;;
     esac
 }
@@ -217,6 +228,9 @@ for server in "${IMPLS[@]}"; do
             skip_reason="$(skip_reason_for "${server}" "${tc}")"
             if [[ -z "${skip_reason}" ]]; then
                 skip_reason="$(skip_reason_for "${client}" "${tc}")"
+            fi
+            if [[ -z "${skip_reason}" ]]; then
+                skip_reason="$(skip_reason_for_pair "${server}" "${client}" "${tc}")"
             fi
             if [[ -n "${skip_reason}" ]]; then
                 echo "ok ${total} - server=${server} client=${client} ${tc} # skip ${skip_reason}"

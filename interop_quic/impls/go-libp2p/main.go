@@ -290,6 +290,9 @@ func gsPayload(idx, length int) []byte {
 	return out
 }
 
+// Role convention (all impls agree): dialer publishes, listener counts.
+// Matches the rust-libp2p + zig impls so #177 cross-impl skips go away.
+
 func runGossipsubServer(ctx context.Context, h host.Host) (int, error) {
 	ps, err := pubsub.NewGossipSub(ctx, h)
 	if err != nil {
