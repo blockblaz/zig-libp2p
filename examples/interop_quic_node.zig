@@ -382,76 +382,95 @@ fn serveOneReqRespResponder(
     deadline_ms: i64,
     payload_len: usize,
 ) !u8 {
-    const Ctx = struct {
-        sid: ?u64 = null,
+    // Cross-impl clients (rust-libp2p, go-libp2p) auto-open identify /
+    // ping / gossipsub streams alongside the reqresp stream, and the
+    // arrival order is not deterministic. Accumulate every inbound sid
+    // and walk them: the first sid that negotiates
+    // `/interop/b4/echo/1.0.0` wins; others get `na`. Other testcases
+    // single-shot the first stream — they don't have this race because
+    // the only stream the same-impl client opens IS the testcase
+    // protocol.
+    const ReqCtx = struct {
+        a: std.mem.Allocator,
+        pending: std.ArrayList(u64),
         fn cb(self_op: ?*anyopaque, _: *QuicListener, _: usize, _: *ZIoConnState, sid: u64) void {
             const ctx_p: *@This() = @ptrCast(@alignCast(self_op.?));
-            if (ctx_p.sid == null) ctx_p.sid = sid;
+            ctx_p.pending.append(ctx_p.a, sid) catch {};
         }
     };
-    var ctx = Ctx{};
+    var ctx = ReqCtx{ .a = a, .pending = .empty };
+    defer ctx.pending.deinit(a);
     listener.lifecycle.ctx = &ctx;
-    listener.lifecycle.on_inbound_stream_ready = Ctx.cb;
+    listener.lifecycle.on_inbound_stream_ready = ReqCtx.cb;
 
-    while (wall_time.milliTimestamp() < deadline_ms and ctx.sid == null) {
-        listener.drive(recv_buf, 5) catch {};
-    }
-    const sid = ctx.sid orelse {
-        std.debug.print("interop_quic_node[server]: reqresp: stream timeout\n", .{});
-        return 1;
-    };
-    std.debug.print("interop_quic_node[server]: reqresp: got stream sid={d}\n", .{sid});
-
-    var raw = RawAppBidiServer{
-        .server = listener.server,
-        .conn = conn,
-        .stream_id = sid,
-    };
-
-    const init_wlen = try stream_multistream.initiatorFirstWriteWireLen(reqresp_protocol_id);
-    while (wall_time.milliTimestamp() < deadline_ms) {
-        listener.drive(recv_buf, 5) catch {};
-        if (raw.unreadRecvLen() >= init_wlen) break;
-    } else return 1;
-
-    {
-        var r = raw.reader();
-        var w = raw.writer();
-        try stream_multistream.responderHandshakeMultistream(&r, &w, reqresp_protocol_id, a);
-    }
-
-    // Drain RR_PAYLOAD_LEN request bytes — allocate on heap since this is
-    // a runtime-size buffer (ping has a comptime fixed 32).
+    const cands = [_][]const u8{reqresp_protocol_id};
     const buf = try a.alloc(u8, payload_len);
     defer a.free(buf);
 
-    while (wall_time.milliTimestamp() < deadline_ms) {
-        listener.drive(recv_buf, 5) catch {};
-        if (raw.unreadRecvLen() >= payload_len) break;
-    } else return 1;
+    stream_loop: while (wall_time.milliTimestamp() < deadline_ms) {
+        while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+        }
+        if (ctx.pending.items.len == 0) break;
+        const sid = ctx.pending.orderedRemove(0);
 
-    {
-        var r = raw.reader();
-        try Io.Reader.readSliceAll(&r, buf);
+        // Keep `raw` (and its send_offset / read_cursor) alive for the
+        // entire negotiate → read → echo → flush pipeline on this sid.
+        // Don't copy it out of this scope — the writer's
+        // `@fieldParentPtr(&writer_buf)` is sensitive to the address.
+        var raw = RawAppBidiServer{
+            .server = listener.server,
+            .conn = conn,
+            .stream_id = sid,
+        };
+
+        var tail = std.ArrayList(u8).empty;
+        defer tail.deinit(a);
+
+        negotiate: while (wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+            var r = raw.reader();
+            var w = raw.writer();
+            _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &cands, a, &tail) catch |err| {
+                switch (err) {
+                    error.DialFailed => continue :negotiate, // need more bytes
+                    error.ProtocolNegotiationFailed => continue :stream_loop, // try next sid
+                    else => continue :stream_loop,
+                }
+            };
+            break :negotiate;
+        }
+        if (wall_time.milliTimestamp() >= deadline_ms) return 1;
+        std.debug.print("interop_quic_node[server]: reqresp: got stream sid={d}\n", .{sid});
+
+        // Drain payload — copy any prefetched bytes from `tail` first,
+        // then read the remainder off the wire.
+        const have_in_tail = @min(tail.items.len, payload_len);
+        if (have_in_tail > 0) @memcpy(buf[0..have_in_tail], tail.items[0..have_in_tail]);
+        var remaining = payload_len - have_in_tail;
+        while (remaining > 0 and wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+            const avail = raw.unreadRecvLen();
+            if (avail == 0) continue;
+            const n = @min(avail, remaining);
+            var r = raw.reader();
+            try Io.Reader.readSliceAll(&r, buf[payload_len - remaining ..][0..n]);
+            remaining -= n;
+        }
+        if (remaining != 0) return 1;
+
+        // Echo + FIN. rust-libp2p's `request_response::Codec` reads with
+        // `read_to_end`, so the response is only delivered after FIN.
+        raw.writeAllFin(buf);
+
+        const flush_until = wall_time.milliTimestamp() + 3_000;
+        while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
+
+        std.debug.print("interop_quic_node[server]: reqresp ok ({d} bytes)\n", .{payload_len});
+        return 0;
     }
-
-    // Echo back the exact same bytes; matches the deterministic payload
-    // the client builds (see `clientOneReqRespInitiator`). FIN the stream
-    // after the last echo byte — rust-libp2p's `request_response::Codec`
-    // reads the response with `read_to_end`, so the response is only
-    // delivered when the writer half closes.
-    raw.writeAllFin(buf);
-
-    // Drain long enough that the FIN + payload land on the wire before we
-    // tear the listener down. With rust-libp2p as the client, the
-    // `request_response::Codec` reads with `read_to_end`, so the response is
-    // only delivered to the application after FIN. Closing the listener
-    // before the FIN packet flushes makes the rust client time out.
-    const flush_until = wall_time.milliTimestamp() + 3_000;
-    while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
-
-    std.debug.print("interop_quic_node[server]: reqresp ok ({d} bytes)\n", .{payload_len});
-    return 0;
+    std.debug.print("interop_quic_node[server]: reqresp: no matching inbound stream\n", .{});
+    return 1;
 }
 
 fn serveOnePingResponder(
@@ -946,29 +965,15 @@ fn runGossipsubInterop(
         try rt.registerKnownPeer(&server_ma, remote_pid);
     }
 
-    // Role split, asymmetric vs. the go-libp2p impl:
-    //
-    //   QuicRuntime's `onPublishCommand` fans publishes out to every
-    //   currently *outbound* peer (the dialed side of each conn). The
-    //   listener side has no outbound peers and so `host.publish` from
-    //   that role produces no wire traffic. To exercise gossipsub
-    //   end-to-end against this codebase today, the dialer publishes
-    //   and the listener subscribes. Cross-impl with go-libp2p stays
-    //   gated behind the upstream zquic TLS gaps anyway, so the
-    //   role-swap doesn't change today's CI surface; tracked in
-    //   src/transport/quic_runtime.zig as a follow-up (let publishes
-    //   reach inbound peers via `listener.server` stream open).
-    //
-    //   ROLE=server → subscribe, count gossip_message events, exit 0
-    //   ROLE=client → subscribe, dial, wait for peer-connected +
-    //                 gossipsub heartbeat, publish N msgs, exit 0
+    // Role convention (all impls agree): dialer publishes, listener counts.
+    // The zig client publishes its N deterministic payloads after a 2 s
+    // settle for GRAFT; the zig server simply counts matching arrivals.
     const payload_buf = try a.alloc(u8, plen);
     defer a.free(payload_buf);
 
     if (is_client) {
-        // Wait for the outbound conn to land before publishing — otherwise
-        // QuicRuntime has no outbound_by_peer entry yet and the publish
-        // fans out to an empty set.
+        // Wait for outbound conn so QuicRuntime has an `outbound_by_peer`
+        // entry to fan publishes out through.
         var saw_peer = false;
         while (wall_time.milliTimestamp() < dl and !saw_peer) {
             var ev = host.nextEvent(100) catch |err| switch (err) {
@@ -982,8 +987,7 @@ fn runGossipsubInterop(
             std.debug.print("interop_quic_node[client]: gossipsub: no peer connected before deadline\n", .{});
             return 1;
         }
-        // Let the gossipsub heartbeat run a couple cycles so the GRAFT
-        // exchange finishes and we have a mesh edge before publishing.
+        // 2 s settle so the gossipsub heartbeat lays the mesh edge.
         const settle_until = wall_time.milliTimestamp() + 2_000;
         while (wall_time.milliTimestamp() < settle_until) {
             var ev = host.nextEvent(100) catch |err| switch (err) {
@@ -1002,7 +1006,7 @@ fn runGossipsubInterop(
             };
         }
         std.debug.print("interop_quic_node[client]: gossipsub published {d} msgs on {s}\n", .{ count, topic });
-        // Stay alive long enough for the server to drain the mesh.
+        // Stay alive long enough for the listener to drain.
         const drain_until = wall_time.milliTimestamp() + 3_000;
         while (wall_time.milliTimestamp() < drain_until) {
             var ev = host.nextEvent(100) catch |err| switch (err) {
@@ -1017,8 +1021,7 @@ fn runGossipsubInterop(
 
     // Server path: drain swarm events, count gossip_message arrivals
     // whose data matches one of the deterministic payloads the client
-    // sends. The matcher tracks which indices have been observed to
-    // tolerate dup deliveries from the gossipsub forwarding layer.
+    // sends.
     var seen = try a.alloc(bool, count);
     defer a.free(seen);
     @memset(seen, false);
@@ -1034,7 +1037,6 @@ fn runGossipsubInterop(
             .gossip_message => |m| {
                 if (!std.mem.eql(u8, m.topic, topic)) continue;
                 if (m.data.len != plen) continue;
-                // Find which index this is by reconstructing payloads.
                 var idx: usize = 0;
                 while (idx < count) : (idx += 1) {
                     gsPayload(payload_buf, idx);
