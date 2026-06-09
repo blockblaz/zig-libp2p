@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* **autonat:** AutoNAT v1 (`/libp2p/autonat/1.0.0`) and v2 (`/libp2p/autonat/2/*`) wire codecs,
+  client probe scheduling, server dial-back handlers with embedder `DialBackFn`, and reachability
+  aggregation (`NatStatus`). Closes [#92](https://github.com/ch4r10t33r/zig-libp2p/issues/92).
+  Guide: [docs/AUTONAT.md](docs/AUTONAT.md).
+
 ## [0.1.15](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.14...v0.1.15) (2026-06-09)
 
 ### Fixed

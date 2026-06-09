@@ -23,6 +23,8 @@ pub const ping = @import("ping.zig");
 pub const ping_wire_quic = @import("ping_wire_quic.zig");
 pub const identify = @import("identify.zig");
 
+pub const autonat = @import("autonat/root.zig");
+
 pub const gossip = struct {
     pub const topic = @import("gossip/topic.zig");
 };
@@ -116,6 +118,7 @@ test {
     _ = @import("gossipsub/duplicate_cache.zig");
     _ = @import("gossipsub/message_id.zig");
     _ = @import("identify.zig");
+    _ = @import("autonat/root.zig");
     _ = @import("connection_manager.zig");
     _ = @import("metrics.zig");
     _ = @import("security/libp2p_tls.zig");
