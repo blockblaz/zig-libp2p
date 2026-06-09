@@ -26,7 +26,7 @@ pub fn initiatorPingRoundTripMs(
     };
     var r = raw.reader();
     var w = raw.writer();
-    try stream_multistream.initiatorHandshakeMultistream(&r, &w, ping.multistream_protocol_id, allocator);
+    try stream_multistream.initiatorHandshakeMultistream(&r, &w, ping.multistream_protocol_id, allocator, null);
     var payload: [ping.payload_len]u8 = undefined;
     return try ping.initiatorRoundTripMs(&r, &w, &payload);
 }
@@ -45,6 +45,6 @@ pub fn responderHandleInbound(
     };
     var r = raw.reader();
     var w = raw.writer();
-    try stream_multistream.responderHandshakeMultistream(&r, &w, ping.multistream_protocol_id, allocator);
+    try stream_multistream.responderHandshakeMultistream(&r, &w, ping.multistream_protocol_id, allocator, null);
     try ping.handleInbound(&r, &w);
 }

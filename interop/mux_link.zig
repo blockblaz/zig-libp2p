@@ -46,9 +46,95 @@ pub const Link = struct {
 
     pub fn negotiateYamux(self: *Link, role: enum { initiator, responder }) Error!void {
         switch (role) {
-            .initiator => try sm.initiatorHandshakeMultistream(self.r, self.w, yamux.multistream_protocol_id, self.allocator),
-            .responder => try sm.responderHandshakeMultistream(self.r, self.w, yamux.multistream_protocol_id, self.allocator),
+            .initiator => try self.initiatorYamuxMultistream(),
+            .responder => try self.responderYamuxMultistream(),
         }
+    }
+
+    fn channelWriteAll(self: *Link, plaintext: []const u8) Error!void {
+        try self.channel.write(self.w, plaintext, &self.wscratch);
+    }
+
+    fn channelReadAppend(self: *Link, acc: *std.ArrayList(u8)) Error!void {
+        if (acc.items.len >= sm.handshake_accum_cap) return error.ProtocolError;
+        const plain = self.channel.read(self.r, self.allocator, &self.ct_buf, &self.pt_buf) catch |e| switch (e) {
+            error.EndOfStream => return error.EndOfStream,
+            else => return e,
+        };
+        try acc.appendSlice(self.allocator, plain);
+        if (acc.items.len > sm.handshake_accum_cap) return error.ProtocolError;
+    }
+
+    fn initiatorYamuxMultistream(self: *Link) Error!void {
+        const neg = zl.transport.multistream_negotiate;
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+        sm.appendFirstStreamInitiatorHandshake(&out, self.allocator, yamux.multistream_protocol_id) catch return error.ProtocolError;
+        try self.channelWriteAll(out.items);
+
+        var acc = std.ArrayList(u8).empty;
+        defer acc.deinit(self.allocator);
+        while (true) {
+            var rem: []const u8 = acc.items;
+            if (neg.initiatorReadPeerMultistream(&rem, neg.default_max_body_len)) |_| {
+                try compactConsumed(&acc, rem);
+                break;
+            } else |err| switch (err) {
+                error.MissingNewline => try self.channelReadAppend(&acc),
+                else => return error.ProtocolError,
+            }
+        }
+        while (true) {
+            var rem: []const u8 = acc.items;
+            if (neg.initiatorReadProtocolAck(&rem, yamux.multistream_protocol_id, neg.default_max_body_len)) |_| {
+                try compactConsumed(&acc, rem);
+                break;
+            } else |err| switch (err) {
+                error.MissingNewline => try self.channelReadAppend(&acc),
+                else => return error.ProtocolError,
+            }
+        }
+        if (acc.items.len > 0) try self.session.feed(acc.items);
+    }
+
+    fn responderYamuxMultistream(self: *Link) Error!void {
+        const neg = zl.transport.multistream_negotiate;
+        var acc = std.ArrayList(u8).empty;
+        defer acc.deinit(self.allocator);
+        var peer_framing: ?neg.Framing = null;
+
+        while (true) {
+            var rem: []const u8 = acc.items;
+            if (neg.responderReadMultistreamOffer(&rem, neg.default_max_body_len)) |_| {
+                try compactConsumed(&acc, rem);
+                break;
+            } else |err| switch (err) {
+                error.MissingNewline => {
+                    try self.channelReadAppend(&acc);
+                    if (acc.items.len > 0) peer_framing = neg.detectFraming(acc.items[0]);
+                },
+                else => return error.ProtocolError,
+            }
+        }
+        const framing = peer_framing orelse .legacy;
+
+        const offered: []const u8 = while (true) {
+            var rem_probe: []const u8 = acc.items;
+            if (neg.responderReadProtocolOffer(&rem_probe, neg.default_max_body_len)) |off| {
+                try compactConsumed(&acc, rem_probe);
+                break off;
+            } else |err| switch (err) {
+                error.MissingNewline => try self.channelReadAppend(&acc),
+                else => return error.ProtocolError,
+            }
+        };
+
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+        neg.responderSendMultistreamHeaderFramed(&out, self.allocator, framing) catch return error.ProtocolError;
+        neg.responderReplyProtocolFramed(&out, self.allocator, offered, yamux.multistream_protocol_id, framing) catch return error.ProtocolError;
+        try self.channelWriteAll(out.items);
+        if (acc.items.len > 0) try self.session.feed(acc.items);
     }
 
     pub fn runDialerPing(self: *Link, deadline_ms: i64) Error!u64 {

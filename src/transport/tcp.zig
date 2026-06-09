@@ -109,7 +109,7 @@ pub fn initiatorHandshakeMultistream(
 ) StreamHandshakeError!void {
     var r = net.Stream.reader(stream, io, scratch_r);
     var w = net.Stream.writer(stream, io, scratch_w);
-    return sm.initiatorHandshakeMultistream(&r.interface, &w.interface, protocol_id, allocator);
+    return sm.initiatorHandshakeMultistream(&r.interface, &w.interface, protocol_id, allocator, null);
 }
 
 /// Run the responder side: accept multistream, echo header, accept one protocol offer, reply if supported.
@@ -123,7 +123,7 @@ pub fn responderHandshakeMultistream(
 ) StreamHandshakeError!void {
     var r = net.Stream.reader(stream, io, scratch_r);
     var w = net.Stream.writer(stream, io, scratch_w);
-    return sm.responderHandshakeMultistream(&r.interface, &w.interface, supported_protocol_id, allocator);
+    return sm.responderHandshakeMultistream(&r.interface, &w.interface, supported_protocol_id, allocator, null);
 }
 
 test "tcp identifiers" {

@@ -85,6 +85,12 @@ fn finishAmongWithTailMove(acc: *std.ArrayList(u8), tail: *std.ArrayList(u8)) vo
     acc.* = .empty;
 }
 
+/// On success, move unread handshake bytes to `tail` without blocking on more stream input.
+fn preserveAccTailOnly(acc: *std.ArrayList(u8), tail: ?*std.ArrayList(u8)) void {
+    if (tail == null) return;
+    finishAmongWithTailMove(acc, tail.?);
+}
+
 fn readMoreHandshake(acc: *std.ArrayList(u8), r: *Io.Reader, allocator: std.mem.Allocator) StreamHandshakeError!void {
     if (acc.items.len >= handshake_accum_cap) return error.ProtocolNegotiationFailed;
     // `readSliceShort` keeps pulling until the slice is full or the stream ends. For finite
@@ -117,6 +123,7 @@ pub fn initiatorHandshakeMultistream(
     w: *Io.Writer,
     protocol_id: []const u8,
     allocator: std.mem.Allocator,
+    tail: ?*std.ArrayList(u8),
 ) StreamHandshakeError!void {
     var acc = std.ArrayList(u8).empty;
     defer acc.deinit(allocator);
@@ -130,7 +137,7 @@ pub fn initiatorHandshakeMultistream(
     Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
     Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
 
-    return initiatorHandshakeMultistreamReadPhase(r, w, protocol_id, allocator);
+    return initiatorHandshakeMultistreamReadPhase(r, w, protocol_id, allocator, tail);
 }
 
 /// Initiator: after [`appendFirstStreamInitiatorHandshake`] was written and flushed, read peer header and protocol ack.
@@ -139,6 +146,7 @@ pub fn initiatorHandshakeMultistreamReadPhase(
     w: *Io.Writer,
     protocol_id: []const u8,
     allocator: std.mem.Allocator,
+    tail: ?*std.ArrayList(u8),
 ) StreamHandshakeError!void {
     _ = w;
     var acc = std.ArrayList(u8).empty;
@@ -159,6 +167,7 @@ pub fn initiatorHandshakeMultistreamReadPhase(
         var rem: []const u8 = acc.items;
         if (neg.initiatorReadProtocolAck(&rem, protocol_id, neg.default_max_body_len)) |_| {
             try compactConsumed(&acc, allocator, rem);
+            preserveAccTailOnly(&acc, tail);
             return;
         } else |err| switch (err) {
             error.MissingNewline => try readMoreHandshake(&acc, r, allocator),
@@ -173,6 +182,7 @@ pub fn responderHandshakeMultistream(
     w: *Io.Writer,
     supported_protocol_id: []const u8,
     allocator: std.mem.Allocator,
+    tail: ?*std.ArrayList(u8),
 ) StreamHandshakeError!void {
     var acc = std.ArrayList(u8).empty;
     defer acc.deinit(allocator);
@@ -218,6 +228,7 @@ pub fn responderHandshakeMultistream(
             try compactConsumed(&acc, allocator, rem_probe);
             Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
             Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+            preserveAccTailOnly(&acc, tail);
             return;
         }
         const pulled = try tryReadMoreHandshake(&acc, r, allocator);
@@ -251,6 +262,7 @@ pub fn responderHandshakeMultistream(
         };
         Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
         Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+        preserveAccTailOnly(&acc, tail);
         return;
     }
 }

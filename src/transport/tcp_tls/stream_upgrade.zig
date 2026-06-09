@@ -125,20 +125,28 @@ fn decodeFirstCertificateDerPem(allocator: std.mem.Allocator, pem: []const u8) U
     return der;
 }
 
+fn seedReaderBuffered(acc: *std.ArrayList(u8), initial_recv: []const u8, allocator: std.mem.Allocator) UpgradeError!void {
+    if (initial_recv.len == 0) return;
+    try acc.appendSlice(allocator, initial_recv);
+}
+
 fn driveNonblockHandshake(
     nb: anytype,
     r: *Io.Reader,
     w: *Io.Writer,
     allocator: std.mem.Allocator,
     send_buf: []u8,
+    initial_recv: []const u8,
+    recv_acc: *std.ArrayList(u8),
 ) UpgradeError!void {
-    var acc = std.ArrayList(u8).empty;
-    defer acc.deinit(allocator);
+    if (recv_acc.items.len == 0) {
+        try seedReaderBuffered(recv_acc, initial_recv, allocator);
+    }
 
     while (!nb.done()) {
-        const res = nb.run(acc.items, send_buf) catch return error.TlsHandshakeFailed;
+        const res = nb.run(recv_acc.items, send_buf) catch return error.TlsHandshakeFailed;
         if (res.recv_pos > 0) {
-            try acc.replaceRange(allocator, 0, res.recv_pos, &.{});
+            try recv_acc.replaceRange(allocator, 0, res.recv_pos, &.{});
         }
         if (res.send.len > 0) {
             try w.writeAll(res.send);
@@ -148,7 +156,7 @@ fn driveNonblockHandshake(
             var chunk: [4096]u8 = undefined;
             const n = r.readSliceShort(&chunk) catch return error.ReadFailed;
             if (n == 0) return error.EndOfStream;
-            try acc.appendSlice(allocator, chunk[0..n]);
+            try recv_acc.appendSlice(allocator, chunk[0..n]);
         }
     }
 }
@@ -222,7 +230,8 @@ pub fn negotiateInitiator(
     expected_remote: ?pid.PeerId,
     client_auth: ?*CertKeyPair,
 ) UpgradeError!HandshakeResult {
-    try sm.initiatorHandshakeMultistream(r, w, libp2p_tls.multistream_protocol_id, allocator);
+    var tls_seed = std.ArrayList(u8).empty;
+    try sm.initiatorHandshakeMultistream(r, w, libp2p_tls.multistream_protocol_id, allocator, &tls_seed);
 
     var send_buf: [output_buffer_len]u8 = undefined;
     var nb = zquic_tls.nonblock.Client.init(.{
@@ -234,7 +243,7 @@ pub fn negotiateInitiator(
         .cipher_suites = offered_cipher_suites,
         .named_groups = offered_named_groups,
     });
-    try driveNonblockHandshake(&nb, r, w, allocator, &send_buf);
+    try driveNonblockHandshake(&nb, r, w, allocator, &send_buf, tls_seed.items, &tls_seed);
 
     const cipher = nb.cipher() orelse return error.TlsHandshakeFailed;
     const leaf = nb.peerLeafCertificateDer();
@@ -244,7 +253,7 @@ pub fn negotiateInitiator(
     return .{
         .channel = .{
             .cipher = cipher,
-            .recv_acc = std.ArrayList(u8).empty,
+            .recv_acc = tls_seed,
         },
         .remote_peer_id = remote,
     };
@@ -259,7 +268,8 @@ pub fn negotiateResponder(
     now_sec: i64,
     expected_remote: ?pid.PeerId,
 ) UpgradeError!HandshakeResult {
-    try sm.responderHandshakeMultistream(r, w, libp2p_tls.multistream_protocol_id, allocator);
+    var tls_seed = std.ArrayList(u8).empty;
+    try sm.responderHandshakeMultistream(r, w, libp2p_tls.multistream_protocol_id, allocator, &tls_seed);
 
     var send_buf: [output_buffer_len]u8 = undefined;
     var nb = zquic_tls.nonblock.Server.init(.{
@@ -271,7 +281,7 @@ pub fn negotiateResponder(
             .insecure_skip_verify = true,
         },
     });
-    try driveNonblockHandshake(&nb, r, w, allocator, &send_buf);
+    try driveNonblockHandshake(&nb, r, w, allocator, &send_buf, tls_seed.items, &tls_seed);
 
     const cipher = nb.cipher() orelse return error.TlsHandshakeFailed;
 
@@ -282,7 +292,7 @@ pub fn negotiateResponder(
     return .{
         .channel = .{
             .cipher = cipher,
-            .recv_acc = std.ArrayList(u8).empty,
+            .recv_acc = tls_seed,
         },
         .remote_peer_id = remote,
     };

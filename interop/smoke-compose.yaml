@@ -1,0 +1,58 @@
+# Minimal unified-testing-compatible smoke test (zig x zig, tcp + tls + yamux).
+# Used by interop/run_smoke.sh and CI before the full unified-testing matrix.
+
+name: zig-libp2p-interop-smoke
+
+networks:
+  interop-smoke:
+    driver: bridge
+
+services:
+  redis:
+    image: redis:7-alpine
+    networks:
+      - interop-smoke
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 10
+
+  listener:
+    image: ${ZIG_LIBP2P_INTEROP_IMAGE:-ch4r10t33r/zig-libp2p-interop:local}
+    init: true
+    networks:
+      - interop-smoke
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - IS_DIALER=false
+      - REDIS_ADDR=redis:6379
+      - TEST_KEY=deadbeef
+      - LISTENER_IP=0.0.0.0
+      - TRANSPORT=tcp
+      - SECURE_CHANNEL=tls
+      - MUXER=yamux
+      - TEST_TIMEOUT_SECS=180
+      - DEBUG=false
+
+  dialer:
+    image: ${ZIG_LIBP2P_INTEROP_IMAGE:-ch4r10t33r/zig-libp2p-interop:local}
+    init: true
+    networks:
+      - interop-smoke
+    depends_on:
+      redis:
+        condition: service_healthy
+      listener:
+        condition: service_started
+    environment:
+      - IS_DIALER=true
+      - REDIS_ADDR=redis:6379
+      - TEST_KEY=deadbeef
+      - TRANSPORT=tcp
+      - SECURE_CHANNEL=tls
+      - MUXER=yamux
+      - TEST_TIMEOUT_SECS=180
+      - DEBUG=false

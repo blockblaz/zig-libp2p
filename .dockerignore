@@ -1,0 +1,14 @@
+.git
+.github
+.cache
+zig-out
+.zig-cache
+**/.zig-cache
+**/zig-out
+**/*.log
+docs/
+examples/
+interop_quic/
+tests/
+*.md
+!interop/README.md
