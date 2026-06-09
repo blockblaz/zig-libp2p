@@ -8,11 +8,19 @@ QUIC + libp2p interop harness (separate from [`interop/`](../interop/), which ta
 |-------|-----------|------|-----------|---------|
 | zig ↔ zig | pass | pass | pass | pass |
 | go ↔ go | pass | pass | pass | pass |
-| rust ↔ rust | pass | pass | skip* | pass |
+| rust ↔ rust | pass | pass | pass¹ | pass |
 | zig ↔ go | **pass** | **pass** | **pass** | pass |
+| zig ↔ rust | **pass** | ½² | ½³ | ½² |
 | full 3-corner (cron) | varies | varies | varies | varies |
 
-\* rust gossipsub skipped pending mesh timing.
+¹ Was skipped pre-#178; now green after the rust interop server waits for `gossipsub::Event::Subscribed` from the remote peer before publishing instead of sleeping a fixed 1.5 s.
+² zig↔rust **handshake** is green both directions after the rust-libp2p `ecdsa`/`secp256k1` Cargo features landed (commit `e25687b`). The remaining ½ failures:
+- `server=zig client=rust reqresp` — rust client times out on the zig server's reqresp framing.
+- `server=rust client=zig ping` and `server=rust client=zig reqresp` — zig client connects, but the `/ipfs/ping/1.0.0` / reqresp wire after multistream-select doesn't complete against a rust-libp2p server.
+
+³ `server=rust client=zig gossipsub` passes. `server=zig client=rust gossipsub` is skipped via the asymmetric `skip_reason_for_pair` table in `run_matrix.sh`: the zig responder rejects the rust client's inbound substream with `ProtocolNegotiationFailed`. Tracked as [#177](https://github.com/ch4r10t33r/zig-libp2p/issues/177).
+
+The remaining failures are post-handshake protocol gaps (multistream-select dialect, stream framing) — not TLS / cert verification. Umbrella: [#166](https://github.com/ch4r10t33r/zig-libp2p/issues/166).
 
 ## Binary
 
