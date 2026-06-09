@@ -434,8 +434,22 @@ fn serveOneReqRespResponder(
             _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &cands, a, &tail) catch |err| {
                 switch (err) {
                     error.DialFailed => continue :negotiate, // need more bytes
-                    error.ProtocolNegotiationFailed => continue :stream_loop, // try next sid
-                    else => continue :stream_loop,
+                    error.ProtocolNegotiationFailed => {
+                        // Send `na` (already done by the responder) then FIN
+                        // our half of the stream so the peer gets a clean
+                        // half-close from us. Without the FIN, the stream
+                        // stays half-open and rust-libp2p / quinn treat
+                        // later STREAM frames on other sids as
+                        // FINAL_SIZE_ERROR-related (#184).
+                        raw.writeAllFin(&.{});
+                        listener.drive(recv_buf, 5) catch {};
+                        continue :stream_loop;
+                    },
+                    else => {
+                        raw.writeAllFin(&.{});
+                        listener.drive(recv_buf, 5) catch {};
+                        continue :stream_loop;
+                    },
                 }
             };
             break :negotiate;

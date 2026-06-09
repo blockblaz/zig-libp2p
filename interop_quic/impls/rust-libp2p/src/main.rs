@@ -123,9 +123,15 @@ struct Behaviour {
 
 impl Behaviour {
     fn new(local_key: &identity::Keypair) -> Result<Self, Box<dyn std::error::Error>> {
+        // `Permissive`: accept unsigned messages (from zig's StrictNoSign /
+        // lean-consensus profile), while signed messages — like those we
+        // produce via `Signed(local_key)` for rust↔rust — still get
+        // validated. `Strict` (the default) would reject zig's unsigned
+        // publishes silently and the rust client would return
+        // `InsufficientPeers` because zig never gets added to fanout (#183).
         let gs_cfg = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_millis(500))
-            .validation_mode(gossipsub::ValidationMode::Strict)
+            .validation_mode(gossipsub::ValidationMode::Permissive)
             .build()?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(local_key.clone()),

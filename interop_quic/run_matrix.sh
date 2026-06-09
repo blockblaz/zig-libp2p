@@ -211,9 +211,7 @@ skip_reason_for() {
 # Reasons should reference an issue.
 skip_reason_for_pair() {
     case "$1:$2:$3" in
-        zig:rust-libp2p:gossipsub) echo "rust client publishes returns InsufficientPeers — rust-libp2p Strict ValidationMode rejects zig's unsigned SUBSCRIBE RPC; #183" ;;
-        zig:rust-libp2p:reqresp) echo "zig server's STREAM frames trigger FINAL_SIZE_ERROR on rust client; #184" ;;
-        zig:go-libp2p:reqresp) echo "same zquic STREAM offset issue when zig is the server and the client opens multiple streams concurrently; #184" ;;
+        zig:rust-libp2p:gossipsub) echo "rust client publishes returns InsufficientPeers — zig opens a per-message gossipsub stream and FINs it, but rust-libp2p expects a persistent per-peer gossipsub stream to receive SUBSCRIBE; #183" ;;
         *) echo "" ;;
     esac
 }
