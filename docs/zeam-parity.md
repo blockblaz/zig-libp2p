@@ -54,6 +54,7 @@ All behaviour layers listed in #31 are implemented in this repo (see **Surface c
 | Gossipsub PRUNE + unsubscribe backoff | Done | [#83](https://github.com/ch4r10t33r/zig-libp2p/issues/83) |
 | Req/resp behaviour | Done | [#40](https://github.com/ch4r10t33r/zig-libp2p/issues/40) — `req_resp.runtime` (timeouts, `channel_id`, `onPeerDisconnected`); `wire_framing`, `wire_tcp`, `wire_quic`; `connection_manager.setReqResp` notifies `ReqResp` on last session close; end-to-end on live streams remains embedder transport + `swarm` |
 | Identify (`/ipfs/id/1.0.0`) | Done | [#41](https://github.com/ch4r10t33r/zig-libp2p/issues/41) |
+| AutoNAT (v1 + v2 NAT detection) | Done | [#92](https://github.com/ch4r10t33r/zig-libp2p/issues/92) — [`autonat`](../src/autonat/); embedder-owned dial-backs via [`DialBackFn`](../src/autonat/server.zig); [docs/AUTONAT.md](AUTONAT.md) |
 | Metrics (Prometheus-style) | Done | [#43](https://github.com/ch4r10t33r/zig-libp2p/issues/43) — [`metrics`](../src/metrics.zig), [`SwarmConfig`](../src/swarm.zig), [`GossipsubConfig`](../src/gossipsub/runtime.zig) |
 | Typed error sets (layers) | Done | [#45](https://github.com/ch4r10t33r/zig-libp2p/issues/45) — `errors` + `layer_events` + transport mappers; `setLastErrorMessage` / `lastErrorMessage` |
 | Fuzz / stress / interop harness | Done (CI scope) | [#44](https://github.com/ch4r10t33r/zig-libp2p/issues/44) — `zig build fuzz`; [`wire_boundaries.zig`](../src/wire_boundaries.zig). Long libFuzzer runs and full rust-libp2p matrix: manual ([`tests/interop/README.md`](../tests/interop/README.md)). |
