@@ -16,6 +16,17 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Free disk space
+      run: |
+        echo "Disk before cleanup:"
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+          "$AGENT_TOOLSDIRECTORY" || true
+        sudo docker image prune --all --force || true
+        echo "Disk after cleanup:"
+        df -h /
+
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:

@@ -1,0 +1,44 @@
+name: Unified-testing transport interop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'interop/**'
+      - 'src/**'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - '.github/workflows/unified-testing-interop.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: unified-testing-interop-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: zig x zig smoke (docker compose)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run interop smoke test
+        run: bash interop/run_smoke.sh
+
+  unified-testing:
+    name: unified-testing matrix (zig ↔ rust)
+    runs-on: ubuntu-latest
+    needs: smoke
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.5/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Run unified-testing transport matrix
+        run: bash interop/run_unified_testing.sh --workers 2

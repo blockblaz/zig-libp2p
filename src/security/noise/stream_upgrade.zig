@@ -46,7 +46,7 @@ pub fn negotiateInitiator(
     payload_scratch: []u8,
     mux_list: *std.ArrayList([]const u8),
 ) UpgradeError!noise.HandshakeResult {
-    try sm.initiatorHandshakeMultistream(r, w, noise.multistream_protocol_id, allocator);
+    try sm.initiatorHandshakeMultistream(r, w, noise.multistream_protocol_id, allocator, null);
     return try noise.handshakeInitiator(
         allocator,
         io,
@@ -78,7 +78,7 @@ pub fn negotiateResponder(
     payload_scratch: []u8,
     mux_list: *std.ArrayList([]const u8),
 ) UpgradeError!noise.HandshakeResult {
-    try sm.responderHandshakeMultistream(r, w, noise.multistream_protocol_id, allocator);
+    try sm.responderHandshakeMultistream(r, w, noise.multistream_protocol_id, allocator, null);
     return try noise.handshakeResponder(
         allocator,
         io,

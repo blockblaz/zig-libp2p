@@ -7,6 +7,7 @@ const Io = std.Io;
 const net = Io.net;
 const zl = @import("zig_libp2p");
 const multiaddr = @import("multiaddr");
+const blocking_stream_io = @import("blocking_stream_io.zig");
 const mux_link = @import("mux_link.zig");
 const redis_client = @import("redis_client.zig");
 
@@ -14,7 +15,13 @@ const tcp = zl.transport.tcp;
 const tcp_tls = zl.transport.tcp_tls;
 const libp2p_tls_cert = zl.security.libp2p_tls_cert;
 
-const Ed25519 = std.crypto.sign.Ed25519;
+const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+const tcp_tuning: tcp.StreamSocketTuning = .{
+    .tcp_nodelay = true,
+    .send_buffer_bytes = 1 << 16,
+    .recv_buffer_bytes = 1 << 16,
+};
 
 const Env = struct {
     is_dialer: bool,
@@ -73,7 +80,6 @@ pub fn main() !void {
 }
 
 const Identity = struct {
-    host_kp: Ed25519.KeyPair,
     local_peer_id: zl.peer_id.PeerId,
     owned_cert: tcp_tls.OwnedCertKeyPair,
     now_sec: i64,
@@ -105,26 +111,33 @@ fn fillRandomBytes(out: []u8) !void {
 }
 
 fn generateIdentity(allocator: std.mem.Allocator) !Identity {
-    var seed: [32]u8 = undefined;
-    try fillRandomBytes(&seed);
-    const host_kp = try Ed25519.KeyPair.generateDeterministic(seed);
-
     const HostSigner = struct {
-        kp: Ed25519.KeyPair,
-        fn sign(ctx: ?*anyopaque, message: []const u8, out_sig: *[64]u8) anyerror!void {
+        kp: EcdsaP256.KeyPair,
+        fn sign(ctx: ?*anyopaque, message: []const u8, out_sig: []u8, out_sig_len: *usize) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            out_sig.* = (try self.kp.sign(message, null)).toBytes();
+            const sig = try self.kp.sign(message, null);
+            var buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
+            const der = sig.toDer(&buf);
+            if (der.len > out_sig.len) return error.NoSpaceLeft;
+            @memcpy(out_sig[0..der.len], der);
+            out_sig_len.* = der.len;
         }
     };
+
+    var host_seed: [32]u8 = undefined;
+    try fillRandomBytes(&host_seed);
+    const host_kp = try EcdsaP256.KeyPair.generateDeterministic(host_seed);
     var signer = HostSigner{ .kp = host_kp };
+    const host_pub_sec1: [65]u8 = host_kp.public_key.toUncompressedSec1();
+
     const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
     var cert_seed: [32]u8 = undefined;
     try fillRandomBytes(&cert_seed);
 
     var gen = try libp2p_tls_cert.generate(allocator, .{
         .host_identity = .{
-            .ed25519 = .{
-                .public_key_bytes = host_kp.public_key.bytes,
+            .ecdsa_p256 = .{
+                .public_key_sec1_uncompressed = host_pub_sec1,
                 .sign = HostSigner.sign,
                 .sign_ctx = &signer,
             },
@@ -137,15 +150,17 @@ fn generateIdentity(allocator: std.mem.Allocator) !Identity {
 
     const cert_pem = try libp2p_tls_cert.certDerToPem(allocator, gen.cert_der);
     defer allocator.free(cert_pem);
-    const key_pem = try libp2p_tls_cert.ed25519SeedToPem(allocator, gen.cert_key_seed);
+    const key_pem = try libp2p_tls_cert.ecdsaP256SeedToPem(allocator, gen.cert_key_seed);
     defer allocator.free(key_pem);
 
     const owned_cert = try tcp_tls.certKeyPairFromPem(allocator, cert_pem, key_pem, now_sec);
-    const host: zl.keypair.KeyPair = .{ .ed25519 = host_kp };
-    const local_peer_id = try zl.keypair.peerIdFromKeyPair(allocator, host);
+    const host_pub_proto = try libp2p_tls_cert.encodeEcdsaPublicKeyProto(allocator, host_pub_sec1);
+    defer allocator.free(host_pub_proto);
+    const reader = try zl.peer_id.PublicKeyReader.init(host_pub_proto);
+    var host_pk = zl.peer_id.PublicKey{ .type = .ECDSA, .data = reader.getData() };
+    const local_peer_id = try zl.peer_id.PeerId.fromPublicKey(allocator, &host_pk);
 
     return .{
-        .host_kp = host_kp,
         .local_peer_id = local_peer_id,
         .owned_cert = owned_cert,
         .now_sec = now_sec,
@@ -160,16 +175,21 @@ fn redisListenerKey(allocator: std.mem.Allocator, env: Env) ![]u8 {
 }
 
 fn runListener(allocator: std.mem.Allocator, io: Io, env: Env, id: *Identity) !void {
+    var redis = try redis_client.Client.connect(allocator, env.redis_host, env.redis_port);
+    defer redis.deinit();
+
+    const publish_ip = try resolvePublishIpv4(&redis, env.listener_ip);
+    if (env.debug) std.log.debug("listener publish ip: {d}.{d}.{d}.{d}", .{
+        publish_ip[0], publish_ip[1], publish_ip[2], publish_ip[3],
+    });
+
     var bind_addr: net.IpAddress = .{ .ip4 = net.Ip4Address.unspecified(0) };
     var server = try tcp.listen(&bind_addr, io, .{ .reuse_address = true });
     defer server.deinit(io);
     const port = server.socket.address.getPort();
 
-    const ma_str = try formatListenerMultiaddr(allocator, env.listener_ip, port, &id.local_peer_id);
+    const ma_str = try formatListenerMultiaddr(allocator, publish_ip, port, &id.local_peer_id);
     defer allocator.free(ma_str);
-
-    var redis = try redis_client.Client.connect(allocator, io, env.redis_host, env.redis_port);
-    defer redis.deinit();
 
     const redis_key = try redisListenerKey(allocator, env);
     defer allocator.free(redis_key);
@@ -179,17 +199,43 @@ fn runListener(allocator: std.mem.Allocator, io: Io, env: Env, id: *Identity) !v
     if (env.debug) std.log.debug("listener published {s} -> {s}", .{ redis_key, ma_str });
 
     const deadline_ms = zl.wall_time.milliTimestamp() + @as(i64, @intCast(env.timeout_secs * 1000));
-    while (zl.wall_time.milliTimestamp() < deadline_ms) {
-        const st = tcp.acceptTuned(&server, io, .{}) catch continue;
-        defer st.close(io);
-        _ = try handleConn(allocator, io, st, id, null, .responder, deadline_ms);
-        return;
-    }
-    return error.Timeout;
+
+    const AcceptCtx = struct {
+        allocator: std.mem.Allocator,
+        io_inner: Io,
+        server: *net.Server,
+        id: *Identity,
+        deadline_ms: i64,
+        err: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            while (zl.wall_time.milliTimestamp() < ctx.deadline_ms) {
+                const st = tcp.acceptTuned(ctx.server, ctx.io_inner, tcp_tuning) catch continue;
+                defer st.close(ctx.io_inner);
+                _ = handleConn(ctx.allocator, st, ctx.id, null, .responder, ctx.deadline_ms) catch |e| {
+                    ctx.err = e;
+                    return;
+                };
+                return;
+            }
+            ctx.err = error.Timeout;
+        }
+    };
+
+    var accept_ctx: AcceptCtx = .{
+        .allocator = allocator,
+        .io_inner = io,
+        .server = &server,
+        .id = id,
+        .deadline_ms = deadline_ms,
+    };
+    const accept_thr = try std.Thread.spawn(.{}, AcceptCtx.run, .{&accept_ctx});
+    accept_thr.join();
+    return accept_ctx.err orelse {};
 }
 
 fn runDialer(allocator: std.mem.Allocator, io: Io, env: Env, id: *Identity) !void {
-    var redis = try redis_client.Client.connect(allocator, io, env.redis_host, env.redis_port);
+    var redis = try redis_client.Client.connect(allocator, env.redis_host, env.redis_port);
     defer redis.deinit();
 
     const redis_key = try redisListenerKey(allocator, env);
@@ -203,12 +249,11 @@ fn runDialer(allocator: std.mem.Allocator, io: Io, env: Env, id: *Identity) !voi
     var dial_addr = try multiaddrToNetAddress(allocator, ma_bytes);
     defer dial_addr.deinit(allocator);
 
-    var client = try tcp.dial(&dial_addr.addr, io, .{});
+    var client = try tcp.dial(&dial_addr.addr, io, .{ .tuning = tcp_tuning });
     defer client.close(io);
 
     const ping_rtt_ms = try handleConn(
         allocator,
-        io,
         client,
         id,
         dial_addr.expected_peer,
@@ -225,7 +270,6 @@ fn runDialer(allocator: std.mem.Allocator, io: Io, env: Env, id: *Identity) !voi
 
 fn handleConn(
     allocator: std.mem.Allocator,
-    io: Io,
     stream: net.Stream,
     id: *Identity,
     expected_remote: ?zl.peer_id.PeerId,
@@ -234,22 +278,21 @@ fn handleConn(
 ) !u64 {
     var scratch_r: [65536]u8 = undefined;
     var scratch_w: [65536]u8 = undefined;
-    var r = net.Stream.reader(stream, io, &scratch_r);
-    var w = net.Stream.writer(stream, io, &scratch_w);
+    var pair = blocking_stream_io.Pair.init(stream, &scratch_r, &scratch_w);
 
     var hs = switch (role) {
         .initiator => try tcp_tls.negotiateInitiator(
             allocator,
-            &r.interface,
-            &w.interface,
+            &pair.reader.interface,
+            &pair.writer.interface,
             id.now_sec,
             expected_remote,
             &id.owned_cert.pair,
         ),
         .responder => try tcp_tls.negotiateResponder(
             allocator,
-            &r.interface,
-            &w.interface,
+            &pair.reader.interface,
+            &pair.writer.interface,
             &id.owned_cert.pair,
             id.now_sec,
             expected_remote,
@@ -262,11 +305,10 @@ fn handleConn(
             .responder => zl.transport.yamux.Session.init(allocator, .{ .keep_alive_interval_ms = 0 }, .responder),
         },
         .channel = undefined,
-        .r = &r.interface,
-        .w = &w.interface,
+        .r = &pair.reader.interface,
+        .w = &pair.writer.interface,
     };
     std.mem.swap(tcp_tls.SecureChannel, &link.channel, &hs.channel);
-    hs.channel.recv_acc = .empty;
     defer link.deinit();
 
     try link.negotiateYamux(switch (role) {
@@ -276,9 +318,9 @@ fn handleConn(
 
     return switch (role) {
         .initiator => try link.runDialerPing(deadline_ms),
-        .responder => {
+        .responder => blk: {
             try link.runListenerPing(deadline_ms);
-            return 0;
+            break :blk 0;
         },
     };
 }
@@ -321,30 +363,40 @@ fn multiaddrToNetAddress(allocator: std.mem.Allocator, ma_str: []const u8) !Pars
     return .{ .addr = addr, .expected_peer = peer };
 }
 
-fn formatListenerMultiaddr(allocator: std.mem.Allocator, ip: []const u8, port: u16, peer: *const zl.peer_id.PeerId) ![]u8 {
-    const ip_bytes = try parseIpv4(ip);
-    var ma = multiaddr.Multiaddr.init(allocator);
-    try ma.push(.{ .Ip4 = .{ .bytes = ip_bytes, .port = 0 } });
-    try ma.push(.{ .Tcp = port });
-    try ma.push(.{ .P2P = peer.* });
-    return ma.toString(allocator);
+fn resolvePublishIpv4(redis: *const redis_client.Client, listener_ip: []const u8) ![4]u8 {
+    const local = redis.localIpv4() catch return parseIpv4Literal(listener_ip);
+    if (!isUnusablePublishIp(&local)) return local;
+    return parseIpv4Literal(listener_ip);
 }
 
-fn parseIpv4(ip: []const u8) ![4]u8 {
+fn isUnusablePublishIp(ip: *const [4]u8) bool {
+    return std.mem.eql(u8, ip, &[4]u8{ 127, 0, 0, 1 }) or std.mem.eql(u8, ip, &[4]u8{ 0, 0, 0, 0 });
+}
+
+fn parseIpv4Literal(ip: []const u8) ![4]u8 {
+    if (std.mem.eql(u8, ip, "0.0.0.0")) return error.UnsupportedAddress;
     var parts: [4]u8 = undefined;
     var idx: usize = 0;
     var start: usize = 0;
     for (ip, 0..) |c, i| {
         if (c == '.') {
-            if (idx >= 4) return error.InvalidAddress;
+            if (idx >= 4) return error.UnsupportedAddress;
             parts[idx] = try std.fmt.parseInt(u8, ip[start..i], 10);
             idx += 1;
             start = i + 1;
         }
     }
-    if (idx != 3) return error.InvalidAddress;
+    if (idx != 3) return error.UnsupportedAddress;
     parts[3] = try std.fmt.parseInt(u8, ip[start..], 10);
     return parts;
+}
+
+fn formatListenerMultiaddr(allocator: std.mem.Allocator, ip_bytes: [4]u8, port: u16, peer: *const zl.peer_id.PeerId) ![]u8 {
+    var ma = multiaddr.Multiaddr.init(allocator);
+    try ma.push(.{ .Ip4 = .{ .bytes = ip_bytes, .port = 0 } });
+    try ma.push(.{ .Tcp = port });
+    try ma.push(.{ .P2P = peer.* });
+    return ma.toString(allocator);
 }
 
 fn envOwned(allocator: std.mem.Allocator, key: []const u8) ?[]u8 {
@@ -392,7 +444,7 @@ fn parseEnv(allocator: std.mem.Allocator) !Env {
 }
 
 fn freeEnv(allocator: std.mem.Allocator, env: Env) void {
-    allocator.free(env.redis_host); // duped in parseEnv
+    allocator.free(env.redis_host);
     allocator.free(env.listener_ip);
     if (env.test_key) |k| allocator.free(k);
     allocator.free(env.transport);
@@ -408,5 +460,5 @@ const MissingIsDialer = error{MissingIsDialer};
 const UnsupportedConfig = error{UnsupportedConfig};
 const InvalidMultiaddr = error{InvalidMultiaddr};
 const InvalidRedisAddr = error{InvalidRedisAddr};
-const InvalidAddress = error{InvalidAddress};
+const UnsupportedAddress = error{UnsupportedAddress};
 const Timeout = error{Timeout};

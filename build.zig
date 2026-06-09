@@ -184,9 +184,9 @@ pub fn build(b: *std.Build) void {
         .name = "transport-interop",
         .root_module = interop_mod,
     });
-    b.installArtifact(interop_exe);
+    const install_interop = b.addInstallArtifact(interop_exe, .{});
     const interop_step = b.step("interop", "Build unified-testing transport interop binary");
-    interop_step.dependOn(&interop_exe.step);
+    interop_step.dependOn(&install_interop.step);
 
     const interop_matrix_cmd = b.addSystemCommand(&.{
         "bash",

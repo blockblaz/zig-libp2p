@@ -46,7 +46,7 @@ pub fn initiatorUnaryExchange(
     };
     var r = raw.reader();
     var w = raw.writer();
-    try stream_multistream.initiatorHandshakeMultistream(&r, &w, protocol_id, allocator);
+    try stream_multistream.initiatorHandshakeMultistream(&r, &w, protocol_id, allocator, null);
     return try framing.initiatorUnaryAfterHandshake(allocator, &r, &w, scratch_r, uncompressed_request, limits);
 }
 
@@ -67,7 +67,7 @@ pub fn initiatorReadResponseSequence(
     };
     var r = raw.reader();
     var w = raw.writer();
-    try stream_multistream.initiatorHandshakeMultistream(&r, &w, protocol_id, allocator);
+    try stream_multistream.initiatorHandshakeMultistream(&r, &w, protocol_id, allocator, null);
     return try framing.initiatorReadResponsesAfterHandshake(allocator, &r, &w, scratch_r, uncompressed_request, limits, count);
 }
 
@@ -89,6 +89,6 @@ pub fn responderUnarySequence(
     };
     var r = raw.reader();
     var w = raw.writer();
-    try stream_multistream.responderHandshakeMultistream(&r, &w, protocol_id, allocator);
+    try stream_multistream.responderHandshakeMultistream(&r, &w, protocol_id, allocator, null);
     return try framing.responderUnarySequenceAfterHandshake(allocator, &r, &w, scratch_r, limits, response_bodies);
 }

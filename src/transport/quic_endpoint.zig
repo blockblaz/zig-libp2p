@@ -504,7 +504,7 @@ fn quicLoopbackOnePingOnStream(
             const ix = try stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, allocator, null);
             if (ix != 1) return error.InvalidData;
         } else {
-            try stream_multistream.responderHandshakeMultistream(&r, &w, ping.multistream_protocol_id, allocator);
+            try stream_multistream.responderHandshakeMultistream(&r, &w, ping.multistream_protocol_id, allocator, null);
         }
     }
 
@@ -516,7 +516,7 @@ fn quicLoopbackOnePingOnStream(
     {
         var r = raw_c.reader();
         var w = raw_c.writer();
-        try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, allocator);
+        try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, allocator, null);
     }
 
     var pay: [ping.payload_len]u8 = undefined;

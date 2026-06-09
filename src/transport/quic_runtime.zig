@@ -1371,7 +1371,7 @@ pub const QuicRuntime = struct {
                 if (req.raw.unreadRecvLen() < need) continue;
                 var r = req.raw.reader();
                 var w = req.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, req.proto.protocolId(), a) catch |err| {
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, req.proto.protocolId(), a, null) catch |err| {
                     log.warn("quic_runtime: read init ack failed: {s}", .{@errorName(err)});
                     continue;
                 };
@@ -1495,7 +1495,7 @@ pub const QuicRuntime = struct {
                 if (op.raw.unreadRecvLen() < need) continue;
                 var r = op.raw.reader();
                 var w = op.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a) catch |err| {
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch |err| {
                     log.warn("quic_runtime: publish read ack failed: {s}", .{@errorName(err)});
                     continue;
                 };

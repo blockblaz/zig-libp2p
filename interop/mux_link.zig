@@ -31,12 +31,20 @@ pub const Link = struct {
         self.channel.deinit(self.allocator);
     }
 
-    pub fn pump(self: *Link) Error!void {
+    /// Flush queued yamux frames to the secure channel without reading. Reading
+    /// is kept separate so the write path never blocks waiting for inbound data
+    /// (which would deadlock half-duplex exchanges where the peer is waiting for
+    /// the very bytes we are about to send).
+    pub fn flushOutbound(self: *Link) Error!void {
         const out = self.session.pendingOutbound();
         if (out.len > 0) {
             try self.channel.write(self.w, out, &self.wscratch);
             self.session.consumeOutbound(out.len);
         }
+    }
+
+    /// Block for one secure-channel record and feed it to the yamux session.
+    fn readInbound(self: *Link) Error!void {
         const plain = self.channel.read(self.r, self.allocator, &self.ct_buf, &self.pt_buf) catch |e| switch (e) {
             error.EndOfStream => return,
             else => return e,
@@ -44,16 +52,110 @@ pub const Link = struct {
         try self.session.feed(plain);
     }
 
+    pub fn pump(self: *Link) Error!void {
+        try self.flushOutbound();
+        try self.readInbound();
+    }
+
     pub fn negotiateYamux(self: *Link, role: enum { initiator, responder }) Error!void {
         switch (role) {
-            .initiator => try sm.initiatorHandshakeMultistream(self.r, self.w, yamux.multistream_protocol_id, self.allocator),
-            .responder => try sm.responderHandshakeMultistream(self.r, self.w, yamux.multistream_protocol_id, self.allocator),
+            .initiator => try self.initiatorYamuxMultistream(),
+            .responder => try self.responderYamuxMultistream(),
         }
     }
 
+    fn channelWriteAll(self: *Link, plaintext: []const u8) Error!void {
+        try self.channel.write(self.w, plaintext, &self.wscratch);
+    }
+
+    fn channelReadAppend(self: *Link, acc: *std.ArrayList(u8)) Error!void {
+        if (acc.items.len >= sm.handshake_accum_cap) return error.ProtocolError;
+        const plain = self.channel.read(self.r, self.allocator, &self.ct_buf, &self.pt_buf) catch |e| switch (e) {
+            error.EndOfStream => return error.EndOfStream,
+            else => return e,
+        };
+        try acc.appendSlice(self.allocator, plain);
+        if (acc.items.len > sm.handshake_accum_cap) return error.ProtocolError;
+    }
+
+    fn initiatorYamuxMultistream(self: *Link) Error!void {
+        const neg = zl.transport.multistream_negotiate;
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+        sm.appendFirstStreamInitiatorHandshake(&out, self.allocator, yamux.multistream_protocol_id) catch return error.ProtocolError;
+        try self.channelWriteAll(out.items);
+
+        var acc = std.ArrayList(u8).empty;
+        defer acc.deinit(self.allocator);
+        while (true) {
+            var rem: []const u8 = acc.items;
+            if (neg.initiatorReadPeerMultistream(&rem, neg.default_max_body_len)) |_| {
+                try compactConsumed(&acc, rem);
+                break;
+            } else |err| switch (err) {
+                error.MissingNewline => try self.channelReadAppend(&acc),
+                else => return error.ProtocolError,
+            }
+        }
+        while (true) {
+            var rem: []const u8 = acc.items;
+            if (neg.initiatorReadProtocolAck(&rem, yamux.multistream_protocol_id, neg.default_max_body_len)) |_| {
+                try compactConsumed(&acc, rem);
+                break;
+            } else |err| switch (err) {
+                error.MissingNewline => try self.channelReadAppend(&acc),
+                else => return error.ProtocolError,
+            }
+        }
+        if (acc.items.len > 0) try self.session.feed(acc.items);
+    }
+
+    fn responderYamuxMultistream(self: *Link) Error!void {
+        const neg = zl.transport.multistream_negotiate;
+        var acc = std.ArrayList(u8).empty;
+        defer acc.deinit(self.allocator);
+        var peer_framing: ?neg.Framing = null;
+
+        while (true) {
+            var rem: []const u8 = acc.items;
+            if (neg.responderReadMultistreamOffer(&rem, neg.default_max_body_len)) |_| {
+                try compactConsumed(&acc, rem);
+                break;
+            } else |err| switch (err) {
+                error.MissingNewline => {
+                    try self.channelReadAppend(&acc);
+                    if (acc.items.len > 0) peer_framing = neg.detectFraming(acc.items[0]);
+                },
+                else => return error.ProtocolError,
+            }
+        }
+        const framing = peer_framing orelse .legacy;
+
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+        while (true) {
+            var rem_probe: []const u8 = acc.items;
+            if (neg.responderReadProtocolOffer(&rem_probe, neg.default_max_body_len)) |offered| {
+                // `offered` aliases `acc`; build the reply (which copies the
+                // protocol id into `out`) before `compactConsumed` shifts `acc`.
+                neg.responderSendMultistreamHeaderFramed(&out, self.allocator, framing) catch return error.ProtocolError;
+                neg.responderReplyProtocolFramed(&out, self.allocator, offered, yamux.multistream_protocol_id, framing) catch return error.ProtocolError;
+                try compactConsumed(&acc, rem_probe);
+                break;
+            } else |err| switch (err) {
+                error.MissingNewline => try self.channelReadAppend(&acc),
+                else => return error.ProtocolError,
+            }
+        }
+        try self.channelWriteAll(out.items);
+        if (acc.items.len > 0) try self.session.feed(acc.items);
+    }
+
     pub fn runDialerPing(self: *Link, deadline_ms: i64) Error!u64 {
+        // The stream's SYN piggybacks on the first data frame; the peer only
+        // ACKs (establishing the stream) once it receives our data, so there is
+        // no separate "wait for established" step — we start sending right away.
         const stream = try self.session.openStream();
-        try self.pumpUntil(deadline_ms, streamIsEstablished, stream);
 
         const t_ping_start: i64 = @intCast(zl.wall_time.milliTimestamp());
         try self.initiatorPingOnStream(stream, deadline_ms);
@@ -72,42 +174,31 @@ pub const Link = struct {
         return error.Timeout;
     }
 
-    fn streamIsEstablished(_: i64, stream: *yamux.Stream) bool {
-        return stream.state == .established;
-    }
-
-    fn pumpUntil(self: *Link, deadline_ms: i64, comptime pred: *const fn (i64, *yamux.Stream) bool, stream: *yamux.Stream) Error!void {
-        while (zl.wall_time.milliTimestamp() < deadline_ms) {
-            if (pred(deadline_ms, stream)) return;
-            try self.pump();
-        }
-        return error.Timeout;
-    }
-
     fn streamWriteAll(self: *Link, stream: *yamux.Stream, bytes: []const u8, deadline_ms: i64) Error!void {
         var off: usize = 0;
         while (off < bytes.len) {
             if (zl.wall_time.milliTimestamp() >= deadline_ms) return error.Timeout;
-            try self.pump();
             const n = stream.write(bytes[off..]) catch |e| switch (e) {
                 error.StreamClosed => return error.StreamClosed,
                 else => return e,
             };
             off += n;
         }
-        try self.pump();
+        try self.flushOutbound();
     }
 
     fn streamReadAppend(self: *Link, stream: *yamux.Stream, acc: *std.ArrayList(u8), deadline_ms: i64) Error!void {
         var tmp: [1024]u8 = undefined;
         while (zl.wall_time.milliTimestamp() < deadline_ms) {
-            try self.pump();
             const n = stream.read(&tmp) catch |e| switch (e) {
                 error.StreamClosed => return error.EndOfStream,
             };
-            if (n == 0) continue;
-            try acc.appendSlice(self.allocator, tmp[0..n]);
-            return;
+            if (n > 0) {
+                try acc.appendSlice(self.allocator, tmp[0..n]);
+                return;
+            }
+            try self.flushOutbound();
+            try self.readInbound();
         }
         return error.Timeout;
     }
@@ -150,12 +241,15 @@ pub const Link = struct {
         var got: usize = 0;
         while (got < echo.len) {
             if (zl.wall_time.milliTimestamp() >= deadline_ms) return error.Timeout;
-            try self.pump();
             const n = stream.read(echo[got..]) catch |e| switch (e) {
                 error.StreamClosed => return error.StreamClosed,
             };
-            if (n == 0) continue;
-            got += n;
+            if (n > 0) {
+                got += n;
+                continue;
+            }
+            try self.flushOutbound();
+            try self.readInbound();
         }
         if (!std.mem.eql(u8, &payload, &echo)) return error.ProtocolError;
     }
@@ -174,33 +268,41 @@ pub const Link = struct {
                 else => return error.ProtocolError,
             }
         }
-        const offered: []const u8 = while (zl.wall_time.milliTimestamp() < deadline_ms) {
-            var rem_offer: []const u8 = acc.items;
-            if (neg.responderReadProtocolOffer(&rem_offer, neg.default_max_body_len)) |off| {
-                try compactConsumed(&acc, rem_offer);
-                break off;
-            } else |err| switch (err) {
-                error.MissingNewline => try self.streamReadAppend(stream, &acc, deadline_ms),
-                else => return error.ProtocolError,
-            }
-        } else return error.Timeout;
-
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.allocator);
-        try neg.responderSendMultistreamHeader(&out, self.allocator);
-        neg.responderReplyProtocol(&out, self.allocator, offered, ping.multistream_protocol_id) catch return error.ProtocolError;
+        {
+            var replied = false;
+            while (zl.wall_time.milliTimestamp() < deadline_ms) {
+                var rem_offer: []const u8 = acc.items;
+                if (neg.responderReadProtocolOffer(&rem_offer, neg.default_max_body_len)) |offered| {
+                    // `offered` aliases `acc`; build the reply before `compactConsumed` shifts `acc`.
+                    try neg.responderSendMultistreamHeader(&out, self.allocator);
+                    neg.responderReplyProtocol(&out, self.allocator, offered, ping.multistream_protocol_id) catch return error.ProtocolError;
+                    try compactConsumed(&acc, rem_offer);
+                    replied = true;
+                    break;
+                } else |err| switch (err) {
+                    error.MissingNewline => try self.streamReadAppend(stream, &acc, deadline_ms),
+                    else => return error.ProtocolError,
+                }
+            }
+            if (!replied) return error.Timeout;
+        }
         try self.streamWriteAll(stream, out.items, deadline_ms);
 
         var buf: [ping.payload_len]u8 = undefined;
         var got: usize = 0;
         while (got < buf.len) {
             if (zl.wall_time.milliTimestamp() >= deadline_ms) return error.Timeout;
-            try self.pump();
             const n = stream.read(buf[got..]) catch |e| switch (e) {
                 error.StreamClosed => return error.StreamClosed,
             };
-            if (n == 0) continue;
-            got += n;
+            if (n > 0) {
+                got += n;
+                continue;
+            }
+            try self.flushOutbound();
+            try self.readInbound();
         }
         try self.streamWriteAll(stream, &buf, deadline_ms);
     }
