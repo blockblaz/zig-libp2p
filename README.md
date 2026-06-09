@@ -41,6 +41,7 @@ Programs under [`examples/`](./examples/). `zig build` installs to `zig-out/bin/
 | `example-gossipsub-mesh` | [gossipsub_mesh.zig](examples/gossipsub_mesh.zig) | Gossipsub subscribe + mesh |
 | `example-ping-membuf` | [ping_membuf.zig](examples/ping_membuf.zig) | Ping 1.0.0 over in-memory I/O |
 | `example-autonat-membuf` | [autonat_membuf.zig](examples/autonat_membuf.zig) | AutoNAT v1 probe round-trip over in-memory I/O |
+| `example-kad-dht-membuf` | [kad_dht_membuf.zig](examples/kad_dht_membuf.zig) | kad-dht FIND_NODE round-trip over in-memory I/O |
 | `example-swarm-tick` | [swarm_tick.zig](examples/swarm_tick.zig) | `Swarm.tick` without background threads |
 | `example-req-resp-tcp-status` | [req_resp_tcp_status.zig](examples/req_resp_tcp_status.zig) | Req/resp over TCP (compile-only in CI) |
 | `example-quic-ping-loopback` | [quic_ping_loopback.zig](examples/quic_ping_loopback.zig) | QUIC loopback ping via `quic_endpoint` |
@@ -67,7 +68,7 @@ Imports use the `zig_libp2p` prefix (e.g. `zig_libp2p.gossipsub.runtime`, `zig_l
 | Area | Modules |
 |------|---------|
 | Core | `host` / `Node`, `swarm`, `connection_manager`, `errors`, `metrics`, `layer_events`, `peer_events` |
-| Protocols | `protocol`, `ping`, `identify`, `autonat`, `gossip`, `gossipsub.*`, `req_resp.*` |
+| Protocols | `protocol`, `ping`, `identify`, `autonat`, `kad_dht`, `gossip`, `gossipsub.*`, `req_resp.*` |
 | Wire | `varint`, `multistream`, `protobuf.wire`, `addr_list` |
 | Transport | `transport.quic_*`, `transport.tcp`, `transport.tcp_tls`, `transport.stream_multistream`, `transport.multistream_negotiate`, `transport.yamux`, `transport.mplex` |
 | Security | `security.libp2p_tls`, `security.libp2p_tls_cert`, `security.noise` |

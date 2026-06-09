@@ -24,6 +24,7 @@ pub const ping_wire_quic = @import("ping_wire_quic.zig");
 pub const identify = @import("identify.zig");
 
 pub const autonat = @import("autonat/root.zig");
+pub const kad_dht = @import("kad_dht/root.zig");
 
 pub const gossip = struct {
     pub const topic = @import("gossip/topic.zig");
@@ -117,6 +118,8 @@ test {
     _ = @import("gossipsub/config.zig");
     _ = @import("gossipsub/duplicate_cache.zig");
     _ = @import("gossipsub/message_id.zig");
+    _ = @import("autonat/root.zig");
+    _ = @import("kad_dht/root.zig");
     _ = @import("identify.zig");
     _ = @import("autonat/root.zig");
     _ = @import("connection_manager.zig");
