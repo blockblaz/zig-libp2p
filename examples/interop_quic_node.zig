@@ -680,7 +680,7 @@ fn clientOneReqRespInitiator(
         outbound.drive(recv_buf, 5) catch {};
         var r = raw.reader();
         var w = raw.writer();
-        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, reqresp_protocol_id, a) catch |err| {
+        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, reqresp_protocol_id, a, null) catch |err| {
             switch (err) {
                 error.ProtocolNegotiationFailed, error.DialFailed => continue,
                 else => return 1,
@@ -758,7 +758,7 @@ fn clientOnePingInitiator(
         respondInboundIdentifyStreamsClient(outbound, recv_buf, sid, a, identify_payload, &inbound_slots);
         var r = raw.reader();
         var w = raw.writer();
-        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, a) catch |err| {
+        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, a, null) catch |err| {
             switch (err) {
                 error.ProtocolNegotiationFailed, error.DialFailed => continue,
                 else => {
