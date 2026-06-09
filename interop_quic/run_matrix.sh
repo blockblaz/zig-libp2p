@@ -211,10 +211,9 @@ skip_reason_for() {
 # Reasons should reference an issue.
 skip_reason_for_pair() {
     case "$1:$2:$3" in
-        zig:rust-libp2p:gossipsub) echo "rust-libp2p impl publishes from the listener; zig dialer-publishes; role-convention mismatch tracked as #177" ;;
-        go-libp2p:rust-libp2p:gossipsub) echo "rust-libp2p impl publishes from the listener; go-libp2p dialer-publishes; same role-convention mismatch as #177" ;;
-        zig:rust-libp2p:reqresp) echo "zig server reqresp responder doesn't pick the right inbound stream when rust opens ping/gossipsub concurrently; #181" ;;
-        zig:go-libp2p:reqresp) echo "zig server reqresp responder doesn't pick the right inbound stream when go opens identify concurrently; #181" ;;
+        zig:rust-libp2p:gossipsub) echo "rust client publishes returns InsufficientPeers — rust-libp2p Strict ValidationMode rejects zig's unsigned SUBSCRIBE RPC; #183" ;;
+        zig:rust-libp2p:reqresp) echo "zig server's STREAM frames trigger FINAL_SIZE_ERROR on rust client; #184" ;;
+        zig:go-libp2p:reqresp) echo "same zquic STREAM offset issue when zig is the server and the client opens multiple streams concurrently; #184" ;;
         *) echo "" ;;
     esac
 }
