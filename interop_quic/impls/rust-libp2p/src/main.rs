@@ -365,68 +365,15 @@ fn gs_payload(idx: usize, length: usize) -> Vec<u8> {
     out
 }
 
-// Role convention (rust impl): SERVER publishes after the remote subscribes;
-// CLIENT subscribes and counts arrivals. Mirrors the rust↔rust conformance
-// test in libp2p-spec. Cross-impl mismatch with the dialer-publishes
-// convention used by go-libp2p / zig is handled via the asymmetric
-// `skip_reason_for_pair` table in `run_matrix.sh` (#177).
+// Role convention (all impls agree): the DIALER publishes N deterministic
+// msgs after a 2 s settle; the LISTENER subscribes and counts arrivals.
+// Aligns rust-libp2p with the go-libp2p and zig conventions and removes the
+// asymmetric-skip dance that #177 needed.
 
 async fn server_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
     let topic = IdentTopic::new(gs_topic());
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     let _ = wait_first_conn(swarm).await?;
-
-    // Wait for the remote peer to announce SUBSCRIBE on our topic before
-    // publishing. Fixed sleeps were racy; gossipsub::Event::Subscribed is the
-    // spec-correct signal that the mesh peer accepts this topic. Bounded by a
-    // deadline so we fail loud rather than hang if the SUBSCRIBE never arrives.
-    let topic_hash = topic.hash();
-    let sub_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(sub_deadline) => {
-                return Err("gossipsub: timed out waiting for remote SUBSCRIBE".into());
-            }
-            event = swarm.next() => match event {
-                Some(SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-                    gossipsub::Event::Subscribed { topic: t, .. },
-                ))) if t == topic_hash => break,
-                Some(_) => {}
-                None => return Err("swarm stream ended before remote SUBSCRIBE".into()),
-            }
-        }
-    }
-
-    let count = gs_count();
-    let plen = gs_payload_len();
-    for i in 0..count {
-        let payload = gs_payload(i, plen);
-        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload) {
-            return Err(format!("publish #{i}: {e:?}").into());
-        }
-        tokio::task::yield_now().await;
-    }
-    println!(
-        "rust_libp2p_interop[server]: gossipsub published {} msgs on {:?}",
-        count,
-        gs_topic()
-    );
-    let drain_until = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(drain_until) => break,
-            _ = swarm.next() => {}
-        }
-    }
-    println!("rust_libp2p_interop[server]: gossipsub ok");
-    Ok(0)
-}
-
-async fn client_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
-    let topic = IdentTopic::new(gs_topic());
-    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     let count = gs_count();
     let plen = gs_payload_len();
@@ -442,7 +389,7 @@ async fn client_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn st
                     seen.insert(message.data);
                 } else {
                     eprintln!(
-                        "rust_libp2p_interop[client]: gossipsub unexpected msg len={}",
+                        "rust_libp2p_interop[server]: gossipsub unexpected msg len={}",
                         message.data.len()
                     );
                 }
@@ -452,10 +399,57 @@ async fn client_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn st
         }
     }
     println!(
-        "rust_libp2p_interop[client]: gossipsub got {}/{} msgs",
+        "rust_libp2p_interop[server]: gossipsub got {}/{} msgs",
         seen.len(),
         count
     );
+    println!("rust_libp2p_interop[server]: gossipsub ok");
+    Ok(0)
+}
+
+async fn client_gossipsub(swarm: &mut Swarm<Behaviour>) -> Result<u8, Box<dyn std::error::Error>> {
+    let topic = IdentTopic::new(gs_topic());
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+    // `run_client` already drove `wait_connected` so the connection is up;
+    // we just need to let the gossipsub heartbeat lay the mesh edge.
+
+    // Fixed 4 s settle. Long enough that the zig peer's SUBSCRIBE RPC
+    // (sent on its first gossipsub heartbeat, ~1 s after connection)
+    // reaches us before we try to publish, so rust's gossipsub treats
+    // zig as a known subscriber and not as `InsufficientPeers`.
+    // `Event::Subscribed` only fires on the listener side in libp2p-0.54,
+    // so we can't wait on it from the dialer.
+    let settle_until = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(settle_until) => break,
+            _ = swarm.next() => {}
+        }
+    }
+
+    let count = gs_count();
+    let plen = gs_payload_len();
+    for i in 0..count {
+        let payload = gs_payload(i, plen);
+        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload) {
+            return Err(format!("publish #{i}: {e:?}").into());
+        }
+        tokio::task::yield_now().await;
+    }
+    println!(
+        "rust_libp2p_interop[client]: gossipsub published {} msgs on {:?}",
+        count,
+        gs_topic()
+    );
+    let drain_until = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(drain_until) => break,
+            _ = swarm.next() => {}
+        }
+    }
     println!("rust_libp2p_interop[client]: gossipsub ok");
     Ok(0)
 }
