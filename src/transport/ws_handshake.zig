@@ -15,6 +15,7 @@ const std = @import("std");
 const ascii = std.ascii;
 const Sha1 = std.crypto.hash.Sha1;
 const base64 = std.base64.standard;
+const timing_safe = std.crypto.timing_safe;
 
 /// Concatenated with the client's `Sec-WebSocket-Key` then SHA-1'd to produce
 /// `Sec-WebSocket-Accept`. Pinned by the RFC.
@@ -40,6 +41,10 @@ pub const ParseError = error{
     HandshakeFailed,
     /// Caller-supplied buffer too small to format the message.
     BufferTooSmall,
+    /// Caller-supplied `host`/`path` contains control characters (CR/LF/NUL)
+    /// or non-printable bytes — refuses HTTP header / request-smuggling
+    /// injection at the source.
+    InvalidArgument,
 };
 
 // ── client → server upgrade request ──────────────────────────────────────
@@ -57,8 +62,49 @@ pub const ClientUpgrade = struct {
 /// `key_b64` is a 24-byte base64 string of the caller's 16 random nonce bytes.
 pub fn writeClientRequest(out: []u8, host: []const u8, path: []const u8, key_b64: []const u8) ParseError!usize {
     if (key_b64.len != key_b64_len) return error.MissingOrInvalidHeader;
+    if (!isSafeHeaderValue(host) or !isSafeRequestTarget(path)) return error.InvalidArgument;
+    if (!isValidStandardBase64(key_b64)) return error.MissingOrInvalidHeader;
     const w = formatRequest(out, host, path, key_b64) catch return error.BufferTooSmall;
     return w;
+}
+
+/// Reject any byte that could close the current header line and start a new
+/// one (CR/LF) or terminate a C-style scan (NUL). Also reject everything
+/// outside printable ASCII / SP / HTAB — RFC 7230 §3.2.6 obs-text.
+fn isSafeHeaderValue(v: []const u8) bool {
+    for (v) |b| {
+        if (b == '\r' or b == '\n' or b == 0) return false;
+        if (b != '\t' and (b < 0x20 or b == 0x7f)) return false;
+    }
+    return true;
+}
+
+/// Request-target subset of `isSafeHeaderValue`: no SP either, because we
+/// splice it into the start line `GET <path> HTTP/1.1`.
+fn isSafeRequestTarget(v: []const u8) bool {
+    if (v.len == 0) return false;
+    for (v) |b| {
+        if (b == '\r' or b == '\n' or b == 0 or b == ' ' or b == '\t') return false;
+        if (b < 0x20 or b == 0x7f) return false;
+    }
+    return true;
+}
+
+/// `Sec-WebSocket-Key` is base64 over the standard alphabet, length exactly
+/// 24 (16-byte nonce + `==` padding). Anything else is rejected so we don't
+/// echo attacker-chosen bytes into `Sec-WebSocket-Accept` computation.
+fn isValidStandardBase64(s: []const u8) bool {
+    if (s.len != key_b64_len) return false;
+    // Last two chars are RFC-pinned padding for a 16-byte payload.
+    if (s[22] != '=' or s[23] != '=') return false;
+    for (s[0..22]) |b| {
+        const ok = (b >= 'A' and b <= 'Z') or
+            (b >= 'a' and b <= 'z') or
+            (b >= '0' and b <= '9') or
+            b == '+' or b == '/';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 fn formatRequest(out: []u8, host: []const u8, path: []const u8, key_b64: []const u8) !usize {
@@ -113,7 +159,7 @@ pub fn parseClientRequest(bytes: []const u8) ParseError!ClientUpgrade {
             if (!std.mem.eql(u8, value, "13")) return error.MissingOrInvalidHeader;
             saw_version_13 = true;
         } else if (asciiEqlIgnoreCase(name, "sec-websocket-key")) {
-            if (value.len != key_b64_len) return error.MissingOrInvalidHeader;
+            if (!isValidStandardBase64(value)) return error.MissingOrInvalidHeader;
             key = value;
         }
     }
@@ -185,7 +231,16 @@ pub fn parseAndVerifyServerResponse(bytes: []const u8, client_key_b64: []const u
     const accept_value = got_accept orelse return error.HandshakeFailed;
     var expected: [accept_b64_len]u8 = undefined;
     try computeAccept(client_key_b64, &expected);
-    if (!std.mem.eql(u8, accept_value, expected[0..])) return error.HandshakeFailed;
+    // Length check first (timing_safe.eql requires comptime-known matching
+    // array lengths); then constant-time byte compare so a network observer
+    // can't learn how many leading bytes of `Sec-WebSocket-Accept` matched
+    // by timing the response. Belt-and-braces — the Accept value is
+    // deterministic from the public key the client just sent, but defending
+    // it the same way we defend MACs avoids special-casing later.
+    if (accept_value.len != accept_b64_len) return error.HandshakeFailed;
+    var got_arr: [accept_b64_len]u8 = undefined;
+    @memcpy(&got_arr, accept_value);
+    if (!timing_safe.eql([accept_b64_len]u8, got_arr, expected)) return error.HandshakeFailed;
     if (!saw_upgrade or !saw_connection_upgrade) return error.HandshakeFailed;
 }
 
@@ -299,4 +354,49 @@ test "encodeKeyB64: 24-char output" {
     var out: [key_b64_len]u8 = undefined;
     encodeKeyB64(nonce, &out);
     try testing.expectEqual(key_b64_len, out.len);
+}
+
+test "writeClientRequest: CRLF in host rejected" {
+    var buf: [256]u8 = undefined;
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    try testing.expectError(
+        error.InvalidArgument,
+        writeClientRequest(&buf, "x.example\r\nX-Injected: yes", "/", key),
+    );
+    try testing.expectError(
+        error.InvalidArgument,
+        writeClientRequest(&buf, "x.example", "/\r\nX-Injected: yes", key),
+    );
+}
+
+test "writeClientRequest: SP or NUL in path rejected" {
+    var buf: [256]u8 = undefined;
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    try testing.expectError(
+        error.InvalidArgument,
+        writeClientRequest(&buf, "x.example", "/foo HTTP/1.1\r\nHost: evil", key),
+    );
+    try testing.expectError(
+        error.InvalidArgument,
+        writeClientRequest(&buf, "x.example", "/\x00", key),
+    );
+}
+
+test "writeClientRequest: non-base64 key rejected" {
+    var buf: [256]u8 = undefined;
+    // 24 chars, but contains '!' (not in standard alphabet).
+    try testing.expectError(
+        error.MissingOrInvalidHeader,
+        writeClientRequest(&buf, "x", "/", "AAAAAAAAAAAAAAAAAAAAA!=="),
+    );
+    // Missing the required `==` padding.
+    try testing.expectError(
+        error.MissingOrInvalidHeader,
+        writeClientRequest(&buf, "x", "/", "AAAAAAAAAAAAAAAAAAAAAAAA"),
+    );
+}
+
+test "parseClientRequest: non-base64 client key rejected" {
+    const bad = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: !!!!!!!!!!!!!!!!!!!!!!==\r\n\r\n";
+    try testing.expectError(error.MissingOrInvalidHeader, parseClientRequest(bad));
 }

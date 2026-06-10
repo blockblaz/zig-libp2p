@@ -106,20 +106,27 @@ pub const Stream = struct {
                 .ping => {
                     // Echo as pong (§5.5.2). Read payload, mask it back if
                     // necessary, then write a pong frame with the same body.
+                    // parseHeader already rejected control frames > 125 in
+                    // ws_codec; re-check here as defence-in-depth so the
+                    // fixed-size stack buffer can't be over-sliced if that
+                    // invariant ever weakens.
+                    if (h.payload_len > 125) return error.Malformed;
                     var pong_buf: [125]u8 = undefined;
-                    const n = try self.readPayload(h, pong_buf[0..h.payload_len]);
+                    const n = try self.readPayload(h, pong_buf[0..@intCast(h.payload_len)]);
                     self.writeControl(.pong, pong_buf[0..n]) catch return error.WriteFailed;
                     continue;
                 },
                 .pong => {
                     // Drop. Spec allows unsolicited pongs as keepalive.
+                    if (h.payload_len > 125) return error.Malformed;
                     var sink: [125]u8 = undefined;
-                    _ = try self.readPayload(h, sink[0..h.payload_len]);
+                    _ = try self.readPayload(h, sink[0..@intCast(h.payload_len)]);
                     continue;
                 },
                 .close => {
+                    if (h.payload_len > 125) return error.Malformed;
                     var sink: [125]u8 = undefined;
-                    _ = try self.readPayload(h, sink[0..h.payload_len]);
+                    _ = try self.readPayload(h, sink[0..@intCast(h.payload_len)]);
                     self.closed = true;
                     return error.EndOfStream;
                 },
@@ -127,10 +134,17 @@ pub const Stream = struct {
                     if (h.opcode == .continuation and !saw_first) return error.Malformed;
                     if (h.opcode != .continuation and saw_first) return error.Malformed;
                     saw_first = true;
-                    if (total + h.payload_len > out.len) return error.BufferTooSmall;
-                    const dst = out[total..][0..h.payload_len];
+                    // Overflow-safe length accumulation. `h.payload_len` is a
+                    // u64; `total` and `out.len` are usize. On a 32-bit host
+                    // a hostile `total + payload_len` could wrap below
+                    // `out.len` and let masking write past the buffer.
+                    if (h.payload_len > std.math.maxInt(usize)) return error.BufferTooSmall;
+                    const pl: usize = @intCast(h.payload_len);
+                    const new_total = std.math.add(usize, total, pl) catch return error.BufferTooSmall;
+                    if (new_total > out.len) return error.BufferTooSmall;
+                    const dst = out[total..][0..pl];
                     _ = try self.readPayload(h, dst);
-                    total += h.payload_len;
+                    total = new_total;
                     if (h.fin) return total;
                 },
                 else => return error.Malformed,
@@ -222,26 +236,18 @@ pub const Stream = struct {
             return;
         }
         if (mask) |m| {
-            // Mask in a scratch copy so we don't corrupt the caller's bytes.
-            // Reuse a small stack buffer in 1 KiB chunks for big payloads.
+            // RFC 6455 §5.3 says byte `i` of the payload is XORed with
+            // `mask[i mod 4]`. We chunk into a scratch buffer so we don't
+            // corrupt the caller's slice; the per-byte mask index is
+            // `(off + j) & 3` regardless of chunk size, so callers can pick
+            // any buffer length safely.
             var chunk_buf: [1024]u8 = undefined;
             var off: usize = 0;
-            var counter: usize = 0;
             while (off < payload.len) {
                 const n = @min(chunk_buf.len, payload.len - off);
-                @memcpy(chunk_buf[0..n], payload[off..][0..n]);
-                // mask is XORed with a 4-byte rolling key; offset matters.
-                var rolling: ws_codec.Mask = m;
-                if ((counter & 0x3) != 0) {
-                    // shift mask so chunk i continues the same XOR pattern.
-                    var shifted: ws_codec.Mask = undefined;
-                    for (0..4) |i| shifted[i] = m[(i + counter) & 0x3];
-                    rolling = shifted;
-                }
-                ws_codec.maskPayload(chunk_buf[0..n], rolling);
+                for (0..n) |j| chunk_buf[j] = payload[off + j] ^ m[(off + j) & 0x3];
                 try self.writer.writeAll(chunk_buf[0..n]);
                 off += n;
-                counter += n;
             }
         } else {
             try self.writer.writeAll(payload);
@@ -506,6 +512,32 @@ test "Stream: fragmented data frames reassembled" {
     var out: [16]u8 = undefined;
     const n = try s.read(&out);
     try testing.expectEqualStrings("hello", out[0..n]);
+}
+
+test "Stream: client→server large masked frame round-trip (non-aligned tail)" {
+    // 1027 bytes — past the 1024-byte scratch chunk boundary and not a
+    // multiple of 4, so a regression in the mask-offset arithmetic would
+    // garble the tail and the server-side unmask would fail.
+    const payload_len: usize = 1027;
+    var payload: [payload_len]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+
+    var c2s_buf: [4096]u8 = undefined;
+    var c2s_w = Io.Writer.fixed(c2s_buf[0..]);
+    var fr = FixedRandom{ .bytes_ = &[_]u8{ 0xa1, 0xb2, 0xc3, 0xd4 } };
+    var dummy_r_buf: [0]u8 = undefined;
+    var dummy_r = Io.Reader.fixed(dummy_r_buf[0..]);
+    var client = newStream(.{ .role = .client, .random = fr.random() }, &dummy_r, &c2s_w);
+    try client.writeBinary(&payload);
+
+    var s_reader = Io.Reader.fixed(c2s_w.buffered());
+    var dummy_w_buf: [0]u8 = undefined;
+    var dummy_w = Io.Writer.fixed(dummy_w_buf[0..]);
+    var server = newStream(.{ .role = .server, .random = fr.random() }, &s_reader, &dummy_w);
+    var out: [payload_len]u8 = undefined;
+    const n = try server.read(&out);
+    try testing.expectEqual(payload_len, n);
+    try testing.expectEqualSlices(u8, &payload, out[0..n]);
 }
 
 test "dialUpgrade + acceptUpgrade staged round-trip via paired buffers" {
