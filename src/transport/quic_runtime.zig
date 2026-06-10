@@ -207,6 +207,9 @@ const InboundStream = struct {
     /// channel_id once we've called `host.registerInboundReqRespChannel`.
     channel_id: ?u64 = null,
     request_id_for_channel: u64 = 0,
+    /// Set after the responder half-closes (FIN) following `finishResponseStream`.
+    /// The zquic raw-app slot is released once this is true and the peer FINs.
+    response_fin_sent: bool = false,
     sender_peer: ?identity.PeerId = null,
     /// Accumulated bytes for an in-progress unary request. Cleared once a
     /// complete request is parsed and the inbound channel registered.
@@ -905,9 +908,7 @@ pub const QuicRuntime = struct {
                 self.handleEndOfStream(e.peer, e.request_id);
             },
             .send_error_response => |e| {
-                _ = e;
-                // Simplified: just end-of-stream without an error code over the wire.
-                // (Bytes-on-the-wire error semantics are out of scope for this PR.)
+                self.handleEndOfStream(e.peer, e.request_id);
             },
             .publish => |p| {
                 defer self.allocator.free(p.topic);
@@ -1407,16 +1408,13 @@ pub const QuicRuntime = struct {
         }
         const ist = found_stream orelse return;
 
-        // Send a FIN on the QUIC stream.
-        self.listener.server.sendRawStreamData(
-            ist.conn,
-            ist.stream_id,
-            ist.raw.send_offset,
-            &[_]u8{},
-            true,
-        );
+        // Half-close the responder write side so rust-libp2p sees the response
+        // stream end (empty chunk sequence is valid for blocks_by_root).
+        ist.raw.writeAllFin(&.{});
+        ist.response_fin_sent = true;
 
-        // Drop from channel map (stream itself stays alive until peer FINs).
+        // Drop from channel map; advanceInboundStreams releases the zquic
+        // raw-app slot once the peer FINs (see ch4r10t33r/zquic#149).
         if (found_key) |k| _ = self.channel_to_inbound.remove(k);
     }
 
@@ -1935,7 +1933,16 @@ pub const QuicRuntime = struct {
                 },
                 else => |idx| {
                     // SSZ req/resp path.
+                    if (ist.response_fin_sent) {
+                        if (ZIo.rawAppStreamFinReceived(ist.conn, ist.stream_id)) {
+                            self.removeInboundStreamAt(i);
+                            continue;
+                        }
+                        i += 1;
+                        continue;
+                    }
                     if (ist.channel_id != null) {
+                        // Request dispatched; waiting for handler finish().
                         i += 1;
                         continue;
                     }
@@ -1966,7 +1973,12 @@ pub const QuicRuntime = struct {
                         };
                         ist.raw.read_cursor = recv_buf.len;
                     }
+                    const peer_fin = ZIo.rawAppStreamFinReceived(ist.conn, ist.stream_id);
                     if (ist.req_acc.items.len == 0) {
+                        if (peer_fin) {
+                            self.removeInboundStreamAt(i);
+                            continue;
+                        }
                         i += 1;
                         continue;
                     }
@@ -1974,6 +1986,14 @@ pub const QuicRuntime = struct {
                     // Attempt to decode a full unary request from the acc.
                     const req_ssz = snappy_wire.decodeRequestSsz(a, ist.req_acc.items) catch |err| switch (err) {
                         error.IncompleteHeader, error.InvalidData => {
+                            if (peer_fin) {
+                                log.warn("quic_runtime: inbound req/resp decode failed after peer FIN ({d} bytes)", .{
+                                    ist.req_acc.items.len,
+                                });
+                                ist.raw.writeAllFin(&.{});
+                                self.removeInboundStreamAt(i);
+                                continue;
+                            }
                             i += 1;
                             continue;
                         },
