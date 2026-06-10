@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## [0.1.18](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.17...v0.1.18) (2026-06-10)
+
+### Fixed
+
+* **transport/quic_runtime:** use go-multistream delimited framing on outbound
+  req/resp and publish streams so rust-libp2p responders accept the handshake
+  ([#184](https://github.com/ch4r10t33r/zig-libp2p/issues/184)). Replace the
+  legacy two-newline inbound pre-buffer with incremental responder negotiation.
+  Answer inbound `/ipfs/id/1.0.0` and `/ipfs/ping/1.0.0` streams from
+  rust-libp2p peers.
+
 ## [0.1.17](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.16...v0.1.17) (2026-06-10)
 
 ### Features
