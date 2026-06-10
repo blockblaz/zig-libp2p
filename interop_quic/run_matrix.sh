@@ -211,7 +211,6 @@ skip_reason_for() {
 # Reasons should reference an issue.
 skip_reason_for_pair() {
     case "$1:$2:$3" in
-        zig:rust-libp2p:gossipsub) echo "rust client publishes returns InsufficientPeers — zig opens a per-message gossipsub stream and FINs it, but rust-libp2p expects a persistent per-peer gossipsub stream to receive SUBSCRIBE; #183" ;;
         *) echo "" ;;
     esac
 }

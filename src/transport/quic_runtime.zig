@@ -132,6 +132,7 @@ const PeerIdContext = struct {
 
 const PeerIdMap = std.HashMap(identity.PeerId, *OutboundConn, PeerIdContext, std.hash_map.default_max_load_percentage);
 const InboundPeerMap = std.HashMap(identity.PeerId, InboundConnRef, PeerIdContext, std.hash_map.default_max_load_percentage);
+const PersistentGossipMap = std.HashMap(identity.PeerId, *PersistentGossipStream, PeerIdContext, std.hash_map.default_max_load_percentage);
 
 const InboundConnRef = struct {
     slot: usize,
@@ -234,6 +235,27 @@ const OutboundPublish = struct {
     wire: []u8,
 };
 
+/// Persistent per-peer outbound `/meshsub/1.1.0` stream — one stream per peer
+/// for the connection's lifetime, multiplexes SUBSCRIBE / GRAFT / PRUNE /
+/// IHAVE / IWANT / publish RPCs back-to-back without FIN (#183).
+///
+/// rust-libp2p (and go-libp2p) expect this shape: a single long-lived control
+/// stream per peer rather than zig's older per-message-stream-then-FIN
+/// pattern. With the latter, rust's gossipsub stream-manager sees the FIN on
+/// what it thinks is the active outbound control stream and the codec
+/// framing collapses (`Failed to encode/decode message` → `Peer disconnected`).
+const PersistentGossipStream = struct {
+    peer: identity.PeerId,
+    stream_id: u64,
+    raw: PublishBidiStream,
+    handshake_sent: bool = false,
+    handshake_done: bool = false,
+    /// Queue of `uvarint(len) + RPC protobuf` frames waiting to be flushed
+    /// once the multistream-select handshake completes. Bytes are heap-owned;
+    /// drained in FIFO order.
+    outbox: std.ArrayList([]u8) = .empty,
+};
+
 /// A queued command from the swarm hook to the drive thread.
 const HookWork = union(enum) {
     dial: struct {
@@ -263,6 +285,11 @@ const HookWork = union(enum) {
         topic: []u8,
         payload: []u8,
     },
+    /// gossipsub SUBSCRIBE — broadcast to every connected peer on its
+    /// persistent `/meshsub/1.1.0` stream (#183).
+    subscribe: struct {
+        topic: []u8,
+    },
 };
 
 fn freeHookWork(a: std.mem.Allocator, w: HookWork) void {
@@ -274,6 +301,7 @@ fn freeHookWork(a: std.mem.Allocator, w: HookWork) void {
             a.free(p.topic);
             a.free(p.payload);
         },
+        .subscribe => |s| a.free(s.topic),
         .send_end_of_stream, .send_error_response => {},
     }
 }
@@ -300,6 +328,17 @@ pub const QuicRuntime = struct {
     /// and we've FIN'd the stream.
     outbound_publishes: std.AutoHashMap(u64, *OutboundPublish),
     next_publish_id: u64 = 1,
+
+    /// Persistent per-peer `/meshsub/1.1.0` streams keyed by remote peer id
+    /// (#183). Opened on connection establishment, alive until peer
+    /// disconnect. All publish + control RPCs to that peer ride this stream.
+    persistent_gossip: PersistentGossipMap,
+
+    /// Topics we have subscribed to locally — used to (a) queue SUBSCRIBE
+    /// frames into freshly-opened persistent streams so newly-connected
+    /// peers see our subscription, (b) re-broadcast on subscribe.
+    /// Keys are heap-owned `[]u8` topic strings.
+    subscribed_topics: std.StringHashMap(void),
     /// Inbound channels: req/resp's `channel_id` -> the InboundStream that
     /// originated it. So when `.send_response_chunk` etc. arrive we can find
     /// the stream to write back on.
@@ -368,6 +407,8 @@ pub const QuicRuntime = struct {
             .outbound_requests = std.AutoHashMap(u64, *OutboundRequest).init(a),
             .outbound_publishes = std.AutoHashMap(u64, *OutboundPublish).init(a),
             .channel_to_inbound = std.AutoHashMap(u64, *InboundStream).init(a),
+            .persistent_gossip = PersistentGossipMap.init(a),
+            .subscribed_topics = std.StringHashMap(void).init(a),
         };
 
         const bound = listener.boundUdpPortIpv4() catch null;
@@ -433,6 +474,19 @@ pub const QuicRuntime = struct {
             self.allocator.destroy(p.*);
         }
         self.outbound_publishes.deinit();
+
+        // Free persistent gossip streams + their outbox bytes.
+        var git = self.persistent_gossip.valueIterator();
+        while (git.next()) |g| {
+            for (g.*.outbox.items) |w| self.allocator.free(w);
+            g.*.outbox.deinit(self.allocator);
+            self.allocator.destroy(g.*);
+        }
+        self.persistent_gossip.deinit();
+
+        var st_it = self.subscribed_topics.keyIterator();
+        while (st_it.next()) |k| self.allocator.free(k.*);
+        self.subscribed_topics.deinit();
 
         self.channel_to_inbound.deinit();
 
@@ -530,7 +584,11 @@ pub const QuicRuntime = struct {
                 } });
                 return .handled;
             },
-            .subscribe, .shutdown => return .fallthrough,
+            .subscribe => |s| {
+                self.enqueueHookWork(.{ .subscribe = .{ .topic = s.topic } });
+                return .handled;
+            },
+            .shutdown => return .fallthrough,
         }
         _ = a;
     }
@@ -577,6 +635,7 @@ pub const QuicRuntime = struct {
                 log.warn("quic_runtime: onConnectionClosed failed: {s}", .{@errorName(e)});
             };
             _ = self.inbound_by_peer.remove(peer);
+            self.destroyPersistentGossipStream(peer);
         }
         self.inbound_conn_notified[slot] = false;
         self.inbound_conn_peer[slot] = null;
@@ -669,6 +728,9 @@ pub const QuicRuntime = struct {
                 log.warn("quic_runtime: advanceOutboundPublishes: {s}", .{@errorName(err)});
             };
 
+            // Advance persistent per-peer /meshsub streams (#183).
+            self.advancePersistentGossipStreams();
+
             // Periodic host ticks (~ every 100ms).
             const now_ms = self.opts.now_ms_fn();
             if (now_ms - last_tick_ms >= 100) {
@@ -707,6 +769,10 @@ pub const QuicRuntime = struct {
                 defer self.allocator.free(p.payload);
                 self.onPublishCommand(p.topic, p.payload);
             },
+            .subscribe => |s| {
+                defer self.allocator.free(s.topic);
+                self.onSubscribeCommand(s.topic);
+            },
         }
     }
 
@@ -744,30 +810,12 @@ pub const QuicRuntime = struct {
         // Build `uvarint(len) + rpc_frame` once; clone per peer.
         var wire_buf: std.ArrayList(u8) = .empty;
         defer wire_buf.deinit(a);
-        varint.append(&wire_buf, a, @intCast(rpc_frame.len)) catch |err| {
-            log.warn("quic_runtime: varint append failed: {s}", .{@errorName(err)});
-            return;
-        };
-        wire_buf.appendSlice(a, rpc_frame) catch |err| {
-            log.warn("quic_runtime: wire append failed: {s}", .{@errorName(err)});
-            return;
-        };
+        varint.append(&wire_buf, a, @intCast(rpc_frame.len)) catch return;
+        wire_buf.appendSlice(a, rpc_frame) catch return;
 
-        // Snapshot peer ids before iterating: `startOutboundPublish` does not
-        // touch `outbound_by_peer`, but the snapshot keeps the publish loop
-        // resilient to future changes (e.g. if a stream-open failure ever
-        // triggered eviction).
         var peers: std.ArrayList(identity.PeerId) = .empty;
         defer peers.deinit(a);
-        var it = self.outbound_by_peer.iterator();
-        while (it.next()) |e| {
-            peers.append(a, e.key_ptr.*) catch return;
-        }
-        var iit = self.inbound_by_peer.iterator();
-        while (iit.next()) |e| {
-            if (self.outbound_by_peer.contains(e.key_ptr.*)) continue;
-            peers.append(a, e.key_ptr.*) catch return;
-        }
+        self.collectConnectedPeers(&peers) catch return;
 
         if (peers.items.len == 0) {
             log.debug("quic_runtime: publish on \"{s}\": no connected peers", .{topic});
@@ -776,16 +824,166 @@ pub const QuicRuntime = struct {
 
         for (peers.items) |peer| {
             const wire_dup = a.dupe(u8, wire_buf.items) catch continue;
-            if (self.outbound_by_peer.contains(peer)) {
-                self.startOutboundPublish(peer, wire_dup) catch |err| {
-                    log.warn("quic_runtime: startOutboundPublish failed: {s}", .{@errorName(err)});
-                    a.free(wire_dup);
-                };
-            } else {
-                self.startInboundPublish(peer, wire_dup) catch |err| {
-                    log.warn("quic_runtime: startInboundPublish failed: {s}", .{@errorName(err)});
-                    a.free(wire_dup);
-                };
+            self.enqueueGossipFrame(peer, wire_dup);
+        }
+    }
+
+    /// Handle the swarm `.subscribe(topic)` command (#183). Track the topic
+    /// so we replay SUBSCRIBE on every future peer connection, then queue a
+    /// SUBSCRIBE RPC into every currently-connected peer's persistent
+    /// `/meshsub/1.1.0` stream.
+    fn onSubscribeCommand(self: *QuicRuntime, topic: []const u8) void {
+        const a = self.allocator;
+        if (!self.subscribed_topics.contains(topic)) {
+            const owned = a.dupe(u8, topic) catch return;
+            self.subscribed_topics.put(owned, {}) catch {
+                a.free(owned);
+                return;
+            };
+        }
+
+        var peers: std.ArrayList(identity.PeerId) = .empty;
+        defer peers.deinit(a);
+        self.collectConnectedPeers(&peers) catch return;
+        for (peers.items) |peer| {
+            const w = self.buildSubscribeWire(topic) orelse continue;
+            self.enqueueGossipFrame(peer, w);
+        }
+    }
+
+    fn collectConnectedPeers(self: *QuicRuntime, out: *std.ArrayList(identity.PeerId)) !void {
+        const a = self.allocator;
+        var it = self.outbound_by_peer.iterator();
+        while (it.next()) |e| try out.append(a, e.key_ptr.*);
+        var iit = self.inbound_by_peer.iterator();
+        while (iit.next()) |e| {
+            if (self.outbound_by_peer.contains(e.key_ptr.*)) continue;
+            try out.append(a, e.key_ptr.*);
+        }
+    }
+
+    fn buildSubscribeWire(self: *QuicRuntime, topic: []const u8) ?[]u8 {
+        const a = self.allocator;
+        const rpc_frame = gossipsub_rpc.encodeSubscribe(a, topic, true) catch return null;
+        defer a.free(rpc_frame);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        varint.append(&buf, a, @intCast(rpc_frame.len)) catch return null;
+        buf.appendSlice(a, rpc_frame) catch return null;
+        return buf.toOwnedSlice(a) catch null;
+    }
+
+    /// Open a persistent /meshsub/1.1.0 stream to `peer` if we don't already
+    /// have one. On a fresh open, queue SUBSCRIBE for every topic we've
+    /// joined so the peer learns of our subscriptions on its first read.
+    fn ensurePersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) ?*PersistentGossipStream {
+        if (self.persistent_gossip.get(peer)) |g| return g;
+        const a = self.allocator;
+
+        var raw: PublishBidiStream = undefined;
+        var stream_id: u64 = undefined;
+        if (self.outbound_by_peer.get(peer)) |slot| {
+            const sid = slot.outbound.nextLocalBidiStream() catch return null;
+            stream_id = sid;
+            raw = .{ .outbound = .{
+                .client = slot.outbound.client,
+                .stream_id = sid,
+            } };
+        } else if (self.inbound_by_peer.get(peer)) |ic| {
+            const sid = ZIo.rawAllocateNextLocalBidiStream(ic.conn) catch return null;
+            stream_id = sid;
+            raw = .{ .inbound = .{
+                .server = self.listener.server,
+                .conn = ic.conn,
+                .stream_id = sid,
+            } };
+        } else return null;
+
+        const g = a.create(PersistentGossipStream) catch return null;
+        g.* = .{
+            .peer = peer,
+            .stream_id = stream_id,
+            .raw = raw,
+        };
+        self.persistent_gossip.put(peer, g) catch {
+            a.destroy(g);
+            return null;
+        };
+        return g;
+    }
+
+    fn enqueueGossipFrame(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) void {
+        const g = self.ensurePersistentGossipStream(peer) orelse {
+            self.allocator.free(wire);
+            return;
+        };
+        g.outbox.append(self.allocator, wire) catch {
+            self.allocator.free(wire);
+        };
+    }
+
+    fn destroyPersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {
+        const g = self.persistent_gossip.fetchRemove(peer) orelse return;
+        for (g.value.outbox.items) |w| self.allocator.free(w);
+        g.value.outbox.deinit(self.allocator);
+        self.allocator.destroy(g.value);
+    }
+
+    /// Per-tick driver for the persistent /meshsub streams: complete the
+    /// multistream-select handshake, then drain the outbox onto the wire.
+    /// Never FINs.
+    fn advancePersistentGossipStreams(self: *QuicRuntime) void {
+        const a = self.allocator;
+        var it = self.persistent_gossip.valueIterator();
+        while (it.next()) |g_ptr| {
+            const g = g_ptr.*;
+            if (!g.handshake_sent) {
+                var out: std.ArrayList(u8) = .empty;
+                defer out.deinit(a);
+                // Delimited (length-prefixed) framing per go-multistream v0.5+
+                // — same dialect rust-libp2p / go-libp2p use on QUIC. The
+                // legacy newline framing would be misread by their
+                // responders and the connection would be torn down (#183).
+                stream_multistream.appendFirstStreamInitiatorHandshakeFramed(
+                    &out,
+                    a,
+                    meshsub_protocol_id,
+                    .delimited,
+                ) catch continue;
+                var w = g.raw.writer();
+                std.Io.Writer.writeAll(&w, out.items) catch continue;
+                std.Io.Writer.flush(&w) catch {};
+                g.handshake_sent = true;
+            }
+            if (!g.handshake_done) {
+                const need = stream_multistream.responderSuccessReplyWireLen(meshsub_protocol_id) catch continue;
+                if (g.raw.unreadRecvLen() < need) continue;
+                var r = g.raw.reader();
+                var w = g.raw.writer();
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch continue;
+                g.handshake_done = true;
+            }
+            // Only drain the outbox AFTER multistream-select completes —
+            // otherwise the gossipsub RPC bytes would arrive before the
+            // peer's responder negotiates `/meshsub/1.1.0` and rust-libp2p's
+            // gossipsub codec would see them as a malformed initial frame.
+            if (g.handshake_done and g.outbox.items.len > 0) {
+                var w = g.raw.writer();
+                var sent: usize = 0;
+                for (g.outbox.items) |frame_wire| {
+                    std.Io.Writer.writeAll(&w, frame_wire) catch break;
+                    a.free(frame_wire);
+                    sent += 1;
+                }
+                std.Io.Writer.flush(&w) catch {};
+                if (sent == g.outbox.items.len) {
+                    g.outbox.clearRetainingCapacity();
+                } else if (sent > 0) {
+                    // Partial drain: drop the sent prefix.
+                    const remaining = g.outbox.items[sent..];
+                    std.mem.copyForwards([]u8, g.outbox.items, remaining);
+                    g.outbox.shrinkRetainingCapacity(g.outbox.items.len - sent);
+                }
             }
         }
     }
@@ -939,6 +1137,18 @@ pub const QuicRuntime = struct {
         self.host.onConnectionEstablished(slot.conn_id, verified, .outbound) catch |err| {
             log.warn("quic_runtime: onConnectionEstablished failed: {s}", .{@errorName(err)});
         };
+
+        // For subscribed nodes, broadcast a fresh SUBSCRIBE to the new peer
+        // — the broadcast lazily opens the persistent stream via
+        // `ensurePersistentGossipStream`. We don't open eagerly when the
+        // node hasn't subscribed yet.
+        if (self.subscribed_topics.count() > 0) {
+            var t_it = self.subscribed_topics.keyIterator();
+            while (t_it.next()) |topic_key| {
+                const w = self.buildSubscribeWire(topic_key.*) orelse continue;
+                self.enqueueGossipFrame(verified, w);
+            }
+        }
     }
 
     fn failDial(self: *QuicRuntime, expected_peer: ?identity.PeerId) void {
@@ -1125,6 +1335,17 @@ pub const QuicRuntime = struct {
                 const cands: []const []const u8 = &supported_protocols;
                 const ix = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, a, null) catch |err| {
                     log.warn("quic_runtime: inbound responder handshake failed: {s}", .{@errorName(err)});
+                    // FIN our write half on `na` instead of releasing the
+                    // stream — releasing resets it on the wire, which
+                    // rust-libp2p's connection handler interprets as a
+                    // peer-induced stream error and tears the whole
+                    // gossipsub stream pair down (#183). A clean half-close
+                    // lets the initiator's protocol handler (e.g. ping)
+                    // observe the `na`, give up on this stream, and keep
+                    // the connection alive.
+                    if (err == error.ProtocolNegotiationFailed) {
+                        ist.raw.server.sendRawStreamData(ist.conn, ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
+                    }
                     self.removeInboundStreamAt(i);
                     continue;
                 };
@@ -1153,6 +1374,13 @@ pub const QuicRuntime = struct {
                     self.host.onConnectionEstablished(cid, sender, .inbound) catch |err| {
                         log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
                     };
+                    if (self.subscribed_topics.count() > 0) {
+                        var t_it2 = self.subscribed_topics.keyIterator();
+                        while (t_it2.next()) |topic_key| {
+                            const wbytes = self.buildSubscribeWire(topic_key.*) orelse continue;
+                            self.enqueueGossipFrame(sender, wbytes);
+                        }
+                    }
                 }
             }
 
