@@ -86,7 +86,11 @@ fn serverRawWriterDrain(w: *Io.Writer, data: []const []const u8, splat: usize) I
     const self: *RawAppBidiServer = @alignCast(@fieldParentPtr("writer_buf", @as(*[2048]u8, @ptrCast(@alignCast(w.buffer.ptr)))));
     const send = struct {
         fn f(ctx: *RawAppBidiServer, chunk: []const u8) void {
-            ctx.server.sendRawStreamData(ctx.conn, ctx.stream_id, ctx.send_offset, chunk, false);
+            if (ctx.client) |c| {
+                c.sendRawStreamData(ctx.stream_id, ctx.send_offset, chunk, false);
+            } else {
+                ctx.server.sendRawStreamData(ctx.conn, ctx.stream_id, ctx.send_offset, chunk, false);
+            }
             ctx.send_offset += @intCast(chunk.len);
         }
     }.f;
@@ -181,10 +185,19 @@ pub const RawAppBidiClient = struct {
 };
 
 /// Multistream-select I/O for a raw bidi stream on [`ZIo.Server`] + [`ZIo.ConnState`].
+///
+/// When `client` is non-null this struct is used for a *remote-initiated* bidi stream on an
+/// *outbound* (client-side) QUIC connection — e.g. a gossipsub `/meshsub/1.1.0` stream that
+/// the remote peer opened on the connection zeam dialed. In that mode `server` is never
+/// dereferenced for sends; all writes go through `client` instead.  `conn` is always a valid
+/// `ConnState` pointer (points to `client.conn` for the client case) and is used for reads.
 pub const RawAppBidiServer = struct {
     server: *ZIo.Server,
     conn: *ZIo.ConnState,
     stream_id: u64,
+    /// Non-null when this adapter wraps a remote-initiated stream on an outbound QUIC
+    /// connection. Writes use `ZIo.Client.sendRawStreamData` instead of `ZIo.Server.sendRawStreamData`.
+    client: ?*ZIo.Client = null,
     send_offset: u64 = 0,
     read_cursor: usize = 0,
     reader_scratch: [2048]u8 = undefined,
@@ -215,6 +228,22 @@ pub const RawAppBidiServer = struct {
 
     /// Send `data` on the raw stream with FIN set on the last chunk (go-libp2p identify expects EOF).
     pub fn writeAllFin(self: *RawAppBidiServer, data: []const u8) void {
+        if (self.client) |c| {
+            if (data.len == 0) {
+                c.sendRawStreamData(self.stream_id, self.send_offset, &[_]u8{}, true);
+                return;
+            }
+            var off: usize = 0;
+            while (off < data.len) {
+                const n = @min(raw_stream_send_chunk_len, data.len - off);
+                const chunk = data[off..][0..n];
+                off += n;
+                const fin = off >= data.len;
+                c.sendRawStreamData(self.stream_id, self.send_offset, chunk, fin);
+                self.send_offset += @intCast(chunk.len);
+            }
+            return;
+        }
         if (data.len == 0) {
             self.server.sendRawStreamData(self.conn, self.stream_id, self.send_offset, &[_]u8{}, true);
             return;

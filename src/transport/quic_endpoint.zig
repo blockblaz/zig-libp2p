@@ -67,6 +67,9 @@ pub const InboundStreamScan = struct {
 /// Next peer-initiated raw bidi stream on `conn` that has not yet been reported to
 /// [`QuicLifecycleHooks.on_inbound_stream_ready`]. Counts (and skips) streams whose id is
 /// beyond what the per-connection bitset can track.
+///
+/// Use this for **listener (server-side)** connections where the remote is the QUIC client:
+/// client-initiated bidi streams have IDs `0, 4, 8, …` (type bits = 00).
 pub fn popNextUnreportedPeerBidiStream(conn: *ZIo.ConnState, reported: *std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams)) InboundStreamScan {
     var over_cap: u32 = 0;
     for (&conn.raw_app_streams) |*slot| {
@@ -74,6 +77,32 @@ pub fn popNextUnreportedPeerBidiStream(conn: *ZIo.ConnState, reported: *std.bit_
         const sid = slot.stream_id;
         if (sid % 4 != 0) continue;
         const n = sid / 4;
+        if (n >= max_tracked_peer_bidi_streams) {
+            over_cap += 1;
+            continue;
+        }
+        const ui: usize = @intCast(n);
+        if (reported.isSet(ui)) continue;
+        reported.set(ui);
+        return .{ .stream_id = sid, .over_cap = over_cap };
+    }
+    return .{ .stream_id = null, .over_cap = over_cap };
+}
+
+/// Next server-initiated raw bidi stream on a **client-side** QUIC connection that has not
+/// yet been dispatched to the application.
+///
+/// Use this for **outbound (client-side)** connections where the remote is the QUIC server:
+/// server-initiated bidi streams have IDs `1, 5, 9, …` (type bits = 01). This mirrors
+/// [`popNextUnreportedPeerBidiStream`] but selects the opposite parity so that remote-opened
+/// gossipsub streams on a zeam-dialled connection are surfaced to the inbound-stream handler.
+pub fn popNextUnreportedServerBidiStream(conn: *ZIo.ConnState, reported: *std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams)) InboundStreamScan {
+    var over_cap: u32 = 0;
+    for (&conn.raw_app_streams) |*slot| {
+        if (!slot.active) continue;
+        const sid = slot.stream_id;
+        if (sid % 4 != 1) continue; // server-initiated bidi: type bits = 01
+        const n = sid / 4; // 1→0, 5→1, 9→2, …
         if (n >= max_tracked_peer_bidi_streams) {
             over_cap += 1;
             continue;

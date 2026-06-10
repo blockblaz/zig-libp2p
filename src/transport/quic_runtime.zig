@@ -194,10 +194,20 @@ const OutboundConn = struct {
     notified: bool = false,
     conn_id: connection_manager_mod.ConnectionId,
     peer_id: ?identity.PeerId = null,
+    /// Tracks which server-initiated bidi stream IDs on this outbound QUIC connection have
+    /// already been surfaced as inbound streams. Server-initiated bidi streams (IDs 1, 5, 9…)
+    /// are opened by the remote peer on the connection zeam dialled; without this tracking they
+    /// would be silently ignored because only the listener's lifecycle callback detects new
+    /// inbound streams. See [`QuicRuntime.dispatchOutboundPeerStreams`].
+    peer_stream_reported: std.bit_set.StaticBitSet(quic_endpoint.max_tracked_peer_bidi_streams) =
+        std.bit_set.StaticBitSet(quic_endpoint.max_tracked_peer_bidi_streams).initEmpty(),
 };
 
 /// Per-inbound-stream state: tracks where in the per-protocol read flow we are.
 const InboundStream = struct {
+    /// Listener connection slot index. Set to `inbound_slot_none` for streams that arrived on
+    /// an outbound (client-side) QUIC connection: those connections are already fully
+    /// established so the normal connection-notification path must be skipped.
     slot: usize,
     conn: *ZIo.ConnState,
     stream_id: u64,
@@ -211,6 +221,10 @@ const InboundStream = struct {
     /// The zquic raw-app slot is released once this is true and the peer FINs.
     response_fin_sent: bool = false,
     sender_peer: ?identity.PeerId = null,
+    /// Pre-verified peer identity for streams on outbound connections. When non-null the TLS
+    /// verification step during multistream negotiation is skipped — the peer was already
+    /// authenticated when the outbound connection was established.
+    known_peer_id: ?identity.PeerId = null,
     /// Accumulated bytes for an in-progress unary request. Cleared once a
     /// complete request is parsed and the inbound channel registered.
     req_acc: std.ArrayList(u8) = .empty,
@@ -790,6 +804,48 @@ pub const QuicRuntime = struct {
         try self.inbound_streams.append(self.allocator, ist);
     }
 
+    /// Sentinel slot value for [`InboundStream.slot`] when the stream arrived on an outbound
+    /// (client-side) QUIC connection and has no corresponding listener slot.
+    const inbound_slot_none: usize = std.math.maxInt(usize);
+
+    /// Detect server-initiated bidi streams that the remote peer opened on one of zeam's
+    /// outbound QUIC connections and surface them as inbound streams.
+    ///
+    /// Gossipsub in rust-libp2p (and go-libp2p) opens its own `/meshsub/1.1.0` stream
+    /// on the connection that zeam dialled.  From zeam's perspective these are inbound
+    /// streams on an *outbound* QUIC connection (QUIC stream IDs 1, 5, 9 … — server-
+    /// initiated bidi).  The listener lifecycle callback fires only for connections that
+    /// zeam accepted, so without this sweep those streams are never added to
+    /// `inbound_streams` and ethlambda's gossipsub messages are silently lost.
+    fn dispatchOutboundPeerStreams(self: *QuicRuntime, slot: *OutboundConn) void {
+        const peer_id = slot.peer_id orelse return;
+        const client = slot.outbound.client;
+        while (true) {
+            const scan = quic_endpoint.popNextUnreportedServerBidiStream(
+                &client.conn,
+                &slot.peer_stream_reported,
+            );
+            const sid = scan.stream_id orelse break;
+            const ist = self.allocator.create(InboundStream) catch break;
+            ist.* = .{
+                .slot = inbound_slot_none,
+                .conn = &client.conn,
+                .stream_id = sid,
+                .raw = .{
+                    .server = self.listener.server, // placeholder; writes go through .client
+                    .conn = &client.conn,
+                    .stream_id = sid,
+                    .client = client,
+                },
+                .known_peer_id = peer_id,
+            };
+            self.inbound_streams.append(self.allocator, ist) catch {
+                self.allocator.destroy(ist);
+                break;
+            };
+        }
+    }
+
     // ── Drive thread ───────────────────────────────────────────────────────
 
     fn driveTrampoline(self: *QuicRuntime) void {
@@ -813,13 +869,14 @@ pub const QuicRuntime = struct {
             // pollAccept once per loop so the lifecycle callback fires.
             _ = self.listener.pollAccept();
 
-            // Drive every active outbound.
+            // Drive every active outbound, then surface any remote-initiated streams.
             {
                 var it = self.outbound_by_peer.valueIterator();
                 while (it.next()) |v| {
                     v.*.outbound.drive(&recv_buf, 0) catch |err| {
                         log.warn("quic_runtime: outbound.drive: {s}", .{@errorName(err)});
                     };
+                    self.dispatchOutboundPeerStreams(v.*);
                 }
             }
 
@@ -1687,7 +1744,11 @@ pub const QuicRuntime = struct {
                         // observe the `na`, give up on this stream, and keep
                         // the connection alive.
                         if (err == error.ProtocolNegotiationFailed) {
-                            ist.raw.server.sendRawStreamData(ist.conn, ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
+                            if (ist.raw.client) |c| {
+                                c.sendRawStreamData(ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
+                            } else {
+                                ist.raw.server.sendRawStreamData(ist.conn, ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
+                            }
                         }
                         self.removeInboundStreamAt(i);
                         continue;
@@ -1701,23 +1762,31 @@ pub const QuicRuntime = struct {
                 ist.ms_tail = tail_local;
                 tail_local = .empty;
 
-                const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
-                const sender = quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn(
-                    ist.conn,
-                    a,
-                    null,
-                    now_sec,
-                ) catch |perr| {
-                    log.warn("quic_runtime: verify inbound peer failed: {s}", .{@errorName(perr)});
-                    self.removeInboundStreamAt(i);
-                    continue;
+                // For streams arriving on an outbound (client-side) connection, the peer was
+                // already authenticated during the QUIC handshake that zeam initiated. Skip the
+                // server-TLS identity extraction and the inbound-connection notification: the
+                // host was already notified via `onConnectionEstablished(.outbound)` when the
+                // dial succeeded.
+                const sender: identity.PeerId = if (ist.known_peer_id) |kp| kp else blk: {
+                    const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
+                    break :blk quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn(
+                        ist.conn,
+                        a,
+                        null,
+                        now_sec,
+                    ) catch |perr| {
+                        log.warn("quic_runtime: verify inbound peer failed: {s}", .{@errorName(perr)});
+                        self.removeInboundStreamAt(i);
+                        continue;
+                    };
                 };
                 ist.handshake_done = true;
                 ist.protocol_index = ix;
                 ist.sender_peer = sender;
 
-                // Lazily notify host of new inbound connection (once per slot).
-                if (!self.inbound_conn_notified[ist.slot]) {
+                // Lazily notify host of new inbound connection (once per listener slot).
+                // Streams on outbound connections have slot == inbound_slot_none so we skip this.
+                if (ist.slot != inbound_slot_none and !self.inbound_conn_notified[ist.slot]) {
                     self.inbound_conn_notified[ist.slot] = true;
                     self.inbound_conn_peer[ist.slot] = sender;
                     self.inbound_by_peer.put(sender, .{ .slot = ist.slot, .conn = ist.conn }) catch {};
