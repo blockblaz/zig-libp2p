@@ -25,6 +25,8 @@ pub const identify = @import("identify.zig");
 
 pub const autonat = @import("autonat/root.zig");
 pub const kad_dht = @import("kad_dht/root.zig");
+pub const relay = @import("relay/root.zig");
+pub const dcutr = @import("dcutr/root.zig");
 
 pub const gossip = struct {
     pub const topic = @import("gossip/topic.zig");
@@ -79,6 +81,10 @@ pub const transport = struct {
     pub const transport_error = @import("transport/transport_error.zig");
     pub const yamux = @import("transport/yamux/root.zig");
     pub const mplex = @import("transport/mplex/root.zig");
+    pub const circuit_transport = @import("transport/circuit_transport.zig");
+    pub const dcutr_punch = @import("transport/dcutr_punch.zig");
+    pub const quic_relay_live = @import("transport/quic_relay_live.zig");
+    pub const quic_dcutr_live = @import("transport/quic_dcutr_live.zig");
 };
 
 pub const security = struct {
@@ -120,6 +126,13 @@ test {
     _ = @import("gossipsub/message_id.zig");
     _ = @import("autonat/root.zig");
     _ = @import("kad_dht/root.zig");
+    _ = @import("relay/root.zig");
+    _ = @import("dcutr/root.zig");
+    _ = @import("transport/circuit_transport.zig");
+    _ = @import("transport/dcutr_punch.zig");
+    _ = @import("transport/quic_relay_live.zig");
+    _ = @import("transport/quic_dcutr_live.zig");
+    _ = @import("relay/scenario.zig");
     _ = @import("identify.zig");
     _ = @import("autonat/root.zig");
     _ = @import("connection_manager.zig");

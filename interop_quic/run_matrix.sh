@@ -202,6 +202,8 @@ skipped=0
 # instead of an associative array because macOS still ships bash 3.2.
 skip_reason_for() {
     case "$1:$2" in
+        go-libp2p:relay|go-libp2p:dcutr) echo "go-libp2p interop node has no relay/dcutr testcase yet (#91)" ;;
+        rust-libp2p:relay|rust-libp2p:dcutr) echo "rust-libp2p interop node has no relay/dcutr testcase yet (#91)" ;;
         *) echo "" ;;
     esac
 }

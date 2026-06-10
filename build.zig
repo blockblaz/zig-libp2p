@@ -11,6 +11,8 @@ const examples: []const struct {
     .{ .exe_name = "example-ping-membuf", .root = "examples/ping_membuf.zig" },
     .{ .exe_name = "example-autonat-membuf", .root = "examples/autonat_membuf.zig" },
     .{ .exe_name = "example-kad-dht-membuf", .root = "examples/kad_dht_membuf.zig" },
+    .{ .exe_name = "example-relay-membuf", .root = "examples/relay_membuf.zig" },
+    .{ .exe_name = "example-dcutr-membuf", .root = "examples/dcutr_membuf.zig" },
     .{ .exe_name = "example-swarm-tick", .root = "examples/swarm_tick.zig" },
     .{ .exe_name = "example-req-resp-tcp-status", .root = "examples/req_resp_tcp_status.zig" },
     .{ .exe_name = "example-quic-ping-loopback", .root = "examples/quic_ping_loopback.zig" },

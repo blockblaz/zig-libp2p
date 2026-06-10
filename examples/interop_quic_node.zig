@@ -8,7 +8,9 @@
 //!
 //!   ROLE           — "server" (listen) or "client" (dial)
 //!   TESTCASE       — "handshake", "ping", "gossipsub" (B3 stub on zig side),
-//!                    or "reqresp" (B4 — echo over a libp2p stream)
+//!                    "reqresp" (B4 — echo over a libp2p stream), "relay"
+//!                    (circuit-v2 HOP RESERVE round-trip), or "dcutr" (CONNECT/SYNC
+//!                    exchange smoke — zig self-pair only in relay_test.sh)
 //!   RR_PAYLOAD_LEN — bytes per request/response on the reqresp testcase
 //!                    (default 256). Length is known to both sides via env;
 //!                    on the wire it's a raw byte run, no length prefix.
@@ -38,7 +40,8 @@ const zl = @import("zig_libp2p");
 const multiaddr = @import("multiaddr");
 const zquic = @import("zquic");
 
-const ZIoConnState = zquic.transport.io.ConnState;
+const ZIo = zquic.transport.io;
+const ZIoConnState = ZIo.ConnState;
 
 const QuicListener = zl.transport.quic_endpoint.QuicListener;
 const QuicOutbound = zl.transport.quic_endpoint.QuicOutbound;
@@ -368,6 +371,14 @@ fn runServer(
         return serveOneReqRespResponder(a, listener, accepted.?, &recv_buf, dl, payload_len);
     }
 
+    if (std.mem.eql(u8, testcase, "relay")) {
+        return serveRelayHopReserve(a, listener, accepted.?, &recv_buf, dl);
+    }
+
+    if (std.mem.eql(u8, testcase, "dcutr")) {
+        return serveDcutrConnect(a, listener, accepted.?, &recv_buf, dl);
+    }
+
     std.debug.print("interop_quic_node[server]: unknown TESTCASE={s}\n", .{testcase});
     return 2;
 }
@@ -654,6 +665,15 @@ fn runClient(
         const payload_len = envInt(usize, "RR_PAYLOAD_LEN", default_reqresp_payload_len);
         const cross_impl = expected_peer != null;
         return clientOneReqRespInitiator(a, &outbound, &recv_buf, dl, payload_len, cross_impl);
+    }
+
+    if (std.mem.eql(u8, testcase, "relay")) {
+        const relay_peer = expected_peer orelse return 2;
+        return clientRelayReserve(a, &outbound, &recv_buf, dl, relay_peer);
+    }
+
+    if (std.mem.eql(u8, testcase, "dcutr")) {
+        return clientDcutrExchange(a, &outbound, &recv_buf, dl);
     }
 
     std.debug.print("interop_quic_node[client]: unknown TESTCASE={s}\n", .{testcase});
@@ -1072,5 +1092,189 @@ fn runGossipsubInterop(
     }
     std.debug.print("interop_quic_node[server]: gossipsub got {d}/{d} msgs\n", .{ seen_count, count });
     std.debug.print("interop_quic_node[server]: gossipsub ok\n", .{});
+    return 0;
+}
+
+fn serveRelayHopReserve(
+    a: std.mem.Allocator,
+    listener: *QuicListener,
+    conn: *ZIoConnState,
+    recv_buf: *[65536]u8,
+    deadline_ms: i64,
+) !u8 {
+    const Ctx = struct {
+        a: std.mem.Allocator,
+        pending: std.ArrayList(u64),
+        fn cb(self_op: ?*anyopaque, _: *QuicListener, _: usize, _: *ZIoConnState, sid: u64) void {
+            const ctx_p: *@This() = @ptrCast(@alignCast(self_op.?));
+            ctx_p.pending.append(ctx_p.a, sid) catch {};
+        }
+    };
+    var ctx = Ctx{ .a = a, .pending = .empty };
+    defer ctx.pending.deinit(a);
+    listener.lifecycle.ctx = &ctx;
+    listener.lifecycle.on_inbound_stream_ready = Ctx.cb;
+
+    const hop_cands = [_][]const u8{zl.relay.wire.hop_protocol_id};
+    const relay_id = try zl.identity.PeerId.random();
+    var srv = zl.relay.Server.init(a, .{
+        .relay_addrs = &.{"/ip4/127.0.0.1/udp/4001/quic-v1"},
+    }, relay_id);
+    defer srv.deinit();
+
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+        }
+        if (ctx.pending.items.len == 0) return 1;
+        const sid = ctx.pending.orderedRemove(0);
+        var raw = RawAppBidiServer{ .server = listener.server, .conn = conn, .stream_id = sid };
+
+        negotiate: while (wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+            if (raw.unreadRecvLen() < 2) continue;
+            var r = raw.reader();
+            var w = raw.writer();
+            _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &hop_cands, a, null) catch continue;
+            break :negotiate;
+        } else return 1;
+
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+            if (raw.unreadRecvLen() < 4) continue;
+            var r = raw.reader();
+            var out_buf: [4096]u8 = undefined;
+            var w_out = Io.Writer.fixed(&out_buf);
+            const hop_peer = try zl.identity.PeerId.random();
+            try srv.handleHopStream(&r, &w_out, hop_peer, false);
+            var w = raw.writer();
+            try Io.Writer.writeAll(&w, out_buf[0..w_out.end]);
+            try Io.Writer.flush(&w);
+            std.debug.print("interop_quic_node[server]: relay reserve ok\n", .{});
+            return 0;
+        }
+    }
+    return 1;
+}
+
+fn serveDcutrConnect(
+    a: std.mem.Allocator,
+    listener: *QuicListener,
+    conn: *ZIoConnState,
+    recv_buf: *[65536]u8,
+    deadline_ms: i64,
+) !u8 {
+    const Ctx = struct {
+        a: std.mem.Allocator,
+        pending: std.ArrayList(u64),
+        fn cb(self_op: ?*anyopaque, _: *QuicListener, _: usize, _: *ZIoConnState, sid: u64) void {
+            const ctx_p: *@This() = @ptrCast(@alignCast(self_op.?));
+            ctx_p.pending.append(ctx_p.a, sid) catch {};
+        }
+    };
+    var ctx = Ctx{ .a = a, .pending = .empty };
+    defer ctx.pending.deinit(a);
+    listener.lifecycle.ctx = &ctx;
+    listener.lifecycle.on_inbound_stream_ready = Ctx.cb;
+
+    const cands = [_][]const u8{zl.dcutr.wire.protocol_id};
+    var coord = zl.dcutr.Coordinator.init(a, .{}, .responder);
+    defer coord.deinit();
+    const obs = [_][]const u8{"/ip4/127.0.0.1/udp/4001/quic-v1"};
+
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+        }
+        if (ctx.pending.items.len == 0) return 1;
+        const sid = ctx.pending.orderedRemove(0);
+        var raw = RawAppBidiServer{ .server = listener.server, .conn = conn, .stream_id = sid };
+
+        negotiate: while (wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+            if (raw.unreadRecvLen() < 2) continue;
+            var r = raw.reader();
+            var w = raw.writer();
+            _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &cands, a, null) catch continue;
+            break :negotiate;
+        } else return 1;
+
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            listener.drive(recv_buf, 5) catch {};
+            if (raw.unreadRecvLen() < 4) continue;
+            var r = raw.reader();
+            const frame = try zl.dcutr.wire.readLengthPrefixedAlloc(&r, a, zl.dcutr.wire.Limits.standard.max_frame_bytes);
+            defer a.free(frame);
+            const reply = try coord.onRemoteConnect(frame, &obs);
+            defer a.free(reply);
+            var w = raw.writer();
+            try zl.dcutr.wire.writeLengthPrefixed(&w, reply);
+            try Io.Writer.flush(&w);
+            std.debug.print("interop_quic_node[server]: dcutr connect ok\n", .{});
+            return 0;
+        }
+    }
+    return 1;
+}
+
+fn clientRelayReserve(
+    a: std.mem.Allocator,
+    outbound: *QuicOutbound,
+    recv_buf: *[65536]u8,
+    deadline_ms: i64,
+    relay_peer: PeerId,
+) !u8 {
+    const sid = try outbound.nextLocalBidiStream();
+    var raw = RawAppBidiClient{ .client = outbound.client, .stream_id = sid };
+    var client = zl.relay.Client.init(a, .{});
+    defer client.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try stream_multistream.appendFirstStreamInitiatorHandshake(&out, a, zl.relay.wire.hop_protocol_id);
+    var w = raw.writer();
+    try Io.Writer.writeAll(&w, out.items);
+    try Io.Writer.flush(&w);
+
+    const need = try stream_multistream.responderSuccessReplyWireLen(zl.relay.wire.hop_protocol_id);
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        outbound.drive(recv_buf, 5) catch {};
+        if (raw.unreadRecvLen() >= need) break;
+    }
+    var r = raw.reader();
+    try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, zl.relay.wire.hop_protocol_id, a, null);
+    try client.reserveOnStream(&r, &w, relay_peer);
+    std.debug.print("interop_quic_node[client]: relay reserve ok\n", .{});
+    return 0;
+}
+
+fn clientDcutrExchange(
+    a: std.mem.Allocator,
+    outbound: *QuicOutbound,
+    recv_buf: *[65536]u8,
+    deadline_ms: i64,
+) !u8 {
+    const sid = try outbound.nextLocalBidiStream();
+    var raw = RawAppBidiClient{ .client = outbound.client, .stream_id = sid };
+    var coord = zl.dcutr.Coordinator.init(a, .{}, .initiator);
+    defer coord.deinit();
+    const obs = [_][]const u8{"/ip4/127.0.0.1/udp/4002/quic-v1"};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try stream_multistream.appendFirstStreamInitiatorHandshake(&out, a, zl.dcutr.wire.protocol_id);
+    var w = raw.writer();
+    try Io.Writer.writeAll(&w, out.items);
+    try Io.Writer.flush(&w);
+
+    const need = try stream_multistream.responderSuccessReplyWireLen(zl.dcutr.wire.protocol_id);
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        outbound.drive(recv_buf, 5) catch {};
+        if (raw.unreadRecvLen() >= need) break;
+    }
+    var r = raw.reader();
+    try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, zl.dcutr.wire.protocol_id, a, null);
+    _ = try coord.runInitiatorExchange(&r, &w, &obs);
+    std.debug.print("interop_quic_node[client]: dcutr exchange ok\n", .{});
     return 0;
 }

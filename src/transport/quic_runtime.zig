@@ -45,6 +45,11 @@ const gossipsub_rpc = @import("../gossipsub/rpc.zig");
 const gossipsub_wire_limits = @import("../gossipsub/wire_limits.zig");
 const varint = @import("../varint.zig");
 
+const relay_mod = @import("../relay/root.zig");
+const dcutr_mod = @import("../dcutr/root.zig");
+const quic_relay_live = @import("quic_relay_live.zig");
+const quic_dcutr_live = @import("quic_dcutr_live.zig");
+
 const zquic = @import("zquic");
 const ZIo = zquic.transport.io;
 
@@ -55,12 +60,21 @@ const max_inbound_gossip_acc_bytes: usize =
     gossipsub_wire_limits.max_rpc_length_delimited_bytes + varint.max_encoding_bytes + 4096;
 const max_inbound_req_acc_bytes: usize = (wire_framing.ExchangeLimits{}).max_accumulated;
 
-const supported_protocols: [4][]const u8 = .{
+const supported_protocols: [7][]const u8 = .{
     meshsub_protocol_id,
     protocol_mod.blocks_by_root_v1,
     protocol_mod.blocks_by_range_v1,
     protocol_mod.status_v1,
+    relay_mod.wire.hop_protocol_id,
+    relay_mod.wire.stop_protocol_id,
+    dcutr_mod.wire.protocol_id,
 };
+
+const proto_meshsub: usize = 0;
+const proto_relay_hop: usize = 4;
+const proto_relay_stop: usize = 5;
+const proto_dcutr: usize = 6;
+const max_inbound_relay_acc_bytes: usize = relay_mod.wire.Limits.standard.max_frame_bytes + varint.max_encoding_bytes + 64;
 
 /// TLS identity material for zquic (file paths or in-memory PEM). See #129.
 pub const TlsPemSource = union(enum) {
@@ -117,6 +131,23 @@ pub const QuicRuntimeOptions = struct {
     now_ms_fn: *const fn () i64 = wall_time.milliTimestamp,
     /// Per-iteration poll timeout for the drive loop.
     poll_timeout_ms: u32 = 50,
+    /// Circuit relay v2 server/client (#91).
+    relay: RelayRuntimeOptions = .{},
+    /// DCUtR hole punching over relayed connections (#91).
+    dcutr: DcutrRuntimeOptions = .{},
+};
+
+pub const RelayRuntimeOptions = struct {
+    enable_server: bool = true,
+    enable_client: bool = true,
+    /// When set, auto-reserve on this relay multiaddr after startup.
+    auto_reserve_relay: ?[]const u8 = null,
+};
+
+pub const DcutrRuntimeOptions = struct {
+    enable: bool = true,
+    /// Observed addresses sent in DCUtR CONNECT (defaults to listen addr).
+    local_obs_addrs: []const []const u8 = &.{},
 };
 
 const PeerIdContext = struct {
@@ -167,6 +198,10 @@ const InboundStream = struct {
     /// stream. Each frame is `uvarint(len) + RPC protobuf` and the stream MAY
     /// carry multiple frames. Bytes are consumed as full frames are decoded.
     gossip_acc: std.ArrayList(u8) = .empty,
+    /// Accumulated bytes for one circuit-relay hop/stop length-prefixed frame.
+    relay_acc: std.ArrayList(u8) = .empty,
+    /// When true, hop/stop/dcutr control frame was handled; stream may bridge.
+    relay_control_done: bool = false,
 };
 
 const OutboundRequest = struct {
@@ -359,6 +394,11 @@ pub const QuicRuntime = struct {
     hook_mutex: std.Io.Mutex = .init,
     hook_queue: std.ArrayList(HookWork) = .empty,
 
+    relay_live: quic_relay_live.LiveRelay,
+    dcutr_live: quic_dcutr_live.LiveDcutr,
+    relay_addrs_buf: ?[]u8 = null,
+    auto_reserve_pending: bool = false,
+
     /// Drive thread control.
     drive_thread: ?std.Thread = null,
     shutdown_requested: std.atomic.Value(bool) = .init(false),
@@ -395,6 +435,26 @@ pub const QuicRuntime = struct {
         const self = try a.create(QuicRuntime);
         errdefer a.destroy(self);
 
+        const relay_hooks = quic_relay_live.RuntimeHooks{
+            .ctx = self,
+            .dial_plain = relayHookDialPlain,
+            .outbound_client = relayHookOutboundClient,
+            .next_bidi_stream = relayHookNextBidiStream,
+            .on_relayed_connected = relayHookRelayedConnected,
+            .on_relayed_dial_failed = relayHookRelayedDialFailed,
+            .next_conn_id = relayHookNextConnId,
+        };
+        const dcutr_hooks = quic_dcutr_live.RuntimeHooks{
+            .ctx = self,
+            .now_ms = opts.now_ms_fn,
+            .listener_port_v4 = dcutrHookListenerPort,
+            .tls_pem_paths = dcutrHookTlsPaths,
+            .tls_pem_bytes = dcutrHookTlsBytes,
+            .use_pem_bytes = dcutrHookUsePemBytes,
+            .on_direct_connected = dcutrHookDirectConnected,
+            .close_relayed = dcutrHookCloseRelayed,
+        };
+
         self.* = .{
             .allocator = a,
             .host = opts.host,
@@ -407,12 +467,34 @@ pub const QuicRuntime = struct {
             .outbound_requests = std.AutoHashMap(u64, *OutboundRequest).init(a),
             .outbound_publishes = std.AutoHashMap(u64, *OutboundPublish).init(a),
             .channel_to_inbound = std.AutoHashMap(u64, *InboundStream).init(a),
+            .relay_live = quic_relay_live.LiveRelay.init(a, opts.host.swarm.local_peer, .{
+                .enable_server = opts.relay.enable_server,
+                .enable_client = opts.relay.enable_client,
+            }, relay_hooks),
+            .dcutr_live = quic_dcutr_live.LiveDcutr.init(a, .{
+                .enable = opts.dcutr.enable,
+                .local_obs_addrs = opts.dcutr.local_obs_addrs,
+            }, dcutr_hooks),
             .persistent_gossip = PersistentGossipMap.init(a),
             .subscribed_topics = std.StringHashMap(void).init(a),
         };
 
         const bound = listener.boundUdpPortIpv4() catch null;
         self.bound_port_v4 = bound;
+
+        if (bound) |port| {
+            const relay_addr = std.fmt.allocPrint(a, "/ip4/0.0.0.0/udp/{d}/quic-v1", .{port}) catch null;
+            if (relay_addr) |ra| {
+                self.relay_addrs_buf = ra;
+                self.relay_live.setRelayAddrs(&.{ra}) catch {
+                    a.free(ra);
+                    self.relay_addrs_buf = null;
+                };
+            }
+        }
+        if (opts.relay.auto_reserve_relay != null) {
+            self.auto_reserve_pending = true;
+        }
 
         // Install the swarm CommandDispatchHook by patching it onto the
         // already-constructed swarm. host.zig owns the swarm but doesn't
@@ -441,6 +523,10 @@ pub const QuicRuntime = struct {
         for (self.hook_queue.items) |w| freeHookWork(self.allocator, w);
         self.hook_queue.deinit(self.allocator);
 
+        self.relay_live.deinit();
+        self.dcutr_live.deinit();
+        if (self.relay_addrs_buf) |b| self.allocator.free(b);
+
         // Free outbound conns.
         var it = self.outbound_by_peer.valueIterator();
         while (it.next()) |v| {
@@ -454,6 +540,7 @@ pub const QuicRuntime = struct {
         for (self.inbound_streams.items) |s| {
             s.req_acc.deinit(self.allocator);
             s.gossip_acc.deinit(self.allocator);
+            s.relay_acc.deinit(self.allocator);
             self.allocator.destroy(s);
         }
         self.inbound_streams.deinit(self.allocator);
@@ -727,6 +814,34 @@ pub const QuicRuntime = struct {
             self.advanceOutboundPublishes() catch |err| {
                 log.warn("quic_runtime: advanceOutboundPublishes: {s}", .{@errorName(err)});
             };
+
+            self.relay_live.advance();
+            self.dcutr_live.advance();
+
+            if (self.auto_reserve_pending) {
+                if (self.opts.relay.auto_reserve_relay) |relay_ma| {
+                    var ma = multiaddr.Multiaddr.fromString(self.allocator, relay_ma) catch null;
+                    if (ma) |*m| {
+                        defer m.deinit();
+                        var iter = m.iterator();
+                        var relay_peer: ?identity.PeerId = null;
+                        while (iter.next() catch break) |proto| {
+                            switch (proto) {
+                                .P2P => |id| relay_peer = id,
+                                else => {},
+                            }
+                        }
+                        if (relay_peer) |rp| {
+                            if (self.outbound_by_peer.contains(rp)) {
+                                self.relay_live.reserveOnRelay(rp) catch |err| {
+                                    log.warn("quic_runtime: auto reserve failed: {s}", .{@errorName(err)});
+                                };
+                                self.auto_reserve_pending = false;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Advance persistent per-peer /meshsub streams (#183).
             self.advancePersistentGossipStreams();
@@ -1030,6 +1145,14 @@ pub const QuicRuntime = struct {
     fn handleDial(self: *QuicRuntime, addr_str: []const u8, expected_peer: ?identity.PeerId) void {
         const a = self.allocator;
 
+        if (quic_relay_live.LiveRelay.isCircuitDialAddr(addr_str)) {
+            self.relay_live.enqueueCircuitDial(addr_str, expected_peer) catch |err| {
+                log.warn("quic_runtime: circuit dial plan failed: {s}", .{@errorName(err)});
+                self.failDial(expected_peer);
+            };
+            return;
+        }
+
         if (expected_peer) |ep| {
             if (self.outbound_by_peer.contains(ep)) return;
             if (self.peerHasActiveConnection(ep)) return;
@@ -1288,8 +1411,109 @@ pub const QuicRuntime = struct {
         if (ist.channel_id) |cid| _ = self.channel_to_inbound.remove(cid);
         ist.req_acc.deinit(self.allocator);
         ist.gossip_acc.deinit(self.allocator);
+        ist.relay_acc.deinit(self.allocator);
         self.allocator.destroy(ist);
         _ = self.inbound_streams.swapRemove(index);
+    }
+
+    fn tryTakeLengthPrefixedFrame(acc: []const u8, max_payload: usize) ?struct { frame: []const u8, total: usize } {
+        const dec = varint.decode(acc) catch return null;
+        const payload_len: usize = @intCast(dec.value);
+        if (payload_len > max_payload) return null;
+        const total = dec.len + payload_len;
+        if (acc.len < total) return null;
+        return .{ .frame = acc[dec.len..total], .total = total };
+    }
+
+    fn appendRelayAcc(self: *QuicRuntime, ist: *InboundStream) void {
+        const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse return;
+        if (recv_buf.len <= ist.raw.read_cursor) return;
+        const new_bytes = recv_buf[ist.raw.read_cursor..];
+        self.appendInboundAccBounded(&ist.relay_acc, new_bytes, max_inbound_relay_acc_bytes) catch {
+            log.warn("quic_runtime: relay_acc cap exceeded", .{});
+        };
+        ist.raw.read_cursor = recv_buf.len;
+    }
+
+    // ── Relay / DCUtR runtime hooks ─────────────────────────────────────────
+
+    fn relayHookDialPlain(ctx: ?*anyopaque, addr: []const u8, expected: ?identity.PeerId) bool {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        self.handleDial(addr, expected);
+        if (expected) |ep| return self.outbound_by_peer.contains(ep);
+        return true;
+    }
+
+    fn relayHookOutboundClient(ctx: ?*anyopaque, peer: identity.PeerId) ?*ZIo.Client {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const slot = self.outbound_by_peer.get(peer) orelse return null;
+        return slot.outbound.client;
+    }
+
+    fn relayHookNextBidiStream(ctx: ?*anyopaque, peer: identity.PeerId) ?u64 {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const slot = self.outbound_by_peer.get(peer) orelse return null;
+        return slot.outbound.nextLocalBidiStream() catch null;
+    }
+
+    fn relayHookRelayedConnected(ctx: ?*anyopaque, target: identity.PeerId, conn_id: connection_manager_mod.ConnectionId) void {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        self.host.onConnectionEstablished(conn_id, target, .outbound) catch |err| {
+            log.warn("quic_runtime: relayed onConnectionEstablished failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn relayHookRelayedDialFailed(ctx: ?*anyopaque, target: ?identity.PeerId) void {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        self.failDial(target);
+    }
+
+    fn relayHookNextConnId(ctx: ?*anyopaque) connection_manager_mod.ConnectionId {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const cid = self.next_conn_id;
+        self.next_conn_id += 1;
+        return cid;
+    }
+
+    fn dcutrHookListenerPort(ctx: ?*anyopaque) ?u16 {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        return self.bound_port_v4;
+    }
+
+    fn dcutrHookTlsPaths(ctx: ?*anyopaque) quic_dcutr_live.TlsPemRef {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        return switch (self.tls_pem_resolved) {
+            .paths => |p| .{ .cert = p.cert_path, .key = p.key_path },
+            .bytes => |b| .{ .cert = b.cert_pem, .key = b.key_pem },
+        };
+    }
+
+    fn dcutrHookTlsBytes(ctx: ?*anyopaque) quic_dcutr_live.TlsPemRef {
+        return dcutrHookTlsPaths(ctx);
+    }
+
+    fn dcutrHookUsePemBytes(ctx: ?*anyopaque) bool {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        return self.tls_pem_resolved == .bytes;
+    }
+
+    fn dcutrHookDirectConnected(ctx: ?*anyopaque, peer: identity.PeerId) void {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        log.info("quic_runtime: DCUtR direct connection to peer (relay upgrade)", .{});
+        _ = peer;
+        _ = self;
+    }
+
+    fn dcutrHookCloseRelayed(ctx: ?*anyopaque, peer: identity.PeerId) void {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        if (self.relay_live.relay_virtual.fetchRemove(peer)) |kv| {
+            self.allocator.destroy(kv.value);
+        }
+    }
+
+    /// Extra listen addrs from an active relay reservation (for Identify).
+    pub fn relayCircuitListenAddrs(self: *const QuicRuntime) []const []const u8 {
+        return self.relay_live.extraListenAddrs();
     }
 
     // ── Per-stream pump ────────────────────────────────────────────────────
@@ -1482,6 +1706,61 @@ pub const QuicRuntime = struct {
                         self.removeInboundStreamAt(i);
                         continue;
                     }
+                },
+                proto_relay_hop, proto_relay_stop => {
+                    if (ist.relay_control_done) {
+                        i += 1;
+                        continue;
+                    }
+                    self.appendRelayAcc(ist);
+                    if (ist.relay_acc.items.len == 0) {
+                        i += 1;
+                        continue;
+                    }
+                    const taken = tryTakeLengthPrefixedFrame(
+                        ist.relay_acc.items,
+                        relay_mod.wire.Limits.standard.max_frame_bytes,
+                    ) orelse {
+                        i += 1;
+                        continue;
+                    };
+                    const hop_leg: quic_relay_live.StreamLeg = .{ .inbound = ist.raw };
+                    if (pi == proto_relay_hop) {
+                        const resp = self.relay_live.handleHopFrame(hop_leg, sender_peer, taken.frame, false) catch {
+                            self.removeInboundStreamAt(i);
+                            continue;
+                        };
+                        if (resp.len > 0) {
+                            var w = ist.raw.writer();
+                            std.Io.Writer.writeAll(&w, resp) catch {};
+                            std.Io.Writer.flush(&w) catch {};
+                        }
+                    } else {
+                        self.relay_live.handleStopFrame(hop_leg, self.host.swarm.local_peer, taken.frame) catch {
+                            self.removeInboundStreamAt(i);
+                            continue;
+                        };
+                    }
+                    ist.relay_control_done = true;
+                    if (ist.relay_acc.items.len > taken.total) {
+                        const rem = ist.relay_acc.items.len - taken.total;
+                        std.mem.copyForwards(u8, ist.relay_acc.items[0..rem], ist.relay_acc.items[taken.total..]);
+                        ist.relay_acc.shrinkRetainingCapacity(rem);
+                    } else {
+                        ist.relay_acc.clearRetainingCapacity();
+                    }
+                    self.removeInboundStreamAt(i);
+                    continue;
+                },
+                proto_dcutr => {
+                    if (!ist.relay_control_done) {
+                        self.dcutr_live.startResponderInbound(sender_peer, ist.raw) catch {
+                            self.removeInboundStreamAt(i);
+                            continue;
+                        };
+                        ist.relay_control_done = true;
+                    }
+                    i += 1;
                 },
                 else => |idx| {
                     // SSZ req/resp path.
