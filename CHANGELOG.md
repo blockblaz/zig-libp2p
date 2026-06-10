@@ -2,7 +2,24 @@
 
 ## Unreleased
 
-## [0.1.20](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.19...v0.1.20) (2026-06-10)
+## [0.1.21](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.20...v0.1.21) (2026-06-10)
+
+### Fixed
+
+* **transport/multistream_negotiate, transport/stream_multistream:** thread the
+  framing detected from the multistream offer line through every subsequent
+  token read. The previous per-token first-byte auto-detection
+  (`'/'` ⇒ legacy, otherwise delimited) collided with go-multistream delimited
+  framing whenever the varint length byte equalled `0x2F = '/'` — i.e. a token
+  of total wire length 47 bytes. The lean consensus protocol id
+  `/leanconsensus/req/blocks_by_root/1/ssz_snappy` has a 46-byte body, so its
+  delimited wire form starts with `'/'` and got mis-classified as a legacy
+  line. The responder mis-parsed the offer and replied `na` even though the
+  protocol was supported, and the initiator mis-parsed the ack the same way.
+  In practice rust-libp2p (ethlambda) observed `The remote supports none of
+  the requested protocols` for every `blocks_by_root` request to a
+  zig-libp2p peer, blocking chain sync. `status` and `blocks_by_range` were
+  unaffected because their wire lengths (39 and 48) don't collide with `'/'`.
 
 ### Fixed
 

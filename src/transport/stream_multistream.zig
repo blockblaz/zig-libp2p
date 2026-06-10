@@ -151,6 +151,7 @@ pub fn initiatorHandshakeMultistreamReadPhase(
     _ = w;
     var acc = std.ArrayList(u8).empty;
     defer acc.deinit(allocator);
+    var peer_framing: ?neg.Framing = null;
 
     while (true) {
         var rem: []const u8 = acc.items;
@@ -158,14 +159,24 @@ pub fn initiatorHandshakeMultistreamReadPhase(
             try compactConsumed(&acc, allocator, rem);
             break;
         } else |err| switch (err) {
-            error.MissingNewline => try readMoreHandshake(&acc, r, allocator),
+            error.MissingNewline => {
+                try readMoreHandshake(&acc, r, allocator);
+                notePeerFraming(&peer_framing, acc.items);
+            },
             else => return terr.fromMultistreamStreamLayer(err),
         }
     }
+    // Auto-detect on the multistream header line is safe — that line is 19
+    // bytes (delimited length 0x13), never colliding with the 0x2F = '/'
+    // edge case. Subsequent reads must use the detected framing because
+    // the protocol-ack token MAY be 47 bytes (delimited length 0x2F = '/'),
+    // which would mis-classify if we kept auto-detecting per token. See
+    // [`neg.readNegotiationToken`] for the full collision discussion.
+    const framing = peer_framing orelse .legacy;
 
     while (true) {
         var rem: []const u8 = acc.items;
-        if (neg.initiatorReadProtocolAck(&rem, protocol_id, neg.default_max_body_len)) |_| {
+        if (neg.initiatorReadProtocolAckFramed(&rem, protocol_id, neg.default_max_body_len, framing)) |_| {
             try compactConsumed(&acc, allocator, rem);
             preserveAccTailOnly(&acc, tail);
             return;
@@ -209,7 +220,8 @@ pub fn responderHandshakeMultistream(
     // write (avoids a tiny second STREAM frame that loopback was losing at 22/36 bytes).
     while (true) {
         var rem_probe: []const u8 = acc.items;
-        const offered_prefetch = neg.responderReadProtocolOffer(&rem_probe, neg.default_max_body_len) catch |err| switch (err) {
+        // Use detected framing — see comment in `responderHandshakeMultistreamAmong`.
+        const offered_prefetch = neg.responderReadProtocolOfferFramed(&rem_probe, neg.default_max_body_len, framing) catch |err| switch (err) {
             error.MissingNewline => @as(?[]const u8, null),
             else => |e| return terr.fromMultistreamStreamLayer(e),
         };
@@ -247,7 +259,7 @@ pub fn responderHandshakeMultistream(
 
     while (true) {
         var rem: []const u8 = acc.items;
-        const offered = neg.responderReadProtocolOffer(&rem, neg.default_max_body_len) catch |err| switch (err) {
+        const offered = neg.responderReadProtocolOfferFramed(&rem, neg.default_max_body_len, framing) catch |err| switch (err) {
             error.MissingNewline => {
                 try readMoreHandshake(&acc, r, allocator);
                 continue;
@@ -299,7 +311,12 @@ pub fn responderHandshakeMultistreamAmong(
 
     while (true) {
         var rem_probe: []const u8 = acc.items;
-        const offered_prefetch = neg.responderReadProtocolOffer(&rem_probe, neg.default_max_body_len) catch |err| switch (err) {
+        // Use the framing detected from the multistream offer line — auto
+        // detecting per-token mis-classifies protocols whose delimited
+        // length byte happens to equal '/' (0x2F = 47), which is exactly
+        // the wire size of `/leanconsensus/req/blocks_by_root/1/ssz_snappy`
+        // and `/leanconsensus/req/blocks_by_range/1/ssz_snappy`.
+        const offered_prefetch = neg.responderReadProtocolOfferFramed(&rem_probe, neg.default_max_body_len, framing) catch |err| switch (err) {
             error.MissingNewline => @as(?[]const u8, null),
             else => |e| return terr.fromMultistreamStreamLayer(e),
         };
@@ -336,7 +353,7 @@ pub fn responderHandshakeMultistreamAmong(
 
     while (true) {
         var rem: []const u8 = acc.items;
-        const offered = neg.responderReadProtocolOffer(&rem, neg.default_max_body_len) catch |err| switch (err) {
+        const offered = neg.responderReadProtocolOfferFramed(&rem, neg.default_max_body_len, framing) catch |err| switch (err) {
             error.MissingNewline => {
                 try readMoreHandshake(&acc, r, allocator);
                 continue;
@@ -379,6 +396,52 @@ test "responderHandshakeMultistreamAmong na for unknown protocol" {
 
     const cands: []const []const u8 = &.{"/meshsub/1.1.0"};
     try std.testing.expectError(error.ProtocolNegotiationFailed, responderHandshakeMultistreamAmong(&r, &aw.writer, cands, a, null));
+}
+
+test "responderHandshakeMultistreamAmong handles 47-byte delimited protocol (length byte == '/')" {
+    // Regression for the framing-detection collision: a delimited token
+    // whose body is 46 bytes has total wire length 47 = 0x2F = '/'. Naive
+    // first-byte auto-detection mis-classifies it as a legacy line and
+    // mis-parses, causing the responder to reply `na` for protocols it
+    // actually supports (e.g. `/leanconsensus/req/blocks_by_root/1/ssz_snappy`).
+    const a = std.testing.allocator;
+    const proto_47 = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
+    try std.testing.expectEqual(@as(usize, 46), proto_47.len);
+
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(a);
+    try neg.initiatorSendMultistreamHeaderFramed(&wire, a, .delimited);
+    try neg.initiatorSendProtocolFramed(&wire, a, proto_47, .delimited);
+    // Sanity check: the protocol token's length byte is exactly '/'.
+    const ms_header_len = std.mem.indexOfScalar(u8, wire.items, '\n').? + 1;
+    try std.testing.expectEqual(@as(u8, '/'), wire.items[ms_header_len]);
+
+    var r = Io.Reader.fixed(wire.items);
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    const cands: []const []const u8 = &.{proto_47};
+    const ix = try responderHandshakeMultistreamAmong(&r, &aw.writer, cands, a, null);
+    try std.testing.expectEqual(@as(usize, 0), ix);
+    // Must NOT contain the legacy `na\n` rejection.
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\nna\n") == null);
+}
+
+test "initiatorHandshakeMultistreamReadPhase handles 47-byte delimited ack (length byte == '/')" {
+    const a = std.testing.allocator;
+    const proto_47 = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
+    try std.testing.expectEqual(@as(usize, 46), proto_47.len);
+
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(a);
+    try neg.responderSendMultistreamHeaderFramed(&wire, a, .delimited);
+    try neg.responderReplyProtocolFramed(&wire, a, proto_47, proto_47, .delimited);
+
+    var r = Io.Reader.fixed(wire.items);
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    try initiatorHandshakeMultistreamReadPhase(&r, &aw.writer, proto_47, a, null);
 }
 
 test "responderHandshakeMultistreamAmong preserves trailing app bytes (go MSSelect)" {

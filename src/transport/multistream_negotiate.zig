@@ -73,10 +73,29 @@ fn readDelimitedToken(remaining: *[]const u8, max_body_len: usize) NegotiateErro
     return ms.trimNegotiationLine(body);
 }
 
-/// Read one negotiation token using legacy or go-multistream delimited framing.
+/// Read one negotiation token using the given framing.
+pub fn readNegotiationTokenFramed(remaining: *[]const u8, max_body_len: usize, framing: Framing) NegotiateError![]const u8 {
+    if (remaining.*.len == 0) return error.MissingNewline;
+    return switch (framing) {
+        .legacy => readNegotiationLine(remaining, max_body_len),
+        .delimited => readDelimitedToken(remaining, max_body_len),
+    };
+}
+
+/// Auto-detect framing from the first byte (legacy lines start with `/`,
+/// legacy `na` starts with `n`) and read one token.
+///
+/// CAUTION: the `/` heuristic collides with delimited framing whenever the
+/// varint length byte happens to equal 0x2F = '/' — i.e. a token whose total
+/// wire length is 47 bytes. Many lean / Ethereum consensus protocol ids hit
+/// this exactly (`/leanconsensus/req/blocks_by_root/1/ssz_snappy` and
+/// `/leanconsensus/req/blocks_by_range/1/ssz_snappy` are both 46-byte bodies
+/// + `\n` = 47). Only use this when the framing is genuinely unknown — i.e.
+/// for the very first token on a stream. After the multistream offer has
+/// been parsed, the framing is known and [`readNegotiationTokenFramed`]
+/// must be used instead.
 pub fn readNegotiationToken(remaining: *[]const u8, max_body_len: usize) NegotiateError![]const u8 {
     if (remaining.*.len == 0) return error.MissingNewline;
-    // Legacy lines start with `/`; legacy `na` rejections start with `na`.
     if (remaining.*[0] == '/' or std.mem.startsWith(u8, remaining.*, "na")) {
         return readNegotiationLine(remaining, max_body_len);
     }
@@ -157,6 +176,14 @@ pub fn initiatorReadProtocolAck(remaining: *[]const u8, expected_protocol: []con
     if (!std.mem.eql(u8, line, expected_protocol)) return error.ProtocolNotSupported;
 }
 
+/// Read the responder's answer using the negotiated framing.
+pub fn initiatorReadProtocolAckFramed(remaining: *[]const u8, expected_protocol: []const u8, max_body_len: usize, framing: Framing) NegotiateError!void {
+    try validateProtocolId(expected_protocol);
+    const line = try readNegotiationTokenFramed(remaining, max_body_len, framing);
+    if (std.mem.eql(u8, line, "na")) return error.ProtocolNotSupported;
+    if (!std.mem.eql(u8, line, expected_protocol)) return error.ProtocolNotSupported;
+}
+
 // ── Responder (listener) side ───────────────────────────────────────────────
 
 /// Read initiator's `/multistream/1.0.0\n` and consume it.
@@ -178,9 +205,20 @@ pub fn responderSendMultistreamHeaderFramed(
     try appendNegotiationToken(write, allocator, multistreamVersionLine(), framing);
 }
 
-/// Read the protocol the initiator requests.
+/// Read the protocol the initiator requests, auto-detecting framing.
+///
+/// Prefer [`responderReadProtocolOfferFramed`] once the multistream offer
+/// has been parsed and the framing is known; auto-detect is unsafe for
+/// 46-byte protocol ids (see [`readNegotiationToken`]).
 pub fn responderReadProtocolOffer(remaining: *[]const u8, max_body_len: usize) NegotiateError![]const u8 {
     const line = try readNegotiationToken(remaining, max_body_len);
+    try validateProtocolId(line);
+    return line;
+}
+
+/// Read the protocol the initiator requests using the negotiated framing.
+pub fn responderReadProtocolOfferFramed(remaining: *[]const u8, max_body_len: usize, framing: Framing) NegotiateError![]const u8 {
+    const line = try readNegotiationTokenFramed(remaining, max_body_len, framing);
     try validateProtocolId(line);
     return line;
 }
