@@ -12,6 +12,7 @@ Pure-Zig implementation of the **lean-consensus / Eth2 libp2p subset**: QUIC + l
 | libp2p TLS 1.3 on QUIC (RFC 0001) | `security.libp2p_tls` + `security.libp2p_tls_cert` | zig ↔ go-libp2p ✅, zig ↔ rust-libp2p ✅ |
 | libp2p TLS on TCP (`/tls/1.0.0`) | `transport.tcp_tls` | manual |
 | TCP transport | `transport.tcp` | — |
+| WebSocket transport (`/ws`, RFC 6455) | `transport.ws`, `transport.ws_codec`, `transport.ws_handshake` | unit-tested; `/wss`, `/quic-v1/webtransport`, `/webrtc-direct` deferred ([#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94)) |
 | Noise XX (`/noise`) | `security.noise` (RSA, ECDSA-P256, secp256k1, ed25519) | manual |
 | Yamux + Mplex muxing | `transport.yamux`, `transport.mplex` | — |
 | Multistream-select (delimited) | `transport.stream_multistream`, `transport.multistream_negotiate` | ✅ |
@@ -33,7 +34,7 @@ Out of scope for the lean/Eth2 surface. PRs welcome on the linked issues.
 | Spec | Status | Issue |
 |------|--------|-------|
 | Circuit Relay v2 + DCUtR hole punching | not planned for 1.0 | [#91](https://github.com/ch4r10t33r/zig-libp2p/issues/91) |
-| WebSocket / WebTransport / WebRTC | not planned for 1.0 | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
+| WSS / WebTransport / WebRTC | planned (WebSocket landed; rest deferred) | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
 | Resource manager (rcmgr scope-based) | planned | [#169](https://github.com/ch4r10t33r/zig-libp2p/issues/169) |
 | PSK / pnet (private networks) | planned | [#171](https://github.com/ch4r10t33r/zig-libp2p/issues/171) |
 | Async swarm (`std.Io.Threaded` → async) | planned | [#57](https://github.com/ch4r10t33r/zig-libp2p/issues/57) |
