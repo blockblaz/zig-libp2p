@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## [0.1.19](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.18...v0.1.19) (2026-06-10)
+
+### Fixed
+
+* **transport/quic_runtime:** persist the multistream-select accumulator across
+  drive ticks for inbound streams. Previously a partial responder negotiation
+  (DialFailed) lost the bytes the helper had already pulled from the raw
+  reader, so the second attempt mis-parsed and the peer saw `na` for
+  legitimate protocols (e.g. rust-libp2p `blocks_by_root` requests).
+
 ## [0.1.18](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.17...v0.1.18) (2026-06-10)
 
 ### Fixed
