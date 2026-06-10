@@ -216,7 +216,12 @@ const InboundStream = struct {
     relay_acc: std.ArrayList(u8) = .empty,
     /// When true, hop/stop/dcutr control frame was handled; stream may bridge.
     relay_control_done: bool = false,
-    /// Bytes read ahead during multistream-select (e.g. ping payload flushed with ack).
+    /// Cumulative bytes pulled from the raw recv buffer for multistream-select;
+    /// persisted across drive ticks so a partial negotiation (DialFailed) does
+    /// not lose bytes the responder helper already consumed.
+    ms_acc: std.ArrayList(u8) = .empty,
+    /// Bytes left over after multistream-select succeeded (e.g. ping payload
+    /// flushed in the same STREAM frame as the handshake ack).
     ms_tail: std.ArrayList(u8) = .empty,
 };
 
@@ -561,6 +566,7 @@ pub const QuicRuntime = struct {
             s.req_acc.deinit(self.allocator);
             s.gossip_acc.deinit(self.allocator);
             s.relay_acc.deinit(self.allocator);
+            s.ms_acc.deinit(self.allocator);
             s.ms_tail.deinit(self.allocator);
             self.allocator.destroy(s);
         }
@@ -1435,6 +1441,7 @@ pub const QuicRuntime = struct {
         ist.req_acc.deinit(self.allocator);
         ist.gossip_acc.deinit(self.allocator);
         ist.relay_acc.deinit(self.allocator);
+        ist.ms_acc.deinit(self.allocator);
         ist.ms_tail.deinit(self.allocator);
         self.allocator.destroy(ist);
         _ = self.inbound_streams.swapRemove(index);
@@ -1612,15 +1619,36 @@ pub const QuicRuntime = struct {
             const ist = self.inbound_streams.items[i];
 
             // 1. Multistream handshake: responder side.
+            //
+            // Bytes pulled from the raw stream live in `ms_acc`, which we own
+            // across drive ticks. Each tick we append any newly-arrived raw
+            // bytes and run the responder helper against a `Reader.fixed`
+            // view; on `error.DialFailed` (helper needs more bytes) we leave
+            // `ms_acc` intact and try again next tick, instead of losing the
+            // bytes the helper already consumed into its local accumulator.
             if (!ist.handshake_done) {
-                if (ist.raw.unreadRecvLen() == 0) {
+                const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id);
+                if (recv_buf) |rb| {
+                    if (rb.len > ist.raw.read_cursor) {
+                        const new_bytes = rb[ist.raw.read_cursor..];
+                        ist.ms_acc.appendSlice(a, new_bytes) catch {
+                            log.warn("quic_runtime: ms_acc append failed", .{});
+                            self.removeInboundStreamAt(i);
+                            continue;
+                        };
+                        ist.raw.read_cursor = rb.len;
+                    }
+                }
+                if (ist.ms_acc.items.len == 0) {
                     i += 1;
                     continue;
                 }
-                var r = ist.raw.reader();
+                var fixed_r = std.Io.Reader.fixed(ist.ms_acc.items);
                 var w = ist.raw.writer();
                 const cands: []const []const u8 = &supported_protocols;
-                const ix = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, a, &ist.ms_tail) catch |err| switch (err) {
+                var tail_local: std.ArrayList(u8) = .empty;
+                defer tail_local.deinit(a);
+                const ix = stream_multistream.responderHandshakeMultistreamAmong(&fixed_r, &w, cands, a, &tail_local) catch |err| switch (err) {
                     error.DialFailed => {
                         i += 1;
                         continue;
@@ -1642,6 +1670,13 @@ pub const QuicRuntime = struct {
                         continue;
                     },
                 };
+
+                // Negotiation consumed every byte of `ms_acc` we passed in
+                // (the helper drains its reader at success time). Anything
+                // the peer flushed past the protocol ack is in `tail_local`.
+                ist.ms_acc.clearAndFree(a);
+                ist.ms_tail = tail_local;
+                tail_local = .empty;
 
                 const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
                 const sender = quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn(
