@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## [0.1.20](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.19...v0.1.20) (2026-06-10)
+
+### Fixed
+
+* **transport/quic_runtime:** drain the per-stream multistream-select tail
+  into the protocol dispatch accumulators (gossipsub, req/resp, relay) before
+  reading new bytes from the raw recv buffer. rust-libp2p and go-libp2p
+  routinely flush the protocol ack and the first application bytes in a
+  single QUIC STREAM frame; those bytes landed in `ms_tail` after
+  negotiation and were never forwarded, so inbound `blocks_by_root` /
+  `status` requests timed out on the responder ([#184](https://github.com/ch4r10t33r/zig-libp2p/issues/184)).
+
 ## [0.1.19](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.18...v0.1.19) (2026-06-10)
 
 ### Fixed
