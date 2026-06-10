@@ -47,6 +47,9 @@ const varint = @import("../varint.zig");
 
 const relay_mod = @import("../relay/root.zig");
 const dcutr_mod = @import("../dcutr/root.zig");
+const identify_mod = @import("../identify.zig");
+const ping_mod = @import("../ping.zig");
+const libp2p_tls = @import("../security/libp2p_tls.zig");
 const quic_relay_live = @import("quic_relay_live.zig");
 const quic_dcutr_live = @import("quic_dcutr_live.zig");
 
@@ -60,7 +63,9 @@ const max_inbound_gossip_acc_bytes: usize =
     gossipsub_wire_limits.max_rpc_length_delimited_bytes + varint.max_encoding_bytes + 4096;
 const max_inbound_req_acc_bytes: usize = (wire_framing.ExchangeLimits{}).max_accumulated;
 
-const supported_protocols: [7][]const u8 = .{
+const identify_protocol_id: []const u8 = std.mem.trimEnd(u8, identify_mod.protocol_line, "\n");
+
+const supported_protocols: [9][]const u8 = .{
     meshsub_protocol_id,
     protocol_mod.blocks_by_root_v1,
     protocol_mod.blocks_by_range_v1,
@@ -68,13 +73,22 @@ const supported_protocols: [7][]const u8 = .{
     relay_mod.wire.hop_protocol_id,
     relay_mod.wire.stop_protocol_id,
     dcutr_mod.wire.protocol_id,
+    identify_protocol_id,
+    ping_mod.multistream_protocol_id,
 };
 
 const proto_meshsub: usize = 0;
 const proto_relay_hop: usize = 4;
 const proto_relay_stop: usize = 5;
 const proto_dcutr: usize = 6;
+const proto_identify: usize = 7;
+const proto_ping: usize = 8;
 const max_inbound_relay_acc_bytes: usize = relay_mod.wire.Limits.standard.max_frame_bytes + varint.max_encoding_bytes + 64;
+
+const PemError = error{
+    PemNoBegin,
+    PemNoEnd,
+};
 
 /// TLS identity material for zquic (file paths or in-memory PEM). See #129.
 pub const TlsPemSource = union(enum) {
@@ -202,6 +216,8 @@ const InboundStream = struct {
     relay_acc: std.ArrayList(u8) = .empty,
     /// When true, hop/stop/dcutr control frame was handled; stream may bridge.
     relay_control_done: bool = false,
+    /// Bytes read ahead during multistream-select (e.g. ping payload flushed with ack).
+    ms_tail: std.ArrayList(u8) = .empty,
 };
 
 const OutboundRequest = struct {
@@ -404,6 +420,9 @@ pub const QuicRuntime = struct {
     shutdown_requested: std.atomic.Value(bool) = .init(false),
     started: bool = false,
 
+    /// Cached raw Identify protobuf for inbound `/ipfs/id/1.0.0` replies.
+    identify_reply_wire: ?[]u8 = null,
+
     /// CommandDispatchHook context — must be heap-stable so the swarm can
     /// hold a `*anyopaque` to it across runtime moves (it can't because we
     /// only allow `*QuicRuntime`).
@@ -526,6 +545,7 @@ pub const QuicRuntime = struct {
         self.relay_live.deinit();
         self.dcutr_live.deinit();
         if (self.relay_addrs_buf) |b| self.allocator.free(b);
+        if (self.identify_reply_wire) |w| self.allocator.free(w);
 
         // Free outbound conns.
         var it = self.outbound_by_peer.valueIterator();
@@ -541,6 +561,7 @@ pub const QuicRuntime = struct {
             s.req_acc.deinit(self.allocator);
             s.gossip_acc.deinit(self.allocator);
             s.relay_acc.deinit(self.allocator);
+            s.ms_tail.deinit(self.allocator);
             self.allocator.destroy(s);
         }
         self.inbound_streams.deinit(self.allocator);
@@ -1071,11 +1092,13 @@ pub const QuicRuntime = struct {
                 g.handshake_sent = true;
             }
             if (!g.handshake_done) {
-                const need = stream_multistream.responderSuccessReplyWireLen(meshsub_protocol_id) catch continue;
-                if (g.raw.unreadRecvLen() < need) continue;
+                if (g.raw.unreadRecvLen() == 0) continue;
                 var r = g.raw.reader();
                 var w = g.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch continue;
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch |err| switch (err) {
+                    error.ProtocolNegotiationFailed, error.DialFailed => continue,
+                    else => continue,
+                };
                 g.handshake_done = true;
             }
             // Only drain the outbox AFTER multistream-select completes —
@@ -1412,6 +1435,7 @@ pub const QuicRuntime = struct {
         ist.req_acc.deinit(self.allocator);
         ist.gossip_acc.deinit(self.allocator);
         ist.relay_acc.deinit(self.allocator);
+        ist.ms_tail.deinit(self.allocator);
         self.allocator.destroy(ist);
         _ = self.inbound_streams.swapRemove(index);
     }
@@ -1518,60 +1542,105 @@ pub const QuicRuntime = struct {
 
     // ── Per-stream pump ────────────────────────────────────────────────────
 
+    fn readTlsCertPemFromPath(a: std.mem.Allocator, path: []const u8) ![]u8 {
+        if (!builtin.link_libc) return error.UnsupportedPlatform;
+        var path_buf: [1024]u8 = undefined;
+        const z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+        const mode: std.c.mode_t = 0;
+        const fd = std.c.open(z.ptr, .{ .ACCMODE = .RDONLY }, mode);
+        if (fd < 0) return error.OpenFailed;
+        defer _ = std.c.close(fd);
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(a);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = std.c.read(fd, &chunk, chunk.len);
+            if (n < 0) return error.ReadFailed;
+            if (n == 0) break;
+            try buf.appendSlice(a, chunk[0..@intCast(n)]);
+        }
+        return try buf.toOwnedSlice(a);
+    }
+
+    fn pemFirstCertDer(a: std.mem.Allocator, pem: []const u8) ![]u8 {
+        const begin = std.mem.indexOf(u8, pem, "-----BEGIN CERTIFICATE-----") orelse return error.PemNoBegin;
+        const after_begin = begin + "-----BEGIN CERTIFICATE-----".len;
+        const end_rel = std.mem.indexOf(u8, pem[after_begin..], "-----END CERTIFICATE-----") orelse return error.PemNoEnd;
+        const b64_block = pem[after_begin .. after_begin + end_rel];
+        const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
+        const upper = decoder.calcSizeUpperBound(b64_block.len);
+        const out = try a.alloc(u8, upper);
+        errdefer a.free(out);
+        const n = try decoder.decode(out, b64_block);
+        return try a.realloc(out, n);
+    }
+
+    fn hostPublicKeyProtoFromCertPem(a: std.mem.Allocator, cert_pem: []const u8) ![]u8 {
+        const der = try pemFirstCertDer(a, cert_pem);
+        defer a.free(der);
+        const ext = try libp2p_tls.findLibp2pExtensionExtValue(der);
+        const sk = try libp2p_tls.parseSignedKey(ext);
+        return try a.dupe(u8, sk.public_key_pb);
+    }
+
+    fn ensureIdentifyReplyWire(self: *QuicRuntime) ![]const u8 {
+        if (self.identify_reply_wire) |w| return w;
+        const a = self.allocator;
+        var cert_pem_owned: ?[]u8 = null;
+        defer if (cert_pem_owned) |p| a.free(p);
+        const cert_pem = switch (self.tls_pem_resolved) {
+            .paths => |paths| blk: {
+                cert_pem_owned = try readTlsCertPemFromPath(a, paths.cert_path);
+                break :blk cert_pem_owned.?;
+            },
+            .bytes => |b| b.cert_pem,
+        };
+        const host_pk = try hostPublicKeyProtoFromCertPem(a, cert_pem);
+        defer a.free(host_pk);
+        const msg = identify_mod.MessageView{
+            .public_key = host_pk,
+            .protocols = &supported_protocols,
+        };
+        self.identify_reply_wire = try identify_mod.encode(a, msg);
+        return self.identify_reply_wire.?;
+    }
+
     fn advanceInboundStreams(self: *QuicRuntime) !void {
         const a = self.allocator;
         var i: usize = 0;
         while (i < self.inbound_streams.items.len) {
             const ist = self.inbound_streams.items[i];
 
-            // 1. Multistream handshake: responder side, among 4 protocols.
+            // 1. Multistream handshake: responder side.
             if (!ist.handshake_done) {
-                // Buffer the full multistream offer (two newline-terminated
-                // lines) before running the handshake; the responder helper
-                // is byte-at-a-time and `error.ProtocolNegotiationFailed`
-                // is unrecoverable mid-stream once it consumes any bytes.
-                const have = ist.raw.unreadRecvLen();
-                if (have < 2) {
-                    // Not enough buffered yet — move to the next stream
-                    // instead of busy-looping. The outer driver will pump
-                    // more bytes via listener.drive() and we'll retry.
+                if (ist.raw.unreadRecvLen() == 0) {
                     i += 1;
                     continue;
                 }
-                const buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse {
-                    i += 1;
-                    continue;
-                };
-                const tail = buf[ist.raw.read_cursor..];
-                // need at least two '\n' bytes in the buffered region.
-                var newlines: u32 = 0;
-                for (tail) |b| {
-                    if (b == '\n') newlines += 1;
-                    if (newlines >= 2) break;
-                }
-                if (newlines < 2) {
-                    i += 1;
-                    continue;
-                }
-
                 var r = ist.raw.reader();
                 var w = ist.raw.writer();
                 const cands: []const []const u8 = &supported_protocols;
-                const ix = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, a, null) catch |err| {
-                    log.warn("quic_runtime: inbound responder handshake failed: {s}", .{@errorName(err)});
-                    // FIN our write half on `na` instead of releasing the
-                    // stream — releasing resets it on the wire, which
-                    // rust-libp2p's connection handler interprets as a
-                    // peer-induced stream error and tears the whole
-                    // gossipsub stream pair down (#183). A clean half-close
-                    // lets the initiator's protocol handler (e.g. ping)
-                    // observe the `na`, give up on this stream, and keep
-                    // the connection alive.
-                    if (err == error.ProtocolNegotiationFailed) {
-                        ist.raw.server.sendRawStreamData(ist.conn, ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
-                    }
-                    self.removeInboundStreamAt(i);
-                    continue;
+                const ix = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, cands, a, &ist.ms_tail) catch |err| switch (err) {
+                    error.DialFailed => {
+                        i += 1;
+                        continue;
+                    },
+                    else => {
+                        log.warn("quic_runtime: inbound responder handshake failed: {s}", .{@errorName(err)});
+                        // FIN our write half on `na` instead of releasing the
+                        // stream — releasing resets it on the wire, which
+                        // rust-libp2p's connection handler interprets as a
+                        // peer-induced stream error and tears the whole
+                        // gossipsub stream pair down (#183). A clean half-close
+                        // lets the initiator's protocol handler (e.g. ping)
+                        // observe the `na`, give up on this stream, and keep
+                        // the connection alive.
+                        if (err == error.ProtocolNegotiationFailed) {
+                            ist.raw.server.sendRawStreamData(ist.conn, ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
+                        }
+                        self.removeInboundStreamAt(i);
+                        continue;
+                    },
                 };
 
                 const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
@@ -1762,6 +1831,33 @@ pub const QuicRuntime = struct {
                     }
                     i += 1;
                 },
+                proto_identify => {
+                    const wire = self.ensureIdentifyReplyWire() catch |err| {
+                        log.warn("quic_runtime: identify reply build failed: {s}", .{@errorName(err)});
+                        self.removeInboundStreamAt(i);
+                        continue;
+                    };
+                    ist.raw.writeAllFin(wire);
+                    self.removeInboundStreamAt(i);
+                    continue;
+                },
+                proto_ping => {
+                    if (ist.ms_tail.items.len < ping_mod.payload_len and ist.raw.unreadRecvLen() == 0) {
+                        i += 1;
+                        continue;
+                    }
+                    var r = ist.raw.reader();
+                    var w = ist.raw.writer();
+                    ping_mod.handleInboundPrefixed(ist.ms_tail.items, &r, &w) catch |err| {
+                        log.warn("quic_runtime: ping inbound failed: {s}", .{@errorName(err)});
+                        self.removeInboundStreamAt(i);
+                        continue;
+                    };
+                    ist.ms_tail.clearRetainingCapacity();
+                    ist.raw.writeAllFin(&.{});
+                    self.removeInboundStreamAt(i);
+                    continue;
+                },
                 else => |idx| {
                     // SSZ req/resp path.
                     if (ist.channel_id != null) {
@@ -1859,7 +1955,12 @@ pub const QuicRuntime = struct {
             if (!req.handshake_sent) {
                 var out: std.ArrayList(u8) = .empty;
                 defer out.deinit(a);
-                stream_multistream.appendFirstStreamInitiatorHandshake(&out, a, req.proto.protocolId()) catch |err| {
+                stream_multistream.appendFirstStreamInitiatorHandshakeFramed(
+                    &out,
+                    a,
+                    req.proto.protocolId(),
+                    .delimited,
+                ) catch |err| {
                     log.warn("quic_runtime: append first init handshake failed: {s}", .{@errorName(err)});
                     continue;
                 };
@@ -1872,15 +1973,17 @@ pub const QuicRuntime = struct {
                 req.handshake_sent = true;
             }
 
-            // 2. Read multistream ack.
+            // 2. Read multistream ack (go-multistream delimited on QUIC).
             if (!req.handshake_done) {
-                const need = stream_multistream.responderSuccessReplyWireLen(req.proto.protocolId()) catch continue;
-                if (req.raw.unreadRecvLen() < need) continue;
+                if (req.raw.unreadRecvLen() == 0) continue;
                 var r = req.raw.reader();
                 var w = req.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, req.proto.protocolId(), a, null) catch |err| {
-                    log.warn("quic_runtime: read init ack failed: {s}", .{@errorName(err)});
-                    continue;
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, req.proto.protocolId(), a, null) catch |err| switch (err) {
+                    error.ProtocolNegotiationFailed, error.DialFailed => continue,
+                    else => {
+                        log.warn("quic_runtime: read init ack failed: {s}", .{@errorName(err)});
+                        continue;
+                    },
                 };
                 req.handshake_done = true;
             }
@@ -1983,7 +2086,12 @@ pub const QuicRuntime = struct {
             if (!op.handshake_sent) {
                 var out: std.ArrayList(u8) = .empty;
                 defer out.deinit(a);
-                stream_multistream.appendFirstStreamInitiatorHandshake(&out, a, meshsub_protocol_id) catch |err| {
+                stream_multistream.appendFirstStreamInitiatorHandshakeFramed(
+                    &out,
+                    a,
+                    meshsub_protocol_id,
+                    .delimited,
+                ) catch |err| {
                     log.warn("quic_runtime: publish handshake build failed: {s}", .{@errorName(err)});
                     continue;
                 };
@@ -1998,13 +2106,15 @@ pub const QuicRuntime = struct {
 
             // 2. Read responder ack.
             if (!op.handshake_done) {
-                const need = stream_multistream.responderSuccessReplyWireLen(meshsub_protocol_id) catch continue;
-                if (op.raw.unreadRecvLen() < need) continue;
+                if (op.raw.unreadRecvLen() == 0) continue;
                 var r = op.raw.reader();
                 var w = op.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch |err| {
-                    log.warn("quic_runtime: publish read ack failed: {s}", .{@errorName(err)});
-                    continue;
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch |err| switch (err) {
+                    error.ProtocolNegotiationFailed, error.DialFailed => continue,
+                    else => {
+                        log.warn("quic_runtime: publish read ack failed: {s}", .{@errorName(err)});
+                        continue;
+                    },
                 };
                 op.handshake_done = true;
             }
