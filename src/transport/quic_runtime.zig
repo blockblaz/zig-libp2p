@@ -1457,6 +1457,7 @@ pub const QuicRuntime = struct {
     }
 
     fn appendRelayAcc(self: *QuicRuntime, ist: *InboundStream) void {
+        self.drainMsTailInto(ist, &ist.relay_acc, max_inbound_relay_acc_bytes);
         const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse return;
         if (recv_buf.len <= ist.raw.read_cursor) return;
         const new_bytes = recv_buf[ist.raw.read_cursor..];
@@ -1464,6 +1465,20 @@ pub const QuicRuntime = struct {
             log.warn("quic_runtime: relay_acc cap exceeded", .{});
         };
         ist.raw.read_cursor = recv_buf.len;
+    }
+
+    /// Move any post-handshake bytes captured during multistream-select into
+    /// the per-protocol accumulator before the dispatch loop reads from the
+    /// raw recv buffer. rust-libp2p / go-libp2p routinely flush the protocol
+    /// ack and the first application bytes (request payload, gossipsub frame,
+    /// hop frame, …) in a single QUIC STREAM frame; without this the bytes
+    /// stay in `ms_tail` and the protocol handler waits forever.
+    fn drainMsTailInto(self: *QuicRuntime, ist: *InboundStream, acc: *std.ArrayList(u8), max_bytes: usize) void {
+        if (ist.ms_tail.items.len == 0) return;
+        self.appendInboundAccBounded(acc, ist.ms_tail.items, max_bytes) catch {
+            log.warn("quic_runtime: dispatch acc cap exceeded while draining ms_tail", .{});
+        };
+        ist.ms_tail.clearAndFree(self.allocator);
     }
 
     // ── Relay / DCUtR runtime hooks ─────────────────────────────────────────
@@ -1728,6 +1743,7 @@ pub const QuicRuntime = struct {
                     // and MAY emit multiple frames before FIN; decode every
                     // complete frame in the accumulator and hand each to
                     // `host.handleGossipRpc` for sender attribution.
+                    self.drainMsTailInto(ist, &ist.gossip_acc, max_inbound_gossip_acc_bytes);
                     const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse {
                         i += 1;
                         continue;
@@ -1912,6 +1928,7 @@ pub const QuicRuntime = struct {
                     // accumulator. `wire_framing.readOneUnaryRequest` consumed
                     // bytes destructively on partial errors so we maintain our
                     // own accumulating buffer and decode straight from it.
+                    self.drainMsTailInto(ist, &ist.req_acc, max_inbound_req_acc_bytes);
                     const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse {
                         i += 1;
                         continue;
