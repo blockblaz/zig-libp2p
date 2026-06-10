@@ -14,3 +14,8 @@ pub fn milliTimestamp() i64 {
         return @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
     }
 }
+
+/// UTC unix time in whole seconds.
+pub fn unixTimestamp() i64 {
+    return @divTrunc(milliTimestamp(), std.time.ms_per_s);
+}
