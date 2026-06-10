@@ -24,6 +24,17 @@ pub const Config = struct {
     enable_client: bool = true,
     /// Advertised relay listen addrs (without `/p2p`). Built from bound port when empty.
     relay_addrs: []const []const u8 = &.{},
+
+    /// Pre-encoded libp2p PublicKey protobuf of this relay's host key.
+    /// Forwarded to `relay.server.Server.Config.public_key_pb`; see there.
+    public_key_pb: ?[]const u8 = null,
+    sign_fn: ?relay.server.SignFn = null,
+    sign_ctx: ?*anyopaque = null,
+
+    /// Per-source-IP / token-bucket rate limit on RESERVE.
+    /// Forwarded to `relay.server.Server.Config.reserve_accept_fn`.
+    reserve_accept_fn: ?relay.server.ReserveAcceptFn = null,
+    reserve_accept_ctx: ?*anyopaque = null,
 };
 
 /// One leg of a relay bridge (inbound server stream or outbound client stream).
@@ -51,6 +62,15 @@ pub const Bridge = struct {
     stop: StreamLeg,
     buf: [8192]u8 = undefined,
     done: bool = false,
+
+    /// Reservation byte budget for this bridge (`null` = unbounded). The
+    /// relay tears the bridge down once `bytes_used >= limit_data_bytes` so a
+    /// reserved-but-unbounded peer can't burn through the relay forever.
+    limit_data_bytes: ?u64 = null,
+    /// Wall-clock unix-second deadline (`null` = unbounded). Once reached,
+    /// the bridge is torn down regardless of whether bytes are flowing.
+    limit_expire_unix: ?u64 = null,
+    bytes_used: u64 = 0,
 };
 
 /// Outbound stop stream open for a pending hop CONNECT.
@@ -131,15 +151,6 @@ pub const LiveRelay = struct {
         cfg: Config,
         hooks: RuntimeHooks,
     ) LiveRelay {
-        const open_fn = struct {
-            fn f(ctx: ?*anyopaque, target: identity.PeerId, initiator: []const u8, limit: ?relay.wire.LimitView) relay.server.OpenStopResult {
-                _ = ctx;
-                _ = target;
-                _ = initiator;
-                _ = limit;
-                return .ok;
-            }
-        }.f;
         var relay_addrs = cfg.relay_addrs;
         var addrs_owned: [][]u8 = &[_][]u8{};
         if (relay_addrs.len == 0) {
@@ -153,7 +164,12 @@ pub const LiveRelay = struct {
             .hooks = hooks,
             .server = relay.server.Server.init(allocator, .{
                 .relay_addrs = relay_addrs,
-            }, local_peer, open_fn),
+                .public_key_pb = cfg.public_key_pb,
+                .sign_fn = cfg.sign_fn,
+                .sign_ctx = cfg.sign_ctx,
+                .reserve_accept_fn = cfg.reserve_accept_fn,
+                .reserve_accept_ctx = cfg.reserve_accept_ctx,
+            }, local_peer),
             .client = relay.client.Client.init(allocator, .{}),
             .relay_addrs_owned = addrs_owned,
             .relay_virtual = std.AutoHashMap(identity.PeerId, *RelayVirtualConn).init(allocator),
@@ -219,23 +235,6 @@ pub const LiveRelay = struct {
             .expected_target = target,
         };
         try self.circuit_dials.append(self.allocator, cd);
-    }
-
-    fn queueStopOpen(
-        self: *LiveRelay,
-        target: identity.PeerId,
-        initiator: []const u8,
-        limit: ?relay.wire.LimitView,
-    ) relay.server.OpenStopResult {
-        _ = self;
-        _ = target;
-        _ = initiator;
-        _ = limit;
-        return .ok;
-    }
-
-    pub fn bindServerCtx(self: *LiveRelay) void {
-        self.server.open_stop_ctx = self;
     }
 
     /// Process one length-prefixed hop frame on an inbound hop stream.
@@ -458,9 +457,23 @@ pub const LiveRelay = struct {
                     so.failed = true;
                     continue;
                 };
+                // Carry the reservation `limit` over to the bridge so
+                // advanceBridges can tear it down at the budget. Without
+                // this, the relay would accept the limit on the wire but
+                // never actually enforce it — letting one peer drain the
+                // relay forever.
+                const expire_unix: ?u64 = if (so.limit) |l| blk: {
+                    if (l.duration_sec) |secs| {
+                        const now = @as(u64, @intCast(wall_time.unixTimestamp()));
+                        break :blk now + @as(u64, secs);
+                    }
+                    break :blk null;
+                } else null;
                 bridge.* = .{
                     .hop = so.hop,
                     .stop = .{ .outbound = so.raw },
+                    .limit_data_bytes = if (so.limit) |l| l.data_bytes else null,
+                    .limit_expire_unix = expire_unix,
                 };
                 self.bridges.append(self.allocator, bridge) catch {
                     self.allocator.destroy(bridge);
@@ -486,14 +499,41 @@ pub const LiveRelay = struct {
                 _ = self.bridges.swapRemove(i);
                 continue;
             }
+            // Duration cap: tear down once the wall-clock deadline arrives.
+            if (b.limit_expire_unix) |deadline| {
+                if (@as(u64, @intCast(wall_time.unixTimestamp())) >= deadline) {
+                    b.done = true;
+                    continue;
+                }
+            }
+            // Per-bridge byte budget: stop pumping once we've used what was
+            // reserved; the bridge is torn down on the next tick.
+            const remaining: ?u64 = if (b.limit_data_bytes) |total| blk: {
+                if (b.bytes_used >= total) break :blk 0;
+                break :blk total - b.bytes_used;
+            } else null;
+            if (remaining) |r| if (r == 0) {
+                b.done = true;
+                continue;
+            };
+
             var hop_r = b.hop.reader();
             var hop_w = b.hop.writer();
             var stop_r = b.stop.reader();
             var stop_w = b.stop.writer();
-            circuit_transport.bridgeStreamsUntilClosed(&hop_r, &hop_w, &stop_r, &stop_w, &b.buf, 8) catch {
+            const pumped = circuit_transport.bridgeStreamsUntilClosed(
+                &hop_r,
+                &hop_w,
+                &stop_r,
+                &stop_w,
+                &b.buf,
+                8,
+                remaining,
+            ) catch {
                 b.done = true;
                 continue;
             };
+            b.bytes_used +|= pumped;
             i += 1;
         }
     }
@@ -582,11 +622,19 @@ pub const LiveRelay = struct {
                         .raw = hop,
                         .conn_id = conn_id,
                     };
-                    self.relay_virtual.put(cd.expected_target, vc) catch {
+                    // `put` would silently overwrite and leak a prior
+                    // `RelayVirtualConn` for the same target. Use `getOrPut`
+                    // and destroy the prior entry explicitly when replacing
+                    // (e.g., a duplicate circuit dial racing the first).
+                    const gop = self.relay_virtual.getOrPut(cd.expected_target) catch {
                         self.allocator.destroy(vc);
                         cd.phase = .failed;
                         continue;
                     };
+                    if (gop.found_existing) {
+                        self.allocator.destroy(gop.value_ptr.*);
+                    }
+                    gop.value_ptr.* = vc;
                     self.hooks.on_relayed_connected(self.hooks.ctx, cd.expected_target, conn_id);
                     cd.phase = .done;
                     cd.plan.deinit(self.allocator);

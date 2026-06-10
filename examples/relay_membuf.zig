@@ -7,19 +7,9 @@ pub fn main() !void {
     const relay_id = try zl.identity.PeerId.random();
     const client_peer = try zl.identity.PeerId.random();
 
-    const OpenStub = struct {
-        fn open(ctx: ?*anyopaque, target: zl.identity.PeerId, initiator: []const u8, limit: ?zl.relay.wire.LimitView) zl.relay.OpenStopResult {
-            _ = ctx;
-            _ = target;
-            _ = initiator;
-            _ = limit;
-            return .ok;
-        }
-    };
-
     var srv = zl.relay.Server.init(a, .{
         .relay_addrs = &.{"/ip4/203.0.113.1/udp/4001/quic-v1"},
-    }, relay_id, OpenStub.open);
+    }, relay_id);
     defer srv.deinit();
 
     var client = zl.relay.Client.init(a, .{});

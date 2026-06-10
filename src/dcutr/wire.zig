@@ -114,6 +114,7 @@ pub fn readLengthPrefixedAlloc(r: *Io.Reader, allocator: std.mem.Allocator, max_
         got += n;
         const d = varint.decode(len_buf[0..got]) catch continue;
         if (d.value > max_total) return error.MessageTooLarge;
+        if (d.value > std.math.maxInt(usize)) return error.MessageTooLarge;
         const payload = try allocator.alloc(u8, @intCast(d.value));
         errdefer allocator.free(payload);
         var filled: usize = 0;

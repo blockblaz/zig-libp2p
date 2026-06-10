@@ -250,6 +250,7 @@ fn decodeLimitOwned(wire: []const u8) Error!LimitOwned {
         off += nv.total;
         if (key.field_number == 1 and key.wire_type == .varint) {
             const d = try proto.decodeVarUInt64(nv.value);
+            if (d.value > std.math.maxInt(u32)) return error.MessageTooLarge;
             out.duration_sec = @intCast(d.value);
         } else if (key.field_number == 2 and key.wire_type == .varint) {
             const d = try proto.decodeVarUInt64(nv.value);
@@ -330,11 +331,7 @@ pub fn decodeHopOwned(allocator: std.mem.Allocator, wire_bytes: []const u8, limi
     while (off < wire_bytes.len) {
         const key = try proto.decodeFieldKey(wire_bytes[off..]);
         off += key.len;
-        const cap: usize = switch (key.field_number) {
-            2, 3 => limits.max_frame_bytes,
-            else => limits.max_frame_bytes,
-        };
-        const nv = try proto.nextFieldValueLimited(wire_bytes[off..], key.wire_type, cap);
+        const nv = try proto.nextFieldValueLimited(wire_bytes[off..], key.wire_type, limits.max_frame_bytes);
         off += nv.total;
         switch (key.field_number) {
             1 => {
@@ -402,6 +399,7 @@ pub fn readLengthPrefixedAlloc(r: *Io.Reader, allocator: std.mem.Allocator, max_
         got += n;
         const d = varint.decode(len_buf[0..got]) catch continue;
         if (d.value > max_total) return error.MessageTooLarge;
+        if (d.value > std.math.maxInt(usize)) return error.MessageTooLarge;
         const payload = try allocator.alloc(u8, @intCast(d.value));
         errdefer allocator.free(payload);
         var filled: usize = 0;
@@ -413,6 +411,130 @@ pub fn readLengthPrefixedAlloc(r: *Io.Reader, allocator: std.mem.Allocator, max_
         return payload;
     }
     return error.Truncated;
+}
+
+// ===========================================================================
+// Reservation voucher (signed envelope) — RFC 0002 + circuit-v2 §reservation
+// ===========================================================================
+//
+// Spec: https://github.com/libp2p/specs/blob/master/RFC/0002-signed-envelopes.md
+//       https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md
+//
+// The voucher field carried inside a HOP STATUS(reserve) response is a libp2p
+// SignedEnvelope wrapping a ReservationVoucher protobuf. The envelope is signed
+// by the relay's host key over a domain-separated input so peers can verify
+// the relay actually issued the reservation.
+
+/// Domain string for relay reservation vouchers (per go-libp2p / spec).
+pub const voucher_domain: []const u8 = "libp2p-relay-rsvp";
+
+/// Multicodec payload-type bytes for relay reservation vouchers.
+pub const voucher_payload_type: []const u8 = &[_]u8{ 0x03, 0x02 };
+
+/// Build the ReservationVoucher protobuf payload (inner record).
+///
+/// Per spec, `expiration` is nanoseconds since unix epoch.
+pub fn buildReservationVoucherPayload(
+    allocator: std.mem.Allocator,
+    relay_id_wire: []const u8,
+    peer_id_wire: []const u8,
+    expiration_ns: u64,
+) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    try proto.appendLengthDelimited(&list, allocator, 1, relay_id_wire);
+    try proto.appendLengthDelimited(&list, allocator, 2, peer_id_wire);
+    try proto.appendFieldKey(&list, allocator, 3, .varint);
+    try proto.appendVarUInt64(&list, allocator, expiration_ns);
+    return try list.toOwnedSlice(allocator);
+}
+
+/// Build the domain-separated signing input the relay must produce a signature
+/// over. Format (per RFC 0002):
+///     varint(len(domain)) || domain
+///   || varint(len(payload_type)) || payload_type
+///   || varint(len(payload)) || payload
+pub fn buildSignedEnvelopeSigningInput(
+    allocator: std.mem.Allocator,
+    domain: []const u8,
+    payload_type: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    try proto.appendVarUInt64(&list, allocator, @intCast(domain.len));
+    try list.appendSlice(allocator, domain);
+    try proto.appendVarUInt64(&list, allocator, @intCast(payload_type.len));
+    try list.appendSlice(allocator, payload_type);
+    try proto.appendVarUInt64(&list, allocator, @intCast(payload.len));
+    try list.appendSlice(allocator, payload);
+    return try list.toOwnedSlice(allocator);
+}
+
+/// Build the outer SignedEnvelope protobuf:
+///     bytes public_key = 1;
+///     bytes payload_type = 2;
+///     bytes payload = 3;
+///     bytes signature = 5;   // note: field 4 intentionally skipped (spec)
+pub fn buildSignedEnvelope(
+    allocator: std.mem.Allocator,
+    public_key_pb: []const u8,
+    payload_type: []const u8,
+    payload: []const u8,
+    signature: []const u8,
+) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    try proto.appendLengthDelimited(&list, allocator, 1, public_key_pb);
+    try proto.appendLengthDelimited(&list, allocator, 2, payload_type);
+    try proto.appendLengthDelimited(&list, allocator, 3, payload);
+    try proto.appendLengthDelimited(&list, allocator, 5, signature);
+    return try list.toOwnedSlice(allocator);
+}
+
+test "signed envelope signing input has correct domain-separated layout" {
+    const a = std.testing.allocator;
+    const got = try buildSignedEnvelopeSigningInput(a, "d", &[_]u8{ 0x03, 0x02 }, "PL");
+    defer a.free(got);
+    // varint(1) "d" varint(2) 0x03 0x02 varint(2) "PL"
+    try std.testing.expectEqualSlices(u8, &.{ 1, 'd', 2, 0x03, 0x02, 2, 'P', 'L' }, got);
+}
+
+test "reservation voucher payload round trip via decode" {
+    const a = std.testing.allocator;
+    const relay = "relay-id-bytes";
+    const peer = "peer-id-bytes";
+    const blob = try buildReservationVoucherPayload(a, relay, peer, 12345);
+    defer a.free(blob);
+
+    // Walk the protobuf and confirm fields appear with the right values.
+    var off: usize = 0;
+    var saw_relay = false;
+    var saw_peer = false;
+    var saw_exp = false;
+    while (off < blob.len) {
+        const key = try proto.decodeFieldKey(blob[off..]);
+        off += key.len;
+        const nv = try proto.nextFieldValue(blob[off..], key.wire_type);
+        off += nv.total;
+        switch (key.field_number) {
+            1 => {
+                try std.testing.expectEqualSlices(u8, relay, nv.value);
+                saw_relay = true;
+            },
+            2 => {
+                try std.testing.expectEqualSlices(u8, peer, nv.value);
+                saw_peer = true;
+            },
+            3 => {
+                const d = try proto.decodeVarUInt64(nv.value);
+                try std.testing.expectEqual(@as(u64, 12345), d.value);
+                saw_exp = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_relay and saw_peer and saw_exp);
 }
 
 test "hop reserve round trip" {

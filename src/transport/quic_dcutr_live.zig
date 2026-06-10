@@ -12,6 +12,7 @@ const quic_endpoint = @import("quic_endpoint.zig");
 const quic_raw_stream_io = @import("quic_raw_stream_io.zig");
 const stream_multistream = @import("stream_multistream.zig");
 const multiaddr = @import("multiaddr");
+const wall_time = @import("../wall_time.zig");
 
 const zquic = @import("zquic");
 const ZIo = zquic.transport.io;
@@ -232,7 +233,12 @@ pub const LiveDcutr = struct {
                     return;
                 };
                 Io.Writer.flush(&w) catch {};
-                if (ex.coordinator.pending_dial) |req| {
+                // pollDial returns an owned DirectDialRequest (its own copy
+                // of addrs); we hand the addrs to schedulePunch (which dupes
+                // them) and then deinit the request to free our copy.
+                if (ex.coordinator.pollDial(wall_time.milliTimestamp())) |req_in| {
+                    var req = req_in;
+                    defer req.deinit(self.allocator);
                     self.schedulePunch(ex.peer, req.addrs, req.fire_at_ms);
                 }
                 ex.phase = .done;
@@ -275,10 +281,11 @@ pub const LiveDcutr = struct {
                     ex.phase = .failed;
                     return;
                 }
-                const req = ex.coordinator.onRemoteSync() catch {
+                var req = ex.coordinator.onRemoteSync() catch {
                     ex.phase = .failed;
                     return;
                 };
+                defer req.deinit(self.allocator);
                 self.schedulePunch(ex.peer, req.addrs, req.fire_at_ms);
                 ex.phase = .done;
             },
@@ -342,7 +349,18 @@ pub const LiveDcutr = struct {
             var ma = multiaddr.Multiaddr.fromString(self.allocator, addr_str) catch continue;
             defer ma.deinit();
 
-            _ = dcutr_punch.bindUdpSocketReusePort(listen_port) catch continue;
+            // Pick the address family from the remote multiaddr so we bind a
+            // socket that can actually reach it. `/ip6/...` requires an AF_INET6
+            // socket; anything else (including the common `/ip4/`) uses AF_INET.
+            const family: dcutr_punch.Family = if (std.mem.indexOf(u8, addr_str, "/ip6/") != null)
+                .ipv6
+            else
+                .ipv4;
+
+            // REUSEPORT-bind the shared socket. We tolerate
+            // ReusePortUnsupported (best-effort punch on platforms without
+            // REUSEPORT) but otherwise propagate to the next candidate addr.
+            _ = dcutr_punch.bindUdpSocketReusePort(family, listen_port) catch continue;
 
             var dial_opts: quic.Libp2pZquicClientDialOptions = .{};
             if (self.hooks.use_pem_bytes(self.hooks.ctx)) {

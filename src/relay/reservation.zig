@@ -53,7 +53,7 @@ pub const Store = struct {
     }
 
     pub fn reservationCount(self: *const Store) usize {
-        return self.entries.len;
+        return self.entries.items.len;
     }
 
     pub fn findReservation(self: *const Store, peer: identity.PeerId) ?*const ReservationEntry {

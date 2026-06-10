@@ -34,7 +34,13 @@ pub fn planCircuitDial(allocator: std.mem.Allocator, circuit_addr_str: []const u
     };
 }
 
-/// Pump relayed bytes between hop-side and stop-side streams until both EOF.
+/// Pump relayed bytes between hop-side and stop-side streams until both EOF
+/// or the byte budget is exhausted. Returns the number of bytes pumped this
+/// call so callers can subtract from a per-bridge `data_bytes` budget.
+///
+/// `bytes_budget == null` means unbounded. Stops early once the cumulative
+/// pumped bytes meet or exceed the budget — the caller should then tear down
+/// the bridge so the partner sees the close.
 pub fn bridgeStreamsUntilClosed(
     hop_r: *Io.Reader,
     hop_w: *Io.Writer,
@@ -42,7 +48,9 @@ pub fn bridgeStreamsUntilClosed(
     stop_w: *Io.Writer,
     buf: []u8,
     max_rounds: usize,
-) Error!void {
+    bytes_budget: ?u64,
+) Error!u64 {
+    var pumped: u64 = 0;
     var rounds: usize = 0;
     while (rounds < max_rounds) : (rounds += 1) {
         const a = bridge.pumpOnce(hop_r, stop_w, buf) catch |e| switch (e) {
@@ -53,8 +61,13 @@ pub fn bridgeStreamsUntilClosed(
             error.IoReadFailed, error.IoWriteFailed => break,
             else => |x| return x,
         };
-        if (!a and !b) break;
+        pumped += @as(u64, a) + @as(u64, b);
+        if (a == 0 and b == 0) break;
+        if (bytes_budget) |budget| {
+            if (pumped >= budget) break;
+        }
     }
+    return pumped;
 }
 
 test "plan circuit dial strips relay transport" {

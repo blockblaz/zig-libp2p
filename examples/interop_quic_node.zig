@@ -1116,19 +1116,10 @@ fn serveRelayHopReserve(
     listener.lifecycle.on_inbound_stream_ready = Ctx.cb;
 
     const hop_cands = [_][]const u8{zl.relay.wire.hop_protocol_id};
-    const OpenStub = struct {
-        fn open(ctx_op: ?*anyopaque, target: zl.identity.PeerId, initiator: []const u8, limit: ?zl.relay.wire.LimitView) zl.relay.OpenStopResult {
-            _ = ctx_op;
-            _ = target;
-            _ = initiator;
-            _ = limit;
-            return .ok;
-        }
-    };
     const relay_id = try zl.identity.PeerId.random();
     var srv = zl.relay.Server.init(a, .{
         .relay_addrs = &.{"/ip4/127.0.0.1/udp/4001/quic-v1"},
-    }, relay_id, OpenStub.open);
+    }, relay_id);
     defer srv.deinit();
 
     while (wall_time.milliTimestamp() < deadline_ms) {

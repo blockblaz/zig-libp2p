@@ -437,7 +437,6 @@ pub const QuicRuntime = struct {
                 .local_obs_addrs = opts.dcutr.local_obs_addrs,
             }, dcutr_hooks),
         };
-        self.relay_live.bindServerCtx();
 
         const bound = listener.boundUdpPortIpv4() catch null;
         self.bound_port_v4 = bound;

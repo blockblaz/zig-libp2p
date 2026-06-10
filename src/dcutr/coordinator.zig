@@ -14,15 +14,40 @@ pub const Error = wire.Error || error{
 
 pub const Role = enum { initiator, responder };
 
+/// Direct-dial request emitted by the coordinator. The `addrs` slice is
+/// freshly allocated and owned by the caller — call `deinit` when done so
+/// the underlying address strings are not leaked.
 pub const DirectDialRequest = struct {
-    addrs: []const []const u8,
+    addrs: [][]u8,
     fire_at_ms: i64,
+
+    pub fn deinit(self: *DirectDialRequest, allocator: std.mem.Allocator) void {
+        for (self.addrs) |a| allocator.free(a);
+        if (self.addrs.len > 0) allocator.free(self.addrs);
+        self.* = undefined;
+    }
 };
+
+fn dupeAddrs(allocator: std.mem.Allocator, src: []const []const u8) ![][]u8 {
+    var list = std.ArrayList([]u8).empty;
+    errdefer {
+        for (list.items) |a| allocator.free(a);
+        list.deinit(allocator);
+    }
+    for (src) |a| try list.append(allocator, try allocator.dupe(u8, a));
+    return try list.toOwnedSlice(allocator);
+}
 
 pub const Config = struct {
     limits: wire.Limits = .standard,
     max_attempts: u32 = 3,
 };
+
+/// Internal, owned-by-coordinator state describing when a dial should fire.
+/// Distinct from `DirectDialRequest` (which is the *output* handed to the
+/// caller with its own owned `addrs` copy) so coordinator state mutations
+/// can never invalidate a request already returned to the caller.
+const PendingDial = struct { fire_at_ms: i64 };
 
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
@@ -31,7 +56,7 @@ pub const Coordinator = struct {
     connect_sent_ms: ?i64 = null,
     remote_addrs: [][]u8 = &[_][]u8{},
     attempt: u32 = 0,
-    pending_dial: ?DirectDialRequest = null,
+    pending_dial: ?PendingDial = null,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config, role: Role) Coordinator {
         return .{ .allocator = allocator, .cfg = cfg, .role = role };
@@ -78,28 +103,30 @@ pub const Coordinator = struct {
         const now = wall_time.milliTimestamp();
         const rtt = if (self.connect_sent_ms) |t| now - t else 0;
         const fire_at = now + @divTrunc(rtt, 2);
-        self.pending_dial = .{
-            .addrs = self.remote_addrs,
-            .fire_at_ms = fire_at,
-        };
+        self.pending_dial = .{ .fire_at_ms = fire_at };
         return try self.buildSync();
     }
 
-    /// Responder: received SYNC — dial immediately.
+    /// Responder: received SYNC — dial immediately. The returned request owns
+    /// its `addrs` copy; caller must `request.deinit(allocator)` when done.
     pub fn onRemoteSync(self: *Coordinator) Error!DirectDialRequest {
         if (self.connect_sent_ms == null) return error.ProtocolError;
-        self.pending_dial = .{
-            .addrs = self.remote_addrs,
-            .fire_at_ms = @intCast(wall_time.milliTimestamp()),
+        const now_ms = @as(i64, @intCast(wall_time.milliTimestamp()));
+        self.pending_dial = .{ .fire_at_ms = now_ms };
+        return .{
+            .addrs = try dupeAddrs(self.allocator, self.remote_addrs),
+            .fire_at_ms = now_ms,
         };
-        return self.pending_dial.?;
     }
 
+    /// Returns an owned DirectDialRequest when the scheduled time is reached.
+    /// Caller must `request.deinit(allocator)` to free the duped `addrs`.
     pub fn pollDial(self: *Coordinator, now_ms: i64) ?DirectDialRequest {
-        const req = self.pending_dial orelse return null;
-        if (now_ms < req.fire_at_ms) return null;
+        const p = self.pending_dial orelse return null;
+        if (now_ms < p.fire_at_ms) return null;
         self.pending_dial = null;
-        return req;
+        const owned_addrs = dupeAddrs(self.allocator, self.remote_addrs) catch return null;
+        return .{ .addrs = owned_addrs, .fire_at_ms = p.fire_at_ms };
     }
 
     pub fn runInitiatorExchange(
@@ -120,7 +147,11 @@ pub const Coordinator = struct {
         const sync = try self.onRemoteConnectReply(reply_frame);
         defer self.allocator.free(sync);
         wire.writeLengthPrefixed(w, sync) catch return error.IoWriteFailed;
-        return self.pending_dial orelse return error.ProtocolError;
+        const p = self.pending_dial orelse return error.ProtocolError;
+        return .{
+            .addrs = try dupeAddrs(self.allocator, self.remote_addrs),
+            .fire_at_ms = p.fire_at_ms,
+        };
     }
 
     pub fn runResponderExchange(

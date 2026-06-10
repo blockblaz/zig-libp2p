@@ -1,4 +1,9 @@
 //! In-process three-node relay scenario (A reserves on R, B connects via R) (#91).
+//!
+//! HOP CONNECT is now intentionally rejected by `Server.handleHopStream`
+//! (the real bridge path lives in `transport/quic_relay_live.zig`), so this
+//! test asserts the expected `unexpected_message` status on the connect leg
+//! rather than `ok`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -7,17 +12,7 @@ const wire = @import("wire.zig");
 const server = @import("server.zig");
 const client = @import("client.zig");
 
-const OpenStub = struct {
-    fn open(ctx: ?*anyopaque, target: identity.PeerId, initiator: []const u8, limit: ?wire.LimitView) server.OpenStopResult {
-        _ = ctx;
-        _ = target;
-        _ = initiator;
-        _ = limit;
-        return .ok;
-    }
-};
-
-test "three-node reserve then connect" {
+test "three-node reserve then connect (connect rejected at protocol layer)" {
     const a = std.testing.allocator;
     const relay_id = try identity.PeerId.random();
     const peer_a = try identity.PeerId.random();
@@ -25,7 +20,7 @@ test "three-node reserve then connect" {
 
     var relay_srv = server.Server.init(a, .{
         .relay_addrs = &.{"/ip4/203.0.113.1/udp/4001/quic-v1"},
-    }, relay_id, OpenStub.open);
+    }, relay_id);
     defer relay_srv.deinit();
 
     // Peer A reserves on relay R.
@@ -46,7 +41,9 @@ test "three-node reserve then connect" {
     try a_client.parseReserveResponse(reserve_frame, relay_id);
     try std.testing.expect(a_client.reservation != null);
 
-    // Peer B connects to A through R.
+    // Peer B connects to A through R. CONNECT is rejected by the protocol
+    // layer — bridging happens in the transport layer (LiveRelay), which
+    // routes CONNECT before handleHopStream sees it.
     var b_client = client.Client.init(a, .{});
     const connect_req = try b_client.buildConnectRequest(peer_a);
     defer a.free(connect_req);
@@ -62,5 +59,5 @@ test "three-node reserve then connect" {
     defer a.free(connect_frame);
     var connect_msg = try wire.decodeHopOwned(a, connect_frame, .standard);
     defer connect_msg.deinit(a);
-    try std.testing.expectEqual(wire.Status.ok, connect_msg.status.?);
+    try std.testing.expectEqual(wire.Status.unexpected_message, connect_msg.status.?);
 }
