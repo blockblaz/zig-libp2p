@@ -943,6 +943,7 @@ pub const QuicRuntime = struct {
                 self.host.runPeriodicTicks(now_ms) catch |err| {
                     log.warn("quic_runtime: host periodic ticks: {s}", .{@errorName(err)});
                 };
+                self.drainGossipsubOutbox();
             }
         }
     }
@@ -1069,11 +1070,39 @@ pub const QuicRuntime = struct {
         const a = self.allocator;
         const rpc_frame = gossipsub_rpc.encodeSubscribe(a, topic, true) catch return null;
         defer a.free(rpc_frame);
+        return lengthPrefixGossipRpcFrame(a, rpc_frame);
+    }
+
+    /// Wrap a raw gossipsub `RPC` protobuf blob in the unsigned-varint length prefix
+    /// required on every `/meshsub/1.1.0` stream frame (persistent or per-message).
+    fn lengthPrefixGossipRpcFrame(allocator: std.mem.Allocator, rpc_frame: []const u8) ?[]u8 {
         var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(a);
-        varint.append(&buf, a, @intCast(rpc_frame.len)) catch return null;
-        buf.appendSlice(a, rpc_frame) catch return null;
-        return buf.toOwnedSlice(a) catch null;
+        defer buf.deinit(allocator);
+        varint.append(&buf, allocator, @intCast(rpc_frame.len)) catch return null;
+        buf.appendSlice(allocator, rpc_frame) catch return null;
+        return buf.toOwnedSlice(allocator) catch null;
+    }
+
+    /// Drain directed gossipsub control frames (GRAFT, PRUNE, IHAVE, IWANT, mesh
+    /// forwards) queued by [`Gossipsub.heartbeat`] and [`Gossipsub.handleInboundRpc`].
+    ///
+    /// Without this, zeam sends SUBSCRIBE on the persistent `/meshsub/1.1.0` stream
+    /// (via [`onSubscribeCommand`]) but never ships the GRAFTs heartbeat generates.
+    /// rust-libp2p (ethlambda) only publishes to mesh peers, so aggregation gossip
+    /// from ethlambda never reaches zeam and justification stalls.
+    ///
+    /// Broadcast entries (`to == null`) are skipped here: local publish and subscribe
+    /// are already handled by [`onPublishCommand`] / [`onSubscribeCommand`].
+    fn drainGossipsubOutbox(self: *QuicRuntime) void {
+        const a = self.allocator;
+        const gs = self.host.gossipsub;
+        while (gs.popOutboxDelivery()) |d| {
+            defer a.free(d.wire);
+            const peer = d.to orelse continue;
+            if (!self.peerHasActiveConnection(peer)) continue;
+            const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
+            self.enqueueGossipFrame(peer, framed);
+        }
     }
 
     /// Open a persistent /meshsub/1.1.0 stream to `peer` if we don't already
