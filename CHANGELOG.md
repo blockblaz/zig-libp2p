@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## [0.1.17](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.16...v0.1.17) (2026-06-10)
+
+### Features
+
+* **relay,dcutr:** Circuit Relay v2 wire codec, reservation/client/server modules, live QUIC
+  bridging, and DCUtR hole-punch coordination. Closes
+  [#91](https://github.com/ch4r10t33r/zig-libp2p/issues/91). Guide:
+  [docs/RELAY.md](docs/RELAY.md), [docs/DCUTR.md](docs/DCUTR.md).
+* **transport/quic_runtime:** persistent per-peer `/meshsub/1.0.0` stream to avoid resubscribe
+  churn; closes [#183](https://github.com/ch4r10t33r/zig-libp2p/issues/183).
+
+### Notes
+
+* Relay/DCUtR interop smoke tests (`interop_quic/relay_test.sh`) cover zig↔zig paths; go/rust
+  matrix and full NAT hole punch over shared sockets remain follow-up work.
+
+## [0.1.16](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.15...v0.1.16) (2026-06-09)
+
 ### Features
 
 * **autonat:** AutoNAT v1 (`/libp2p/autonat/1.0.0`) and v2 (`/libp2p/autonat/2/*`) wire codecs,
