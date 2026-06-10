@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## [0.1.22](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.21...v0.1.22) (2026-06-10)
+
+### Fixed
+
+* **transport/quic_runtime:** respond to inbound `/ipfs/id/push/1.0.0` streams from
+  rust-libp2p identify (ethlambda opens push after the initial identify exchange).
+  Previously these streams got `na` → `ProtocolNegotiationFailed` at startup.
+  Also log accumulated byte count on other inbound handshake failures for easier
+  diagnosis.
+
 ## [0.1.21](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.20...v0.1.21) (2026-06-10)
 
 ### Fixed

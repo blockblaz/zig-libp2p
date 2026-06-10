@@ -64,8 +64,9 @@ const max_inbound_gossip_acc_bytes: usize =
 const max_inbound_req_acc_bytes: usize = (wire_framing.ExchangeLimits{}).max_accumulated;
 
 const identify_protocol_id: []const u8 = std.mem.trimEnd(u8, identify_mod.protocol_line, "\n");
+const identify_push_protocol_id: []const u8 = std.mem.trimEnd(u8, identify_mod.push_protocol_line, "\n");
 
-const supported_protocols: [9][]const u8 = .{
+const supported_protocols: [10][]const u8 = .{
     meshsub_protocol_id,
     protocol_mod.blocks_by_root_v1,
     protocol_mod.blocks_by_range_v1,
@@ -75,6 +76,7 @@ const supported_protocols: [9][]const u8 = .{
     dcutr_mod.wire.protocol_id,
     identify_protocol_id,
     ping_mod.multistream_protocol_id,
+    identify_push_protocol_id,
 };
 
 const proto_meshsub: usize = 0;
@@ -83,6 +85,7 @@ const proto_relay_stop: usize = 5;
 const proto_dcutr: usize = 6;
 const proto_identify: usize = 7;
 const proto_ping: usize = 8;
+const proto_identify_push: usize = 9;
 const max_inbound_relay_acc_bytes: usize = relay_mod.wire.Limits.standard.max_frame_bytes + varint.max_encoding_bytes + 64;
 
 const PemError = error{
@@ -1669,7 +1672,14 @@ pub const QuicRuntime = struct {
                         continue;
                     },
                     else => {
-                        log.warn("quic_runtime: inbound responder handshake failed: {s}", .{@errorName(err)});
+                        if (ist.ms_acc.items.len > 0) {
+                            log.warn("quic_runtime: inbound responder handshake failed: {s} (accumulated {d} bytes)", .{
+                                @errorName(err),
+                                ist.ms_acc.items.len,
+                            });
+                        } else {
+                            log.warn("quic_runtime: inbound responder handshake failed: {s}", .{@errorName(err)});
+                        }
                         // FIN our write half on `na` instead of releasing the
                         // stream — releasing resets it on the wire, which
                         // rust-libp2p's connection handler interprets as a
@@ -1905,6 +1915,20 @@ pub const QuicRuntime = struct {
                         continue;
                     };
                     ist.ms_tail.clearRetainingCapacity();
+                    ist.raw.writeAllFin(&.{});
+                    self.removeInboundStreamAt(i);
+                    continue;
+                },
+                proto_identify_push => {
+                    // rust-libp2p identify opens `/ipfs/id/push/1.0.0` after the
+                    // initial exchange to push listen-addrs updates. Receive-only:
+                    // drain any pushed protobuf and half-close cleanly.
+                    self.drainMsTailInto(ist, &ist.req_acc, max_inbound_req_acc_bytes);
+                    const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id);
+                    if (recv_buf) |rb| {
+                        if (rb.len > ist.raw.read_cursor) ist.raw.read_cursor = rb.len;
+                    }
+                    ist.req_acc.clearRetainingCapacity();
                     ist.raw.writeAllFin(&.{});
                     self.removeInboundStreamAt(i);
                     continue;
