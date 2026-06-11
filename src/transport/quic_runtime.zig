@@ -341,37 +341,50 @@ const OutboundPublish = struct {
     wire: []u8,
 };
 
-/// Persistent per-peer outbound `/meshsub/1.1.0` stream — one stream per peer
-/// for the connection's lifetime, multiplexes SUBSCRIBE / GRAFT / PRUNE /
-/// IHAVE / IWANT / publish RPCs back-to-back without FIN (#183).
+/// Persistent per-peer outbound `/meshsub/1.1.0` stream — exactly one stream
+/// per peer for the connection's lifetime. All gossipsub RPCs (SUBSCRIBE,
+/// GRAFT, PRUNE, IHAVE, IWANT, **publish**) multiplex onto this stream
+/// back-to-back without FIN.
 ///
-/// rust-libp2p (and go-libp2p) expect this shape: a single long-lived control
-/// stream per peer rather than zig's older per-message-stream-then-FIN
-/// pattern. With the latter, rust's gossipsub stream-manager sees the FIN on
-/// what it thinks is the active outbound control stream and the codec
-/// framing collapses (`Failed to encode/decode message` → `Peer disconnected`).
+/// **Why only one stream:** rust-libp2p's gossipsub handler caps inbound
+/// substreams per connection at `MAX_SUBSTREAM_ATTEMPTS = 1`
+/// (`MaxInboundSubstreams` in `GossipsubHandlerError`). Opening a second
+/// `/meshsub` stream — whether for a publish (per-message-stream pattern) or
+/// to retry after a wedge — trips that limit, the rust handler is disabled,
+/// and **all** gossip on that connection dies permanently.
+///
+/// Consequently this code never:
+///   * opens a per-message publish stream (publishes ride this stream too);
+///   * recreates the stream after a wedge (a wedge means the peer's gossip
+///     handler is broken — opening a new stream cannot fix it).
+///
+/// On wedge: the stream is marked `broken`, outbox is dropped, and a single
+/// warn is logged. The QUIC connection eventually times out via keepalive or
+/// is closed by the peer, at which point our connection_manager redials and
+/// `ensurePersistentGossipStream` opens a fresh stream on the new connection.
 const PersistentGossipStream = struct {
     peer: identity.PeerId,
     stream_id: u64,
     raw: PublishBidiStream,
     handshake_sent: bool = false,
     handshake_done: bool = false,
-    /// Drive-loop ticks spent waiting for the multistream responder after
-    /// `handshake_sent`. If this exceeds [`persistent_gossip_handshake_tick_max`]
-    /// while the outbox is non-empty, the stream is torn down and reopened so
-    /// a wedged negotiation does not stall all zeam→peer gossip forever.
-    handshake_wait_ticks: u32 = 0,
+    /// Set when the multistream-select handshake or a frame write fails.
+    /// Once broken, the stream is never revived for the remainder of the
+    /// underlying QUIC connection's lifetime; new outbox enqueues are dropped
+    /// and the drain loop skips this entry.
+    broken: bool = false,
     /// Queue of `uvarint(len) + RPC protobuf` frames waiting to be flushed
     /// once the multistream-select handshake completes. Bytes are heap-owned;
-    /// drained in FIFO order.
+    /// drained in FIFO order. Capped at [`persistent_gossip_outbox_cap`] so a
+    /// peer that never reads cannot make us hold unbounded memory before the
+    /// QUIC keepalive notices and tears down the connection.
     outbox: std.ArrayList([]u8) = .empty,
 };
 
-/// Max [`QuicRuntime.driveLoop`] iterations to wait for a persistent gossip
-/// stream's multistream handshake before recreating the stream. At ~1ms/tick
-/// this is ~2s — long enough for a slow peer, short enough to recover from a
-/// wedged `/meshsub` responder without losing the queued outbox.
-const persistent_gossip_handshake_tick_max: u32 = 2000;
+/// Hard cap on queued outbox frames per peer before the persistent gossip
+/// stream is marked broken. Picked to accommodate ~30 seconds of gossip on a
+/// healthy mainnet topic without unbounded growth on a wedged peer.
+const persistent_gossip_outbox_cap: usize = 1024;
 
 /// A queued command from the swarm hook to the drive thread.
 const HookWork = union(enum) {
@@ -1069,28 +1082,11 @@ pub const QuicRuntime = struct {
 
         for (peers.items) |peer| {
             const wire_dup = a.dupe(u8, wire_buf.items) catch continue;
-            // Publishes use the per-message-stream pattern (open, handshake,
-            // one length-prefixed frame, FIN). rust-libp2p expects short-lived
-            // publish streams and keeps a separate long-lived control stream for
-            // SUBSCRIBE / GRAFT / PRUNE. Routing publishes through the
-            // persistent stream wedged zeam→ethlambda gossip after ~10 slots.
-            self.startPublishToPeer(peer, wire_dup);
-        }
-    }
-
-    /// Open a per-message `/meshsub` publish stream to `peer` (outbound dial or
-    /// inbound accept) and queue it on [`outbound_publishes`].
-    fn startPublishToPeer(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) void {
-        if (self.outbound_by_peer.contains(peer)) {
-            self.startOutboundPublish(peer, wire) catch {
-                self.allocator.free(wire);
-            };
-        } else if (self.inbound_by_peer.contains(peer)) {
-            self.startInboundPublish(peer, wire) catch {
-                self.allocator.free(wire);
-            };
-        } else {
-            self.allocator.free(wire);
+            // Publishes ride the single per-peer persistent `/meshsub` stream
+            // alongside SUBSCRIBE / GRAFT / PRUNE. See [`PersistentGossipStream`]
+            // for why opening a per-message stream here would trip rust-libp2p's
+            // `MaxInboundSubstreams` cap and kill all gossip on the connection.
+            self.enqueueGossipFrame(peer, wire_dup);
         }
     }
 
@@ -1211,74 +1207,56 @@ pub const QuicRuntime = struct {
             self.allocator.free(wire);
             return;
         };
+        if (g.broken) {
+            self.allocator.free(wire);
+            return;
+        }
+        if (g.outbox.items.len >= persistent_gossip_outbox_cap) {
+            log.warn(
+                "quic_runtime: persistent gossip outbox cap ({d}) hit for peer; marking stream broken",
+                .{persistent_gossip_outbox_cap},
+            );
+            self.markPersistentGossipBroken(g);
+            self.allocator.free(wire);
+            return;
+        }
         g.outbox.append(self.allocator, wire) catch {
             self.allocator.free(wire);
         };
     }
 
-    /// Half-close the write side of a persistent gossip stream so rust-libp2p
-    /// can retire the old `/meshsub` handler before we open a replacement.
-    /// A QUIC reset would surface as `reason=error` on the whole connection.
-    fn closePersistentGossipStreamWriteHalf(g: *PersistentGossipStream) void {
-        if (g.handshake_sent) g.raw.finStream();
+    /// Mark the stream broken and drop all queued frames. The stream entry is
+    /// kept in the map so subsequent enqueues short-circuit instead of opening
+    /// a replacement (which would trip rust-libp2p's `MaxInboundSubstreams`).
+    fn markPersistentGossipBroken(self: *QuicRuntime, g: *PersistentGossipStream) void {
+        g.broken = true;
+        for (g.outbox.items) |w| self.allocator.free(w);
+        g.outbox.clearRetainingCapacity();
     }
 
     fn destroyPersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {
-        if (self.persistent_gossip.getPtr(peer)) |g_ptr| {
-            closePersistentGossipStreamWriteHalf(g_ptr.*);
-        }
         const g = self.persistent_gossip.fetchRemove(peer) orelse return;
         for (g.value.outbox.items) |w| self.allocator.free(w);
         g.value.outbox.deinit(self.allocator);
         self.allocator.destroy(g.value);
     }
 
-    /// Tear down a wedged persistent `/meshsub` stream and open a fresh one,
-    /// preserving any queued gossip RPC frames. The old QUIC stream slot is
-    /// half-closed (write FIN) before abandoning so rust-libp2p does not keep
-    /// a stale handler that blocks the replacement stream.
-    fn recreatePersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {
-        const a = self.allocator;
-        var preserved: std.ArrayList([]u8) = .empty;
-        defer preserved.deinit(a);
-
-        if (self.persistent_gossip.getPtr(peer)) |g_ptr| {
-            closePersistentGossipStreamWriteHalf(g_ptr.*);
-        }
-        if (self.persistent_gossip.fetchRemove(peer)) |entry| {
-            for (entry.value.outbox.items) |w| {
-                preserved.append(a, w) catch {
-                    a.free(w);
-                };
-            }
-            entry.value.outbox.deinit(a);
-            a.destroy(entry.value);
-        }
-
-        if (self.ensurePersistentGossipStream(peer)) |g| {
-            for (preserved.items) |w| {
-                g.outbox.append(a, w) catch {
-                    a.free(w);
-                };
-            }
-        } else {
-            for (preserved.items) |w| a.free(w);
-        }
-    }
-
     /// Per-tick driver for the persistent /meshsub streams: complete the
     /// multistream-select handshake, then drain the outbox onto the wire.
-    /// Never FINs. On handshake or write failure the stream is recreated so
-    /// a single wedged `/meshsub` control stream cannot silence all gossip to
-    /// a peer for the rest of the connection (zeam→ethlambda attestations).
+    /// Never FINs.
+    ///
+    /// On handshake or write failure the stream is marked **broken** for the
+    /// rest of the underlying QUIC connection — no retry, no replacement
+    /// stream. See [`PersistentGossipStream`] for why opening a second
+    /// `/meshsub` stream would kill all gossip to the peer instead of
+    /// recovering anything.
     fn advancePersistentGossipStreams(self: *QuicRuntime) void {
         const a = self.allocator;
-        var peers_to_recreate: std.ArrayList(identity.PeerId) = .empty;
-        defer peers_to_recreate.deinit(a);
 
         var it = self.persistent_gossip.valueIterator();
         while (it.next()) |g_ptr| {
             const g = g_ptr.*;
+            if (g.broken) continue;
             if (!g.handshake_sent) {
                 var out: std.ArrayList(u8) = .empty;
                 defer out.deinit(a);
@@ -1292,43 +1270,32 @@ pub const QuicRuntime = struct {
                     meshsub_initiator_offer,
                     .delimited,
                 ) catch {
-                    peers_to_recreate.append(a, g.peer) catch {};
+                    log.warn("quic_runtime: persistent gossip handshake build failed; marking stream broken", .{});
+                    self.markPersistentGossipBroken(g);
                     continue;
                 };
                 var w = g.raw.writer();
                 std.Io.Writer.writeAll(&w, out.items) catch {
-                    peers_to_recreate.append(a, g.peer) catch {};
+                    log.warn("quic_runtime: persistent gossip handshake write failed; marking stream broken", .{});
+                    self.markPersistentGossipBroken(g);
                     continue;
                 };
                 std.Io.Writer.flush(&w) catch {};
                 g.handshake_sent = true;
             }
             if (!g.handshake_done) {
-                if (g.raw.unreadRecvLen() == 0) {
-                    if (g.handshake_sent and g.outbox.items.len > 0) {
-                        g.handshake_wait_ticks +|= 1;
-                        if (g.handshake_wait_ticks >= persistent_gossip_handshake_tick_max) {
-                            log.warn(
-                                "quic_runtime: persistent gossip handshake timed out for peer (outbox={d} frames), recreating stream",
-                                .{g.outbox.items.len},
-                            );
-                            peers_to_recreate.append(a, g.peer) catch {};
-                        }
-                    }
-                    continue;
-                }
+                if (g.raw.unreadRecvLen() == 0) continue;
                 var r = g.raw.reader();
                 var w = g.raw.writer();
                 stream_multistream.initiatorHandshakeMeshsubReadPhase(&r, &w, a, null) catch |err| {
                     log.warn(
-                        "quic_runtime: persistent gossip handshake failed: {s}, recreating stream",
+                        "quic_runtime: persistent gossip handshake failed: {s}; marking stream broken",
                         .{@errorName(err)},
                     );
-                    peers_to_recreate.append(a, g.peer) catch {};
+                    self.markPersistentGossipBroken(g);
                     continue;
                 };
                 g.handshake_done = true;
-                g.handshake_wait_ticks = 0;
             }
             // Only drain the outbox AFTER multistream-select completes —
             // otherwise the gossipsub RPC bytes would arrive before the
@@ -1352,31 +1319,19 @@ pub const QuicRuntime = struct {
                 };
                 if (write_failed) {
                     log.warn(
-                        "quic_runtime: persistent gossip write failed for peer after {d}/{d} frames, recreating stream",
+                        "quic_runtime: persistent gossip write failed for peer after {d}/{d} frames; marking stream broken",
                         .{ sent, g.outbox.items.len },
                     );
-                    // Frames `[0..sent)` were freed; `[sent..]` are still owned.
-                    // Compact to valid tail only before recreate copies the outbox.
+                    // Free the unsent tail before marking broken (which clears).
                     if (sent < g.outbox.items.len) {
-                        const tail = g.outbox.items[sent..];
-                        g.outbox.clearRetainingCapacity();
-                        for (tail) |frame| {
-                            g.outbox.append(a, frame) catch {
-                                a.free(frame);
-                            };
-                        }
-                    } else {
-                        g.outbox.clearRetainingCapacity();
+                        for (g.outbox.items[sent..]) |frame| a.free(frame);
                     }
-                    peers_to_recreate.append(a, g.peer) catch {};
+                    g.outbox.clearRetainingCapacity();
+                    self.markPersistentGossipBroken(g);
                 } else {
                     g.outbox.clearRetainingCapacity();
                 }
             }
-        }
-
-        for (peers_to_recreate.items) |peer| {
-            self.recreatePersistentGossipStream(peer);
         }
     }
 
