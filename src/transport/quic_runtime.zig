@@ -56,7 +56,14 @@ const quic_dcutr_live = @import("quic_dcutr_live.zig");
 const zquic = @import("zquic");
 const ZIo = zquic.transport.io;
 
+/// Canonical gossipsub multistream protocol id zeam uses for *outgoing* streams.
+/// Inbound streams accept the wider `/meshsub/1.0.0`–`/meshsub/1.3.0` set so we can interop
+/// with rust-libp2p peers (e.g. ethlambda) that offer the highest version they support first
+/// and tear the stream down on `na` without trying lower versions.
 const meshsub_protocol_id: []const u8 = "/meshsub/1.1.0";
+const meshsub_protocol_id_v10: []const u8 = "/meshsub/1.0.0";
+const meshsub_protocol_id_v12: []const u8 = "/meshsub/1.2.0";
+const meshsub_protocol_id_v13: []const u8 = "/meshsub/1.3.0";
 
 /// Per-stream inbound accumulator caps (#119).
 const max_inbound_gossip_acc_bytes: usize =
@@ -66,8 +73,15 @@ const max_inbound_req_acc_bytes: usize = (wire_framing.ExchangeLimits{}).max_acc
 const identify_protocol_id: []const u8 = std.mem.trimEnd(u8, identify_mod.protocol_line, "\n");
 const identify_push_protocol_id: []const u8 = std.mem.trimEnd(u8, identify_mod.push_protocol_line, "\n");
 
-const supported_protocols: [10][]const u8 = .{
-    meshsub_protocol_id,
+const supported_protocols: [13][]const u8 = .{
+    // Meshsub variants first, highest version preferred so rust-libp2p's offer of the
+    // newest version is accepted on the first round. Any of these maps to the same
+    // gossipsub-1.1 dispatch path because newer wire fields are protobuf-additive and
+    // ignored by a 1.1 decoder.
+    meshsub_protocol_id_v13,
+    meshsub_protocol_id_v12,
+    meshsub_protocol_id, // /meshsub/1.1.0 — canonical, also offered by our initiator
+    meshsub_protocol_id_v10,
     protocol_mod.blocks_by_root_v1,
     protocol_mod.blocks_by_range_v1,
     protocol_mod.status_v1,
@@ -79,13 +93,25 @@ const supported_protocols: [10][]const u8 = .{
     identify_push_protocol_id,
 };
 
+/// Last index in `supported_protocols` that should be dispatched as the gossipsub
+/// `/meshsub/*` path. Used by `normalizeProtocolIndex` to collapse the four versioned
+/// entries onto `proto_meshsub`.
+const proto_meshsub_last_index: usize = 3;
 const proto_meshsub: usize = 0;
-const proto_relay_hop: usize = 4;
-const proto_relay_stop: usize = 5;
-const proto_dcutr: usize = 6;
-const proto_identify: usize = 7;
-const proto_ping: usize = 8;
-const proto_identify_push: usize = 9;
+const proto_relay_hop: usize = 7;
+const proto_relay_stop: usize = 8;
+const proto_dcutr: usize = 9;
+const proto_identify: usize = 10;
+const proto_ping: usize = 11;
+const proto_identify_push: usize = 12;
+
+/// Map a `supported_protocols` index returned by the multistream responder onto the
+/// canonical per-protocol dispatch index. Today this only collapses the four meshsub
+/// variants onto `proto_meshsub`; non-meshsub indices are returned unchanged.
+fn normalizeProtocolIndex(ix: usize) usize {
+    if (ix <= proto_meshsub_last_index) return proto_meshsub;
+    return ix;
+}
 const max_inbound_relay_acc_bytes: usize = relay_mod.wire.Limits.standard.max_frame_bytes + varint.max_encoding_bytes + 64;
 
 const PemError = error{
@@ -1810,7 +1836,7 @@ pub const QuicRuntime = struct {
                     };
                 };
                 ist.handshake_done = true;
-                ist.protocol_index = ix;
+                ist.protocol_index = normalizeProtocolIndex(ix);
                 ist.sender_peer = sender;
 
                 // Lazily notify host of new inbound connection (once per listener slot).
@@ -2043,9 +2069,9 @@ pub const QuicRuntime = struct {
                         continue;
                     }
                     const proto: protocol_mod.LeanSupportedProtocol = switch (idx) {
-                        1 => .blocks_by_root,
-                        2 => .blocks_by_range,
-                        3 => .status,
+                        proto_meshsub_last_index + 1 => .blocks_by_root,
+                        proto_meshsub_last_index + 2 => .blocks_by_range,
+                        proto_meshsub_last_index + 3 => .status,
                         else => {
                             i += 1;
                             continue;
