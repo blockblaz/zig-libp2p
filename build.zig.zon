@@ -1,7 +1,7 @@
 .{
     .name = .zig_libp2p,
     // x-release-please-start-version
-    .version = "0.1.41",
+    .version = "0.1.42",
     // x-release-please-end
     .fingerprint = 0x6e2dd2ac84762996,
     .minimum_zig_version = "0.16.0",
@@ -24,8 +24,8 @@
         },
         .zquic = .{
             // v1.6.16 — libp2p QUIC transport preset + closeConnection for gossip recovery.
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.16#c329840b6c084569ea7857268ab6e93d63836e6e",
-            .hash = "zquic-1.6.16-2zRc1HaKEwBjIAkUKJgTus4YpfdMTFw-JUI5Q3e35_0l",
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.17#f8777768c20c72232649d553aafe6674700afca3",
+            .hash = "zquic-1.6.17-2zRc1MiYEwDPNW0zkYFN_ZVoxArgawYfAOIRyDy55cKT",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",
