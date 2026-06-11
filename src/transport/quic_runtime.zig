@@ -822,7 +822,7 @@ pub const QuicRuntime = struct {
         const client = slot.outbound.client;
         while (true) {
             const scan = quic_endpoint.popNextUnreportedServerBidiStream(
-                &client.conn,
+                client,
                 &slot.peer_stream_reported,
             );
             const sid = scan.stream_id orelse break;
@@ -1523,7 +1523,7 @@ pub const QuicRuntime = struct {
         // /meshsub/1.1.0 stream and FINs) exhausts all slots within ~30 s
         // of normal traffic and every subsequent inbound STREAM frame is
         // silently dropped by zquic.  See ch4r10t33r/zquic#149.
-        _ = ZIo.releaseRawAppStream(ist.conn, ist.stream_id, self.allocator);
+        _ = ist.raw.release(self.allocator);
         if (ist.channel_id) |cid| _ = self.channel_to_inbound.remove(cid);
         ist.req_acc.deinit(self.allocator);
         ist.gossip_acc.deinit(self.allocator);
@@ -1545,7 +1545,7 @@ pub const QuicRuntime = struct {
 
     fn appendRelayAcc(self: *QuicRuntime, ist: *InboundStream) void {
         self.drainMsTailInto(ist, &ist.relay_acc, max_inbound_relay_acc_bytes);
-        const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse return;
+        const recv_buf = ist.raw.recvBuffer() orelse return;
         if (recv_buf.len <= ist.raw.read_cursor) return;
         const new_bytes = recv_buf[ist.raw.read_cursor..];
         self.appendInboundAccBounded(&ist.relay_acc, new_bytes, max_inbound_relay_acc_bytes) catch {
@@ -1729,7 +1729,7 @@ pub const QuicRuntime = struct {
             // `ms_acc` intact and try again next tick, instead of losing the
             // bytes the helper already consumed into its local accumulator.
             if (!ist.handshake_done) {
-                const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id);
+                const recv_buf = ist.raw.recvBuffer();
                 if (recv_buf) |rb| {
                     if (rb.len > ist.raw.read_cursor) {
                         const new_bytes = rb[ist.raw.read_cursor..];
@@ -1850,7 +1850,7 @@ pub const QuicRuntime = struct {
                     // complete frame in the accumulator and hand each to
                     // `host.handleGossipRpc` for sender attribution.
                     self.drainMsTailInto(ist, &ist.gossip_acc, max_inbound_gossip_acc_bytes);
-                    const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse {
+                    const recv_buf = ist.raw.recvBuffer() orelse {
                         i += 1;
                         continue;
                     };
@@ -1870,7 +1870,7 @@ pub const QuicRuntime = struct {
                         // can absorb the next inbound per-message stream.
                         // Without this, finned-and-drained streams stay in
                         // inbound_streams forever and the slot table fills.
-                        if (ZIo.rawAppStreamFinReceived(ist.conn, ist.stream_id)) {
+                        if (ist.raw.finReceived()) {
                             self.removeInboundStreamAt(i);
                             continue;
                         }
@@ -1926,9 +1926,7 @@ pub const QuicRuntime = struct {
                     // accumulator down to nothing, the stream is done — drop
                     // it so the zquic 64-slot raw-app table can take the
                     // next inbound stream (see ch4r10t33r/zquic#149).
-                    if (ist.gossip_acc.items.len == 0 and
-                        ZIo.rawAppStreamFinReceived(ist.conn, ist.stream_id))
-                    {
+                    if (ist.gossip_acc.items.len == 0 and ist.raw.finReceived()) {
                         self.removeInboundStreamAt(i);
                         continue;
                     }
@@ -2020,7 +2018,7 @@ pub const QuicRuntime = struct {
                     // initial exchange to push listen-addrs updates. Receive-only:
                     // drain any pushed protobuf and half-close cleanly.
                     self.drainMsTailInto(ist, &ist.req_acc, max_inbound_req_acc_bytes);
-                    const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id);
+                    const recv_buf = ist.raw.recvBuffer();
                     if (recv_buf) |rb| {
                         if (rb.len > ist.raw.read_cursor) ist.raw.read_cursor = rb.len;
                     }
@@ -2032,7 +2030,7 @@ pub const QuicRuntime = struct {
                 else => |idx| {
                     // SSZ req/resp path.
                     if (ist.response_fin_sent) {
-                        if (ZIo.rawAppStreamFinReceived(ist.conn, ist.stream_id)) {
+                        if (ist.raw.finReceived()) {
                             self.removeInboundStreamAt(i);
                             continue;
                         }
@@ -2058,7 +2056,7 @@ pub const QuicRuntime = struct {
                     // bytes destructively on partial errors so we maintain our
                     // own accumulating buffer and decode straight from it.
                     self.drainMsTailInto(ist, &ist.req_acc, max_inbound_req_acc_bytes);
-                    const recv_buf = ZIo.rawAppRecvBuffer(ist.conn, ist.stream_id) orelse {
+                    const recv_buf = ist.raw.recvBuffer() orelse {
                         i += 1;
                         continue;
                     };
@@ -2071,7 +2069,7 @@ pub const QuicRuntime = struct {
                         };
                         ist.raw.read_cursor = recv_buf.len;
                     }
-                    const peer_fin = ZIo.rawAppStreamFinReceived(ist.conn, ist.stream_id);
+                    const peer_fin = ist.raw.finReceived();
                     if (ist.req_acc.items.len == 0) {
                         if (peer_fin) {
                             self.removeInboundStreamAt(i);

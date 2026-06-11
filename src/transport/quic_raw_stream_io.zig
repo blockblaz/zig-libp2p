@@ -73,7 +73,7 @@ fn clientRawWriterDrain(w: *Io.Writer, data: []const []const u8, splat: usize) I
 
 fn serverRawReaderStream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
     const self: *RawAppBidiServer = @alignCast(@fieldParentPtr("reader_scratch", @as(*[2048]u8, @ptrCast(@alignCast(r.buffer.ptr)))));
-    const buf = ZIo.rawAppRecvBuffer(self.conn, self.stream_id) orelse return error.ReadFailed;
+    const buf = self.recvBuffer() orelse return error.ReadFailed;
     if (self.read_cursor >= buf.len) return error.ReadFailed;
     const avail = buf[self.read_cursor..];
     const max_out: usize = if (limit == .unlimited) avail.len else @min(avail.len, @intFromEnum(limit));
@@ -222,8 +222,32 @@ pub const RawAppBidiServer = struct {
 
     /// Bytes queued by zquic for this stream that this adapter has not yet consumed.
     pub fn unreadRecvLen(self: *const RawAppBidiServer) usize {
-        const buf = ZIo.rawAppRecvBuffer(self.conn, self.stream_id) orelse return 0;
+        const buf = self.recvBuffer() orelse return 0;
         return buf.len - self.read_cursor;
+    }
+
+    /// Pending receive buffer for this stream.
+    ///
+    /// When `client` is set this is a *remote-initiated* stream on an outbound (client-side)
+    /// QUIC connection — the inbound bytes live in the client's `raw_app_recv` slot table.
+    /// Otherwise this is an ordinary inbound stream on a listener-side connection and the
+    /// bytes live in `conn.raw_app_streams`.
+    pub fn recvBuffer(self: *const RawAppBidiServer) ?[]const u8 {
+        if (self.client) |c| return c.rawAppRecvBuffer(self.stream_id);
+        return ZIo.rawAppRecvBuffer(self.conn, self.stream_id);
+    }
+
+    /// Whether the peer has sent FIN on this stream. Routes to the client-side helper when
+    /// the adapter is wrapping a remote-initiated stream on an outbound connection.
+    pub fn finReceived(self: *const RawAppBidiServer) bool {
+        if (self.client) |c| return c.rawAppStreamFinReceived(self.stream_id);
+        return ZIo.rawAppStreamFinReceived(self.conn, self.stream_id);
+    }
+
+    /// Release the zquic-side raw_app slot so the per-connection table doesn't fill up.
+    pub fn release(self: *RawAppBidiServer, allocator: std.mem.Allocator) bool {
+        if (self.client) |c| return c.releaseRawAppStream(self.stream_id);
+        return ZIo.releaseRawAppStream(self.conn, self.stream_id, allocator);
     }
 
     /// Send `data` on the raw stream with FIN set on the last chunk (go-libp2p identify expects EOF).

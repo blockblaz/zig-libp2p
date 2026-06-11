@@ -96,9 +96,15 @@ pub fn popNextUnreportedPeerBidiStream(conn: *ZIo.ConnState, reported: *std.bit_
 /// server-initiated bidi streams have IDs `1, 5, 9, …` (type bits = 01). This mirrors
 /// [`popNextUnreportedPeerBidiStream`] but selects the opposite parity so that remote-opened
 /// gossipsub streams on a zeam-dialled connection are surfaced to the inbound-stream handler.
-pub fn popNextUnreportedServerBidiStream(conn: *ZIo.ConnState, reported: *std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams)) InboundStreamScan {
+///
+/// Note: STREAM frames received by a [`ZIo.Client`] land in `Client.raw_app_recv` (a
+/// separate slot table from the server-side `conn.raw_app_streams`), so this helper must
+/// iterate the client-side recv table — using `conn.raw_app_streams` here would never see
+/// any server-initiated streams. This was the silent miss behind ethlambda → zeam gossip
+/// being dropped entirely.
+pub fn popNextUnreportedServerBidiStream(client: *ZIo.Client, reported: *std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams)) InboundStreamScan {
     var over_cap: u32 = 0;
-    for (&conn.raw_app_streams) |*slot| {
+    for (&client.raw_app_recv) |*slot| {
         if (!slot.active) continue;
         const sid = slot.stream_id;
         if (sid % 4 != 1) continue; // server-initiated bidi: type bits = 01
