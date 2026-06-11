@@ -8,12 +8,11 @@
 //! gossipsub publish / receive path are implemented end-to-end — the
 //! corresponding loopback tests at the bottom of this file are the truth
 //! gate. TLS identity is configured via [`TlsPemSource`] (on-disk PEM paths or
-//! in-memory PEM bytes materialized for zquic on create; #129). Outbound publish opens one `/meshsub/1.1.0` stream per currently
-//! connected peer per message (per-message-stream pattern), runs the
-//! initiator multistream handshake, then writes one `uvarint(len) + RPC
-//! protobuf` frame and FINs the stream. Inbound `/meshsub/1.1.0` streams
-//! drain length-prefixed frames into [`host_mod.Host.handleGossipRpc`]
-//! with the verified sender peer id.
+//! in-memory PEM bytes materialized for zquic on create; #129). Outbound gossip
+//! uses one persistent `/meshsub/1.1.0` stream per peer on the **outbound**
+//! (locally-dialed) QUIC connection; SUBSCRIBE and publish RPCs share that
+//! stream. Inbound `/meshsub/1.1.0` streams drain length-prefixed frames into
+//! [`host_mod.Host.handleGossipRpc`] with the verified sender peer id.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -331,7 +330,13 @@ const PublishBidiStream = union(enum) {
     fn finStream(self: *PublishBidiStream) void {
         switch (self.*) {
             .outbound => |*c| c.client.sendRawStreamData(c.stream_id, c.send_offset, &[_]u8{}, true),
-            .inbound => |*s| s.server.sendRawStreamData(s.conn, s.stream_id, s.send_offset, &[_]u8{}, true),
+            .inbound => |*s| {
+                if (s.client) |c| {
+                    c.sendRawStreamData(s.stream_id, s.send_offset, &[_]u8{}, true);
+                } else {
+                    s.server.sendRawStreamData(s.conn, s.stream_id, s.send_offset, &[_]u8{}, true);
+                }
+            },
         }
     }
 };
@@ -1273,48 +1278,33 @@ pub const QuicRuntime = struct {
     /// Open a persistent /meshsub/1.1.0 stream to `peer` if we don't already
     /// have one. On a fresh open, queue SUBSCRIBE for every topic we've
     /// joined so the peer learns of our subscriptions on its first read.
+    ///
+    /// **Outbound dial only:** gossip publishes must ride the QUIC connection
+    /// zeam/libp2p initiated toward the peer. rust-libp2p attributes inbound
+    /// gossipsub RPCs to the dialer leg; opening the persistent stream on a
+    /// peer-initiated inbound connection delivers the first few frames then
+    /// stalls once the outbound leg comes up.
     fn ensurePersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) ?*PersistentGossipStream {
-        if (self.persistent_gossip.get(peer)) |g| return g;
+        if (self.persistent_gossip.get(peer)) |existing| return existing;
+
+        const slot = self.outbound_by_peer.get(peer) orelse return null;
         const a = self.allocator;
 
         var raw: PublishBidiStream = undefined;
         var stream_id: u64 = undefined;
-        if (self.outbound_by_peer.get(peer)) |slot| {
-            const sid = slot.outbound.nextLocalBidiStream() catch |err| {
-                var peer_buf: [128]u8 = undefined;
-                log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=outbound err={s}", .{
-                    peerBase58(peer, &peer_buf),
-                    @errorName(err),
-                });
-                return null;
-            };
-            stream_id = sid;
-            raw = .{ .outbound = .{
-                .client = slot.outbound.client,
-                .stream_id = sid,
-            } };
-        } else if (self.inbound_by_peer.get(peer)) |ic| {
-            const sid = ZIo.rawAllocateNextLocalBidiStream(ic.conn) catch |err| {
-                var peer_buf: [128]u8 = undefined;
-                log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=inbound err={s}", .{
-                    peerBase58(peer, &peer_buf),
-                    @errorName(err),
-                });
-                return null;
-            };
-            stream_id = sid;
-            raw = .{ .inbound = .{
-                .server = self.listener.server,
-                .conn = ic.conn,
-                .stream_id = sid,
-            } };
-        } else {
+        const sid = slot.outbound.nextLocalBidiStream() catch |err| {
             var peer_buf: [128]u8 = undefined;
-            log.debug("quic_runtime: persistent gossip stream open failed peer={s}: not connected", .{
+            log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=outbound err={s}", .{
                 peerBase58(peer, &peer_buf),
+                @errorName(err),
             });
             return null;
-        }
+        };
+        stream_id = sid;
+        raw = .{ .outbound = .{
+            .client = slot.outbound.client,
+            .stream_id = sid,
+        } };
 
         const g = a.create(PersistentGossipStream) catch return null;
         g.* = .{
@@ -1327,7 +1317,7 @@ pub const QuicRuntime = struct {
             return null;
         };
         var peer_buf: [128]u8 = undefined;
-        log.debug("quic_runtime: opened persistent /meshsub stream peer={s} stream_id={d}", .{
+        log.debug("quic_runtime: opened persistent /meshsub stream peer={s} stream_id={d} leg=outbound", .{
             peerBase58(peer, &peer_buf),
             stream_id,
         });
@@ -1422,6 +1412,23 @@ pub const QuicRuntime = struct {
         for (g.value.outbox.items) |w| self.allocator.free(w);
         g.value.outbox.deinit(self.allocator);
         self.allocator.destroy(g.value);
+    }
+
+    /// FIN the wire stream and drop the map entry. Used when migrating gossip
+    /// publish from a peer-dialed inbound leg to our outbound dial leg.
+    fn dropPersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {
+        const g = self.persistent_gossip.get(peer) orelse return;
+        if (g.handshake_sent and !g.broken) g.raw.finStream();
+        self.destroyPersistentGossipStream(peer);
+    }
+
+    fn replaySubscribeToPeer(self: *QuicRuntime, peer: identity.PeerId) void {
+        if (self.subscribed_topics.count() == 0) return;
+        var t_it = self.subscribed_topics.keyIterator();
+        while (t_it.next()) |topic_key| {
+            const w = self.buildSubscribeWire(topic_key.*) orelse continue;
+            self.enqueueGossipFrame(peer, w);
+        }
     }
 
     /// Per-tick driver for the persistent /meshsub streams: complete the
@@ -1689,17 +1696,24 @@ pub const QuicRuntime = struct {
             log.warn("quic_runtime: onConnectionEstablished failed: {s}", .{@errorName(err)});
         };
 
-        // For subscribed nodes, broadcast a fresh SUBSCRIBE to the new peer
-        // — the broadcast lazily opens the persistent stream via
-        // `ensurePersistentGossipStream`. We don't open eagerly when the
-        // node hasn't subscribed yet.
-        if (self.subscribed_topics.count() > 0) {
-            var t_it = self.subscribed_topics.keyIterator();
-            while (t_it.next()) |topic_key| {
-                const w = self.buildSubscribeWire(topic_key.*) orelse continue;
-                self.enqueueGossipFrame(verified, w);
+        // Tear down any stale gossip publish stream that was bound to a
+        // peer-dialed inbound leg (pre-fix builds) before replaying SUBSCRIBE
+        // on this outbound dial leg.
+        if (self.persistent_gossip.get(verified)) |g| {
+            if (g.raw == .inbound) {
+                var peer_buf: [128]u8 = undefined;
+                log.info(
+                    "quic_runtime: migrating persistent gossip from inbound to outbound leg peer={s}",
+                    .{peerBase58(verified, &peer_buf)},
+                );
+                self.dropPersistentGossipStream(verified);
             }
         }
+
+        // SUBSCRIBE replay rides the outbound dial leg only (see
+        // `ensurePersistentGossipStream`). Inbound notification may arrive
+        // before our dial completes; defer gossip wire setup until then.
+        self.replaySubscribeToPeer(verified);
     }
 
     fn failDial(self: *QuicRuntime, expected_peer: ?identity.PeerId) void {
@@ -2132,13 +2146,6 @@ pub const QuicRuntime = struct {
                     self.host.onConnectionEstablished(cid, sender, .inbound) catch |err| {
                         log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
                     };
-                    if (self.subscribed_topics.count() > 0) {
-                        var t_it2 = self.subscribed_topics.keyIterator();
-                        while (t_it2.next()) |topic_key| {
-                            const wbytes = self.buildSubscribeWire(topic_key.*) orelse continue;
-                            self.enqueueGossipFrame(sender, wbytes);
-                        }
-                    }
                 }
             }
 

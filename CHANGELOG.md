@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## [0.1.39](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.38...v0.1.39) (2026-06-11)
+
+### Fixed
+
+* **transport/quic_runtime:** bind the persistent `/meshsub/1.1.0` publish stream
+  to the **outbound** (locally-dialed) QUIC connection only. When a rust-libp2p
+  peer dials first, opening gossip publish on that inbound leg delivers a few
+  frames then stalls once the dialer leg comes up; zeam→ethlambda gossip now
+  migrates to the outbound connection and replays SUBSCRIBE there.
+
 ## [0.1.22](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.21...v0.1.22) (2026-06-10)
 
 ### Fixed
