@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## [0.1.45](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.44...v0.1.45) (2026-06-11)
+
+### Fixed
+
+* **deps/zquic:** bump zquic to v1.7.1. Client outbound 1-RTT sends now
+  call `cc.onPacketSent` when the loss detector records a packet (mirrors
+  `Server.send1Rtt`). Without this, `bytes_in_flight` stayed 0 on the
+  outbound dial path, `checkPto` branch 1 never fired, tail STREAM losses
+  on zeam→quinn gossip were not recovered, and ethlambda eventually logged
+  mass `decryption failed` before `ConnectionError(TimedOut)`.
+
 ## [0.1.44](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.43...v0.1.44) (2026-06-11)
 
 ### Fixed
