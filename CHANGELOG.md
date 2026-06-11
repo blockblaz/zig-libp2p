@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## [0.1.43](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.42...v0.1.43) (2026-06-11)
+
+### Fixed
+
+* **transport/quic_runtime:** app-layer keepalive on persistent `/meshsub`
+  streams. QUIC keepalive PINGs (v1.6.17) refresh only the transport idle
+  timer, not rust-libp2p's connection handler. On stable-mesh topics where
+  gossipsub heartbeat produces no traffic, the handler's own idle timer
+  expires after ~60s and the connection is torn down even though QUIC is
+  healthy. Each persistent `/meshsub/1.1.0` stream now flushes an
+  empty-control gossipsub RPC every 20 s of inactivity (one
+  `ControlMessage` with no sub-fields — a true wire-level no-op at the
+  gossipsub layer that still keeps the handler alive).
+
+* **deps/zquic:** bump zquic to v1.6.18 to pull in connection-lost
+  declaration when ACKs stop arriving. v1.6.17's keepalive PING extends
+  the idle window but cannot recover if every probe is dropped (kernel
+  UDP buffer overflow, NAT rebind, peer crash) — `draining` only flips on
+  receipt of a CONNECTION_CLOSE frame which by definition cannot arrive
+  in those conditions. v1.6.18 adds a time-based fallback: after 2× the
+  effective `max_idle_timeout` without any ACK, `draining` is forced true
+  and `detectOutboundConnectionClose` evicts the slot so
+  connection_manager can redial.
+
 ## [0.1.42](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.41...v0.1.42) (2026-06-11)
 
 ### Fixed

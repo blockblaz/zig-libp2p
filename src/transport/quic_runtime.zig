@@ -399,12 +399,34 @@ const PersistentGossipStream = struct {
     /// peer that never reads cannot make us hold unbounded memory before the
     /// QUIC keepalive notices and tears down the connection.
     outbox: std.ArrayList([]u8) = .empty,
+    /// Wall-clock time of the most recent successful flush on this stream.
+    /// Used by [`maybeSendPersistentGossipKeepalive`] to emit an empty-control
+    /// RPC every [`persistent_gossip_keepalive_interval_ms`] when the stream
+    /// is otherwise idle. Without this, rust-libp2p's gossipsub handler
+    /// receives no application-layer traffic on stable-mesh topics and the
+    /// connection is torn down with an error close once its idle timer
+    /// fires — independent of QUIC-layer keepalive PINGs which only refresh
+    /// the transport idle timer, not the libp2p handler's keep-alive.
+    /// Seeded at handshake completion so the first keepalive fires one full
+    /// interval later, not immediately on connect.
+    last_write_ms: i64 = 0,
 };
 
 /// Hard cap on queued outbox frames per peer before the persistent gossip
 /// stream is marked broken. Picked to accommodate ~30 seconds of gossip on a
 /// healthy mainnet topic without unbounded growth on a wedged peer.
 const persistent_gossip_outbox_cap: usize = 1024;
+
+/// Interval at which an empty-control gossipsub RPC is pushed onto an
+/// otherwise-idle persistent `/meshsub` stream. The frame is a no-op at the
+/// gossipsub layer (one `ControlMessage` field with all sub-fields absent)
+/// but generates real wire traffic, which is what rust-libp2p's connection
+/// handler needs to keep the connection alive on a stable mesh topic.
+///
+/// 20s is comfortably under rust-libp2p's default `idle_timeout` for both
+/// gossipsub (60s) and the underlying `libp2p-quic` (30s effective) so we
+/// always refresh both timers with at least 10s of slack before they fire.
+const persistent_gossip_keepalive_interval_ms: i64 = 20_000;
 
 /// A queued command from the swarm hook to the drive thread.
 const HookWork = union(enum) {
@@ -1511,6 +1533,9 @@ pub const QuicRuntime = struct {
                     continue;
                 };
                 g.handshake_done = true;
+                // Seed the keepalive baseline so the first empty-control RPC
+                // fires `keepalive_interval` after handshake, not immediately.
+                g.last_write_ms = self.opts.now_ms_fn();
                 // Fall through: we may already have a SUBSCRIBE / GRAFT in
                 // the outbox that can ship in this same tick.
             }
@@ -1546,11 +1571,73 @@ pub const QuicRuntime = struct {
                     }
                     g.outbox.clearRetainingCapacity();
                     self.markPersistentGossipBroken(g, "write_failed");
-                } else {
-                    g.outbox.clearRetainingCapacity();
+                    continue;
                 }
+                g.outbox.clearRetainingCapacity();
+                g.last_write_ms = self.opts.now_ms_fn();
+            }
+
+            // App-layer keepalive: when the stream is healthy, handshaken,
+            // and otherwise idle, emit an empty-control gossipsub RPC every
+            // `persistent_gossip_keepalive_interval_ms`. See the field doc
+            // on [`PersistentGossipStream.last_write_ms`] for rationale.
+            if (g.handshake_done and !g.broken) {
+                self.maybeSendPersistentGossipKeepalive(g);
             }
         }
+    }
+
+    /// If the persistent /meshsub stream `g` has been idle for at least
+    /// [`persistent_gossip_keepalive_interval_ms`], synthesize and flush
+    /// one length-prefixed empty-control gossipsub RPC to refresh the
+    /// peer's application-layer connection handler.
+    ///
+    /// Wire shape (per go-libp2p-pubsub `rpc.proto`): a top-level `RPC`
+    /// with field 3 (`ControlMessage control`) set to an empty submessage
+    /// (2 bytes: tag 0x1a, length 0x00). Length-prefixed with the usual
+    /// unsigned varint per the libp2p gossipsub framing. The receiver
+    /// parses it as a valid RPC with no subscriptions, no publishes, and
+    /// no control sub-messages — a true no-op at the gossipsub layer that
+    /// still produces real bytes on the wire.
+    fn maybeSendPersistentGossipKeepalive(self: *QuicRuntime, g: *PersistentGossipStream) void {
+        const a = self.allocator;
+        const now_ms = self.opts.now_ms_fn();
+        if (g.last_write_ms == 0) g.last_write_ms = now_ms; // safety net
+        if (now_ms - g.last_write_ms < persistent_gossip_keepalive_interval_ms) return;
+
+        const rpc_frame = gossipsub_rpc.encodeEmptyControlRpc(a) catch {
+            // OOM here is non-fatal: skip this tick, try again next cycle.
+            return;
+        };
+        defer a.free(rpc_frame);
+        const framed = lengthPrefixGossipRpcFrame(a, rpc_frame) orelse return;
+        defer a.free(framed);
+
+        var w = g.raw.writer();
+        std.Io.Writer.writeAll(&w, framed) catch {
+            var peer_buf: [128]u8 = undefined;
+            log.warn(
+                "quic_runtime: persistent gossip keepalive write failed peer={s}; marking stream broken",
+                .{peerBase58(g.peer, &peer_buf)},
+            );
+            self.markPersistentGossipBroken(g, "keepalive_write_failed");
+            return;
+        };
+        std.Io.Writer.flush(&w) catch {
+            var peer_buf: [128]u8 = undefined;
+            log.warn(
+                "quic_runtime: persistent gossip keepalive flush failed peer={s}; marking stream broken",
+                .{peerBase58(g.peer, &peer_buf)},
+            );
+            self.markPersistentGossipBroken(g, "keepalive_flush_failed");
+            return;
+        };
+        g.last_write_ms = now_ms;
+        var peer_buf: [128]u8 = undefined;
+        log.debug(
+            "quic_runtime: persistent gossip keepalive sent peer={s} wire_bytes={d}",
+            .{ peerBase58(g.peer, &peer_buf), framed.len },
+        );
     }
 
     fn startOutboundPublish(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) !void {
