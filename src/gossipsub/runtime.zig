@@ -1077,8 +1077,17 @@ pub const Gossipsub = struct {
         if (try control.decodeFirstPruneWithPeers(self.allocator, ctl)) |pp_view| {
             var prune = pp_view;
             defer control.deinitPruneWithPeersOwned(self.allocator, &prune);
-            if (self.mesh.getPtr(prune.topic)) |mp| {
-                _ = mp.peers.remove(sender);
+            // Direct peers are "always-mesh" (libp2p gossipsub direct-peer
+            // semantics, #85): we never PRUNE them and we ignore PRUNEs they
+            // send us, keeping them in every subscribed topic mesh. Removing a
+            // direct peer here would stop `forwardPublish` from fanning out to
+            // it until the next heartbeat re-GRAFT — and against a remote that
+            // PRUNEs aggressively (e.g. rust-libp2p subnet meshes) that turns
+            // into a wedge where mesh traffic to the direct peer dies entirely.
+            if (!self.direct_peers.contains(sender)) {
+                if (self.mesh.getPtr(prune.topic)) |mp| {
+                    _ = mp.peers.remove(sender);
+                }
             }
             // Harvest PX peer-id suggestions (#85). signed_peer_record is preserved upstream
             // but not auto-verified here; embedders that want full verification can pull the
@@ -2492,6 +2501,37 @@ test "direct peer bypasses PRUNE back-off" {
 
     try std.testing.expect(!g.isPeerBackedOff(peer, "t"));
     try std.testing.expectEqual(@as(usize, 0), g.activeBackoffCount());
+}
+
+test "inbound PRUNE does not evict a direct peer from the mesh" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 2 });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+    try g.addDirectPeer(peer);
+
+    // Heartbeat grafts the direct peer into the topic mesh.
+    try g.heartbeat();
+    try std.testing.expectEqual(@as(?usize, 1), g.meshPeerCountForTopic("t"));
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+
+    // A remote PRUNE from the direct peer must be ignored for mesh purposes:
+    // direct peers are always-mesh, so `forwardPublish` keeps fanning out to it.
+    const prune = try control.encodePrune(a, "t", 60);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+
+    try std.testing.expectEqual(@as(?usize, 1), g.meshPeerCountForTopic("t"));
+    try std.testing.expect(!g.isPeerBackedOff(peer, "t"));
 }
 
 test "direct peer is never selected as mesh-prune victim" {
