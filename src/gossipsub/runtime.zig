@@ -166,6 +166,16 @@ pub const GossipsubConfig = struct {
     /// PRUNE `peers` lists, #85). Embedders pop via [`popDialSuggestion`] and feed
     /// `connection_manager.registerKnownPeer`.
     max_px_dial_queue: usize = 256,
+    /// libp2p gossipsub v1.1 §4.1: cap on IHAVE entries processed per inbound RPC. Anything
+    /// past this is silently dropped. Matches rust-libp2p `max_ihave_messages` default.
+    /// Defense against IHAVE amplification.
+    max_ihave_ids_per_rpc: usize = 5000,
+    /// Cap on the number of distinct unseen ids we will request via IWANT per inbound IHAVE
+    /// RPC. Matches rust-libp2p `max_ihave_length` default.
+    max_iwant_ids_per_rpc: usize = 5000,
+    /// Behaviour score delta applied to a peer that sends GRAFT during its own active PRUNE
+    /// back-off window (rust-libp2p applies a `P7` weight here). `0` disables.
+    graft_during_backoff_score_delta: i32 = -50,
     /// When set, [`Gossipsub`] updates `lean_gossip_mesh_peers` from [`meshPeers`] on membership changes and heartbeat (#43).
     metrics: ?*metrics_mod.Metrics = null,
 
@@ -263,6 +273,12 @@ pub const Gossipsub = struct {
     control_i_want_rx: u64,
     /// Publishes queued in response to IWANT when the id was still in the pull cache.
     control_i_want_fulfilled: u64,
+    /// Outbound IWANT RPCs emitted in response to inbound IHAVE for unseen ids.
+    iwant_tx: u64,
+    /// Distinct message ids requested across all outbound IWANT RPCs.
+    iwant_ids_requested: u64,
+    /// IHAVE ids dropped because the per-RPC `max_ihave_ids_per_rpc` cap was hit.
+    ihave_ids_capped: u64,
     /// Outbound IHAVE RPCs emitted from [`heartbeat`] lazy gossip.
     lazy_i_have_tx: u64,
     /// Lazy IHAVE entries dropped due to per-peer or global outbox backpressure (#39).
@@ -327,6 +343,9 @@ pub const Gossipsub = struct {
             .control_i_want_rx = 0,
             .control_i_want_fulfilled = 0,
             .lazy_i_have_tx = 0,
+            .iwant_tx = 0,
+            .iwant_ids_requested = 0,
+            .ihave_ids_capped = 0,
             .dropped_lazy_ihave_backpressure = 0,
             .recent_seen = .empty,
             .pull_fifo = .empty,
@@ -721,6 +740,77 @@ pub const Gossipsub = struct {
         try self.pull_fifo.append(self.allocator, .{ .id = id, .topic = t, .data = d, .stored_ms = self.clock_ms });
     }
 
+    /// True if we already hold (or recently saw) `(topic, id)`. Used to filter peer IHAVE
+    /// offers down to the ids we actually need to pull. Checks both [`pull_fifo`] (full
+    /// payloads cached for IWANT response) and [`recent_seen`] (id-only history window).
+    fn haveSeenMessageId(self: *const Gossipsub, topic: []const u8, id: [20]u8) bool {
+        for (self.pull_fifo.items) |e| {
+            if (!std.mem.eql(u8, e.topic, topic)) continue;
+            if (std.mem.eql(u8, &e.id, &id)) return true;
+        }
+        for (self.recent_seen.items) |s| {
+            if (!std.mem.eql(u8, s.topic, topic)) continue;
+            if (std.mem.eql(u8, &s.id, &id)) return true;
+        }
+        return false;
+    }
+
+    /// Inbound IHAVE handler — libp2p gossipsub v1.1 §3.4.
+    ///
+    /// For each offered id we have not already seen, request the body via IWANT. We only
+    /// request ids for topics we are subscribed to (offering an id for an unsubscribed topic
+    /// would force us to drop the payload anyway). Caps come from the spec: rust-libp2p
+    /// enforces `max_ihave_messages` / `max_ihave_length` here; we follow the same shape
+    /// using [`max_ihave_ids_per_rpc`] and [`max_iwant_ids_per_rpc`].
+    fn handleIHaveOffer(
+        self: *Gossipsub,
+        sender: identity.PeerId,
+        topic: []const u8,
+        offered_ids: [][]u8,
+    ) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (!self.subs.contains(topic)) return;
+
+        var wanted_storage: std.ArrayList([20]u8) = .empty;
+        defer wanted_storage.deinit(self.allocator);
+
+        const ihave_budget: usize = @min(offered_ids.len, self.cfg.max_ihave_ids_per_rpc);
+        if (offered_ids.len > ihave_budget) {
+            self.ihave_ids_capped += offered_ids.len - ihave_budget;
+        }
+
+        for (offered_ids[0..ihave_budget]) |mid_raw| {
+            if (wanted_storage.items.len >= self.cfg.max_iwant_ids_per_rpc) break;
+            if (mid_raw.len != 20) continue;
+            var id: [20]u8 = undefined;
+            @memcpy(id[0..], mid_raw[0..20]);
+            if (self.haveSeenMessageId(topic, id)) continue;
+            // Avoid requesting the same id twice in this same IHAVE (peer may repeat).
+            var dup = false;
+            for (wanted_storage.items) |seen| {
+                if (std.mem.eql(u8, &seen, &id)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            try wanted_storage.append(self.allocator, id);
+        }
+        if (wanted_storage.items.len == 0) return;
+
+        var mid_views: std.ArrayList([]const u8) = .empty;
+        defer mid_views.deinit(self.allocator);
+        for (wanted_storage.items) |*id| try mid_views.append(self.allocator, id[0..]);
+
+        const ctl_out = try control.encodeIWant(self.allocator, mid_views.items);
+        errdefer self.allocator.free(ctl_out);
+        const wire = try rpc.encodeControlOnlyRpc(self.allocator, ctl_out);
+        self.allocator.free(ctl_out);
+        errdefer self.allocator.free(wire);
+        try self.appendOut(wire, sender);
+        self.iwant_tx += 1;
+        self.iwant_ids_requested += wanted_storage.items.len;
+    }
+
     fn findPullPayload(self: *const Gossipsub, id: [20]u8) ?PullEntry {
         var i: usize = self.pull_fifo.items.len;
         while (i > 0) {
@@ -1053,13 +1143,19 @@ pub const Gossipsub = struct {
     fn handleInboundControl(self: *Gossipsub, sender: identity.PeerId, ctl: []const u8) (control.Error || rpc.Error || msg_mod.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         if (try control.decodeFirstGraftTopic(self.allocator, ctl)) |gt| {
             defer self.allocator.free(gt);
-            const remain_s: ?u64 = blk: {
-                if (self.remainingBackoffSecondsFor(sender, gt)) |s| break :blk s;
-                if (!self.subs.contains(gt)) break :blk self.remainingTopicUnsubscribeSeconds(gt);
-                break :blk null;
-            };
+            const active_backoff_s = self.remainingBackoffSecondsFor(sender, gt);
+            const unsub_cooldown_s: ?u64 = if (!self.subs.contains(gt))
+                self.remainingTopicUnsubscribeSeconds(gt)
+            else
+                null;
+            const remain_s: ?u64 = active_backoff_s orelse unsub_cooldown_s;
             if (remain_s) |rs| {
                 self.graft_refused_during_backoff += 1;
+                // libp2p gossipsub v1.1 §3.3.3: peer ignored its own PRUNE back-off (or our
+                // unsubscribe cooldown) and re-GRAFTed early. Dock its behaviour score —
+                // rust-libp2p models this as the `P7` weight. `0` keeps the legacy
+                // back-compat behaviour (PRUNE only, no penalty).
+                self.applyScoreDelta(sender, self.cfg.graft_during_backoff_score_delta);
                 const ctl_out = try control.encodePrune(self.allocator, gt, rs);
                 defer self.allocator.free(ctl_out);
                 const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl_out);
@@ -1119,6 +1215,7 @@ pub const Gossipsub = struct {
             var owned = ih;
             defer control.deinitIHaveOwned(self.allocator, &owned);
             self.control_i_have_rx += 1;
+            try self.handleIHaveOffer(sender, owned.topic, owned.message_ids);
         }
         if (try control.decodeFirstIWant(self.allocator, ctl)) |iw| {
             var owned = iw;
@@ -1353,6 +1450,21 @@ pub const Gossipsub = struct {
     /// Inbound GRAFTs refused because the sender was in active PRUNE back-off (#75).
     pub fn graftRefusedDuringBackoffCount(self: *const Gossipsub) u64 {
         return self.graft_refused_during_backoff;
+    }
+
+    /// Outbound IWANT RPCs emitted in response to inbound IHAVE.
+    pub fn iwantTxCount(self: *const Gossipsub) u64 {
+        return self.iwant_tx;
+    }
+
+    /// Distinct message ids requested across all outbound IWANT RPCs.
+    pub fn iwantIdsRequestedCount(self: *const Gossipsub) u64 {
+        return self.iwant_ids_requested;
+    }
+
+    /// IHAVE ids dropped because the per-RPC `max_ihave_ids_per_rpc` cap was hit.
+    pub fn ihaveIdsCappedCount(self: *const Gossipsub) u64 {
+        return self.ihave_ids_capped;
     }
 
     /// Inbound publishes dropped because their `(from, seqno)` pair was already cached (#75).
@@ -2847,4 +2959,162 @@ test "PX queue evicts oldest when full" {
     const got2 = g.popDialSuggestion().?;
     defer a.free(got2);
     try std.testing.expectEqualStrings("p3", got2);
+}
+
+test "inbound IHAVE for unseen ids emits IWANT to the offering peer" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    var id_a: [20]u8 = undefined;
+    var id_b: [20]u8 = undefined;
+    @memset(id_a[0..], 0xaa);
+    @memset(id_b[0..], 0xbb);
+    const ids = [_][]const u8{ id_a[0..], id_b[0..] };
+
+    const ihave = try control.encodeIHave(a, "t", ids[0..]);
+    defer a.free(ihave);
+    const wire = try rpc.encodeControlOnlyRpc(a, ihave);
+    defer a.free(wire);
+    try g.handleInboundRpc(peer, wire);
+
+    try std.testing.expectEqual(@as(u64, 1), g.iwantTxCount());
+    try std.testing.expectEqual(@as(u64, 2), g.iwantIdsRequestedCount());
+
+    // Pull the IWANT off the outbox and confirm it targets `peer` with both ids.
+    var saw_iwant = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        try std.testing.expect(d.to != null and d.to.?.eql(&peer));
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if (try control.decodeFirstIWant(a, ctl)) |iw| {
+            var ow = iw;
+            defer control.deinitIWantOwned(a, &ow);
+            try std.testing.expectEqual(@as(usize, 2), ow.message_ids.len);
+            saw_iwant = true;
+        }
+    }
+    try std.testing.expect(saw_iwant);
+}
+
+test "inbound IHAVE filters ids we have already seen" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    // Inject one id into the recent-seen cache (simulating a prior receive).
+    var id_known: [20]u8 = undefined;
+    var id_new: [20]u8 = undefined;
+    @memset(id_known[0..], 0xcc);
+    @memset(id_new[0..], 0xdd);
+    try g.recordSeenForLazy("t", id_known);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+    const ids = [_][]const u8{ id_known[0..], id_new[0..] };
+    const ihave = try control.encodeIHave(a, "t", ids[0..]);
+    defer a.free(ihave);
+    const wire = try rpc.encodeControlOnlyRpc(a, ihave);
+    defer a.free(wire);
+    try g.handleInboundRpc(peer, wire);
+
+    try std.testing.expectEqual(@as(u64, 1), g.iwantTxCount());
+    try std.testing.expectEqual(@as(u64, 1), g.iwantIdsRequestedCount());
+}
+
+test "inbound IHAVE for unsubscribed topic does not trigger IWANT" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    var id_x: [20]u8 = undefined;
+    @memset(id_x[0..], 0xee);
+    const ids = [_][]const u8{id_x[0..]};
+    const ihave = try control.encodeIHave(a, "topic-we-dont-care-about", ids[0..]);
+    defer a.free(ihave);
+    const wire = try rpc.encodeControlOnlyRpc(a, ihave);
+    defer a.free(wire);
+    try g.handleInboundRpc(peer, wire);
+
+    try std.testing.expectEqual(@as(u64, 0), g.iwantTxCount());
+}
+
+test "inbound IHAVE caps the number of ids it will pull per RPC" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .max_iwant_ids_per_rpc = 3,
+    });
+    defer g.deinit();
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    var id_storage: [10][20]u8 = undefined;
+    var id_views: [10][]const u8 = undefined;
+    for (&id_storage, 0..) |*buf, i| {
+        @memset(buf[0..], @intCast(i + 1));
+        id_views[i] = buf[0..];
+    }
+    const ihave = try control.encodeIHave(a, "t", id_views[0..]);
+    defer a.free(ihave);
+    const wire = try rpc.encodeControlOnlyRpc(a, ihave);
+    defer a.free(wire);
+    try g.handleInboundRpc(peer, wire);
+
+    try std.testing.expectEqual(@as(u64, 1), g.iwantTxCount());
+    try std.testing.expectEqual(@as(u64, 3), g.iwantIdsRequestedCount());
+}
+
+test "GRAFT during active back-off docks sender behaviour score" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    g.setClockMs(0);
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    const prune = try control.encodePrune(a, "t", 30);
+    defer a.free(prune);
+    const prune_rpc = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(prune_rpc);
+    try g.handleInboundRpc(peer, prune_rpc);
+
+    const score_before = g.peerBehaviourScore(peer);
+
+    g.setClockMs(5_000);
+    const graft = try control.encodeGraft(a, "t");
+    defer a.free(graft);
+    const graft_rpc = try rpc.encodeControlOnlyRpc(a, graft);
+    defer a.free(graft_rpc);
+    try g.handleInboundRpc(peer, graft_rpc);
+
+    const score_after = g.peerBehaviourScore(peer);
+    try std.testing.expect(score_after < score_before);
+    // Drain the PRUNE refusal so the test allocator doesn't leak.
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
 }

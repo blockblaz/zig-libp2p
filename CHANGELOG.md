@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## [0.1.41](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.40...v0.1.41) (2026-06-11)
+
+### Fixed
+
+* **gossipsub:** handle inbound IHAVE control messages by emitting IWANT for
+  unseen ids (libp2p gossipsub v1.1 §3.4). Previously zig-libp2p decoded IHAVE
+  and dropped it on the floor, so lazy-gossip recovery against rust- and
+  go-libp2p peers was effectively dead: a peer outside our mesh could announce
+  message ids but we never pulled them, breaking mesh healing after a partition
+  and degrading dissemination redundancy. The new
+  `runtime.handleIHaveOffer` filters against `pull_fifo` + `recent_seen`,
+  caps the number of ids accepted per RPC (`max_ihave_ids_per_rpc`) and the
+  number requested in the resulting IWANT (`max_iwant_ids_per_rpc`) — both
+  defaulting to 5000 to match rust-libp2p — and exposes
+  `iwantTxCount` / `iwantIdsRequestedCount` / `ihaveIdsCappedCount`.
+
+* **gossipsub:** dock the sender's behaviour score (configurable via
+  `graft_during_backoff_score_delta`, default `-50`) when an inbound GRAFT
+  arrives during the peer's own active PRUNE back-off window. rust-libp2p
+  models this as the `P7` weight; we previously refused the GRAFT with a
+  PRUNE+remaining-backoff but applied no penalty, so a misbehaving peer
+  could flood-GRAFT freely. The unsubscribe-cooldown branch keeps its
+  original behaviour (no penalty — that path doesn't represent the same
+  flood pattern).
+
+* **autonat:** v2 amplification cost is now uniformly sampled across the
+  full `[amplification_min_bytes, amplification_max_bytes]` range from a
+  SplitMix64 step over the peer nonce. The previous shape
+  `std.math.clamp(min, 1, max)` always returned exactly the minimum
+  (30 KiB by default) and silently ignored `amplification_max_bytes`,
+  making the cost trivially predictable to a client and leaving the
+  spec-mandated range knob dead.
+
 ## [0.1.40](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.39...v0.1.40) (2026-06-11)
 
 ### Fixed
