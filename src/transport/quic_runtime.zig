@@ -64,6 +64,10 @@ const meshsub_protocol_id: []const u8 = "/meshsub/1.1.0";
 const meshsub_protocol_id_v10: []const u8 = "/meshsub/1.0.0";
 const meshsub_protocol_id_v12: []const u8 = "/meshsub/1.2.0";
 const meshsub_protocol_id_v13: []const u8 = "/meshsub/1.3.0";
+/// Protocol id offered on zeam-initiated `/meshsub` streams. Offer the highest
+/// version first so rust-libp2p's responder can pick the newest it supports;
+/// the ack may be any `/meshsub/*` (see [`initiatorHandshakeMeshsubReadPhase`]).
+const meshsub_initiator_offer: []const u8 = meshsub_protocol_id_v13;
 
 /// Per-stream inbound accumulator caps (#119).
 const max_inbound_gossip_acc_bytes: usize =
@@ -1065,7 +1069,28 @@ pub const QuicRuntime = struct {
 
         for (peers.items) |peer| {
             const wire_dup = a.dupe(u8, wire_buf.items) catch continue;
-            self.enqueueGossipFrame(peer, wire_dup);
+            // Publishes use the per-message-stream pattern (open, handshake,
+            // one length-prefixed frame, FIN). rust-libp2p expects short-lived
+            // publish streams and keeps a separate long-lived control stream for
+            // SUBSCRIBE / GRAFT / PRUNE. Routing publishes through the
+            // persistent stream wedged zeam→ethlambda gossip after ~10 slots.
+            self.startPublishToPeer(peer, wire_dup);
+        }
+    }
+
+    /// Open a per-message `/meshsub` publish stream to `peer` (outbound dial or
+    /// inbound accept) and queue it on [`outbound_publishes`].
+    fn startPublishToPeer(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) void {
+        if (self.outbound_by_peer.contains(peer)) {
+            self.startOutboundPublish(peer, wire) catch {
+                self.allocator.free(wire);
+            };
+        } else if (self.inbound_by_peer.contains(peer)) {
+            self.startInboundPublish(peer, wire) catch {
+                self.allocator.free(wire);
+            };
+        } else {
+            self.allocator.free(wire);
         }
     }
 
@@ -1191,7 +1216,17 @@ pub const QuicRuntime = struct {
         };
     }
 
+    /// Half-close the write side of a persistent gossip stream so rust-libp2p
+    /// can retire the old `/meshsub` handler before we open a replacement.
+    /// A QUIC reset would surface as `reason=error` on the whole connection.
+    fn closePersistentGossipStreamWriteHalf(g: *PersistentGossipStream) void {
+        if (g.handshake_sent) g.raw.finStream();
+    }
+
     fn destroyPersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {
+        if (self.persistent_gossip.getPtr(peer)) |g_ptr| {
+            closePersistentGossipStreamWriteHalf(g_ptr.*);
+        }
         const g = self.persistent_gossip.fetchRemove(peer) orelse return;
         for (g.value.outbox.items) |w| self.allocator.free(w);
         g.value.outbox.deinit(self.allocator);
@@ -1200,13 +1235,16 @@ pub const QuicRuntime = struct {
 
     /// Tear down a wedged persistent `/meshsub` stream and open a fresh one,
     /// preserving any queued gossip RPC frames. The old QUIC stream slot is
-    /// abandoned (the connection stays up); the next [`ensurePersistentGossipStream`]
-    /// call allocates a new local bidi stream id.
+    /// half-closed (write FIN) before abandoning so rust-libp2p does not keep
+    /// a stale handler that blocks the replacement stream.
     fn recreatePersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {
         const a = self.allocator;
         var preserved: std.ArrayList([]u8) = .empty;
         defer preserved.deinit(a);
 
+        if (self.persistent_gossip.getPtr(peer)) |g_ptr| {
+            closePersistentGossipStreamWriteHalf(g_ptr.*);
+        }
         if (self.persistent_gossip.fetchRemove(peer)) |entry| {
             for (entry.value.outbox.items) |w| {
                 preserved.append(a, w) catch {
@@ -1251,7 +1289,7 @@ pub const QuicRuntime = struct {
                 stream_multistream.appendFirstStreamInitiatorHandshakeFramed(
                     &out,
                     a,
-                    meshsub_protocol_id,
+                    meshsub_initiator_offer,
                     .delimited,
                 ) catch {
                     peers_to_recreate.append(a, g.peer) catch {};
@@ -1281,7 +1319,7 @@ pub const QuicRuntime = struct {
                 }
                 var r = g.raw.reader();
                 var w = g.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch |err| {
+                stream_multistream.initiatorHandshakeMeshsubReadPhase(&r, &w, a, null) catch |err| {
                     log.warn(
                         "quic_runtime: persistent gossip handshake failed: {s}, recreating stream",
                         .{@errorName(err)},
@@ -2401,7 +2439,7 @@ pub const QuicRuntime = struct {
                 stream_multistream.appendFirstStreamInitiatorHandshakeFramed(
                     &out,
                     a,
-                    meshsub_protocol_id,
+                    meshsub_initiator_offer,
                     .delimited,
                 ) catch |err| {
                     log.warn("quic_runtime: publish handshake build failed: {s}", .{@errorName(err)});
@@ -2421,7 +2459,7 @@ pub const QuicRuntime = struct {
                 if (op.raw.unreadRecvLen() == 0) continue;
                 var r = op.raw.reader();
                 var w = op.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch |err| switch (err) {
+                stream_multistream.initiatorHandshakeMeshsubReadPhase(&r, &w, a, null) catch |err| switch (err) {
                     error.ProtocolNegotiationFailed, error.DialFailed => continue,
                     else => {
                         log.warn("quic_runtime: publish read ack failed: {s}", .{@errorName(err)});

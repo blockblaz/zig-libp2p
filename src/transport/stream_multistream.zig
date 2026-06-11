@@ -187,6 +187,46 @@ pub fn initiatorHandshakeMultistreamReadPhase(
     }
 }
 
+/// Initiator read phase for `/meshsub/*` streams: accepts any `/meshsub/` ack line.
+pub fn initiatorHandshakeMeshsubReadPhase(
+    r: *Io.Reader,
+    w: *Io.Writer,
+    allocator: std.mem.Allocator,
+    tail: ?*std.ArrayList(u8),
+) StreamHandshakeError!void {
+    _ = w;
+    var acc = std.ArrayList(u8).empty;
+    defer acc.deinit(allocator);
+    var peer_framing: ?neg.Framing = null;
+
+    while (true) {
+        var rem: []const u8 = acc.items;
+        if (neg.initiatorReadPeerMultistream(&rem, neg.default_max_body_len)) |_| {
+            try compactConsumed(&acc, allocator, rem);
+            break;
+        } else |err| switch (err) {
+            error.MissingNewline => {
+                try readMoreHandshake(&acc, r, allocator);
+                notePeerFraming(&peer_framing, acc.items);
+            },
+            else => return terr.fromMultistreamStreamLayer(err),
+        }
+    }
+    const framing = peer_framing orelse .legacy;
+
+    while (true) {
+        var rem: []const u8 = acc.items;
+        if (neg.initiatorReadMeshsubProtocolAckFramed(&rem, neg.default_max_body_len, framing)) |_| {
+            try compactConsumed(&acc, allocator, rem);
+            preserveAccTailOnly(&acc, tail);
+            return;
+        } else |err| switch (err) {
+            error.MissingNewline => try readMoreHandshake(&acc, r, allocator),
+            else => return terr.fromMultistreamStreamLayer(err),
+        }
+    }
+}
+
 /// Responder: read multistream offer, send header, read protocol, reply with ack or `na`.
 pub fn responderHandshakeMultistream(
     r: *Io.Reader,

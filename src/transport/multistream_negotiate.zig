@@ -184,6 +184,15 @@ pub fn initiatorReadProtocolAckFramed(remaining: *[]const u8, expected_protocol:
     if (!std.mem.eql(u8, line, expected_protocol)) return error.ProtocolNotSupported;
 }
 
+/// Like [`initiatorReadProtocolAckFramed`], but accepts any `/meshsub/` protocol id.
+/// rust-libp2p may ack with `/meshsub/1.3.0` even when the initiator offered
+/// `/meshsub/1.1.0`; protobuf wire is additive across 1.0–1.3.
+pub fn initiatorReadMeshsubProtocolAckFramed(remaining: *[]const u8, max_body_len: usize, framing: Framing) NegotiateError!void {
+    const line = try readNegotiationTokenFramed(remaining, max_body_len, framing);
+    if (std.mem.eql(u8, line, "na")) return error.ProtocolNotSupported;
+    if (!std.mem.startsWith(u8, line, "/meshsub/")) return error.ProtocolNotSupported;
+}
+
 // ── Responder (listener) side ───────────────────────────────────────────────
 
 /// Read initiator's `/multistream/1.0.0\n` and consume it.
