@@ -1201,25 +1201,47 @@ pub const QuicRuntime = struct {
         return buf.toOwnedSlice(allocator) catch null;
     }
 
-    /// Drain directed gossipsub control frames (GRAFT, PRUNE, IHAVE, IWANT, mesh
-    /// forwards) queued by [`Gossipsub.heartbeat`] and [`Gossipsub.handleInboundRpc`].
+    /// Drain gossipsub control frames (GRAFT, PRUNE, IHAVE, IWANT, mesh forwards,
+    /// SUBSCRIBE / UNSUBSCRIBE) queued by [`Gossipsub.heartbeat`],
+    /// [`Gossipsub.handleInboundRpc`], and [`Gossipsub.subscribe`] /
+    /// [`Gossipsub.unsubscribe`].
     ///
-    /// Without this, zeam sends SUBSCRIBE on the persistent `/meshsub/1.1.0` stream
-    /// (via [`onSubscribeCommand`]) but never ships the GRAFTs heartbeat generates.
-    /// rust-libp2p (ethlambda) only publishes to mesh peers, so aggregation gossip
-    /// from ethlambda never reaches zeam and justification stalls.
+    /// Without this, zeam never ships the GRAFTs heartbeat generates and
+    /// rust-libp2p (ethlambda) only publishes to mesh peers — so aggregation
+    /// gossip from ethlambda never reaches zeam and justification stalls.
     ///
-    /// Broadcast entries (`to == null`) are skipped here: local publish and subscribe
-    /// are already handled by [`onPublishCommand`] / [`onSubscribeCommand`].
+    /// Broadcast entries (`to == null`) are fanned out to every peer with an
+    /// active persistent `/meshsub` stream. This is what [`Gossipsub.subscribe`]
+    /// / [`Gossipsub.unsubscribe`] emit. The transport-side
+    /// [`onSubscribeCommand`] still records the topic in `subscribed_topics`
+    /// so it can be replayed to *future* connections; this fan-out covers
+    /// already-connected peers in the same tick.
     fn drainGossipsubOutbox(self: *QuicRuntime) void {
         const a = self.allocator;
         const gs = self.host.gossipsub;
         while (gs.popOutboxDelivery()) |d| {
             defer a.free(d.wire);
-            const peer = d.to orelse continue;
-            if (!self.peerHasActiveConnection(peer)) continue;
-            const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
-            self.enqueueGossipFrame(peer, framed);
+            if (d.to) |peer| {
+                if (!self.peerHasActiveConnection(peer)) continue;
+                const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
+                self.enqueueGossipFrame(peer, framed);
+            } else {
+                // Broadcast (SUBSCRIBE/UNSUBSCRIBE). Length-prefix once, clone per peer.
+                // Targets every currently-connected peer (outbound and inbound)
+                // so late `Gossipsub.subscribe` calls also reach existing peers,
+                // not just future connections. New connections still get
+                // SUBSCRIBE via `subscribed_topics` replay in
+                // `onConnectionEstablished` / inbound-stream notify path.
+                const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
+                defer a.free(framed);
+                var peers: std.ArrayList(identity.PeerId) = .empty;
+                defer peers.deinit(a);
+                self.collectConnectedPeers(&peers) catch continue;
+                for (peers.items) |peer| {
+                    const dup = a.dupe(u8, framed) catch continue;
+                    self.enqueueGossipFrame(peer, dup);
+                }
+            }
         }
     }
 
@@ -1317,6 +1339,15 @@ pub const QuicRuntime = struct {
         while (it.next()) |g_ptr| {
             const g = g_ptr.*;
             if (g.broken) continue;
+            // Each of the three steps below (offer, ack, drain) is non-blocking
+            // and falls through to the next when its precondition becomes
+            // available in the same tick. The previous code returned `continue`
+            // between steps, costing one reactor cycle (~100ms) per step — a
+            // cold-start latency of ~200-400ms before the first SUBSCRIBE
+            // could even leave the box. With small frames the responder's ack
+            // is often already in `unreadRecvLen` by the time we finish
+            // writing our offer, so coalescing here makes the common-case
+            // mesh formation happen in one tick.
             if (!g.handshake_sent) {
                 var out: std.ArrayList(u8) = .empty;
                 defer out.deinit(a);
@@ -1342,6 +1373,7 @@ pub const QuicRuntime = struct {
                 };
                 std.Io.Writer.flush(&w) catch {};
                 g.handshake_sent = true;
+                // Fall through: the responder ack may already be buffered.
             }
             if (!g.handshake_done) {
                 if (g.raw.unreadRecvLen() == 0) continue;
@@ -1356,6 +1388,8 @@ pub const QuicRuntime = struct {
                     continue;
                 };
                 g.handshake_done = true;
+                // Fall through: we may already have a SUBSCRIBE / GRAFT in
+                // the outbox that can ship in this same tick.
             }
             // Only drain the outbox AFTER multistream-select completes —
             // otherwise the gossipsub RPC bytes would arrive before the
