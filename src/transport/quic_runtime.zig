@@ -224,15 +224,21 @@ const OutboundConn = struct {
     notified: bool = false,
     conn_id: connection_manager_mod.ConnectionId,
     peer_id: ?identity.PeerId = null,
-    /// Last observed value of `outbound.client.conn.phase`, sampled at the end of every
-    /// [`QuicRuntime.driveLoop`] iteration by [`detectOutboundConnectionClose`]. The
-    /// transition `notified == true && prev_phase != .closed && current == .closed`
-    /// is how we detect that the remote QUIC peer sent `CONNECTION_CLOSE` (or that we
-    /// hit a transport idle-timeout). Without this poll, an outbound connection's
-    /// remote close is invisible — `outbound_by_peer` retains a dead entry, the host
-    /// never sees `onConnectionClosed`, and `connection_manager` never schedules a
-    /// redial. Mirrors the listener-side [`QuicListener.syncSeenFlags`] sweep.
-    prev_phase: ZIo.ConnPhase = .initial,
+    /// Last observed *effective* connection state, sampled at the end of every
+    /// [`QuicRuntime.driveLoop`] iteration by [`detectOutboundConnectionClose`].
+    /// `notified == true && prev_closed == false && current_closed == true` is how we
+    /// detect that the remote QUIC peer sent `CONNECTION_CLOSE` (or that we hit a
+    /// transport idle-timeout).
+    ///
+    /// `current_closed` is true when either `conn.phase == .closed` **or**
+    /// `conn.draining` — zquic sets `draining = true` on every CONNECTION_CLOSE
+    /// receipt and only later (after the 3×PTO draining deadline) reaps the
+    /// connection; if we wait for `.closed` we miss the disconnect entirely on the
+    /// client (outbound) side. Without this signal `outbound_by_peer` retains a
+    /// dead entry, the host never sees `onConnectionClosed`, and
+    /// `connection_manager` never schedules a redial. Mirrors the listener-side
+    /// [`QuicListener.syncSeenFlags`] sweep.
+    prev_closed: bool = false,
     /// Tracks which server-initiated bidi stream IDs on this outbound QUIC connection have
     /// already been surfaced as inbound streams. Server-initiated bidi streams (IDs 1, 5, 9…)
     /// are opened by the remote peer on the connection zeam dialled; without this tracking they
@@ -863,11 +869,20 @@ pub const QuicRuntime = struct {
         var it = self.outbound_by_peer.iterator();
         while (it.next()) |entry| {
             const slot = entry.value_ptr.*;
-            const cur_phase = slot.outbound.client.conn.phase;
-            if (slot.notified and slot.prev_phase != .closed and cur_phase == .closed) {
+            const conn = &slot.outbound.client.conn;
+            // `draining` flips to true as soon as we send or receive a
+            // CONNECTION_CLOSE frame (see zquic transport/io.zig). The
+            // QUIC spec requires us to keep the connection state around for
+            // 3*PTO afterwards, so `phase` does not move to `.closed` for
+            // hundreds of ms (longer if the deadline math drags). For our
+            // purposes — telling the connection_manager that the link is
+            // dead and clearing publish state — draining is the moment of
+            // truth.
+            const cur_closed = (conn.phase == .closed) or conn.draining;
+            if (slot.notified and !slot.prev_closed and cur_closed) {
                 to_close.append(self.allocator, entry.key_ptr.*) catch {};
             }
-            slot.prev_phase = cur_phase;
+            slot.prev_closed = cur_closed;
         }
 
         for (to_close.items) |peer| {

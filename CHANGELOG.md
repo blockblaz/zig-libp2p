@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## [0.1.40](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.39...v0.1.40) (2026-06-11)
+
+### Fixed
+
+* **transport/quic_runtime:** detect outbound QUIC connection close as soon as
+  `CONNECTION_CLOSE` is received, not after the 3×PTO draining deadline. zquic
+  flips `conn.draining = true` on `CONNECTION_CLOSE` receipt but keeps
+  `conn.phase` at `.connected` until the drain timer reaps the slot — the
+  client side never reaps at all today. The previous detector only checked
+  `phase == .closed`, so a remote-initiated close (e.g. rust-libp2p ending the
+  session due to gossipsub mesh degrade or transport error) was silent on the
+  zeam side: `outbound_by_peer` retained the dead entry, gossip publishes
+  drained into the void, and `connection_manager` never scheduled a redial.
+  Now `detectOutboundConnectionClose` treats `phase == .closed || draining`
+  as terminal and fires `host.onConnectionClosed` immediately, mirroring the
+  listener-side close path.
+
 ## [0.1.39](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.38...v0.1.39) (2026-06-11)
 
 ### Fixed
