@@ -1,7 +1,7 @@
 .{
     .name = .zig_libp2p,
     // x-release-please-start-version
-    .version = "0.1.43",
+    .version = "0.1.44",
     // x-release-please-end
     .fingerprint = 0x6e2dd2ac84762996,
     .minimum_zig_version = "0.16.0",
@@ -23,11 +23,13 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            // v1.6.18 — declare connection lost after 2× idle timeout without ACKs
-            // so detectOutboundConnectionClose fires even when CONNECTION_CLOSE
-            // itself is dropped (UDP recv-buf overflow, NAT rebind, peer crash).
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.18#3b80c4af5e63ac83a691a7473d413c6da6e0bc98",
-            .hash = "zquic-1.6.18-2zRc1AGpEwD4moudActEKjkAvwJBJDozoKotkRrKqDPr",
+            // v1.7.0 — buffer flow-control-blocked raw STREAM bytes instead of
+            // silently dropping them, fixing the root-cause "stream wedge" where
+            // ethlambda's quinn 128 KiB stream window would cause zquic to drop
+            // the tail of large gossipsub frames (aggregations / blocks) and
+            // permanently misalign the receiver's stream offset.
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.7.0#faa55d4be1e94379d34e2930626ab61d300b2dbb",
+            .hash = "zquic-1.7.0-2zRc1LvlEwCplvteJEU3h2BjWVDGcwtVNATV2oor4vu1",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",

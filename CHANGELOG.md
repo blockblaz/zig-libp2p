@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## [0.1.44](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.43...v0.1.44) (2026-06-11)
+
+### Fixed
+
+* **deps/zquic:** bump zquic to v1.7.0 to pull in the root-cause fix for
+  the persistent `/meshsub` stream wedge: zquic now **buffers**
+  flow-control-blocked application STREAM bytes (RFC 9000 §4, §19.9,
+  §19.13) instead of silently dropping them. Previously, when the
+  peer's per-stream receive window was exhausted (e.g. rust-libp2p /
+  quinn's default `stream_receive_window = 128 KiB`, easily exceeded by
+  a single 188 KB aggregation or 235 KB block), zquic dropped the
+  remainder of the frame and returned void. The raw-stream writer
+  adapter advances `send_offset` unconditionally after each
+  `sendRawStreamData` call, so each drop punched a permanent hole in
+  the QUIC stream; the receiver could not reassemble messages past the
+  gap, never advanced MAX_STREAM_DATA, and the connection eventually
+  closed with `reason=error` after gossipsub's 60 s app-layer idle
+  timeout fired. All earlier mitigations in this repo — the v0.1.39
+  outbound-only persistent-stream fix, the v0.1.40 draining detection,
+  the v0.1.43 app-layer gossip keepalive — were addressing downstream
+  symptoms of this transport-level silent drop. With v1.7.0, the
+  pending-send queue inside zquic absorbs the bytes and drains them on
+  MAX_DATA / MAX_STREAM_DATA arrival (and as a safety net every
+  `checkPto` tick), so the application's writes always reach the wire
+  in offset order.
+
 ## [0.1.43](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.42...v0.1.43) (2026-06-11)
 
 ### Fixed
