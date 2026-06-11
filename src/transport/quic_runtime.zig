@@ -1100,6 +1100,10 @@ pub const QuicRuntime = struct {
         return self.host.connection_manager.hasActiveConnection(peer);
     }
 
+    fn peerBase58(peer: identity.PeerId, buf: *[128]u8) []const u8 {
+        return peer.toBase58(buf) catch "<peer-id-format-err>";
+    }
+
     /// The swarm's `.publish` command carries raw `(topic, payload)` — the
     /// payload is the application data, not the gossipsub RPC frame.  We
     /// build the RPC protobuf here (`Message{topic, data}` wrapped in
@@ -1146,9 +1150,20 @@ pub const QuicRuntime = struct {
         self.collectConnectedPeers(&peers) catch return;
 
         if (peers.items.len == 0) {
-            log.debug("quic_runtime: publish on \"{s}\": no connected peers", .{topic});
+            log.info("quic_runtime: gossipsub publish topic={s} inner_bytes={d} wire_bytes={d}: no connected peers", .{
+                topic,
+                inner.len,
+                wire_buf.items.len,
+            });
             return;
         }
+
+        log.info("quic_runtime: gossipsub publish topic={s} inner_bytes={d} wire_bytes={d} peer_count={d}", .{
+            topic,
+            inner.len,
+            wire_buf.items.len,
+            peers.items.len,
+        });
 
         for (peers.items) |peer| {
             const wire_dup = a.dupe(u8, wire_buf.items) catch continue;
@@ -1265,21 +1280,41 @@ pub const QuicRuntime = struct {
         var raw: PublishBidiStream = undefined;
         var stream_id: u64 = undefined;
         if (self.outbound_by_peer.get(peer)) |slot| {
-            const sid = slot.outbound.nextLocalBidiStream() catch return null;
+            const sid = slot.outbound.nextLocalBidiStream() catch |err| {
+                var peer_buf: [128]u8 = undefined;
+                log.info("quic_runtime: persistent gossip stream open failed peer={s} direction=outbound err={s}", .{
+                    peerBase58(peer, &peer_buf),
+                    @errorName(err),
+                });
+                return null;
+            };
             stream_id = sid;
             raw = .{ .outbound = .{
                 .client = slot.outbound.client,
                 .stream_id = sid,
             } };
         } else if (self.inbound_by_peer.get(peer)) |ic| {
-            const sid = ZIo.rawAllocateNextLocalBidiStream(ic.conn) catch return null;
+            const sid = ZIo.rawAllocateNextLocalBidiStream(ic.conn) catch |err| {
+                var peer_buf: [128]u8 = undefined;
+                log.info("quic_runtime: persistent gossip stream open failed peer={s} direction=inbound err={s}", .{
+                    peerBase58(peer, &peer_buf),
+                    @errorName(err),
+                });
+                return null;
+            };
             stream_id = sid;
             raw = .{ .inbound = .{
                 .server = self.listener.server,
                 .conn = ic.conn,
                 .stream_id = sid,
             } };
-        } else return null;
+        } else {
+            var peer_buf: [128]u8 = undefined;
+            log.info("quic_runtime: persistent gossip stream open failed peer={s}: not connected", .{
+                peerBase58(peer, &peer_buf),
+            });
+            return null;
+        }
 
         const g = a.create(PersistentGossipStream) catch return null;
         g.* = .{
@@ -1291,28 +1326,53 @@ pub const QuicRuntime = struct {
             a.destroy(g);
             return null;
         };
+        var peer_buf: [128]u8 = undefined;
+        log.info("quic_runtime: opened persistent /meshsub stream peer={s} stream_id={d}", .{
+            peerBase58(peer, &peer_buf),
+            stream_id,
+        });
         return g;
     }
 
     fn enqueueGossipFrame(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) void {
+        var peer_buf: [128]u8 = undefined;
+        const peer_str = peerBase58(peer, &peer_buf);
+
         const g = self.ensurePersistentGossipStream(peer) orelse {
+            log.info("quic_runtime: gossip frame dropped peer={s} wire_bytes={d}: no persistent stream", .{
+                peer_str,
+                wire.len,
+            });
             self.allocator.free(wire);
             return;
         };
         if (g.broken) {
+            log.info("quic_runtime: gossip frame dropped peer={s} wire_bytes={d}: persistent stream broken", .{
+                peer_str,
+                wire.len,
+            });
             self.allocator.free(wire);
             return;
         }
         if (g.outbox.items.len >= persistent_gossip_outbox_cap) {
             log.warn(
-                "quic_runtime: persistent gossip outbox cap ({d}) hit for peer; marking stream broken",
-                .{persistent_gossip_outbox_cap},
+                "quic_runtime: persistent gossip outbox cap ({d}) hit for peer={s}; marking stream broken",
+                .{ persistent_gossip_outbox_cap, peer_str },
             );
-            self.markPersistentGossipBroken(g);
+            self.markPersistentGossipBroken(g, "outbox_cap");
             self.allocator.free(wire);
             return;
         }
+        log.info("quic_runtime: gossip frame queued peer={s} wire_bytes={d} outbox_depth={d}", .{
+            peer_str,
+            wire.len,
+            g.outbox.items.len + 1,
+        });
         g.outbox.append(self.allocator, wire) catch {
+            log.info("quic_runtime: gossip frame dropped peer={s} wire_bytes={d}: outbox append failed", .{
+                peer_str,
+                wire.len,
+            });
             self.allocator.free(wire);
         };
     }
@@ -1321,8 +1381,15 @@ pub const QuicRuntime = struct {
     /// kept in the map so subsequent enqueues short-circuit instead of opening
     /// a replacement (which would trip rust-libp2p's `MaxInboundSubstreams`).
     /// Also closes the QUIC connection so connection_manager can redial promptly.
-    fn markPersistentGossipBroken(self: *QuicRuntime, g: *PersistentGossipStream) void {
+    fn markPersistentGossipBroken(self: *QuicRuntime, g: *PersistentGossipStream, reason: []const u8) void {
         const peer = g.peer;
+        var peer_buf: [128]u8 = undefined;
+        log.info("quic_runtime: persistent gossip stream broken peer={s} reason={s} stream_id={d} queued_frames={d}", .{
+            peerBase58(peer, &peer_buf),
+            reason,
+            g.stream_id,
+            g.outbox.items.len,
+        });
         g.broken = true;
         for (g.outbox.items) |w| self.allocator.free(w);
         g.outbox.clearRetainingCapacity();
@@ -1333,16 +1400,18 @@ pub const QuicRuntime = struct {
     /// A broken stream cannot be recreated on the same connection (rust-libp2p
     /// `MaxInboundSubstreams`); closing the connection is the only recovery path.
     fn closePeerConnectionForGossipRecovery(self: *QuicRuntime, peer: identity.PeerId) void {
+        var peer_buf: [128]u8 = undefined;
+        const peer_str = peerBase58(peer, &peer_buf);
         if (self.outbound_by_peer.get(peer)) |slot| {
             if (slot.outbound.client.conn.phase != .closed) {
-                log.warn("quic_runtime: closing outbound QUIC connection after gossip stream wedge", .{});
+                log.info("quic_runtime: closing outbound QUIC connection for gossip recovery peer={s}", .{peer_str});
                 slot.outbound.closeConnection();
             }
             return;
         }
         if (self.inbound_by_peer.get(peer)) |ic| {
             if (ic.conn.phase != .closed) {
-                log.warn("quic_runtime: closing inbound QUIC connection after gossip stream wedge", .{});
+                log.info("quic_runtime: closing inbound QUIC connection for gossip recovery peer={s}", .{peer_str});
                 self.listener.server.closeConnection(ic.conn, 0, "gossip stream wedge");
             }
         }
@@ -1394,13 +1463,13 @@ pub const QuicRuntime = struct {
                     .delimited,
                 ) catch {
                     log.warn("quic_runtime: persistent gossip handshake build failed; marking stream broken", .{});
-                    self.markPersistentGossipBroken(g);
+                    self.markPersistentGossipBroken(g, "handshake_build_failed");
                     continue;
                 };
                 var w = g.raw.writer();
                 std.Io.Writer.writeAll(&w, out.items) catch {
                     log.warn("quic_runtime: persistent gossip handshake write failed; marking stream broken", .{});
-                    self.markPersistentGossipBroken(g);
+                    self.markPersistentGossipBroken(g, "handshake_write_failed");
                     continue;
                 };
                 std.Io.Writer.flush(&w) catch {};
@@ -1416,7 +1485,7 @@ pub const QuicRuntime = struct {
                         "quic_runtime: persistent gossip handshake failed: {s}; marking stream broken",
                         .{@errorName(err)},
                     );
-                    self.markPersistentGossipBroken(g);
+                    self.markPersistentGossipBroken(g, "handshake_read_failed");
                     continue;
                 };
                 g.handshake_done = true;
@@ -1444,16 +1513,17 @@ pub const QuicRuntime = struct {
                     write_failed = true;
                 };
                 if (write_failed) {
+                    var peer_buf: [128]u8 = undefined;
                     log.warn(
-                        "quic_runtime: persistent gossip write failed for peer after {d}/{d} frames; marking stream broken",
-                        .{ sent, g.outbox.items.len },
+                        "quic_runtime: persistent gossip write failed peer={s} after {d}/{d} frames; marking stream broken",
+                        .{ peerBase58(g.peer, &peer_buf), sent, g.outbox.items.len },
                     );
                     // Free the unsent tail before marking broken (which clears).
                     if (sent < g.outbox.items.len) {
                         for (g.outbox.items[sent..]) |frame| a.free(frame);
                     }
                     g.outbox.clearRetainingCapacity();
-                    self.markPersistentGossipBroken(g);
+                    self.markPersistentGossipBroken(g, "write_failed");
                 } else {
                     g.outbox.clearRetainingCapacity();
                 }
