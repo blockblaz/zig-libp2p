@@ -30,10 +30,10 @@ jobs:
       - name: Cache Zig packages
         uses: actions/cache@v4
         with:
-          path: ~/.cache/zig
-          key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
+          path: ~/.cache/zig/p
+          key: ${{ runner.os }}-zig-p-${{ hashFiles('build.zig.zon', 'build.zig') }}
           restore-keys: |
-            ${{ runner.os }}-zig-
+            ${{ runner.os }}-zig-p-
 
       - name: Fetch deps
         run: zig build --fetch
@@ -61,8 +61,8 @@ jobs:
       - name: Cache Zig packages
         uses: actions/cache@v4
         with:
-          path: ~/.cache/zig
-          key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
+          path: ~/.cache/zig/p
+          key: ${{ runner.os }}-zig-p-${{ hashFiles('build.zig.zon', 'build.zig') }}
 
       - name: Fetch deps
         run: zig build --fetch

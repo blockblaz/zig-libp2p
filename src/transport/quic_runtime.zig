@@ -1150,7 +1150,7 @@ pub const QuicRuntime = struct {
         self.collectConnectedPeers(&peers) catch return;
 
         if (peers.items.len == 0) {
-            log.info("quic_runtime: gossipsub publish topic={s} inner_bytes={d} wire_bytes={d}: no connected peers", .{
+            log.debug("quic_runtime: gossipsub publish topic={s} inner_bytes={d} wire_bytes={d}: no connected peers", .{
                 topic,
                 inner.len,
                 wire_buf.items.len,
@@ -1282,7 +1282,7 @@ pub const QuicRuntime = struct {
         if (self.outbound_by_peer.get(peer)) |slot| {
             const sid = slot.outbound.nextLocalBidiStream() catch |err| {
                 var peer_buf: [128]u8 = undefined;
-                log.info("quic_runtime: persistent gossip stream open failed peer={s} direction=outbound err={s}", .{
+                log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=outbound err={s}", .{
                     peerBase58(peer, &peer_buf),
                     @errorName(err),
                 });
@@ -1296,7 +1296,7 @@ pub const QuicRuntime = struct {
         } else if (self.inbound_by_peer.get(peer)) |ic| {
             const sid = ZIo.rawAllocateNextLocalBidiStream(ic.conn) catch |err| {
                 var peer_buf: [128]u8 = undefined;
-                log.info("quic_runtime: persistent gossip stream open failed peer={s} direction=inbound err={s}", .{
+                log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=inbound err={s}", .{
                     peerBase58(peer, &peer_buf),
                     @errorName(err),
                 });
@@ -1310,7 +1310,7 @@ pub const QuicRuntime = struct {
             } };
         } else {
             var peer_buf: [128]u8 = undefined;
-            log.info("quic_runtime: persistent gossip stream open failed peer={s}: not connected", .{
+            log.debug("quic_runtime: persistent gossip stream open failed peer={s}: not connected", .{
                 peerBase58(peer, &peer_buf),
             });
             return null;
@@ -1327,7 +1327,7 @@ pub const QuicRuntime = struct {
             return null;
         };
         var peer_buf: [128]u8 = undefined;
-        log.info("quic_runtime: opened persistent /meshsub stream peer={s} stream_id={d}", .{
+        log.debug("quic_runtime: opened persistent /meshsub stream peer={s} stream_id={d}", .{
             peerBase58(peer, &peer_buf),
             stream_id,
         });
@@ -1363,7 +1363,7 @@ pub const QuicRuntime = struct {
             self.allocator.free(wire);
             return;
         }
-        log.info("quic_runtime: gossip frame queued peer={s} wire_bytes={d} outbox_depth={d}", .{
+        log.debug("quic_runtime: gossip frame queued peer={s} wire_bytes={d} outbox_depth={d}", .{
             peer_str,
             wire.len,
             g.outbox.items.len + 1,

@@ -22,8 +22,11 @@ jobs:
         df -h /
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
           /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-          "$AGENT_TOOLSDIRECTORY" || true
+          /usr/local/share/chromium /usr/local/share/powershell \
+          /opt/microsoft /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+        sudo apt-get clean || true
         sudo docker image prune --all --force || true
+        sudo docker system prune --all --force --volumes || true
         echo "Disk after cleanup:"
         df -h /
 
@@ -35,10 +38,18 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v4
       with:
-        path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig', 'examples/**') }}
+        # Package store only — do not cache global build artifacts (o/tmp),
+        # which balloon restore size and have caused runner disk exhaustion.
+        path: ~/.cache/zig/p
+        key: ${{ runner.os }}-zig-p-${{ hashFiles('build.zig.zon', 'build.zig', 'examples/**') }}
         restore-keys: |
-          ${{ runner.os }}-zig-
+          ${{ runner.os }}-zig-p-
+
+    - name: Prune stale Zig global cache artifacts
+      run: |
+        du -sh ~/.cache/zig 2>/dev/null || true
+        rm -rf ~/.cache/zig/o ~/.cache/zig/tmp || true
+        df -h /
 
     - name: Fetch Zig dependencies
       run: |
@@ -70,6 +81,12 @@ jobs:
         done
         echo "All unit test attempts failed"
         exit 1
+
+    - name: Prune local Zig build artifacts
+      if: always()
+      run: |
+        rm -rf .zig-cache/o .zig-cache/tmp || true
+        df -h /
 
     - name: Wire fuzz harness (std.testing.fuzz smoke, #44)
       run: zig build fuzz --summary all
