@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## [0.1.42](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.41...v0.1.42) (2026-06-11)
+
+### Fixed
+
+* **deps/zquic:** bump zquic to v1.6.17 to pull in the QUIC idle-timeout
+  keepalive fix. zquic's `checkPto` only emitted PING probes while
+  `bytes_in_flight > 0`. Asymmetric gossip patterns (zeam mostly receives
+  between its own publish slots while a rust-libp2p peer keeps publishing)
+  left zeam silent at the QUIC transport for the full
+  `peer_max_idle_timeout` window; quinn / rust-libp2p then closed the
+  connection with an error-class reason. The new release sends an
+  ACK-eliciting PING every `max_idle_timeout / 2` per RFC 9000 §10.1.2,
+  fixing the recurring ~44s connection drops observed between zeam and
+  ethlambda in the local devnet.
+
 ## [0.1.41](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.40...v0.1.41) (2026-06-11)
 
 ### Fixed
