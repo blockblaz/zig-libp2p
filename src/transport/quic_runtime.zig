@@ -352,11 +352,22 @@ const PersistentGossipStream = struct {
     raw: PublishBidiStream,
     handshake_sent: bool = false,
     handshake_done: bool = false,
+    /// Drive-loop ticks spent waiting for the multistream responder after
+    /// `handshake_sent`. If this exceeds [`persistent_gossip_handshake_tick_max`]
+    /// while the outbox is non-empty, the stream is torn down and reopened so
+    /// a wedged negotiation does not stall all zeam→peer gossip forever.
+    handshake_wait_ticks: u32 = 0,
     /// Queue of `uvarint(len) + RPC protobuf` frames waiting to be flushed
     /// once the multistream-select handshake completes. Bytes are heap-owned;
     /// drained in FIFO order.
     outbox: std.ArrayList([]u8) = .empty,
 };
+
+/// Max [`QuicRuntime.driveLoop`] iterations to wait for a persistent gossip
+/// stream's multistream handshake before recreating the stream. At ~1ms/tick
+/// this is ~2s — long enough for a slow peer, short enough to recover from a
+/// wedged `/meshsub` responder without losing the queued outbox.
+const persistent_gossip_handshake_tick_max: u32 = 2000;
 
 /// A queued command from the swarm hook to the drive thread.
 const HookWork = union(enum) {
@@ -1187,11 +1198,46 @@ pub const QuicRuntime = struct {
         self.allocator.destroy(g.value);
     }
 
+    /// Tear down a wedged persistent `/meshsub` stream and open a fresh one,
+    /// preserving any queued gossip RPC frames. The old QUIC stream slot is
+    /// abandoned (the connection stays up); the next [`ensurePersistentGossipStream`]
+    /// call allocates a new local bidi stream id.
+    fn recreatePersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {
+        const a = self.allocator;
+        var preserved: std.ArrayList([]u8) = .empty;
+        defer preserved.deinit(a);
+
+        if (self.persistent_gossip.fetchRemove(peer)) |entry| {
+            for (entry.value.outbox.items) |w| {
+                preserved.append(a, w) catch {
+                    a.free(w);
+                };
+            }
+            entry.value.outbox.deinit(a);
+            a.destroy(entry.value);
+        }
+
+        if (self.ensurePersistentGossipStream(peer)) |g| {
+            for (preserved.items) |w| {
+                g.outbox.append(a, w) catch {
+                    a.free(w);
+                };
+            }
+        } else {
+            for (preserved.items) |w| a.free(w);
+        }
+    }
+
     /// Per-tick driver for the persistent /meshsub streams: complete the
     /// multistream-select handshake, then drain the outbox onto the wire.
-    /// Never FINs.
+    /// Never FINs. On handshake or write failure the stream is recreated so
+    /// a single wedged `/meshsub` control stream cannot silence all gossip to
+    /// a peer for the rest of the connection (zeam→ethlambda attestations).
     fn advancePersistentGossipStreams(self: *QuicRuntime) void {
         const a = self.allocator;
+        var peers_to_recreate: std.ArrayList(identity.PeerId) = .empty;
+        defer peers_to_recreate.deinit(a);
+
         var it = self.persistent_gossip.valueIterator();
         while (it.next()) |g_ptr| {
             const g = g_ptr.*;
@@ -1207,21 +1253,44 @@ pub const QuicRuntime = struct {
                     a,
                     meshsub_protocol_id,
                     .delimited,
-                ) catch continue;
+                ) catch {
+                    peers_to_recreate.append(a, g.peer) catch {};
+                    continue;
+                };
                 var w = g.raw.writer();
-                std.Io.Writer.writeAll(&w, out.items) catch continue;
+                std.Io.Writer.writeAll(&w, out.items) catch {
+                    peers_to_recreate.append(a, g.peer) catch {};
+                    continue;
+                };
                 std.Io.Writer.flush(&w) catch {};
                 g.handshake_sent = true;
             }
             if (!g.handshake_done) {
-                if (g.raw.unreadRecvLen() == 0) continue;
+                if (g.raw.unreadRecvLen() == 0) {
+                    if (g.handshake_sent and g.outbox.items.len > 0) {
+                        g.handshake_wait_ticks +|= 1;
+                        if (g.handshake_wait_ticks >= persistent_gossip_handshake_tick_max) {
+                            log.warn(
+                                "quic_runtime: persistent gossip handshake timed out for peer (outbox={d} frames), recreating stream",
+                                .{g.outbox.items.len},
+                            );
+                            peers_to_recreate.append(a, g.peer) catch {};
+                        }
+                    }
+                    continue;
+                }
                 var r = g.raw.reader();
                 var w = g.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch |err| switch (err) {
-                    error.ProtocolNegotiationFailed, error.DialFailed => continue,
-                    else => continue,
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, meshsub_protocol_id, a, null) catch |err| {
+                    log.warn(
+                        "quic_runtime: persistent gossip handshake failed: {s}, recreating stream",
+                        .{@errorName(err)},
+                    );
+                    peers_to_recreate.append(a, g.peer) catch {};
+                    continue;
                 };
                 g.handshake_done = true;
+                g.handshake_wait_ticks = 0;
             }
             // Only drain the outbox AFTER multistream-select completes —
             // otherwise the gossipsub RPC bytes would arrive before the
@@ -1230,21 +1299,46 @@ pub const QuicRuntime = struct {
             if (g.handshake_done and g.outbox.items.len > 0) {
                 var w = g.raw.writer();
                 var sent: usize = 0;
-                for (g.outbox.items) |frame_wire| {
-                    std.Io.Writer.writeAll(&w, frame_wire) catch break;
+                var write_failed = false;
+                for (g.outbox.items, 0..) |frame_wire, i| {
+                    std.Io.Writer.writeAll(&w, frame_wire) catch {
+                        write_failed = true;
+                        sent = i;
+                        break;
+                    };
                     a.free(frame_wire);
-                    sent += 1;
+                    sent = i + 1;
                 }
-                std.Io.Writer.flush(&w) catch {};
-                if (sent == g.outbox.items.len) {
+                std.Io.Writer.flush(&w) catch {
+                    write_failed = true;
+                };
+                if (write_failed) {
+                    log.warn(
+                        "quic_runtime: persistent gossip write failed for peer after {d}/{d} frames, recreating stream",
+                        .{ sent, g.outbox.items.len },
+                    );
+                    // Frames `[0..sent)` were freed; `[sent..]` are still owned.
+                    // Compact to valid tail only before recreate copies the outbox.
+                    if (sent < g.outbox.items.len) {
+                        const tail = g.outbox.items[sent..];
+                        g.outbox.clearRetainingCapacity();
+                        for (tail) |frame| {
+                            g.outbox.append(a, frame) catch {
+                                a.free(frame);
+                            };
+                        }
+                    } else {
+                        g.outbox.clearRetainingCapacity();
+                    }
+                    peers_to_recreate.append(a, g.peer) catch {};
+                } else {
                     g.outbox.clearRetainingCapacity();
-                } else if (sent > 0) {
-                    // Partial drain: drop the sent prefix.
-                    const remaining = g.outbox.items[sent..];
-                    std.mem.copyForwards([]u8, g.outbox.items, remaining);
-                    g.outbox.shrinkRetainingCapacity(g.outbox.items.len - sent);
                 }
             }
+        }
+
+        for (peers_to_recreate.items) |peer| {
+            self.recreatePersistentGossipStream(peer);
         }
     }
 
