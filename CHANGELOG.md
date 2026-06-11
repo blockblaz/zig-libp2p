@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## [0.1.46](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.45...v0.1.46) (2026-06-11)
+
+### Fixed
+
+* **quic_raw_stream_io:** advance `send_offset` only by bytes accepted from
+  `Client.sendRawStreamData` (zquic v1.7.2). When congestion or flow
+  control blocks a send, the adapter no longer punches permanent STREAM
+  offset holes that wedge quinn gossip peers.
+
+* **deps/zquic:** bump zquic to v1.7.2 (client CC gating + accepted-byte
+  return value on `sendRawStreamData`).
+
 ## [0.1.45](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.44...v0.1.45) (2026-06-11)
 
 ### Fixed

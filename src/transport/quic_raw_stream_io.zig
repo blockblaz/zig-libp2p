@@ -20,16 +20,18 @@ pub const raw_stream_send_chunk_len: usize = 1200;
 
 fn emitChunks(
     ctx: anytype,
-    comptime sendFn: fn (@TypeOf(ctx), []const u8) void,
+    comptime sendFn: fn (@TypeOf(ctx), []const u8) usize,
     slice: []const u8,
 ) usize {
     var off: usize = 0;
     var sent: usize = 0;
     while (off < slice.len) {
         const n = @min(raw_stream_send_chunk_len, slice.len - off);
-        sendFn(ctx, slice[off..][0..n]);
-        off += n;
-        sent += n;
+        const chunk = slice[off..][0..n];
+        const accepted = sendFn(ctx, chunk);
+        if (accepted == 0) break;
+        off += accepted;
+        sent += accepted;
     }
     return sent;
 }
@@ -48,9 +50,10 @@ fn clientRawReaderStream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reade
 fn clientRawWriterDrain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
     const self: *RawAppBidiClient = @alignCast(@fieldParentPtr("writer_buf", @as(*[2048]u8, @ptrCast(@alignCast(w.buffer.ptr)))));
     const send = struct {
-        fn f(ctx: *RawAppBidiClient, chunk: []const u8) void {
-            ctx.client.sendRawStreamData(ctx.stream_id, ctx.send_offset, chunk, false);
-            ctx.send_offset += @intCast(chunk.len);
+        fn f(ctx: *RawAppBidiClient, chunk: []const u8) usize {
+            const accepted = ctx.client.sendRawStreamData(ctx.stream_id, ctx.send_offset, chunk, false);
+            ctx.send_offset += @intCast(accepted);
+            return accepted;
         }
     }.f;
     // Honor `std.Io.Writer`: bytes already copied into `buffer[0..end]` must be sent before `data`.
@@ -85,13 +88,15 @@ fn serverRawReaderStream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reade
 fn serverRawWriterDrain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
     const self: *RawAppBidiServer = @alignCast(@fieldParentPtr("writer_buf", @as(*[2048]u8, @ptrCast(@alignCast(w.buffer.ptr)))));
     const send = struct {
-        fn f(ctx: *RawAppBidiServer, chunk: []const u8) void {
+        fn f(ctx: *RawAppBidiServer, chunk: []const u8) usize {
             if (ctx.client) |c| {
-                c.sendRawStreamData(ctx.stream_id, ctx.send_offset, chunk, false);
-            } else {
-                ctx.server.sendRawStreamData(ctx.conn, ctx.stream_id, ctx.send_offset, chunk, false);
+                const accepted = c.sendRawStreamData(ctx.stream_id, ctx.send_offset, chunk, false);
+                ctx.send_offset += @intCast(accepted);
+                return accepted;
             }
+            ctx.server.sendRawStreamData(ctx.conn, ctx.stream_id, ctx.send_offset, chunk, false);
             ctx.send_offset += @intCast(chunk.len);
+            return chunk.len;
         }
     }.f;
     if (w.end != 0) {
@@ -169,17 +174,18 @@ pub const RawAppBidiClient = struct {
     /// Send `data` on the raw stream with FIN set on the last chunk (go-libp2p identify expects EOF).
     pub fn writeAllFin(self: *RawAppBidiClient, data: []const u8) void {
         if (data.len == 0) {
-            self.client.sendRawStreamData(self.stream_id, self.send_offset, &[_]u8{}, true);
+            _ = self.client.sendRawStreamData(self.stream_id, self.send_offset, &[_]u8{}, true);
             return;
         }
         var off: usize = 0;
         while (off < data.len) {
             const n = @min(raw_stream_send_chunk_len, data.len - off);
             const chunk = data[off..][0..n];
-            off += n;
-            const fin = off >= data.len;
-            self.client.sendRawStreamData(self.stream_id, self.send_offset, chunk, fin);
-            self.send_offset += @intCast(chunk.len);
+            const fin = off + n >= data.len;
+            const accepted = self.client.sendRawStreamData(self.stream_id, self.send_offset, chunk, fin);
+            if (accepted == 0) break;
+            self.send_offset += @intCast(accepted);
+            off += accepted;
         }
     }
 };
@@ -254,17 +260,18 @@ pub const RawAppBidiServer = struct {
     pub fn writeAllFin(self: *RawAppBidiServer, data: []const u8) void {
         if (self.client) |c| {
             if (data.len == 0) {
-                c.sendRawStreamData(self.stream_id, self.send_offset, &[_]u8{}, true);
+                _ = c.sendRawStreamData(self.stream_id, self.send_offset, &[_]u8{}, true);
                 return;
             }
             var off: usize = 0;
             while (off < data.len) {
                 const n = @min(raw_stream_send_chunk_len, data.len - off);
                 const chunk = data[off..][0..n];
-                off += n;
-                const fin = off >= data.len;
-                c.sendRawStreamData(self.stream_id, self.send_offset, chunk, fin);
-                self.send_offset += @intCast(chunk.len);
+                const fin = off + n >= data.len;
+                const accepted = c.sendRawStreamData(self.stream_id, self.send_offset, chunk, fin);
+                if (accepted == 0) break;
+                self.send_offset += @intCast(accepted);
+                off += accepted;
             }
             return;
         }

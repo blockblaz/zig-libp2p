@@ -1,7 +1,7 @@
 .{
     .name = .zig_libp2p,
     // x-release-please-start-version
-    .version = "0.1.45",
+    .version = "0.1.46",
     // x-release-please-end
     .fingerprint = 0x6e2dd2ac84762996,
     .minimum_zig_version = "0.16.0",
@@ -23,10 +23,9 @@
             .hash = "peer_id-0.0.0-vHIk8V9gAADOHHLTSiieUPV0WBjGKAkrkH1sG-Vfukyo",
         },
         .zquic = .{
-            // v1.7.1 — client outbound 1-RTT sends now update CC bytes_in_flight
-            // so checkPto can recover tail losses on the zeam→quinn gossip path.
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.7.1#1d34e7d384be46765900cdcb3ada77bd70c62df0",
-            .hash = "zquic-1.7.0-2zRc1DjtEwAgbNkUATwsEdO0vRYdqTgvtxmZVma8kh6t",
+            // v1.7.2 — client CC gating + sendRawStreamData returns accepted bytes
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.7.2#5e09805c8c9ef3ddfc227aaa1b4c10d152c943e9",
+            .hash = "zquic-1.7.0-2zRc1K7sEwCkh4lyL7QzGSI-C9oZYycxn6xLDcP3CIBk",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",

@@ -335,10 +335,10 @@ const PublishBidiStream = union(enum) {
 
     fn finStream(self: *PublishBidiStream) void {
         switch (self.*) {
-            .outbound => |*c| c.client.sendRawStreamData(c.stream_id, c.send_offset, &[_]u8{}, true),
+            .outbound => |*c| _ = c.client.sendRawStreamData(c.stream_id, c.send_offset, &[_]u8{}, true),
             .inbound => |*s| {
                 if (s.client) |c| {
-                    c.sendRawStreamData(s.stream_id, s.send_offset, &[_]u8{}, true);
+                    _ = c.sendRawStreamData(s.stream_id, s.send_offset, &[_]u8{}, true);
                 } else {
                     s.server.sendRawStreamData(s.conn, s.stream_id, s.send_offset, &[_]u8{}, true);
                 }
@@ -2199,7 +2199,7 @@ pub const QuicRuntime = struct {
                         // the connection alive.
                         if (err == error.ProtocolNegotiationFailed) {
                             if (ist.raw.client) |c| {
-                                c.sendRawStreamData(ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
+                                _ = c.sendRawStreamData(ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
                             } else {
                                 ist.raw.server.sendRawStreamData(ist.conn, ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
                             }
