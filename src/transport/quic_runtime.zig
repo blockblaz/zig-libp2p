@@ -224,6 +224,15 @@ const OutboundConn = struct {
     notified: bool = false,
     conn_id: connection_manager_mod.ConnectionId,
     peer_id: ?identity.PeerId = null,
+    /// Last observed value of `outbound.client.conn.phase`, sampled at the end of every
+    /// [`QuicRuntime.driveLoop`] iteration by [`detectOutboundConnectionClose`]. The
+    /// transition `notified == true && prev_phase != .closed && current == .closed`
+    /// is how we detect that the remote QUIC peer sent `CONNECTION_CLOSE` (or that we
+    /// hit a transport idle-timeout). Without this poll, an outbound connection's
+    /// remote close is invisible — `outbound_by_peer` retains a dead entry, the host
+    /// never sees `onConnectionClosed`, and `connection_manager` never schedules a
+    /// redial. Mirrors the listener-side [`QuicListener.syncSeenFlags`] sweep.
+    prev_phase: ZIo.ConnPhase = .initial,
     /// Tracks which server-initiated bidi stream IDs on this outbound QUIC connection have
     /// already been surfaced as inbound streams. Server-initiated bidi streams (IDs 1, 5, 9…)
     /// are opened by the remote peer on the connection zeam dialled; without this tracking they
@@ -830,6 +839,51 @@ pub const QuicRuntime = struct {
         self.inbound_conn_ids[slot] = 0;
     }
 
+    /// Detect outbound QUIC connections that the remote peer has closed
+    /// (`CONNECTION_CLOSE` frame received, or transport idle-timeout fired locally)
+    /// and surface them via `host.onConnectionClosed`. Without this poll, zeam keeps
+    /// the dead entry in `outbound_by_peer` and `connection_manager` never schedules
+    /// a redial — gossip stays silent forever even though the underlying transport
+    /// has signalled the disconnect.
+    ///
+    /// Mirrors the listener-side [`QuicListener.syncSeenFlags`] which fires
+    /// [`onLifecycleClosed`] for inbound connections.
+    fn detectOutboundConnectionClose(self: *QuicRuntime) void {
+        // Two-pass: collect peers to evict, then mutate the map. Avoids invalidating
+        // the iterator on `fetchRemove` and keeps the close handling identical to
+        // the inbound path (host callback then destroyPersistentGossipStream).
+        var to_close: std.ArrayList(identity.PeerId) = .empty;
+        defer to_close.deinit(self.allocator);
+
+        var it = self.outbound_by_peer.iterator();
+        while (it.next()) |entry| {
+            const slot = entry.value_ptr.*;
+            const cur_phase = slot.outbound.client.conn.phase;
+            if (slot.notified and slot.prev_phase != .closed and cur_phase == .closed) {
+                to_close.append(self.allocator, entry.key_ptr.*) catch {};
+            }
+            slot.prev_phase = cur_phase;
+        }
+
+        for (to_close.items) |peer| {
+            const slot = self.outbound_by_peer.get(peer) orelse continue;
+            const cid = slot.conn_id;
+            const now_ms = self.opts.now_ms_fn();
+            log.info(
+                "quic_runtime: outbound QUIC connection closed by remote (cid={d}); notifying host",
+                .{cid},
+            );
+            self.host.onConnectionClosed(now_ms, cid, peer, .remote_close) catch |e| {
+                log.warn("quic_runtime: outbound onConnectionClosed failed: {s}", .{@errorName(e)});
+            };
+            self.destroyPersistentGossipStream(peer);
+            if (self.outbound_by_peer.fetchRemove(peer)) |kv| {
+                kv.value.outbound.deinit();
+                self.allocator.destroy(kv.value);
+            }
+        }
+    }
+
     fn onLifecycleInboundStream(
         ctx: ?*anyopaque,
         _: *quic_endpoint.QuicListener,
@@ -933,6 +987,12 @@ pub const QuicRuntime = struct {
                     self.dispatchOutboundPeerStreams(v.*);
                 }
             }
+
+            // Detect outbound connections the remote closed (CONNECTION_CLOSE / idle
+            // timeout) and surface to the host so connection_manager can redial.
+            // Must run AFTER outbound.drive so zquic has processed any inbound packets
+            // that triggered the phase transition this tick.
+            self.detectOutboundConnectionClose();
 
             // Drain hook queue.
             self.drainHookWork(&work_scratch);
