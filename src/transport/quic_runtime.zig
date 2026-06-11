@@ -42,6 +42,7 @@ const snappy_wire = @import("../req_resp/snappy_wire.zig");
 
 const gossipsub_msg = @import("../gossipsub/message.zig");
 const gossipsub_rpc = @import("../gossipsub/rpc.zig");
+const gossipsub_cfg = @import("../gossipsub/config.zig");
 const gossipsub_wire_limits = @import("../gossipsub/wire_limits.zig");
 const varint = @import("../varint.zig");
 
@@ -367,10 +368,9 @@ const OutboundPublish = struct {
 ///   * recreates the stream after a wedge (a wedge means the peer's gossip
 ///     handler is broken — opening a new stream cannot fix it).
 ///
-/// On wedge: the stream is marked `broken`, outbox is dropped, and a single
-/// warn is logged. The QUIC connection eventually times out via keepalive or
-/// is closed by the peer, at which point our connection_manager redials and
-/// `ensurePersistentGossipStream` opens a fresh stream on the new connection.
+/// On wedge: the stream is marked `broken`, outbox is dropped, and the
+/// underlying QUIC connection is closed locally so `connection_manager`
+/// redials and `ensurePersistentGossipStream` opens a fresh stream.
 const PersistentGossipStream = struct {
     peer: identity.PeerId,
     stream_id: u64,
@@ -1115,8 +1115,18 @@ pub const QuicRuntime = struct {
             return;
         };
         defer a.free(inner);
+        if (inner.len > gossipsub_cfg.max_transmit_size_bytes) {
+            log.warn("quic_runtime: gossipsub publish dropped: payload {d} bytes exceeds max_transmit_size {d}", .{
+                inner.len,
+                gossipsub_cfg.max_transmit_size_bytes,
+            });
+            return;
+        }
         if (inner.len > gossipsub_wire_limits.max_rpc_length_delimited_bytes) {
-            log.warn("quic_runtime: gossipsub publish dropped: payload exceeds wire limit", .{});
+            log.warn("quic_runtime: gossipsub publish dropped: payload {d} bytes exceeds wire limit {d}", .{
+                inner.len,
+                gossipsub_wire_limits.max_rpc_length_delimited_bytes,
+            });
             return;
         }
         const rpc_frame = gossipsub_rpc.encodePublish(a, inner) catch |err| {
@@ -1310,10 +1320,32 @@ pub const QuicRuntime = struct {
     /// Mark the stream broken and drop all queued frames. The stream entry is
     /// kept in the map so subsequent enqueues short-circuit instead of opening
     /// a replacement (which would trip rust-libp2p's `MaxInboundSubstreams`).
+    /// Also closes the QUIC connection so connection_manager can redial promptly.
     fn markPersistentGossipBroken(self: *QuicRuntime, g: *PersistentGossipStream) void {
+        const peer = g.peer;
         g.broken = true;
         for (g.outbox.items) |w| self.allocator.free(w);
         g.outbox.clearRetainingCapacity();
+        self.closePeerConnectionForGossipRecovery(peer);
+    }
+
+    /// Tear down the QUIC connection after a persistent `/meshsub` stream wedge.
+    /// A broken stream cannot be recreated on the same connection (rust-libp2p
+    /// `MaxInboundSubstreams`); closing the connection is the only recovery path.
+    fn closePeerConnectionForGossipRecovery(self: *QuicRuntime, peer: identity.PeerId) void {
+        if (self.outbound_by_peer.get(peer)) |slot| {
+            if (slot.outbound.client.conn.phase != .closed) {
+                log.warn("quic_runtime: closing outbound QUIC connection after gossip stream wedge", .{});
+                slot.outbound.closeConnection();
+            }
+            return;
+        }
+        if (self.inbound_by_peer.get(peer)) |ic| {
+            if (ic.conn.phase != .closed) {
+                log.warn("quic_runtime: closing inbound QUIC connection after gossip stream wedge", .{});
+                self.listener.server.closeConnection(ic.conn, 0, "gossip stream wedge");
+            }
+        }
     }
 
     fn destroyPersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {

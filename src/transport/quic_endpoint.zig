@@ -401,6 +401,13 @@ pub const QuicOutbound = struct {
         return ZIo.rawAllocateNextLocalBidiStream(&self.client.conn);
     }
 
+    /// Close the underlying QUIC connection (sends CONNECTION_CLOSE).
+    pub fn closeConnection(self: *QuicOutbound) void {
+        if (self.client.conn.phase != .closed) {
+            self.client.closeConnection(0, "local close");
+        }
+    }
+
     /// Remote [`PeerId`](`peer_id_mod.PeerId`) from the TLS server leaf (caller owns via [`PeerId.deinit`]).
     pub fn verifiedRemotePeerId(
         self: *const QuicOutbound,

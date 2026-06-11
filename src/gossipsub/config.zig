@@ -18,9 +18,11 @@ pub const duplicate_cache_ttl_ms: i64 = 24_000;
 /// Heartbeats worth of message IDs to remember for lazy gossip.
 pub const history_length: u8 = 6;
 
-/// Upper bound on serialized gossipsub message size (publish path), per #39:
-/// `max(snappy(10 MiB) + 1 KiB, 1 MiB)`.
-pub const max_transmit_size_bytes: usize = @max(10 * 1024 * 1024 + 1024, 1024 * 1024);
+/// Upper bound on serialized gossipsub message size (publish path), per #39.
+/// Matches ethlambda `MAX_COMPRESSED_PAYLOAD_SIZE` (consensus-specs max_message_size
+/// snappy headroom): `32 + 10 MiB + 10 MiB/6 + 1024` (~12 MiB).
+pub const max_payload_size_bytes: usize = 10 * 1024 * 1024;
+pub const max_transmit_size_bytes: usize = 32 + max_payload_size_bytes + max_payload_size_bytes / 6 + 1024;
 
 /// Default PRUNE back-off when a peer sends PRUNE without an explicit `backoff_seconds`
 /// (libp2p gossipsub v1.1 spec recommends 1 minute).

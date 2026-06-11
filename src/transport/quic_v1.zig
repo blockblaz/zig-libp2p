@@ -61,6 +61,7 @@ pub fn libp2pZquicServerConfig(options: Libp2pZquicServerOptions) Io.ServerConfi
         .alpn = tls_alpn,
         .raw_application_streams = true,
         .request_client_certificate = true,
+        .transport_params_preset = .libp2p,
     };
 }
 
@@ -101,6 +102,7 @@ pub fn libp2pZquicClientConfig(options: Libp2pZquicClientOptions) Io.ClientConfi
         .client_key_path = options.client_key_path,
         .client_cert_pem = options.client_cert_pem,
         .client_key_pem = options.client_key_pem,
+        .transport_params_preset = .libp2p,
     };
 }
 
