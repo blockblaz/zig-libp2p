@@ -4,6 +4,7 @@ const std = @import("std");
 const w = @import("../protobuf/wire.zig");
 const errors = @import("../errors.zig");
 const lim = @import("wire_limits.zig");
+const forward_compat = @import("forward_compat.zig");
 
 pub const Error = errors.GossipsubError || w.Error || error{
     MissingPruneTopic,
@@ -90,7 +91,7 @@ pub fn decodeFirstIHave(allocator: std.mem.Allocator, control: []const u8) (Erro
                         try ids.append(allocator, copy);
                     }
                 },
-                else => {},
+                else => forward_compat.noteUnknownField(.control_ihave, ik.field_number, ik.wire_type),
             }
         }
         const top = topic orelse return error.MissingIHaveTopic;
@@ -175,7 +176,7 @@ pub fn decodeFirstIWant(allocator: std.mem.Allocator, control: []const u8) (Erro
                         try ids.append(allocator, copy);
                     }
                 },
-                else => {},
+                else => forward_compat.noteUnknownField(.control_iwant, ik.field_number, ik.wire_type),
             }
         }
         const owned_ids = try ids.toOwnedSlice(allocator);
@@ -256,7 +257,7 @@ pub fn decodeFirstIDontWant(allocator: std.mem.Allocator, control: []const u8) (
                         try ids.append(allocator, copy);
                     }
                 },
-                else => {},
+                else => forward_compat.noteUnknownField(.control_idontwant, ik.field_number, ik.wire_type),
             }
         }
         const owned_ids = try ids.toOwnedSlice(allocator);
@@ -325,6 +326,9 @@ pub fn decodeFirstGraftTopic(allocator: std.mem.Allocator, control: []const u8) 
             if (gk.field_number == 1 and gk.wire_type == .length_delimited) {
                 return try allocator.dupe(u8, gv.value);
             }
+            if (gk.field_number != 1) {
+                forward_compat.noteUnknownField(.control_graft, gk.field_number, gk.wire_type);
+            }
         }
     }
     return null;
@@ -374,7 +378,7 @@ pub fn decodeFirstPrune(allocator: std.mem.Allocator, control: []const u8) (Erro
                     const vv = try w.decodeVarUInt64(pv.value);
                     backoff = vv.value;
                 },
-                else => {},
+                else => forward_compat.noteUnknownField(.control_prune, pk.field_number, pk.wire_type),
             }
         }
         const top = topic orelse return error.MissingPruneTopic;
@@ -491,7 +495,7 @@ fn decodePeerInfo(allocator: std.mem.Allocator, blob: []const u8) (Error || std.
                 if (out.signed_peer_record != null) continue;
                 out.signed_peer_record = try allocator.dupe(u8, nv.value);
             },
-            else => {},
+            else => forward_compat.noteUnknownField(.control_peer_info, key.field_number, key.wire_type),
         }
     }
     return out;
@@ -550,7 +554,7 @@ pub fn decodeFirstPruneWithPeers(allocator: std.mem.Allocator, control: []const 
                     const vv = try w.decodeVarUInt64(pv.value);
                     backoff = vv.value;
                 },
-                else => {},
+                else => forward_compat.noteUnknownField(.control_prune, pk.field_number, pk.wire_type),
             }
         }
         const top = topic orelse return error.MissingPruneTopic;
@@ -625,7 +629,7 @@ pub fn decodeFirstControlExtensions(control: []const u8) Error!?ControlExtension
                     const vv = try w.decodeVarUInt64(iv.value);
                     view.partial_messages = vv.value != 0;
                 },
-                else => {},
+                else => forward_compat.noteUnknownField(.control_extensions, ik.field_number, ik.wire_type),
             }
         }
         return view;

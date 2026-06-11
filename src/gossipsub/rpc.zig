@@ -5,6 +5,7 @@ const std = @import("std");
 const w = @import("../protobuf/wire.zig");
 const errors = @import("../errors.zig");
 const lim = @import("wire_limits.zig");
+const forward_compat = @import("forward_compat.zig");
 
 pub const Error = errors.GossipsubError || w.Error || error{MissingSubscribeFields};
 
@@ -101,7 +102,7 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
                 // compatibility (rust-libp2p / go-libp2p may add new SubOpts fields).
                 // Returning an error here drops the entire RPC including the control
                 // and publish sections — see [`handleInboundRpc`].
-                else => {},
+                else => forward_compat.noteUnknownField(.rpc_sub_opts, sk.field_number, sk.wire_type),
             }
         }
         const sub = subscribe orelse return error.MissingSubscribeFields;
@@ -173,7 +174,7 @@ pub fn decodeSubscribes(allocator: std.mem.Allocator, rpc_wire: []const u8) (Err
                 // compatibility (rust-libp2p / go-libp2p may add new SubOpts fields).
                 // Returning an error here drops the entire RPC including the control
                 // and publish sections — see [`handleInboundRpc`].
-                else => {},
+                else => forward_compat.noteUnknownField(.rpc_sub_opts, sk.field_number, sk.wire_type),
             }
         }
         const sub = subscribe orelse return error.MissingSubscribeFields;
