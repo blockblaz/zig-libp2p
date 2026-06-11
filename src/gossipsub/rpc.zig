@@ -97,7 +97,11 @@ pub fn decodeFirstSubscribe(allocator: std.mem.Allocator, rpc: []const u8) (Erro
                     if (sk.wire_type != .length_delimited) return error.UnsupportedWireType;
                     topic = chunk;
                 },
-                else => return error.UnsupportedWireType,
+                // Per protobuf spec, unknown fields must be skipped for forward
+                // compatibility (rust-libp2p / go-libp2p may add new SubOpts fields).
+                // Returning an error here drops the entire RPC including the control
+                // and publish sections — see [`handleInboundRpc`].
+                else => {},
             }
         }
         const sub = subscribe orelse return error.MissingSubscribeFields;
@@ -165,7 +169,11 @@ pub fn decodeSubscribes(allocator: std.mem.Allocator, rpc_wire: []const u8) (Err
                     if (sk.wire_type != .length_delimited) return error.UnsupportedWireType;
                     topic = chunk;
                 },
-                else => return error.UnsupportedWireType,
+                // Per protobuf spec, unknown fields must be skipped for forward
+                // compatibility (rust-libp2p / go-libp2p may add new SubOpts fields).
+                // Returning an error here drops the entire RPC including the control
+                // and publish sections — see [`handleInboundRpc`].
+                else => {},
             }
         }
         const sub = subscribe orelse return error.MissingSubscribeFields;
@@ -327,6 +335,55 @@ test "subscribe round trip" {
     defer deinitSubscribeView(a, &got);
     try std.testing.expect(got.subscribe);
     try std.testing.expectEqualStrings("hello-topic", got.topic);
+}
+
+test "decodeSubscribes skips unknown inner SubOpts fields (forward compat)" {
+    // Per protobuf spec, decoders must skip unknown field numbers — rust-libp2p
+    // and go-libp2p extend SubOpts with vendor fields and we used to drop the
+    // whole RPC (including control + publish sections) with `UnsupportedWireType`.
+    const a = std.testing.allocator;
+
+    // Hand-build SubOpts with: field 1 (subscribe=true), field 2 (topic="hi"),
+    // and an unknown field 7 (varint=42) + unknown field 11 (length-delimited).
+    var sub = std.ArrayList(u8).empty;
+    defer sub.deinit(a);
+    try w.appendFieldKey(&sub, a, 1, .varint);
+    try w.appendVarUInt64(&sub, a, 1);
+    try w.appendLengthDelimited(&sub, a, 2, "hi");
+    try w.appendFieldKey(&sub, a, 7, .varint);
+    try w.appendVarUInt64(&sub, a, 42);
+    try w.appendLengthDelimited(&sub, a, 11, "vendor-blob");
+
+    var rpc_buf = std.ArrayList(u8).empty;
+    defer rpc_buf.deinit(a);
+    try w.appendLengthDelimited(&rpc_buf, a, 1, sub.items);
+
+    const views = try decodeSubscribes(a, rpc_buf.items);
+    defer freeSubscribeViews(a, views);
+    try std.testing.expectEqual(@as(usize, 1), views.len);
+    try std.testing.expect(views[0].subscribe);
+    try std.testing.expectEqualStrings("hi", views[0].topic);
+}
+
+test "decodeFirstSubscribe skips unknown inner SubOpts fields (forward compat)" {
+    const a = std.testing.allocator;
+    var sub = std.ArrayList(u8).empty;
+    defer sub.deinit(a);
+    try w.appendLengthDelimited(&sub, a, 9, "future-field");
+    try w.appendFieldKey(&sub, a, 1, .varint);
+    try w.appendVarUInt64(&sub, a, 0);
+    try w.appendLengthDelimited(&sub, a, 2, "t");
+    try w.appendFieldKey(&sub, a, 13, .varint);
+    try w.appendVarUInt64(&sub, a, 99);
+
+    var rpc_buf = std.ArrayList(u8).empty;
+    defer rpc_buf.deinit(a);
+    try w.appendLengthDelimited(&rpc_buf, a, 1, sub.items);
+
+    var got = (try decodeFirstSubscribe(a, rpc_buf.items)).?;
+    defer deinitSubscribeView(a, &got);
+    try std.testing.expect(!got.subscribe);
+    try std.testing.expectEqualStrings("t", got.topic);
 }
 
 test "decodeFirstSubscribe returns null on control-only rpc" {

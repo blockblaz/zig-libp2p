@@ -23,6 +23,8 @@ const message_id = @import("message_id.zig");
 const msg_mod = @import("message.zig");
 const rpc = @import("rpc.zig");
 
+const log = std.log.scoped(.gossipsub);
+
 /// `arc4random_buf` is missing from `std.c` on Linux with older glibc (see `std.c.arc4random_buf`),
 /// which breaks CI. Prefer the `getrandom` syscall on Linux; otherwise libc where linked.
 fn gossipsubPrngSeed() u64 {
@@ -295,6 +297,15 @@ pub const Gossipsub = struct {
     px_dial_queue: std.ArrayList([]u8),
     /// Per-topic deadline until we may `subscribe` again after `unsubscribe` (#83).
     topic_unsubscribed_until: std.StringHashMap(i64),
+    /// Count of inbound RPC frames whose `subscriptions` section failed to decode.
+    /// Each phase (subscribe / control / publish) is isolated by [`handleInboundRpc`]
+    /// so a forward-incompatible field added by a peer running a newer gossipsub
+    /// version does not wedge the entire mesh.
+    inbound_rpc_subscribe_decode_errors: u64,
+    /// Count of inbound RPC frames whose `control` section failed to decode or handle.
+    inbound_rpc_control_decode_errors: u64,
+    /// Count of inbound RPC frames whose `publish` section failed to decode.
+    inbound_rpc_publish_decode_errors: u64,
 
     pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
         try config.validate();
@@ -333,6 +344,9 @@ pub const Gossipsub = struct {
             .direct_peers = .init(allocator),
             .px_dial_queue = .empty,
             .topic_unsubscribed_until = std.StringHashMap(i64).init(allocator),
+            .inbound_rpc_subscribe_decode_errors = 0,
+            .inbound_rpc_control_decode_errors = 0,
+            .inbound_rpc_publish_decode_errors = 0,
         };
         return p;
     }
@@ -1183,18 +1197,44 @@ pub const Gossipsub = struct {
     }
 
     pub fn handleInboundRpc(self: *Gossipsub, sender: identity.PeerId, frame: []const u8) (rpc.Error || msg_mod.Error || control.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
-        const sub_views = try rpc.decodeSubscribes(self.allocator, frame);
-        defer rpc.freeSubscribeViews(self.allocator, sub_views);
-        for (sub_views) |sv| {
-            try self.noteRemoteSubscription(sender, sv.topic, sv.subscribe);
+        // The three sections of an RPC frame (subscriptions, control, publish)
+        // are independent on the wire. A decode failure in one — for example, a
+        // forward-incompatible field added by a peer running a newer gossipsub
+        // version — must NOT prevent the others from being processed. Otherwise
+        // a single malformed SUBSCRIBE wedges the entire mesh: GRAFT/PRUNE
+        // never apply, blocks never propagate, and the chain forks. Each phase
+        // is isolated and the error is counted for observability.
+        if (rpc.decodeSubscribes(self.allocator, frame)) |sub_views| {
+            defer rpc.freeSubscribeViews(self.allocator, sub_views);
+            for (sub_views) |sv| {
+                self.noteRemoteSubscription(sender, sv.topic, sv.subscribe) catch |err| {
+                    log.warn("gossipsub: noteRemoteSubscription failed: {s}", .{@errorName(err)});
+                    self.inbound_rpc_subscribe_decode_errors += 1;
+                };
+            }
+        } else |err| {
+            log.warn("gossipsub: inbound RPC subscriptions decode failed: {s}", .{@errorName(err)});
+            self.inbound_rpc_subscribe_decode_errors += 1;
         }
 
-        if (try rpc.decodeControlPayload(self.allocator, frame)) |ctl| {
-            defer self.allocator.free(ctl);
-            try self.handleInboundControl(sender, ctl);
+        if (rpc.decodeControlPayload(self.allocator, frame)) |maybe_ctl| {
+            if (maybe_ctl) |ctl| {
+                defer self.allocator.free(ctl);
+                self.handleInboundControl(sender, ctl) catch |err| {
+                    log.warn("gossipsub: inbound RPC control handling failed: {s}", .{@errorName(err)});
+                    self.inbound_rpc_control_decode_errors += 1;
+                };
+            }
+        } else |err| {
+            log.warn("gossipsub: inbound RPC control decode failed: {s}", .{@errorName(err)});
+            self.inbound_rpc_control_decode_errors += 1;
         }
 
-        const blobs = try rpc.decodePublishes(self.allocator, frame);
+        const blobs = rpc.decodePublishes(self.allocator, frame) catch |err| {
+            log.warn("gossipsub: inbound RPC publishes decode failed: {s}", .{@errorName(err)});
+            self.inbound_rpc_publish_decode_errors += 1;
+            return;
+        };
         defer rpc.freePublishBlobs(self.allocator, blobs);
         for (blobs) |b| {
             var decoded = try msg_mod.decode(self.allocator, b);
