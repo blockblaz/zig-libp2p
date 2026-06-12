@@ -34,6 +34,13 @@ jobs:
       uses: mlugg/setup-zig@v2.0.5
       with:
         version: 0.16.0
+        # mlugg/setup-zig restores a cached `~/.cache/zig` based on the toolchain
+        # key; on Ubuntu runners this has been resurrecting a broken state where
+        # the manifest references `libcompiler_rt.a` but the file isn't on disk,
+        # producing a deterministic `failed to parse archive: FileNotFound` on
+        # every fresh build. Disable the action's cache; we still cache the
+        # package store (`~/.cache/zig/p`) ourselves below.
+        use-cache: false
 
     - name: Cache Zig packages
       uses: actions/cache@v4
