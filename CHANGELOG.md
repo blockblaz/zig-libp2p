@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+## [0.1.51](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.50...v0.1.51) (2026-06-12)
+
+### Security
+
+* **gossipsub:** verify the `signed_peer_record` envelope (RFC 0002) on PRUNE
+  Peer Exchange entries before queueing them for the embedder to dial (#201).
+  Previously the envelope was preserved by the decoder but never verified, so
+  a malicious PRUNE sender could splice attacker-chosen multiaddrs into the
+  dial queue under any peer-id they liked. The new path derives the PeerId
+  from the envelope's public key, checks the RFC 0002 signature, and rejects
+  on `peer_id` mismatch. Failed envelopes drop the entry and dock the PRUNE
+  sender's behaviour score via the new `px_invalid_envelope_score_delta`
+  knob (default `-100`). `px_envelope_required` (default off) makes the
+  receiver also reject envelope-less PX entries; spec wording explicitly
+  allows omission so the default stays lenient. Observability via the new
+  `pxEnvelopeVerifiedCount` / `pxEnvelopeInvalidCount` /
+  `pxEnvelopeMissingAcceptedCount` / `pxEnvelopeMissingRejectedCount`
+  accessors.
+
+### Changed
+
+* **identify:** expose `encodeSignedPeerRecordTestWire` and
+  `encodePeerRecordTestWire` as `pub` so other modules can build signed
+  envelope wire blobs in their unit tests (used by the new gossipsub PX
+  envelope tests).
+* **identity:** re-export `PublicKey` (was already in `peer_id`) so
+  downstream code can derive `PeerId`s without an extra `peer_id` import.
+
+### CI
+
+* Disable `mlugg/setup-zig`'s built-in cache (`use-cache: false`) and wipe
+  `~/.cache/zig/o` between retry attempts. The setup-zig action was
+  restoring a poisoned `~/.cache/zig` manifest that referenced
+  `libcompiler_rt.a` at a content-addressed hash dir whose backing file
+  wasn't on disk, producing a deterministic `failed to parse archive:
+  FileNotFound` against
+  `~/.cache/zig/o/2d97f70991449679e905922fee93ca9d/libcompiler_rt.a` on
+  every fresh build. The project's own `~/.cache/zig/p` package-store
+  cache is unaffected.
+
 ## [0.1.50](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.49...v0.1.50) (2026-06-12)
 
 ### Fixed

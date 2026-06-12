@@ -12,6 +12,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const identity = @import("../identity.zig");
+const identify_mod = @import("../identify.zig");
 const connection_manager = @import("../connection_manager.zig");
 const errors = @import("../errors.zig");
 const control = @import("control.zig");
@@ -166,6 +167,22 @@ pub const GossipsubConfig = struct {
     /// PRUNE `peers` lists, #85). Embedders pop via [`popDialSuggestion`] and feed
     /// `connection_manager.registerKnownPeer`.
     max_px_dial_queue: usize = 256,
+    /// When a PRUNE PX `PeerInfo` carries a `signed_peer_record` envelope, verify the
+    /// RFC 0002 signature (and that the envelope's PeerId matches the carried `peer_id`
+    /// multihash) before queuing the suggestion for the embedder to dial. Failed
+    /// verifications are dropped and the PRUNE sender's behaviour score is docked by
+    /// `px_invalid_envelope_score_delta`. Spec wording (libp2p gossipsub v1.1
+    /// §"Peer Exchange") doesn't strictly mandate verification but accepting unverified
+    /// envelopes lets the PRUNE sender inject arbitrary multiaddrs into our dial queue.
+    px_verify_signed_envelope: bool = true,
+    /// Reject PX entries that omit the `signed_peer_record` envelope entirely. Defaults
+    /// off because the spec explicitly allows emitters without an envelope ("the
+    /// emitting peer is allowed to omit the signed peer record if it doesn't have one").
+    /// Strict deployments flip this on; embedders verify identity later (TLS / Noise).
+    px_envelope_required: bool = false,
+    /// Behaviour score delta applied to the PRUNE sender when one of its PX entries
+    /// carries an envelope that fails verification. `0` disables.
+    px_invalid_envelope_score_delta: i32 = -100,
     /// libp2p gossipsub v1.1 §4.1: cap on IHAVE entries processed per inbound RPC. Anything
     /// past this is silently dropped. Matches rust-libp2p `max_ihave_messages` default.
     /// Defense against IHAVE amplification.
@@ -279,6 +296,14 @@ pub const Gossipsub = struct {
     iwant_ids_requested: u64,
     /// IHAVE ids dropped because the per-RPC `max_ihave_ids_per_rpc` cap was hit.
     ihave_ids_capped: u64,
+    /// PX `PeerInfo` entries whose envelope verified successfully (sig + peer-id match).
+    px_envelope_verified: u64,
+    /// PX `PeerInfo` entries dropped because the carried envelope failed verification.
+    px_envelope_invalid: u64,
+    /// PX `PeerInfo` entries with no envelope accepted (default policy — spec allows omission).
+    px_envelope_missing_accepted: u64,
+    /// PX `PeerInfo` entries with no envelope rejected (strict policy: `px_envelope_required`).
+    px_envelope_missing_rejected: u64,
     /// Outbound IHAVE RPCs emitted from [`heartbeat`] lazy gossip.
     lazy_i_have_tx: u64,
     /// Lazy IHAVE entries dropped due to per-peer or global outbox backpressure (#39).
@@ -346,6 +371,10 @@ pub const Gossipsub = struct {
             .iwant_tx = 0,
             .iwant_ids_requested = 0,
             .ihave_ids_capped = 0,
+            .px_envelope_verified = 0,
+            .px_envelope_invalid = 0,
+            .px_envelope_missing_accepted = 0,
+            .px_envelope_missing_rejected = 0,
             .dropped_lazy_ihave_backpressure = 0,
             .recent_seen = .empty,
             .pull_fifo = .empty,
@@ -683,6 +712,26 @@ pub const Gossipsub = struct {
     pub fn popDialSuggestion(self: *Gossipsub) ?[]u8 {
         if (self.px_dial_queue.items.len == 0) return null;
         return self.px_dial_queue.orderedRemove(0);
+    }
+
+    /// Verify a PX `signed_peer_record` envelope claims to belong to the same
+    /// peer that the surrounding `PeerInfo.peer_id` advertises. Returns `true`
+    /// when the envelope's RFC 0002 signature checks out, the envelope's
+    /// derived PeerId matches `claimed_peer_id_bytes`, and the inner
+    /// `PeerRecord.peer_id` matches in turn.
+    fn verifyPxEnvelope(
+        self: *Gossipsub,
+        claimed_peer_id_bytes: []const u8,
+        envelope_wire: []const u8,
+    ) bool {
+        const claimed = identity.PeerId.fromBytes(claimed_peer_id_bytes) catch return false;
+        var rec = identify_mod.verifySignedPeerRecord(
+            self.allocator,
+            envelope_wire,
+            claimed,
+        ) catch return false;
+        defer rec.deinit(self.allocator);
+        return true;
     }
 
     fn queueDialSuggestion(self: *Gossipsub, peer_bytes: []const u8) void {
@@ -1185,11 +1234,33 @@ pub const Gossipsub = struct {
                     _ = mp.peers.remove(sender);
                 }
             }
-            // Harvest PX peer-id suggestions (#85). signed_peer_record is preserved upstream
-            // but not auto-verified here; embedders that want full verification can pull the
-            // raw envelope via the lower-level `control.decodeFirstPruneWithPeers` API.
+            // Harvest PX peer-id suggestions. Each `PeerInfo` may carry a `signed_peer_record`
+            // envelope (RFC 0002). When present and `px_verify_signed_envelope` is set we
+            // verify the signature + cross-check the envelope's PeerId against the
+            // claimed `peer_id` multihash. Failed envelopes are dropped and the PRUNE
+            // sender's behaviour score is docked. Without verification the sender could
+            // splice attacker-chosen multiaddrs into our dial queue (see #201).
             for (prune.peers) |pi| {
-                if (pi.peer_id) |pb| self.queueDialSuggestion(pb);
+                const pb = pi.peer_id orelse continue;
+                if (pi.signed_peer_record) |spr| {
+                    if (self.cfg.px_verify_signed_envelope) {
+                        if (self.verifyPxEnvelope(pb, spr)) {
+                            self.px_envelope_verified += 1;
+                        } else {
+                            self.px_envelope_invalid += 1;
+                            self.applyScoreDelta(sender, self.cfg.px_invalid_envelope_score_delta);
+                            continue;
+                        }
+                    } else {
+                        self.px_envelope_verified += 1;
+                    }
+                } else if (self.cfg.px_envelope_required) {
+                    self.px_envelope_missing_rejected += 1;
+                    continue;
+                } else {
+                    self.px_envelope_missing_accepted += 1;
+                }
+                self.queueDialSuggestion(pb);
             }
             if (!self.direct_peers.contains(sender)) {
                 const backoff_ms: i64 = if (prune.backoff_seconds) |s| blk: {
@@ -1465,6 +1536,26 @@ pub const Gossipsub = struct {
     /// IHAVE ids dropped because the per-RPC `max_ihave_ids_per_rpc` cap was hit.
     pub fn ihaveIdsCappedCount(self: *const Gossipsub) u64 {
         return self.ihave_ids_capped;
+    }
+
+    /// PX `PeerInfo` entries whose carried envelope verified successfully.
+    pub fn pxEnvelopeVerifiedCount(self: *const Gossipsub) u64 {
+        return self.px_envelope_verified;
+    }
+
+    /// PX `PeerInfo` entries dropped because the carried envelope failed verification.
+    pub fn pxEnvelopeInvalidCount(self: *const Gossipsub) u64 {
+        return self.px_envelope_invalid;
+    }
+
+    /// PX `PeerInfo` entries accepted with no envelope (lenient default policy).
+    pub fn pxEnvelopeMissingAcceptedCount(self: *const Gossipsub) u64 {
+        return self.px_envelope_missing_accepted;
+    }
+
+    /// PX `PeerInfo` entries rejected for lacking an envelope (strict policy).
+    pub fn pxEnvelopeMissingRejectedCount(self: *const Gossipsub) u64 {
+        return self.px_envelope_missing_rejected;
     }
 
     /// Inbound publishes dropped because their `(from, seqno)` pair was already cached (#75).
@@ -3117,4 +3208,165 @@ test "GRAFT during active back-off docks sender behaviour score" {
     try std.testing.expect(score_after < score_before);
     // Drain the PRUNE refusal so the test allocator doesn't leak.
     while (g.popOutboxDelivery()) |d| a.free(d.wire);
+}
+
+// ── PX envelope verification (#201) ──────────────────────────────────────────
+
+/// Build a valid SignedPeerRecord wire blob for `host_kp` to use as a PX entry
+/// envelope. `claimed_peer_id_bytes` is the multihash bytes of the host
+/// keypair's peer-id, which the envelope claims and the verifier checks.
+fn buildPxSignedEnvelopeForTest(
+    a: std.mem.Allocator,
+    host_kp: std.crypto.sign.Ed25519.KeyPair,
+    claimed_peer_id_bytes: []const u8,
+    opts: struct { corrupt_signature: bool = false },
+) ![]u8 {
+    const rec_wire = try identify_mod.encodePeerRecordTestWire(a, claimed_peer_id_bytes, 1);
+    defer a.free(rec_wire);
+    return identify_mod.encodeSignedPeerRecordTestWire(
+        a,
+        host_kp,
+        rec_wire,
+        .{ .corrupt_signature = opts.corrupt_signature },
+    );
+}
+
+test "PX entry with valid signed envelope is queued and verified counter ticks" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const sender = try identity.PeerId.random();
+    g.onPeerConnected(sender);
+
+    // Mint a fresh key + peer-id for the PX suggestion.
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x42);
+    const px_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var px_pub = identity.PublicKey{ .type = .ED25519, .data = &px_kp.public_key.bytes };
+    const px_peer = try identity.PeerId.fromPublicKey(a, &px_pub);
+    var pid_buf: [128]u8 = undefined;
+    const px_peer_bytes = try px_peer.toBytes(&pid_buf);
+
+    const envelope = try buildPxSignedEnvelopeForTest(a, px_kp, px_peer_bytes, .{});
+    defer a.free(envelope);
+
+    const peer_id_owned = try a.dupe(u8, px_peer_bytes);
+    defer a.free(peer_id_owned);
+    const env_owned = try a.dupe(u8, envelope);
+    defer a.free(env_owned);
+    var peers = [_]control.PeerInfoOwned{
+        .{ .peer_id = peer_id_owned, .signed_peer_record = env_owned },
+    };
+    const prune = try control.encodePruneWithPeers(a, "t", 0, peers[0..]);
+    defer a.free(prune);
+    const wire = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(wire);
+    try g.handleInboundRpc(sender, wire);
+
+    try std.testing.expectEqual(@as(u64, 1), g.pxEnvelopeVerifiedCount());
+    try std.testing.expectEqual(@as(u64, 0), g.pxEnvelopeInvalidCount());
+    try std.testing.expectEqual(@as(usize, 1), g.dialSuggestionCount());
+    while (g.popDialSuggestion()) |b| a.free(b);
+}
+
+test "PX entry with tampered envelope is dropped and sender score docked" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const sender = try identity.PeerId.random();
+    g.onPeerConnected(sender);
+    const score_before = g.peerBehaviourScore(sender);
+
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x43);
+    const px_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var px_pub = identity.PublicKey{ .type = .ED25519, .data = &px_kp.public_key.bytes };
+    const px_peer = try identity.PeerId.fromPublicKey(a, &px_pub);
+    var pid_buf: [128]u8 = undefined;
+    const px_peer_bytes = try px_peer.toBytes(&pid_buf);
+
+    const bad_env = try buildPxSignedEnvelopeForTest(a, px_kp, px_peer_bytes, .{ .corrupt_signature = true });
+    defer a.free(bad_env);
+
+    const peer_id_owned = try a.dupe(u8, px_peer_bytes);
+    defer a.free(peer_id_owned);
+    const env_owned = try a.dupe(u8, bad_env);
+    defer a.free(env_owned);
+    var peers = [_]control.PeerInfoOwned{
+        .{ .peer_id = peer_id_owned, .signed_peer_record = env_owned },
+    };
+    const prune = try control.encodePruneWithPeers(a, "t", 0, peers[0..]);
+    defer a.free(prune);
+    const wire = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(wire);
+    try g.handleInboundRpc(sender, wire);
+
+    try std.testing.expectEqual(@as(u64, 1), g.pxEnvelopeInvalidCount());
+    try std.testing.expectEqual(@as(u64, 0), g.pxEnvelopeVerifiedCount());
+    try std.testing.expectEqual(@as(usize, 0), g.dialSuggestionCount());
+    try std.testing.expect(g.peerBehaviourScore(sender) < score_before);
+}
+
+test "PX entry without envelope is accepted by default (lenient policy)" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const sender = try identity.PeerId.random();
+    g.onPeerConnected(sender);
+
+    const peer_id_owned = try a.dupe(u8, "px-suggested-peer-bytes");
+    defer a.free(peer_id_owned);
+    var peers = [_]control.PeerInfoOwned{
+        .{ .peer_id = peer_id_owned, .signed_peer_record = null },
+    };
+    const prune = try control.encodePruneWithPeers(a, "t", 0, peers[0..]);
+    defer a.free(prune);
+    const wire = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(wire);
+    try g.handleInboundRpc(sender, wire);
+
+    try std.testing.expectEqual(@as(u64, 1), g.pxEnvelopeMissingAcceptedCount());
+    try std.testing.expectEqual(@as(usize, 1), g.dialSuggestionCount());
+    while (g.popDialSuggestion()) |b| a.free(b);
+}
+
+test "PX entry without envelope is rejected under strict policy" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .px_envelope_required = true,
+    });
+    defer g.deinit();
+    try g.subscribe("t");
+    a.free(g.popOutboxDelivery().?.wire);
+
+    const sender = try identity.PeerId.random();
+    g.onPeerConnected(sender);
+
+    const peer_id_owned = try a.dupe(u8, "px-suggested-peer-bytes");
+    defer a.free(peer_id_owned);
+    var peers = [_]control.PeerInfoOwned{
+        .{ .peer_id = peer_id_owned, .signed_peer_record = null },
+    };
+    const prune = try control.encodePruneWithPeers(a, "t", 0, peers[0..]);
+    defer a.free(prune);
+    const wire = try rpc.encodeControlOnlyRpc(a, prune);
+    defer a.free(wire);
+    try g.handleInboundRpc(sender, wire);
+
+    try std.testing.expectEqual(@as(u64, 1), g.pxEnvelopeMissingRejectedCount());
+    try std.testing.expectEqual(@as(usize, 0), g.dialSuggestionCount());
 }
