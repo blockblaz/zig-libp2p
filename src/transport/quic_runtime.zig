@@ -340,7 +340,7 @@ const PublishBidiStream = union(enum) {
                 if (s.client) |c| {
                     _ = c.sendRawStreamData(s.stream_id, s.send_offset, &[_]u8{}, true);
                 } else {
-                    s.server.sendRawStreamData(s.conn, s.stream_id, s.send_offset, &[_]u8{}, true);
+                    _ = s.server.sendRawStreamData(s.conn, s.stream_id, s.send_offset, &[_]u8{}, true);
                 }
             },
         }
@@ -2220,7 +2220,7 @@ pub const QuicRuntime = struct {
                             if (ist.raw.client) |c| {
                                 _ = c.sendRawStreamData(ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
                             } else {
-                                ist.raw.server.sendRawStreamData(ist.conn, ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
+                                _ = ist.raw.server.sendRawStreamData(ist.conn, ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
                             }
                         }
                         self.removeInboundStreamAt(i);

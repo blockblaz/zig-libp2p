@@ -94,9 +94,16 @@ fn serverRawWriterDrain(w: *Io.Writer, data: []const []const u8, splat: usize) I
                 ctx.send_offset += @intCast(accepted);
                 return accepted;
             }
-            ctx.server.sendRawStreamData(ctx.conn, ctx.stream_id, ctx.send_offset, chunk, false);
-            ctx.send_offset += @intCast(chunk.len);
-            return chunk.len;
+            // `Server.sendRawStreamData` returns the number of payload bytes
+            // the QUIC stack accepted (either flushed on the wire or queued in
+            // `pending_stream_sends`).  Treating an unconditional `chunk.len`
+            // as accepted — as we did before zquic v1.7.9 — silently punches a
+            // hole in the stream whenever the pending queue is exhausted (the
+            // STREAM offset advances past bytes that never reach the peer, so
+            // the receiver hangs forever waiting for the gap).
+            const accepted = ctx.server.sendRawStreamData(ctx.conn, ctx.stream_id, ctx.send_offset, chunk, false);
+            ctx.send_offset += @intCast(accepted);
+            return accepted;
         }
     }.f;
     if (w.end != 0) {
@@ -276,17 +283,22 @@ pub const RawAppBidiServer = struct {
             return;
         }
         if (data.len == 0) {
-            self.server.sendRawStreamData(self.conn, self.stream_id, self.send_offset, &[_]u8{}, true);
+            _ = self.server.sendRawStreamData(self.conn, self.stream_id, self.send_offset, &[_]u8{}, true);
             return;
         }
         var off: usize = 0;
         while (off < data.len) {
             const n = @min(raw_stream_send_chunk_len, data.len - off);
             const chunk = data[off..][0..n];
-            off += n;
-            const fin = off >= data.len;
-            self.server.sendRawStreamData(self.conn, self.stream_id, self.send_offset, chunk, fin);
-            self.send_offset += @intCast(chunk.len);
+            const fin = off + n >= data.len;
+            const accepted = self.server.sendRawStreamData(self.conn, self.stream_id, self.send_offset, chunk, fin);
+            // zquic now returns the bytes it accepted; bail rather than
+            // advancing past a refusal — the caller treats writeAllFin as
+            // best-effort and a subsequent retry on the same stream will
+            // resume from the unmodified `send_offset`.
+            if (accepted == 0) break;
+            self.send_offset += @intCast(accepted);
+            off += accepted;
         }
     }
 };
