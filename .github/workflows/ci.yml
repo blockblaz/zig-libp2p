@@ -60,6 +60,7 @@ jobs:
             exit 0
           fi
           echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          rm -rf ~/.cache/zig/o ~/.cache/zig/tmp || true
           sleep 5
         done
         echo "All fetch attempts failed"
@@ -77,6 +78,13 @@ jobs:
             exit 0
           fi
           echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          # Zig 0.16 occasionally fails on a first run with
+          # `failed to parse archive: FileNotFound` against an internally-generated
+          # `libcompiler_rt.a`. The hash dir is content-addressed, so naive retries
+          # replay the same broken state. Wipe `o/` so the next attempt rebuilds
+          # compiler_rt and any other transient artifacts from scratch.
+          rm -rf ~/.cache/zig/o ~/.cache/zig/tmp .zig-cache/o .zig-cache/tmp || true
+          df -h /
           sleep 5
         done
         echo "All unit test attempts failed"
@@ -103,6 +111,7 @@ jobs:
             exit 0
           fi
           echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          rm -rf ~/.cache/zig/o ~/.cache/zig/tmp .zig-cache/o .zig-cache/tmp || true
           sleep 5
         done
         echo "All example build attempts failed"
@@ -117,6 +126,7 @@ jobs:
             exit 0
           fi
           echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          rm -rf ~/.cache/zig/o ~/.cache/zig/tmp .zig-cache/o .zig-cache/tmp || true
           sleep 5
         done
         echo "All build attempts failed"
