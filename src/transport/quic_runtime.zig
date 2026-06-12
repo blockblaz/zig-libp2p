@@ -1829,8 +1829,17 @@ pub const QuicRuntime = struct {
         }
 
         if (expected_peer) |ep| {
+            // Skip only when we already have an *outbound* leg to this peer.
+            // An inbound-only connection is NOT sufficient: the persistent
+            // /meshsub/1.1.0 stream binds to the outbound leg exclusively
+            // (see PersistentGossipStream + ensurePersistentGossipStream),
+            // so losing the outbound after a gossip wedge requires a fresh
+            // outbound dial even when the peer's own outbound (our inbound)
+            // is still alive. The earlier `peerHasActiveConnection` check
+            // also matched inbound-only state and silently short-circuited
+            // every connection_manager redial-on-outbound-death, leaving
+            // gossip permanently broken to the affected peer.
             if (self.outbound_by_peer.contains(ep)) return;
-            if (self.peerHasActiveConnection(ep)) return;
         }
 
         var ma = multiaddr.Multiaddr.fromString(a, addr_str) catch |err| {
@@ -1902,7 +1911,11 @@ pub const QuicRuntime = struct {
             slot.outbound.deinit();
             a.destroy(slot);
             if (expected_peer) |ep| {
-                if (self.peerHasActiveConnection(ep)) return;
+                // Same outbound-only semantics as the pre-dial dedupe above:
+                // an inbound-only state must NOT swallow the dial failure,
+                // otherwise connection_manager keeps `dial_inflight=true`
+                // forever and never retries the outbound we still need.
+                if (self.outbound_by_peer.contains(ep)) return;
             }
             self.failDial(expected_peer);
             return;
