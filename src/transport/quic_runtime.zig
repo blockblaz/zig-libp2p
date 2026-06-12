@@ -413,6 +413,16 @@ const OutboundPublish = struct {
 /// On wedge: the stream is marked `broken`, outbox is dropped, and the
 /// underlying QUIC connection is closed locally so `connection_manager`
 /// redials and `ensurePersistentGossipStream` opens a fresh stream.
+///
+/// Wedge is declared by any of:
+///   * `markPersistentGossipBroken` on a handshake or keepalive write/flush
+///     failure (synchronous error from the writer).
+///   * `outbox_stuck_since_ms` in [`advancePersistentGossipStreams`] exceeding
+///     [`persistent_gossip_outbox_stuck_timeout_ms`] (proactive trigger fires
+///     before zquic's 60 s no-ACK conn-lost timer so libp2p drives recovery
+///     on its own clock rather than waiting for the transport to give up —
+///     a single 20 s wedge per peer used to drop 30+ slots of gossip,
+///     starving the FFG supermajority and stalling finalization).
 const PersistentGossipStream = struct {
     peer: identity.PeerId,
     stream_id: u64,
@@ -441,6 +451,22 @@ const PersistentGossipStream = struct {
     /// Seeded at handshake completion so the first keepalive fires one full
     /// interval later, not immediately on connect.
     last_write_ms: i64 = 0,
+    /// Wall-clock time of the first drain tick where `sendChunk` returned 0
+    /// (transient backpressure from zquic's full per-stream pending queue)
+    /// without having accepted any bytes in the current tick. Cleared back
+    /// to `null` on any drain tick that accepts > 0 bytes.
+    ///
+    /// When this stays non-null for at least
+    /// [`persistent_gossip_outbox_stuck_timeout_ms`], the stream is marked
+    /// broken (see [`markPersistentGossipBroken`]), which tears down the
+    /// underlying QUIC connection and lets `connection_manager` redial. The
+    /// alternative — waiting for zquic's 60 s no-ACK conn-lost timeout — left
+    /// gossip silent for a full minute per wedge, dropped every block from
+    /// the affected peer during that window, and was the direct cause of
+    /// asymmetric attestation aggregation (zeam aggregator seeing only 2/3
+    /// instead of 3/3 of validators, blocking FFG supermajority and stalling
+    /// finalization).
+    outbox_stuck_since_ms: ?i64 = null,
 };
 
 /// Hard cap on queued outbox frames per peer before the persistent gossip
@@ -458,6 +484,19 @@ const persistent_gossip_outbox_cap: usize = 1024;
 /// gossipsub (60s) and the underlying `libp2p-quic` (30s effective) so we
 /// always refresh both timers with at least 10s of slack before they fire.
 const persistent_gossip_keepalive_interval_ms: i64 = 20_000;
+
+/// Maximum time the persistent gossip outbox is allowed to be fully stuck
+/// (every drain tick returns 0 accepted bytes from zquic) before we declare
+/// the stream wedged and trigger recovery via [`markPersistentGossipBroken`].
+///
+/// Picked to fire strictly *before* zquic's 60 s no-ACK conn-lost timeout so
+/// libp2p drives recovery on its own clock instead of waiting for the
+/// transport to give up. 20 s is also long enough to ride out brief cwnd
+/// collapses without bouncing healthy connections — a 20 s outbox stall in
+/// steady state implies the peer has stopped reading the stream, which is
+/// terminal for a `/meshsub/1.1.0` stream that rust-libp2p caps at one
+/// substream per connection (see [`PersistentGossipStream`] doc).
+const persistent_gossip_outbox_stuck_timeout_ms: i64 = 20_000;
 
 /// A queued command from the swarm hook to the drive thread.
 const HookWork = union(enum) {
@@ -942,7 +981,7 @@ pub const QuicRuntime = struct {
             const slot = self.outbound_by_peer.get(peer) orelse continue;
             const cid = slot.conn_id;
             const now_ms = self.opts.now_ms_fn();
-            log.info(
+            log.warn(
                 "quic_runtime: outbound QUIC connection closed by remote (cid={d}); notifying host",
                 .{cid},
             );
@@ -1442,7 +1481,7 @@ pub const QuicRuntime = struct {
     fn markPersistentGossipBroken(self: *QuicRuntime, g: *PersistentGossipStream, reason: []const u8) void {
         const peer = g.peer;
         var peer_buf: [128]u8 = undefined;
-        log.info("quic_runtime: persistent gossip stream broken peer={s} reason={s} stream_id={d} queued_frames={d}", .{
+        log.warn("quic_runtime: persistent gossip stream broken peer={s} reason={s} stream_id={d} queued_frames={d}", .{
             peerBase58(peer, &peer_buf),
             reason,
             g.stream_id,
@@ -1462,14 +1501,14 @@ pub const QuicRuntime = struct {
         const peer_str = peerBase58(peer, &peer_buf);
         if (self.outbound_by_peer.get(peer)) |slot| {
             if (slot.outbound.client.conn.phase != .closed) {
-                log.info("quic_runtime: closing outbound QUIC connection for gossip recovery peer={s}", .{peer_str});
+                log.warn("quic_runtime: closing outbound QUIC connection for gossip recovery peer={s}", .{peer_str});
                 slot.outbound.closeConnection();
             }
             return;
         }
         if (self.inbound_by_peer.get(peer)) |ic| {
             if (ic.conn.phase != .closed) {
-                log.info("quic_runtime: closing inbound QUIC connection for gossip recovery peer={s}", .{peer_str});
+                log.warn("quic_runtime: closing inbound QUIC connection for gossip recovery peer={s}", .{peer_str});
                 self.listener.server.closeConnection(ic.conn, 0, "gossip stream wedge");
             }
         }
@@ -1597,6 +1636,7 @@ pub const QuicRuntime = struct {
                 // without disturbing the stream state.  The stream is only
                 // marked broken by handshake failures or peer-side closures
                 // handled in other code paths.
+                var any_accepted_this_tick: bool = false;
                 while (g.outbox.items.len > 0) {
                     const frame_wire = g.outbox.items[0];
                     var sent: usize = 0;
@@ -1610,6 +1650,7 @@ pub const QuicRuntime = struct {
                         sent += accepted;
                     }
                     if (sent == 0) break;
+                    any_accepted_this_tick = true;
                     if (sent < frame_wire.len) {
                         // Partial frame.  Rewrite outbox head to the unsent
                         // suffix so the next tick resumes exactly where we
@@ -1635,6 +1676,19 @@ pub const QuicRuntime = struct {
                 }
                 if (g.broken) continue;
                 if (g.outbox.items.len > 0) {
+                    // Wedge timer: outbox has frames waiting but the drain
+                    // accepted nothing this tick (zquic full per-stream
+                    // pending queue). Start (or continue) the stuck clock;
+                    // if it crosses the timeout, declare the stream wedged
+                    // so the existing recovery path (close conn → redial →
+                    // re-subscribe → fresh stream) fires immediately
+                    // instead of waiting on zquic's 60 s conn-lost timer.
+                    const now_ms = self.opts.now_ms_fn();
+                    if (!any_accepted_this_tick) {
+                        if (g.outbox_stuck_since_ms == null) g.outbox_stuck_since_ms = now_ms;
+                    } else {
+                        g.outbox_stuck_since_ms = null;
+                    }
                     var peer_buf: [128]u8 = undefined;
                     const backlog = if (self.outbound_by_peer.get(g.peer)) |slot|
                         slot.outbound.client.pendingStreamSendBacklog()
@@ -1644,6 +1698,20 @@ pub const QuicRuntime = struct {
                         "quic_runtime: persistent gossip outbox paused peer={s} outbox_frames={d} zquic_pending_bytes={d}",
                         .{ peerBase58(g.peer, &peer_buf), g.outbox.items.len, backlog },
                     );
+                    if (g.outbox_stuck_since_ms) |since| {
+                        const stuck_ms = now_ms - since;
+                        if (stuck_ms >= persistent_gossip_outbox_stuck_timeout_ms) {
+                            log.warn(
+                                "quic_runtime: persistent gossip outbox stuck peer={s} for {d}ms (>= {d}ms); declaring wedge to trigger redial",
+                                .{ peerBase58(g.peer, &peer_buf), stuck_ms, persistent_gossip_outbox_stuck_timeout_ms },
+                            );
+                            self.markPersistentGossipBroken(g, "outbox_stuck_timeout");
+                            continue;
+                        }
+                    }
+                } else {
+                    // Outbox drained cleanly this tick; reset the wedge clock.
+                    g.outbox_stuck_since_ms = null;
                 }
             }
 
@@ -1874,7 +1942,7 @@ pub const QuicRuntime = struct {
         if (self.persistent_gossip.get(verified)) |g| {
             if (g.raw == .inbound) {
                 var peer_buf: [128]u8 = undefined;
-                log.info(
+                log.warn(
                     "quic_runtime: migrating persistent gossip from inbound to outbound leg peer={s}",
                     .{peerBase58(verified, &peer_buf)},
                 );

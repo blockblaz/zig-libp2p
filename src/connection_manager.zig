@@ -447,7 +447,7 @@ pub const ConnectionManager = struct {
             // recovers without waiting for the inbound to die too.
             if (self.known.getPtr(peer)) |st| {
                 if (!st.dial_inflight and st.failure_count < max_reconnect_failures) {
-                    log.info(
+                    log.warn(
                         "onConnectionClosed: outbound died for known peer (inbound still up, count={d}); resubmitting dial",
                         .{count},
                     );
