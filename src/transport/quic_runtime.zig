@@ -345,6 +345,37 @@ const PublishBidiStream = union(enum) {
             },
         }
     }
+
+    /// Single-shot raw-stream send that returns the number of bytes zquic
+    /// accepted (queued for transmission).  A return value of `0` means
+    /// **transient backpressure** — the zquic per-stream pending queue is at
+    /// its cap and the caller must hold the unsent bytes and retry on a
+    /// later tick.  This is the equivalent of `Poll::Pending` from quinn's
+    /// `SendStream::poll_write` (rust-libp2p treats it the same way and
+    /// suspends the writer task without dropping the stream).
+    ///
+    /// `send_offset` is advanced by the accepted byte count so the next call
+    /// continues at the right STREAM frame offset; partial sends never
+    /// re-emit accepted bytes.
+    fn sendChunk(self: *PublishBidiStream, chunk: []const u8, fin: bool) usize {
+        return switch (self.*) {
+            .outbound => |*c| blk: {
+                const accepted = c.client.sendRawStreamData(c.stream_id, c.send_offset, chunk, fin);
+                c.send_offset += @intCast(accepted);
+                break :blk accepted;
+            },
+            .inbound => |*s| blk: {
+                if (s.client) |c| {
+                    const accepted = c.sendRawStreamData(s.stream_id, s.send_offset, chunk, fin);
+                    s.send_offset += @intCast(accepted);
+                    break :blk accepted;
+                }
+                const accepted = s.server.sendRawStreamData(s.conn, s.stream_id, s.send_offset, chunk, fin);
+                s.send_offset += @intCast(accepted);
+                break :blk accepted;
+            },
+        };
+    }
 };
 
 /// In-flight gossipsub publish on a `/meshsub/1.1.0` stream. One per peer per
@@ -1547,42 +1578,62 @@ pub const QuicRuntime = struct {
                 if (self.outbound_by_peer.get(g.peer)) |slot| {
                     slot.outbound.client.drainDeferredStreamSends();
                 }
-                var w = g.raw.writer();
-                var write_failed = false;
+                // Drain the outbox via direct chunked `sendRawStreamData`
+                // calls (NOT `std.Io.Writer.writeAll`).  Rationale: when
+                // zquic's per-stream pending queue is at its cap it returns
+                // `accepted == 0` from `sendRawStreamData` — a *transient*
+                // backpressure signal.  Routing that through `std.Io.Writer`
+                // surfaces it as `error.WriteFailed` (since writeAll requires
+                // all bytes accepted), which the previous implementation
+                // misinterpreted as the stream being unrecoverably broken
+                // and dropped the entire outbox + closed the underlying QUIC
+                // connection.  That is the same failure mode quinn /
+                // rust-libp2p deliberately avoid: quinn's `SendStream::poll_
+                // write` returns `Poll::Pending` on flow-control backpressure
+                // and the writer task simply suspends until the stream is
+                // writable again; the stream is *not* dropped.  We mirror
+                // that by tracking partial-frame progress in the outbox head
+                // (rewriting it to the unsent suffix) and pausing the drain
+                // without disturbing the stream state.  The stream is only
+                // marked broken by handshake failures or peer-side closures
+                // handled in other code paths.
                 while (g.outbox.items.len > 0) {
-                    const off0 = switch (g.raw) {
-                        .outbound => |*c| c.send_offset,
-                        .inbound => |*s| s.send_offset,
-                    };
                     const frame_wire = g.outbox.items[0];
-                    std.Io.Writer.writeAll(&w, frame_wire) catch {
-                        write_failed = true;
+                    var sent: usize = 0;
+                    while (sent < frame_wire.len) {
+                        const n = @min(
+                            quic_raw_stream_io.raw_stream_send_chunk_len,
+                            frame_wire.len - sent,
+                        );
+                        const accepted = g.raw.sendChunk(frame_wire[sent..][0..n], false);
+                        if (accepted == 0) break;
+                        sent += accepted;
+                    }
+                    if (sent == 0) break;
+                    if (sent < frame_wire.len) {
+                        // Partial frame.  Rewrite outbox head to the unsent
+                        // suffix so the next tick resumes exactly where we
+                        // stopped — `send_offset` already advanced for the
+                        // accepted prefix, so re-sending it would corrupt
+                        // the STREAM frame layout.
+                        const suffix = a.dupe(u8, frame_wire[sent..]) catch {
+                            log.warn(
+                                "quic_runtime: persistent gossip partial-frame suffix alloc failed; marking stream broken",
+                                .{},
+                            );
+                            self.markPersistentGossipBroken(g, "partial_suffix_alloc_failed");
+                            break;
+                        };
+                        a.free(frame_wire);
+                        g.outbox.items[0] = suffix;
+                        g.last_write_ms = self.opts.now_ms_fn();
                         break;
-                    };
-                    std.Io.Writer.flush(&w) catch {
-                        write_failed = true;
-                        break;
-                    };
-                    const off1 = switch (g.raw) {
-                        .outbound => |*c| c.send_offset,
-                        .inbound => |*s| s.send_offset,
-                    };
-                    if (off1 == off0) break;
+                    }
                     _ = g.outbox.orderedRemove(0);
                     a.free(frame_wire);
                     g.last_write_ms = self.opts.now_ms_fn();
                 }
-                if (write_failed) {
-                    var peer_buf: [128]u8 = undefined;
-                    log.warn(
-                        "quic_runtime: persistent gossip write failed peer={s} with {d} frames still queued; marking stream broken",
-                        .{ peerBase58(g.peer, &peer_buf), g.outbox.items.len },
-                    );
-                    for (g.outbox.items) |frame| a.free(frame);
-                    g.outbox.clearRetainingCapacity();
-                    self.markPersistentGossipBroken(g, "write_failed");
-                    continue;
-                }
+                if (g.broken) continue;
                 if (g.outbox.items.len > 0) {
                     var peer_buf: [128]u8 = undefined;
                     const backlog = if (self.outbound_by_peer.get(g.peer)) |slot|
