@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## [0.1.47](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.46...v0.1.47) (2026-06-12)
+
+### Fixed
+
+* **deps/zquic:** bump zquic to v1.7.3 (pending STREAM queue backpressure
+  without redial thrashing; dedupe enqueue; Client.checkPto in
+  processPendingWork).
+
 ## [0.1.46](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.45...v0.1.46) (2026-06-11)
 
 ### Fixed
