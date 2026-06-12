@@ -1544,37 +1544,56 @@ pub const QuicRuntime = struct {
             // peer's responder negotiates `/meshsub/1.1.0` and rust-libp2p's
             // gossipsub codec would see them as a malformed initial frame.
             if (g.handshake_done and g.outbox.items.len > 0) {
+                if (self.outbound_by_peer.get(g.peer)) |slot| {
+                    slot.outbound.client.drainDeferredStreamSends();
+                }
                 var w = g.raw.writer();
-                var sent: usize = 0;
                 var write_failed = false;
-                for (g.outbox.items, 0..) |frame_wire, i| {
+                while (g.outbox.items.len > 0) {
+                    const off0 = switch (g.raw) {
+                        .outbound => |*c| c.send_offset,
+                        .inbound => |*s| s.send_offset,
+                    };
+                    const frame_wire = g.outbox.items[0];
                     std.Io.Writer.writeAll(&w, frame_wire) catch {
                         write_failed = true;
-                        sent = i;
                         break;
                     };
+                    std.Io.Writer.flush(&w) catch {
+                        write_failed = true;
+                        break;
+                    };
+                    const off1 = switch (g.raw) {
+                        .outbound => |*c| c.send_offset,
+                        .inbound => |*s| s.send_offset,
+                    };
+                    if (off1 == off0) break;
+                    _ = g.outbox.orderedRemove(0);
                     a.free(frame_wire);
-                    sent = i + 1;
+                    g.last_write_ms = self.opts.now_ms_fn();
                 }
-                std.Io.Writer.flush(&w) catch {
-                    write_failed = true;
-                };
                 if (write_failed) {
                     var peer_buf: [128]u8 = undefined;
                     log.warn(
-                        "quic_runtime: persistent gossip write failed peer={s} after {d}/{d} frames; marking stream broken",
-                        .{ peerBase58(g.peer, &peer_buf), sent, g.outbox.items.len },
+                        "quic_runtime: persistent gossip write failed peer={s} with {d} frames still queued; marking stream broken",
+                        .{ peerBase58(g.peer, &peer_buf), g.outbox.items.len },
                     );
-                    // Free the unsent tail before marking broken (which clears).
-                    if (sent < g.outbox.items.len) {
-                        for (g.outbox.items[sent..]) |frame| a.free(frame);
-                    }
+                    for (g.outbox.items) |frame| a.free(frame);
                     g.outbox.clearRetainingCapacity();
                     self.markPersistentGossipBroken(g, "write_failed");
                     continue;
                 }
-                g.outbox.clearRetainingCapacity();
-                g.last_write_ms = self.opts.now_ms_fn();
+                if (g.outbox.items.len > 0) {
+                    var peer_buf: [128]u8 = undefined;
+                    const backlog = if (self.outbound_by_peer.get(g.peer)) |slot|
+                        slot.outbound.client.pendingStreamSendBacklog()
+                    else
+                        0;
+                    log.info(
+                        "quic_runtime: persistent gossip outbox paused peer={s} outbox_frames={d} zquic_pending_bytes={d}",
+                        .{ peerBase58(g.peer, &peer_buf), g.outbox.items.len, backlog },
+                    );
+                }
             }
 
             // App-layer keepalive: when the stream is healthy, handshaken,

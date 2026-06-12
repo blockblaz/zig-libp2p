@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## [0.1.50](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.49...v0.1.50) (2026-06-12)
+
+### Fixed
+
+* **quic_runtime:** retain persistent gossip outbox frames when zquic
+  `send_offset` does not advance (CC/pending backpressure); drain zquic
+  deferred STREAM bytes before each outbox flush.
+
+* **deps/zquic:** bump zquic to v1.7.6 (pending-queue stall logging,
+  processPendingWork drain parity with quinn).
+
 ## [0.1.47](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.46...v0.1.47) (2026-06-12)
 
 ### Fixed
