@@ -24,8 +24,8 @@
         },
         .zquic = .{
             // v1.7.3 — pending STREAM queue backpressure without redial thrash
-            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.7.4#1d227fe57174559fdfbf53544f04cd378c713e11",
-            .hash = "zquic-1.7.0-2zRc1H_2EwCaP0bO1GL1RgVa-Y8Bve_6QrxgHhpBkDWb",
+            .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.7.5#8d8143c3ab9beadb63ca2712a79102a5d41673a2",
+            .hash = "zquic-1.7.0-2zRc1MoKFADpj9onp_eMtjC1sHZ5kYOx7qgrDYi4u7N6",
         },
         .zig_varint = .{
             .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",
