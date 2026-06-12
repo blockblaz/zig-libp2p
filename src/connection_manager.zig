@@ -14,6 +14,8 @@ const peer_events = @import("peer_events.zig");
 const req_resp_runtime = @import("req_resp/runtime.zig");
 const swarm_mod = @import("swarm.zig");
 
+const log = std.log.scoped(.connection_manager);
+
 pub const ConnectionId = u64;
 
 /// At most this many consecutive failures (failed dials or non-local closes) before giving up.
@@ -371,14 +373,47 @@ pub const ConnectionManager = struct {
         conn_id: ConnectionId,
         reason: peer_events.DisconnectReason,
     ) !void {
-        const ent = self.conns.fetchRemove(conn_id) orelse return;
+        const ent = self.conns.fetchRemove(conn_id) orelse {
+            // Defensive: a close arrived for a conn we never recorded (or
+            // already removed via a prior close). Without this log, a
+            // double-close races silently and the embedder sees a wedged
+            // publish path with no clue why no `peer_disconnected` ever
+            // fired (the gossip-asymmetry bug observed against quinn).
+            log.warn(
+                "onConnectionClosed: unknown conn_id={d} reason={s} (already closed or never registered)",
+                .{ conn_id, @tagName(reason) },
+            );
+            return;
+        };
         const peer = ent.value.peer;
         const direction = ent.value.direction;
         _ = self.trim_recommended.remove(conn_id);
 
-        const pr = self.peer_active.getPtr(peer) orelse return;
+        const pr = self.peer_active.getPtr(peer) orelse {
+            log.warn(
+                "onConnectionClosed: conn_id={d} dir={s} but peer not in peer_active map (skew)",
+                .{ conn_id, @tagName(direction) },
+            );
+            return;
+        };
+        if (pr.* == 0) {
+            // Would underflow — peer_active was already 0 when we still had
+            // a `conns` entry. Means the maps are out of sync, log and
+            // bail rather than wrapping to u32_max.
+            log.warn(
+                "onConnectionClosed: conn_id={d} dir={s} peer_active already 0 (map skew); removing entry",
+                .{ conn_id, @tagName(direction) },
+            );
+            _ = self.peer_active.remove(peer);
+            return;
+        }
         pr.* -= 1;
         const count = pr.*;
+        log.info(
+            "onConnectionClosed: conn_id={d} dir={s} reason={s} peer_active_after={d}",
+            .{ conn_id, @tagName(direction), @tagName(reason), count },
+        );
+
         if (count == 0) {
             _ = self.peer_active.remove(peer);
             try self.swarm.queueEvent(.{ .peer_disconnected = .{
@@ -399,6 +434,33 @@ pub const ConnectionManager = struct {
                         const idx = st.failure_count - 1;
                         st.next_dial_deadline_ms = now_ms + backoff_ms[idx];
                     }
+                }
+            }
+        } else if (direction == .outbound and reason != .local_close) {
+            // Outbound leg died but an inbound leg is still up so
+            // `peerActiveCount > 0` and `tick` would skip this peer. The
+            // libp2p QUIC publish path only writes on the outbound dial
+            // leg (zig-libp2p `quic_runtime.persistent_gossip` is keyed
+            // off the outbound slot) — losing it breaks gossip publish to
+            // this peer even though req/resp on the inbound stream still
+            // works. Submit the redial directly here so the publish mesh
+            // recovers without waiting for the inbound to die too.
+            if (self.known.getPtr(peer)) |st| {
+                if (!st.dial_inflight and st.failure_count < max_reconnect_failures) {
+                    log.info(
+                        "onConnectionClosed: outbound died for known peer (inbound still up, count={d}); resubmitting dial",
+                        .{count},
+                    );
+                    self.swarm.submit(.{ .dial = .{
+                        .addr = st.dial_str,
+                        .expected_peer = peer,
+                    } }) catch {
+                        // Transient swarm submit failure (queue full,
+                        // shutting down). `tick` will retry once the
+                        // inbound also drops or the queue drains.
+                    };
+                    st.dial_inflight = true;
+                    st.next_dial_deadline_ms = std.math.maxInt(i64);
                 }
             }
         }
