@@ -5,6 +5,7 @@ const std = @import("std");
 const pid = @import("peer_id");
 
 pub const PeerId = pid.PeerId;
+pub const PublicKey = pid.PublicKey;
 pub const ParseError = pid.id.ParseError;
 
 test "PeerId random bytes round trip" {

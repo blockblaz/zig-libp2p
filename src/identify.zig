@@ -660,7 +660,10 @@ pub fn verifySignedPeerRecord(
     return rec;
 }
 
-fn encodeSignedPeerRecordTestWire(
+/// Test-only helper: build a SignedEnvelope wire blob (RFC 0002) wrapping a
+/// `PeerRecord` payload, signed by an Ed25519 keypair. Exposed for unit tests
+/// in other modules (e.g. gossipsub PX envelope verification).
+pub fn encodeSignedPeerRecordTestWire(
     allocator: std.mem.Allocator,
     host_kp: std.crypto.sign.Ed25519.KeyPair,
     peer_record_wire: []const u8,
@@ -694,7 +697,9 @@ fn encodeSignedPeerRecordTestWire(
     return try wire.toOwnedSlice(allocator);
 }
 
-fn encodePeerRecordTestWire(allocator: std.mem.Allocator, peer_id_bytes: []const u8, seq: u64) ![]u8 {
+/// Test-only helper: build a bare `PeerRecord` protobuf body. Exposed for
+/// reuse from other modules' unit tests.
+pub fn encodePeerRecordTestWire(allocator: std.mem.Allocator, peer_id_bytes: []const u8, seq: u64) ![]u8 {
     var wire = std.ArrayList(u8).empty;
     errdefer wire.deinit(allocator);
     try proto.appendLengthDelimited(&wire, allocator, 1, peer_id_bytes);
