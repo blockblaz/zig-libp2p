@@ -1,7 +1,7 @@
 .{
     .name = .zig_libp2p,
     // x-release-please-start-version
-    .version = "0.1.68",
+    .version = "0.1.69",
     // x-release-please-end
     .fingerprint = 0x6e2dd2ac84762996,
     .minimum_zig_version = "0.16.0",
@@ -27,8 +27,8 @@
             .hash = "zig_varint-0.1.0-JouQHUVXAAAGN-XdMYrVEmYrzJd6zXtI7zk9bPnKYXVK",
         },
         .zquic = .{
-            .url = "https://github.com/ch4r10t33r/zquic/archive/refs/tags/v1.7.20.tar.gz",
-            .hash = "zquic-1.7.0-2zRc1NVQFACAw12ozgxUPeN1Okzsc4a6vs3MFiy1CKJP",
+            .url = "https://github.com/ch4r10t33r/zquic/archive/refs/tags/v1.7.21.tar.gz",
+            .hash = "zquic-1.7.0-2zRc1AhiFADSiGqPREYxQoAO9m0TtE66kSl4CxDHhdqS",
         },
     },
     .paths = .{
