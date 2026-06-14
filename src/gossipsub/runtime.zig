@@ -272,7 +272,51 @@ const IDontWantEntry = struct {
     expires_ms: i64,
 };
 
+/// Coarse **recursive** spin-lock guarding all `Gossipsub` public entry points.
+/// This Zig exposes only `std.Io.Mutex` (which needs an `Io` handle gossipsub
+/// does not carry), but the contention here is between *raw OS threads* — the
+/// QuicRuntime drive thread, the embedder's clock thread, and the consensus
+/// thread — so an atomic spin-lock is the right primitive. Critical sections
+/// are short (map/list ops, RPC encode) and contention is low.
+///
+/// It must be **recursive** because `handleInboundRpc` invokes the embedder's
+/// `topic_validator` callback while holding the lock, and that callback may
+/// call back into a public method (e.g. zeam's validator reads `meshPeers()`).
+/// Re-entry on the *same* thread is safe — no other thread can be mutating the
+/// shared maps at that point — so we let the owner re-acquire while still
+/// excluding every other thread.
+const SpinLock = struct {
+    /// Owning OS thread id, or 0 when unlocked. (Thread ids are never 0.)
+    owner: std.atomic.Value(u64) = .init(0),
+    /// Re-entrancy depth; only ever touched by the owning thread.
+    depth: u32 = 0,
+    fn lock(self: *SpinLock) void {
+        const tid: u64 = std.Thread.getCurrentId();
+        if (self.owner.load(.monotonic) == tid) {
+            self.depth += 1;
+            return;
+        }
+        while (self.owner.cmpxchgWeak(0, tid, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+        self.depth = 1;
+    }
+    fn unlock(self: *SpinLock) void {
+        self.depth -= 1;
+        if (self.depth == 0) self.owner.store(0, .release);
+    }
+};
+
 pub const Gossipsub = struct {
+    /// Serializes all public entry points. zeam drives gossipsub from several
+    /// threads — the QuicRuntime drive thread (`drainGossipsubOutbox`,
+    /// `handleInboundRpc`, peer up/down), the embedder's clock thread
+    /// (`heartbeat` via `Host.runPeriodicTicks`), and the consensus thread
+    /// (`Host.publish` → `publish`, plus `meshPeers` reads). The shared
+    /// `outbox`/`mesh`/score maps are not otherwise synchronized, so concurrent
+    /// access corrupted the heap (jemalloc segfault in an `outbox` realloc).
+    /// This coarse lock makes every public method mutually exclusive.
+    mutex: SpinLock = .{},
     allocator: std.mem.Allocator,
     cfg: GossipsubConfig,
     dup: duplicate_cache.DuplicateCache,
@@ -347,6 +391,16 @@ pub const Gossipsub = struct {
     inbound_rpc_control_decode_errors: u64,
     /// Count of inbound RPC frames whose `publish` section failed to decode.
     inbound_rpc_publish_decode_errors: u64,
+
+    /// Acquire the coarse lock. `*const` so read-only public methods (which
+    /// still touch shared maps and must not run during a writer) can guard
+    /// themselves; the mutex is logically not part of the struct's value.
+    fn lock(self: *const Gossipsub) void {
+        @constCast(&self.mutex).lock();
+    }
+    fn unlock(self: *const Gossipsub) void {
+        @constCast(&self.mutex).unlock();
+    }
 
     pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
         try config.validate();
@@ -439,6 +493,8 @@ pub const Gossipsub = struct {
     }
 
     pub fn setClockMs(self: *Gossipsub, t: i64) void {
+        self.lock();
+        defer self.unlock();
         self.clock_ms = t;
     }
 
@@ -448,7 +504,7 @@ pub const Gossipsub = struct {
 
     fn syncMeshPeers(self: *Gossipsub) void {
         if (self.cfg.metrics) |m| {
-            m.setMeshPeers(self.meshPeers());
+            m.setMeshPeers(self.meshPeersInner());
         }
     }
 
@@ -513,6 +569,11 @@ pub const Gossipsub = struct {
     /// `true` iff the local node is currently in PRUNE back-off toward `(peer, topic)`,
     /// i.e. MUST NOT send GRAFT.
     pub fn isPeerBackedOff(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) bool {
+        self.lock();
+        defer self.unlock();
+        return self.isPeerBackedOffInner(peer, topic);
+    }
+    fn isPeerBackedOffInner(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) bool {
         return self.findActiveBackoff(peer, topic) != null;
     }
 
@@ -696,20 +757,28 @@ pub const Gossipsub = struct {
     /// Mark `peer` as a direct (always-mesh) peer. Direct peers are never pruned by the
     /// heartbeat and bypass PRUNE back-off (libp2p gossipsub direct-peer behaviour, #85).
     pub fn addDirectPeer(self: *Gossipsub, peer: identity.PeerId) std.mem.Allocator.Error!void {
+        self.lock();
+        defer self.unlock();
         try self.direct_peers.put(peer, {});
     }
 
     pub fn removeDirectPeer(self: *Gossipsub, peer: identity.PeerId) void {
+        self.lock();
+        defer self.unlock();
         _ = self.direct_peers.remove(peer);
     }
 
     pub fn isDirectPeer(self: *const Gossipsub, peer: identity.PeerId) bool {
+        self.lock();
+        defer self.unlock();
         return self.direct_peers.contains(peer);
     }
 
     /// Pop the next PX dial suggestion (peer-id bytes) harvested from inbound PRUNE PX, or
     /// `null` if the queue is empty. Caller owns the returned slice (#85).
     pub fn popDialSuggestion(self: *Gossipsub) ?[]u8 {
+        self.lock();
+        defer self.unlock();
         if (self.px_dial_queue.items.len == 0) return null;
         return self.px_dial_queue.orderedRemove(0);
     }
@@ -748,7 +817,7 @@ pub const Gossipsub = struct {
 
     fn applyScoreDelta(self: *Gossipsub, peer: identity.PeerId, delta: i32) void {
         if (delta == 0) return;
-        const cur = self.peerBehaviourScore(peer);
+        const cur = self.peerBehaviourScoreInner(peer);
         const next: i32 = cur +| delta;
         self.peer_scores.put(peer, next) catch return;
     }
@@ -1021,6 +1090,8 @@ pub const Gossipsub = struct {
     }
 
     pub fn subscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        self.lock();
+        defer self.unlock();
         if (self.subs.contains(topic)) return;
         if (self.remainingTopicUnsubscribeSeconds(topic)) |_| return error.TopicUnsubscribeBackoff;
         if (self.topic_unsubscribed_until.fetchRemove(topic)) |kv| {
@@ -1036,6 +1107,8 @@ pub const Gossipsub = struct {
     }
 
     pub fn unsubscribe(self: *Gossipsub, topic: []const u8) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        self.lock();
+        defer self.unlock();
         if (!self.subs.contains(topic)) return;
         try self.leaveTopicMesh(topic, self.cfg.unsubscribe_backoff_ms);
 
@@ -1063,6 +1136,8 @@ pub const Gossipsub = struct {
     }
 
     pub fn publish(self: *Gossipsub, topic: []const u8, payload: []const u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        self.lock();
+        defer self.unlock();
         const inner = try msg_mod.encode(self.allocator, .{ .topic = topic, .data = payload });
         defer self.allocator.free(inner);
         if (inner.len > self.cfg.max_transmit_size_bytes) return error.PayloadTooLarge;
@@ -1078,10 +1153,14 @@ pub const Gossipsub = struct {
     }
 
     pub fn onPeerConnected(self: *Gossipsub, peer: identity.PeerId) void {
+        self.lock();
+        defer self.unlock();
         self.connected.put(peer, {}) catch return;
     }
 
     pub fn onPeerDisconnected(self: *Gossipsub, peer: identity.PeerId) void {
+        self.lock();
+        defer self.unlock();
         _ = self.connected.remove(peer);
         _ = self.peer_scores.remove(peer);
         var mit = self.mesh.iterator();
@@ -1097,11 +1176,18 @@ pub const Gossipsub = struct {
     }
 
     pub fn peerBehaviourScore(self: *const Gossipsub, peer: identity.PeerId) i32 {
+        self.lock();
+        defer self.unlock();
+        return self.peerBehaviourScoreInner(peer);
+    }
+    fn peerBehaviourScoreInner(self: *const Gossipsub, peer: identity.PeerId) i32 {
         return self.peer_scores.get(peer) orelse 0;
     }
 
     /// Sets a behaviour score used for mesh GRAFT / PRUNE ordering and lazy IHAVE peer selection (#39).
     pub fn setPeerBehaviourScore(self: *Gossipsub, peer: identity.PeerId, score: i32) std.mem.Allocator.Error!void {
+        self.lock();
+        defer self.unlock();
         try self.peer_scores.put(peer, score);
     }
 
@@ -1160,7 +1246,7 @@ pub const Gossipsub = struct {
             }
             // libp2p gossipsub v1.1: skip peers currently in PRUNE back-off for this topic.
             // Direct peers bypass back-off entirely (always-mesh).
-            if (!self.direct_peers.contains(p) and self.isPeerBackedOff(p, topic)) continue;
+            if (!self.direct_peers.contains(p) and self.isPeerBackedOffInner(p, topic)) continue;
             try self.scratch_peers.append(self.allocator, p);
         }
         // Direct peers always sort to the front; otherwise score-desc, then bytes.
@@ -1374,6 +1460,8 @@ pub const Gossipsub = struct {
     }
 
     pub fn handleInboundRpc(self: *Gossipsub, sender: identity.PeerId, frame: []const u8) (rpc.Error || msg_mod.Error || control.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        self.lock();
+        defer self.unlock();
         // The three sections of an RPC frame (subscriptions, control, publish)
         // are independent on the wire. A decode failure in one — for example, a
         // forward-incompatible field added by a peer running a newer gossipsub
@@ -1457,6 +1545,8 @@ pub const Gossipsub = struct {
     }
 
     pub fn heartbeat(self: *Gossipsub) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        self.lock();
+        defer self.unlock();
         self.dup.prune(self.clock_ms);
         self.prunePullCache();
         self.pruneRecentSeen();
@@ -1500,6 +1590,11 @@ pub const Gossipsub = struct {
 
     /// Sum of per-topic mesh sizes (a peer in multiple topics is counted multiple times).
     pub fn meshPeers(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
+        return self.meshPeersInner();
+    }
+    fn meshPeersInner(self: *const Gossipsub) u64 {
         var it = self.mesh.iterator();
         var sum: u64 = 0;
         while (it.next()) |e| {
@@ -1510,87 +1605,123 @@ pub const Gossipsub = struct {
 
     /// Mesh size for `topic`, or `null` if we have no mesh row for that topic string.
     pub fn meshPeerCountForTopic(self: *const Gossipsub, topic: []const u8) ?usize {
+        self.lock();
+        defer self.unlock();
         const mp = self.mesh.getPtr(topic) orelse return null;
         return mp.peers.count();
     }
 
     pub fn inboundDeliveredCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.inbound_delivered;
     }
 
     /// Inbound GRAFTs refused because the sender was in active PRUNE back-off (#75).
     pub fn graftRefusedDuringBackoffCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.graft_refused_during_backoff;
     }
 
     /// Outbound IWANT RPCs emitted in response to inbound IHAVE.
     pub fn iwantTxCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.iwant_tx;
     }
 
     /// Distinct message ids requested across all outbound IWANT RPCs.
     pub fn iwantIdsRequestedCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.iwant_ids_requested;
     }
 
     /// IHAVE ids dropped because the per-RPC `max_ihave_ids_per_rpc` cap was hit.
     pub fn ihaveIdsCappedCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.ihave_ids_capped;
     }
 
     /// PX `PeerInfo` entries whose carried envelope verified successfully.
     pub fn pxEnvelopeVerifiedCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.px_envelope_verified;
     }
 
     /// PX `PeerInfo` entries dropped because the carried envelope failed verification.
     pub fn pxEnvelopeInvalidCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.px_envelope_invalid;
     }
 
     /// PX `PeerInfo` entries accepted with no envelope (lenient default policy).
     pub fn pxEnvelopeMissingAcceptedCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.px_envelope_missing_accepted;
     }
 
     /// PX `PeerInfo` entries rejected for lacking an envelope (strict policy).
     pub fn pxEnvelopeMissingRejectedCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.px_envelope_missing_rejected;
     }
 
     /// Inbound publishes dropped because their `(from, seqno)` pair was already cached (#75).
     pub fn inboundDroppedSeqnoReplayCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.inbound_dropped_seqno_replay;
     }
 
     /// Active back-off window count (post-expiry sweep).
     pub fn activeBackoffCount(self: *Gossipsub) usize {
+        self.lock();
+        defer self.unlock();
         self.pruneBackoff();
         return self.backoff.items.len;
     }
 
     /// Inbound publishes the topic validator marked `reject` (#84).
     pub fn validatorRejectCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.inbound_dropped_validator_reject;
     }
     /// Inbound publishes the topic validator marked `ignore` (#84).
     pub fn validatorIgnoreCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.inbound_dropped_validator_ignore;
     }
     /// Outbound publishes suppressed because the destination had sent IDONTWANT (#85).
     pub fn suppressedOutboundIDontWantCount(self: *const Gossipsub) u64 {
+        self.lock();
+        defer self.unlock();
         return self.suppressed_outbound_idontwant;
     }
     /// Active IDONTWANT entries (post-lazy-sweep).
     pub fn idontwantCount(self: *const Gossipsub) usize {
+        self.lock();
+        defer self.unlock();
         return self.idontwant.items.len;
     }
     /// PX dial-suggestion queue depth.
     pub fn dialSuggestionCount(self: *const Gossipsub) usize {
+        self.lock();
+        defer self.unlock();
         return self.px_dial_queue.items.len;
     }
 
     pub fn popOutboxDelivery(self: *Gossipsub) ?OutDelivery {
+        self.lock();
+        defer self.unlock();
         if (self.outbox.items.len == 0) return null;
         return self.outbox.orderedRemove(0);
     }
