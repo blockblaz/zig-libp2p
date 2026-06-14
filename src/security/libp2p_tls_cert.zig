@@ -14,6 +14,90 @@ const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Secp256k1 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 const ArrayList = std.ArrayList(u8);
 
+/// Sign `message` with a secp256k1 key and DER-encode the result with a
+/// canonical **low-S** value (`S <= n/2`).
+///
+/// libp2p mandates low-S secp256k1 ECDSA signatures to avoid malleability, and
+/// verifiers built on libsecp256k1 — notably lantern/c-lean-libp2p's
+/// `secp256k1_ecdsa_verify` — REJECT high-S signatures outright. Zig's
+/// `std.crypto` ECDSA does not normalize S, so the libp2p TLS SignedKey signer
+/// must reduce it here, or roughly half of all generated certs fail peer
+/// verification against a libsecp256k1 peer. `out` receives the DER bytes.
+pub fn signSecp256k1LowSDer(
+    kp: Secp256k1.KeyPair,
+    message: []const u8,
+    out: []u8,
+) !usize {
+    var sig = try kp.sign(message, null);
+    // Normalize S to the lower half of the group order: if S > n-S, use n-S.
+    const neg_s = secp256k1OrderMinus(sig.s);
+    if (std.mem.order(u8, &sig.s, &neg_s) == .gt) {
+        sig.s = neg_s;
+    }
+    var der_buf: [Secp256k1.Signature.der_encoded_length_max]u8 = undefined;
+    const der = sig.toDer(&der_buf);
+    if (der.len > out.len) return error.SignBufferTooSmall;
+    @memcpy(out[0..der.len], der);
+    return der.len;
+}
+
+/// secp256k1 group order `n` (big-endian).
+const secp256k1_order: [32]u8 = .{
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b,
+    0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+};
+
+/// Compute `n - s` (big-endian, 256-bit) for `s` in `[1, n-1]`.
+fn secp256k1OrderMinus(s: [32]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    var borrow: i16 = 0;
+    var i: usize = 32;
+    while (i > 0) {
+        i -= 1;
+        var diff: i16 = @as(i16, secp256k1_order[i]) - @as(i16, s[i]) - borrow;
+        if (diff < 0) {
+            diff += 256;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out[i] = @intCast(diff);
+    }
+    return out;
+}
+
+test "signSecp256k1LowSDer always emits low-S" {
+    const order_half = [_]u8{
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d,
+        0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+    };
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        var seed: [32]u8 = undefined;
+        @memset(&seed, @intCast(i + 1));
+        const sk = try Secp256k1.SecretKey.fromBytes(seed);
+        const kp = try Secp256k1.KeyPair.fromSecretKey(sk);
+        var msg: [8]u8 = undefined;
+        @memset(&msg, @intCast(i));
+        var der_out: [Secp256k1.Signature.der_encoded_length_max]u8 = undefined;
+        const n = try signSecp256k1LowSDer(kp, &msg, &der_out);
+        // Parse S from DER: 0x30 len 0x02 rlen r 0x02 slen s.
+        const der = der_out[0..n];
+        var p: usize = 2 + 2 + der[3]; // skip seq hdr, r INTEGER
+        try std.testing.expectEqual(@as(u8, 0x02), der[p]);
+        const slen = der[p + 1];
+        p += 2;
+        var s: [32]u8 = [_]u8{0} ** 32;
+        const raw = der[p .. p + slen];
+        // Strip a leading 0x00 sign byte, right-align into 32 bytes.
+        const start: usize = if (raw.len == 33 and raw[0] == 0) 1 else 0;
+        @memcpy(s[32 - (raw.len - start) ..], raw[start..]);
+        try std.testing.expect(std.mem.order(u8, &s, &order_half) != .gt);
+    }
+}
+
 /// Algorithm the ephemeral certificate key uses (determines which PEM writer
 /// the consumer must call for the matching private key).
 pub const CertKeyKind = enum {

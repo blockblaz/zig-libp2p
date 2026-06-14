@@ -26,6 +26,7 @@ const zl = @import("zig_libp2p");
 const libp2p_tls_cert = zl.security.libp2p_tls_cert;
 const peer_id_mod = zl.peer_id;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const Secp256k1 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 
 fn getEnv(key: []const u8) ?[]const u8 {
     var buf: [256]u8 = undefined;
@@ -76,22 +77,21 @@ pub fn main() !u8 {
     var cert_seed: [32]u8 = undefined;
     try fillRandom(&cert_seed);
 
-    // ECDSA-P-256 host identity.  Same algorithm as the cert keypair so
-    // libp2p_tls_cert.generate's `ecdsa_p256` arm fires.
-    const host_kp = try EcdsaP256.KeyPair.generateDeterministic(host_seed);
-    const host_pub: [65]u8 = host_kp.public_key.toUncompressedSec1();
+    // secp256k1 host identity.  secp256k1 (NOT Ed25519 or P-256) is the libp2p
+    // convention in the lean ecosystem and what zeam uses at runtime
+    // (zeam/pkgs/network/src/ethlibp2p_v2.zig); lantern/c-lean-libp2p only
+    // accepts secp256k1 host identity keys, so the interop harness must match.
+    // The seed is the 32-byte secp256k1 private-key scalar.
+    const host_sk = try Secp256k1.SecretKey.fromBytes(host_seed);
+    const host_kp = try Secp256k1.KeyPair.fromSecretKey(host_sk);
+    const host_pub: [33]u8 = host_kp.public_key.toCompressedSec1();
 
     const HostSigner = struct {
-        kp: EcdsaP256.KeyPair,
+        kp: Secp256k1.KeyPair,
         fn sign(ctx: ?*anyopaque, message: []const u8, out_sig: []u8, out_sig_len: *usize) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            const sig = try self.kp.sign(message, null);
-            const Sig = @TypeOf(sig);
-            var der_buf: [Sig.der_encoded_length_max]u8 = undefined;
-            const der = sig.toDer(&der_buf);
-            if (der.len > out_sig.len) return error.SignBufferTooSmall;
-            @memcpy(out_sig[0..der.len], der);
-            out_sig_len.* = der.len;
+            // libp2p / libsecp256k1 (lantern) require canonical low-S signatures.
+            out_sig_len.* = try libp2p_tls_cert.signSecp256k1LowSDer(self.kp, message, out_sig);
         }
     };
     var signer = HostSigner{ .kp = host_kp };
@@ -99,8 +99,8 @@ pub fn main() !u8 {
     const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
     var gen = try libp2p_tls_cert.generate(a, .{
         .host_identity = .{
-            .ecdsa_p256 = .{
-                .public_key_sec1_uncompressed = host_pub,
+            .secp256k1 = .{
+                .public_key_sec1_compressed = host_pub,
                 .sign = HostSigner.sign,
                 .sign_ctx = &signer,
             },
@@ -122,14 +122,9 @@ pub fn main() !u8 {
     try writeFile(cert_path, cert_pem);
     try writeFile(key_path, key_pem);
 
-    // Derive PeerId from the ECDSA-P-256 host pubkey via the protobuf
-    // PublicKey { type=ECDSA, data=PKIX-SPKI } encoding (RFC 0001 spec).
-    const pk_proto = try libp2p_tls_cert.encodeEcdsaPublicKeyProto(a, host_pub);
-    defer a.free(pk_proto);
-    const reader = try peer_id_mod.PublicKeyReader.init(pk_proto);
-    const data_copy = try a.dupe(u8, reader.getData());
-    defer a.free(data_copy);
-    var pk = peer_id_mod.PublicKey{ .type = .ECDSA, .data = data_copy };
+    // Derive PeerId from the secp256k1 host pubkey via the protobuf
+    // PublicKey { type=SECP256K1, data=<compressed SEC1> } encoding (RFC 0001).
+    var pk = peer_id_mod.PublicKey{ .type = .SECP256K1, .data = &host_pub };
     const pid = try peer_id_mod.PeerId.fromPublicKey(a, &pk);
     var pid_buf: [128]u8 = undefined;
     const pid_b58 = try pid.toBase58(&pid_buf);

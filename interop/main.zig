@@ -15,7 +15,7 @@ const tcp = zl.transport.tcp;
 const tcp_tls = zl.transport.tcp_tls;
 const libp2p_tls_cert = zl.security.libp2p_tls_cert;
 
-const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const Secp256k1 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 
 const tcp_tuning: tcp.StreamSocketTuning = .{
     .tcp_nodelay = true,
@@ -111,24 +111,24 @@ fn fillRandomBytes(out: []u8) !void {
 }
 
 fn generateIdentity(allocator: std.mem.Allocator) !Identity {
+    // secp256k1 host identity matches zeam (the lean ecosystem convention) and
+    // is the only host key type lantern/c-lean-libp2p accepts. The ephemeral
+    // cert keypair stays ECDSA-P-256.
     const HostSigner = struct {
-        kp: EcdsaP256.KeyPair,
+        kp: Secp256k1.KeyPair,
         fn sign(ctx: ?*anyopaque, message: []const u8, out_sig: []u8, out_sig_len: *usize) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            const sig = try self.kp.sign(message, null);
-            var buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
-            const der = sig.toDer(&buf);
-            if (der.len > out_sig.len) return error.NoSpaceLeft;
-            @memcpy(out_sig[0..der.len], der);
-            out_sig_len.* = der.len;
+            // libp2p / libsecp256k1 (lantern) require canonical low-S signatures.
+            out_sig_len.* = try libp2p_tls_cert.signSecp256k1LowSDer(self.kp, message, out_sig);
         }
     };
 
     var host_seed: [32]u8 = undefined;
     try fillRandomBytes(&host_seed);
-    const host_kp = try EcdsaP256.KeyPair.generateDeterministic(host_seed);
+    const host_sk = try Secp256k1.SecretKey.fromBytes(host_seed);
+    const host_kp = try Secp256k1.KeyPair.fromSecretKey(host_sk);
     var signer = HostSigner{ .kp = host_kp };
-    const host_pub_sec1: [65]u8 = host_kp.public_key.toUncompressedSec1();
+    const host_pub_sec1: [33]u8 = host_kp.public_key.toCompressedSec1();
 
     const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
     var cert_seed: [32]u8 = undefined;
@@ -136,8 +136,8 @@ fn generateIdentity(allocator: std.mem.Allocator) !Identity {
 
     var gen = try libp2p_tls_cert.generate(allocator, .{
         .host_identity = .{
-            .ecdsa_p256 = .{
-                .public_key_sec1_uncompressed = host_pub_sec1,
+            .secp256k1 = .{
+                .public_key_sec1_compressed = host_pub_sec1,
                 .sign = HostSigner.sign,
                 .sign_ctx = &signer,
             },
@@ -154,10 +154,7 @@ fn generateIdentity(allocator: std.mem.Allocator) !Identity {
     defer allocator.free(key_pem);
 
     const owned_cert = try tcp_tls.certKeyPairFromPem(allocator, cert_pem, key_pem, now_sec);
-    const host_pub_proto = try libp2p_tls_cert.encodeEcdsaPublicKeyProto(allocator, host_pub_sec1);
-    defer allocator.free(host_pub_proto);
-    const reader = try zl.peer_id.PublicKeyReader.init(host_pub_proto);
-    var host_pk = zl.peer_id.PublicKey{ .type = .ECDSA, .data = reader.getData() };
+    var host_pk = zl.peer_id.PublicKey{ .type = .SECP256K1, .data = &host_pub_sec1 };
     const local_peer_id = try zl.peer_id.PeerId.fromPublicKey(allocator, &host_pk);
 
     return .{
