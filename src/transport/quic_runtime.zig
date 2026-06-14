@@ -68,6 +68,17 @@ const meshsub_protocol_id_v13: []const u8 = "/meshsub/1.3.0";
 /// version first so rust-libp2p's responder can pick the newest it supports;
 /// the ack may be any `/meshsub/*` (see [`initiatorHandshakeMeshsubReadPhase`]).
 const meshsub_initiator_offer: []const u8 = meshsub_protocol_id_v13;
+/// Versions offered on a zeam-initiated `/meshsub` stream, newest first. The
+/// first is sent up-front; on a `na` reply the negotiation falls back to the
+/// next via [`stream_multistream.initiatorMeshsubFallbackStep`]. Lantern
+/// (c-lean-libp2p) and go-libp2p only support `/meshsub/1.1.0` and
+/// `/meshsub/1.2.0`, so without this fallback zeam's single 1.3.0 offer is
+/// rejected and the connection flaps. `[0]` must equal `meshsub_initiator_offer`.
+const meshsub_offer_fallbacks = [_][]const u8{
+    meshsub_protocol_id_v13, // /meshsub/1.3.0 — ethlambda / zeam
+    meshsub_protocol_id_v12, // /meshsub/1.2.0 — lantern, go-libp2p, rust-libp2p
+    meshsub_protocol_id, //     /meshsub/1.1.0 — oldest standard fallback
+};
 
 /// Per-stream inbound accumulator caps (#119).
 const max_inbound_gossip_acc_bytes: usize =
@@ -429,6 +440,15 @@ const PersistentGossipStream = struct {
     raw: PublishBidiStream,
     handshake_sent: bool = false,
     handshake_done: bool = false,
+    /// True once the peer's `/multistream/1.0.0` header has been consumed by
+    /// [`stream_multistream.initiatorMeshsubFallbackStep`]. The header is read
+    /// once; subsequent ticks read only protocol-ack tokens.
+    ms_header_done: bool = false,
+    /// Index into [`meshsub_offer_fallbacks`] of the `/meshsub` version we are
+    /// currently offering. Advances each time the responder answers `na`, so a
+    /// peer that doesn't support the newest version negotiates down instead of
+    /// tearing the connection down (lantern / go-libp2p interop).
+    offer_idx: usize = 0,
     /// Set when the multistream-select handshake or a frame write fails.
     /// Once broken, the stream is never revived for the remainder of the
     /// underlying QUIC connection's lifetime; new outbox enqueues are dropped
@@ -1594,7 +1614,15 @@ pub const QuicRuntime = struct {
                 if (g.raw.unreadRecvLen() == 0) continue;
                 var r = g.raw.reader();
                 var w = g.raw.writer();
-                stream_multistream.initiatorHandshakeMeshsubReadPhase(&r, &w, a, null) catch |err| {
+                const neg_res = stream_multistream.initiatorMeshsubFallbackStep(
+                    &r,
+                    &w,
+                    a,
+                    &g.ms_header_done,
+                    &meshsub_offer_fallbacks,
+                    &g.offer_idx,
+                    null,
+                ) catch |err| {
                     log.warn(
                         "quic_runtime: persistent gossip handshake failed: {s}; marking stream broken",
                         .{@errorName(err)},
@@ -1602,6 +1630,15 @@ pub const QuicRuntime = struct {
                     self.markPersistentGossipBroken(g, "handshake_read_failed");
                     continue;
                 };
+                switch (neg_res) {
+                    .incomplete => continue, // wait for the next reply (or just re-offered)
+                    .exhausted => {
+                        log.warn("quic_runtime: persistent gossip: peer supports no /meshsub version we offer; marking stream broken", .{});
+                        self.markPersistentGossipBroken(g, "no_common_meshsub_version");
+                        continue;
+                    },
+                    .accepted => {},
+                }
                 g.handshake_done = true;
                 // Seed the keepalive baseline so the first empty-control RPC
                 // fires `keepalive_interval` after handshake, not immediately.

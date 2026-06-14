@@ -187,6 +187,88 @@ pub fn initiatorHandshakeMultistreamReadPhase(
     }
 }
 
+/// Outcome of one [`initiatorMeshsubFallbackStep`] call.
+pub const MeshsubFallbackResult = enum {
+    /// Responder accepted a `/meshsub/*` version — negotiation complete.
+    accepted,
+    /// Not enough bytes buffered yet (or a re-offer was just sent); call again
+    /// next tick once more data has arrived.
+    incomplete,
+    /// Every candidate in `offers` was rejected with `na` — no common version.
+    exhausted,
+};
+
+/// Multi-tick initiator `/meshsub` negotiation **with version fallback**.
+///
+/// The caller must already have written the multistream header + `offers[0]`
+/// (see [`appendFirstStreamInitiatorHandshakeFramed`]). Each tick, this pulls
+/// the buffered reply, consumes the peer's multistream header once
+/// (tracked via `header_done`), then reads the protocol ack:
+///   * a `/meshsub/*` line  → `.accepted`
+///   * `na`                 → advance `offer_idx` and write the next candidate
+///                            (`offers[offer_idx]`); returns `.incomplete`
+///   * not enough bytes yet → `.incomplete`
+///
+/// Returns `.exhausted` when `na` is received for the last candidate. This is
+/// what lets zeam interop with peers (e.g. lantern / go-libp2p) that don't
+/// support the newest `/meshsub` version zeam offers first: instead of tearing
+/// the connection down on the first `na`, it negotiates down to a common one.
+/// QUIC peers use delimited framing for acks.
+pub fn initiatorMeshsubFallbackStep(
+    r: *Io.Reader,
+    w: *Io.Writer,
+    allocator: std.mem.Allocator,
+    header_done: *bool,
+    offers: []const []const u8,
+    offer_idx: *usize,
+    tail: ?*std.ArrayList(u8),
+) StreamHandshakeError!MeshsubFallbackResult {
+    var acc = std.ArrayList(u8).empty;
+    defer acc.deinit(allocator);
+    try drainReaderTail(&acc, r, allocator);
+
+    if (!header_done.*) {
+        var rem: []const u8 = acc.items;
+        neg.initiatorReadPeerMultistream(&rem, neg.default_max_body_len) catch |err| switch (err) {
+            error.MissingNewline => return .incomplete,
+            else => return terr.fromMultistreamStreamLayer(err),
+        };
+        try compactConsumed(&acc, allocator, rem);
+        header_done.* = true;
+    }
+
+    while (true) {
+        var rem: []const u8 = acc.items;
+        const tok = neg.readNegotiationTokenFramed(&rem, neg.default_max_body_len, .delimited) catch |err| switch (err) {
+            error.MissingNewline => return .incomplete,
+            else => return terr.fromMultistreamStreamLayer(err),
+        };
+        if (std.mem.startsWith(u8, tok, "/meshsub/")) {
+            try compactConsumed(&acc, allocator, rem);
+            preserveAccTailOnly(&acc, tail);
+            return .accepted;
+        }
+        if (std.mem.eql(u8, tok, "na")) {
+            try compactConsumed(&acc, allocator, rem);
+            offer_idx.* += 1;
+            if (offer_idx.* >= offers.len) return .exhausted;
+            var out = std.ArrayList(u8).empty;
+            defer out.deinit(allocator);
+            neg.initiatorSendProtocolFramed(&out, allocator, offers[offer_idx.*], .delimited) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => |er| return terr.fromMultistreamStreamLayer(er),
+            };
+            Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
+            Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
+            // The next reply is a fresh round-trip; it is usually not buffered
+            // yet, so the next loop read returns `.incomplete` and we resume
+            // on a later tick.
+            continue;
+        }
+        return terr.fromMultistreamStreamLayer(error.ProtocolNotSupported);
+    }
+}
+
 /// Initiator read phase for `/meshsub/*` streams: accepts any `/meshsub/` ack line.
 pub fn initiatorHandshakeMeshsubReadPhase(
     r: *Io.Reader,
@@ -505,4 +587,46 @@ test "responderHandshakeMultistreamAmong preserves trailing app bytes (go MSSele
     try std.testing.expectEqual(@as(usize, 1), ix);
     try std.testing.expectEqual(payload.len, tail.items.len);
     try std.testing.expectEqualSlices(u8, &payload, tail.items);
+}
+
+test "initiatorMeshsubFallbackStep negotiates down to a supported version on na" {
+    const a = std.testing.allocator;
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(a);
+    // Responder: header, `na` for /meshsub/1.3.0, then accepts /meshsub/1.2.0.
+    try neg.responderSendMultistreamHeaderFramed(&wire, a, .delimited);
+    try neg.responderReplyProtocolFramed(&wire, a, "/meshsub/1.3.0", "/meshsub/1.2.0", .delimited); // na
+    try neg.responderReplyProtocolFramed(&wire, a, "/meshsub/1.2.0", "/meshsub/1.2.0", .delimited); // ack
+
+    var r = Io.Reader.fixed(wire.items);
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    const offers: []const []const u8 = &.{ "/meshsub/1.3.0", "/meshsub/1.2.0", "/meshsub/1.1.0" };
+    var header_done = false;
+    var offer_idx: usize = 0;
+    const res = try initiatorMeshsubFallbackStep(&r, &aw.writer, a, &header_done, offers, &offer_idx, null);
+    try std.testing.expectEqual(MeshsubFallbackResult.accepted, res);
+    try std.testing.expectEqual(@as(usize, 1), offer_idx); // advanced past 1.3.0 to 1.2.0
+    try std.testing.expect(header_done);
+}
+
+test "initiatorMeshsubFallbackStep exhausts when peer supports no offered version" {
+    const a = std.testing.allocator;
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(a);
+    try neg.responderSendMultistreamHeaderFramed(&wire, a, .delimited);
+    try neg.responderReplyProtocolFramed(&wire, a, "/meshsub/1.3.0", "/other/1", .delimited); // na
+    try neg.responderReplyProtocolFramed(&wire, a, "/meshsub/1.2.0", "/other/1", .delimited); // na
+    try neg.responderReplyProtocolFramed(&wire, a, "/meshsub/1.1.0", "/other/1", .delimited); // na
+
+    var r = Io.Reader.fixed(wire.items);
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    const offers: []const []const u8 = &.{ "/meshsub/1.3.0", "/meshsub/1.2.0", "/meshsub/1.1.0" };
+    var header_done = false;
+    var offer_idx: usize = 0;
+    const res = try initiatorMeshsubFallbackStep(&r, &aw.writer, a, &header_done, offers, &offer_idx, null);
+    try std.testing.expectEqual(MeshsubFallbackResult.exhausted, res);
 }
