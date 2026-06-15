@@ -1165,13 +1165,34 @@ pub const QuicRuntime = struct {
     /// the drive thread is what lets QUIC recv/ACK keep flowing during a
     /// seconds-long block validation.
     fn gossipWorkerLoop(self: *QuicRuntime) void {
+        // Claim this thread as the gossipsub owner: state-mutating calls made on
+        // it (handleGossipRpc below, the validator) apply inline; calls from
+        // other threads (consensus publish, drive peer-events) are posted to the
+        // gossipsub command queue and drained here via `processCommands`.
+        self.host.gossipsub.claimOwnerThread();
+        var last_hb_ms: i64 = self.opts.now_ms_fn();
         while (!self.shutdown_requested.load(.acquire)) {
+            var did_work = false;
+            // 1. Inbound gossip frames the drive thread queued (heavy validation
+            //    runs here, off the drive thread).
             if (self.popInboundGossip()) |w| {
                 self.host.handleGossipRpc(w.sender, w.frame) catch |err| {
                     log.warn("quic_runtime: handleGossipRpc (worker) failed: {s}", .{@errorName(err)});
                 };
                 self.allocator.free(w.frame);
-            } else {
+                did_work = true;
+            }
+            // 2. Other gossipsub mutations posted by non-owner threads
+            //    (publish / subscribe / peer up-down / set-clock).
+            self.host.gossipsub.processCommands();
+            // 3. Heartbeat on a ~100ms timer (the owner runs it, not the drive
+            //    thread's runPeriodicTicks, which is now a no-op for gossipsub).
+            const now_ms = self.opts.now_ms_fn();
+            if (now_ms - last_hb_ms >= 100) {
+                last_hb_ms = now_ms;
+                self.host.gossipsub.heartbeatTick();
+            }
+            if (!did_work) {
                 // Idle: brief passive wait to avoid busy-spinning the core.
                 // libc nanosleep (Zig 0.16 dropped `std.Thread.sleep`).
                 var req = std.c.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_us };

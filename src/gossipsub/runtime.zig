@@ -299,16 +299,56 @@ const SpinLock = struct {
     }
 };
 
+/// Single-owner **actor** command (migration stages 2–4).  All state-mutating
+/// entry points called from non-owner threads are posted here and applied by
+/// the owner thread (the QuicRuntime gossip worker) in `processCommands`, so the
+/// `mesh`/score/`outbox` maps have exactly one writer and need no lock on the
+/// state itself.  Heap-owned slices are freed by the owner after the command is
+/// applied.
+const GossipCommand = union(enum) {
+    inbound_rpc: struct { sender: identity.PeerId, frame: []u8 },
+    publish: struct { topic: []u8, data: []u8 },
+    subscribe: struct { topic: []u8 },
+    unsubscribe: struct { topic: []u8 },
+    peer_connected: identity.PeerId,
+    peer_disconnected: identity.PeerId,
+    set_clock: i64,
+};
+
+fn freeCommand(a: std.mem.Allocator, cmd: GossipCommand) void {
+    switch (cmd) {
+        .inbound_rpc => |c| a.free(c.frame),
+        .publish => |c| {
+            a.free(c.topic);
+            a.free(c.data);
+        },
+        .subscribe => |c| a.free(c.topic),
+        .unsubscribe => |c| a.free(c.topic),
+        .peer_connected, .peer_disconnected, .set_clock => {},
+    }
+}
+
 pub const Gossipsub = struct {
-    /// Serializes all public entry points. zeam drives gossipsub from several
-    /// threads — the QuicRuntime drive thread (`drainGossipsubOutbox`,
-    /// `handleInboundRpc`, peer up/down), the embedder's clock thread
-    /// (`heartbeat` via `Host.runPeriodicTicks`), and the consensus thread
-    /// (`Host.publish` → `publish`, plus `meshPeers` reads). The shared
-    /// `outbox`/`mesh`/score maps are not otherwise synchronized, so concurrent
-    /// access corrupted the heap (jemalloc segfault in an `outbox` realloc).
-    /// This coarse lock makes every public method mutually exclusive.
-    mutex: SpinLock = .{},
+    /// Guards the cross-thread queues only (`cmd_queue`, `outbox`) — NOT the
+    /// gossipsub state, which has a single writer (the owner thread draining
+    /// `cmd_queue` in `processCommands`).  Critical sections are tiny (one
+    /// queue push/pop).  See `GossipCommand` for the actor model.
+    cmd_lock: SpinLock = .{},
+    outbox_lock: SpinLock = .{},
+    /// Pending state-mutating commands posted by non-owner threads.
+    cmd_queue: std.ArrayList(GossipCommand) = .empty,
+    /// Lock-free snapshot of `meshPeersInner()`, refreshed by the owner after
+    /// each command batch / heartbeat.  The only gossipsub read reached from
+    /// other threads (zeam's publish path + metrics); every other reader is the
+    /// owner thread itself (e.g. the validator, which now runs on the worker).
+    mesh_peer_count: std.atomic.Value(u64) = .init(0),
+    /// OS thread id of the owner (the QuicRuntime gossip worker), or 0 before it
+    /// is claimed.  Public mutators called *on* the owner thread (the worker
+    /// draining commands, and the validator which runs there) apply directly;
+    /// calls from any other thread are posted to `cmd_queue`.  When unclaimed
+    /// (0 — e.g. unit tests with no worker) everything applies directly, so the
+    /// synchronous test harness is unchanged.
+    owner_tid: std.atomic.Value(u64) = .init(0),
     allocator: std.mem.Allocator,
     cfg: GossipsubConfig,
     dup: duplicate_cache.DuplicateCache,
@@ -384,14 +424,90 @@ pub const Gossipsub = struct {
     /// Count of inbound RPC frames whose `publish` section failed to decode.
     inbound_rpc_publish_decode_errors: u64,
 
-    /// Acquire the coarse lock. `*const` so read-only public methods (which
-    /// still touch shared maps and must not run during a writer) can guard
-    /// themselves; the mutex is logically not part of the struct's value.
-    fn lock(self: *const Gossipsub) void {
-        @constCast(&self.mutex).lock();
+    /// No-ops under the single-owner actor model.  Gossipsub state has exactly
+    /// one writer — the owner thread draining `cmd_queue` in `processCommands`
+    /// (plus heartbeat).  The historical `self.lock()`/`unlock()` call sites are
+    /// retained as no-ops so the conversion stays surgical; the cross-thread
+    /// queues (`cmd_queue`, `outbox`) are guarded explicitly by `cmd_lock` /
+    /// `outbox_lock`, and the one cross-thread read (`meshPeers`) is a
+    /// `mesh_peer_count` atomic.
+    inline fn lock(self: *const Gossipsub) void {
+        _ = self;
     }
-    fn unlock(self: *const Gossipsub) void {
-        @constCast(&self.mutex).unlock();
+    inline fn unlock(self: *const Gossipsub) void {
+        _ = self;
+    }
+
+    /// Claim the calling thread as the gossipsub owner.  Called once by the
+    /// QuicRuntime gossip worker before it starts draining commands.
+    pub fn claimOwnerThread(self: *Gossipsub) void {
+        self.owner_tid.store(std.Thread.getCurrentId(), .monotonic);
+    }
+
+    /// True when a mutator may run inline (we are the owner thread, or no owner
+    /// has been claimed — the single-threaded test/embed case).
+    fn onOwnerThread(self: *const Gossipsub) bool {
+        const o = self.owner_tid.load(.monotonic);
+        return o == 0 or o == std.Thread.getCurrentId();
+    }
+
+    /// Post a state-mutating command to the owner thread.  Called from any
+    /// non-owner thread (consensus `publish`, drive peer-events / subscribe).
+    /// Heap slices in `cmd` are owned by the command and freed by the owner.
+    fn postCommand(self: *Gossipsub, cmd: GossipCommand) void {
+        self.cmd_lock.lock();
+        defer self.cmd_lock.unlock();
+        self.cmd_queue.append(self.allocator, cmd) catch {
+            log.err("gossipsub: command queue append failed; dropping command", .{});
+            freeCommand(self.allocator, cmd);
+        };
+    }
+
+    /// Owner-thread drain: apply every queued command, then refresh the
+    /// `mesh_peer_count` snapshot.  Invoked each tick by the QuicRuntime gossip
+    /// worker (the sole gossipsub owner).
+    pub fn processCommands(self: *Gossipsub) void {
+        while (true) {
+            self.cmd_lock.lock();
+            const maybe = if (self.cmd_queue.items.len > 0) self.cmd_queue.orderedRemove(0) else null;
+            self.cmd_lock.unlock();
+            const cmd = maybe orelse break;
+            switch (cmd) {
+                .inbound_rpc => |c| {
+                    self.handleInboundRpcInner(c.sender, c.frame) catch |err|
+                        log.warn("gossipsub: handleInboundRpc: {s}", .{@errorName(err)});
+                    self.allocator.free(c.frame);
+                },
+                .publish => |c| {
+                    self.publishInner(c.topic, c.data) catch |err|
+                        log.warn("gossipsub: publish: {s}", .{@errorName(err)});
+                    self.allocator.free(c.topic);
+                    self.allocator.free(c.data);
+                },
+                .subscribe => |c| {
+                    self.subscribeInner(c.topic) catch |err|
+                        log.warn("gossipsub: subscribe: {s}", .{@errorName(err)});
+                    self.allocator.free(c.topic);
+                },
+                .unsubscribe => |c| {
+                    self.unsubscribeInner(c.topic) catch |err|
+                        log.warn("gossipsub: unsubscribe: {s}", .{@errorName(err)});
+                    self.allocator.free(c.topic);
+                },
+                .peer_connected => |peer| self.onPeerConnectedInner(peer),
+                .peer_disconnected => |peer| self.onPeerDisconnectedInner(peer),
+                .set_clock => |t| self.clock_ms = t,
+            }
+        }
+        self.mesh_peer_count.store(self.meshPeersInner(), .monotonic);
+    }
+
+    /// Run a heartbeat on the owner thread (called by the gossip worker on a
+    /// timer).  Mirrors the old `heartbeat` but owner-only / lock-free.
+    pub fn heartbeatTick(self: *Gossipsub) void {
+        self.heartbeatInner() catch |err|
+            log.warn("gossipsub: heartbeat: {s}", .{@errorName(err)});
+        self.mesh_peer_count.store(self.meshPeersInner(), .monotonic);
     }
 
     pub fn init(allocator: std.mem.Allocator, config: GossipsubConfig) (InitConfigError || std.mem.Allocator.Error)!*Gossipsub {
@@ -467,6 +583,8 @@ pub const Gossipsub = struct {
         self.remote_interest.deinit();
         for (self.outbox.items) |d| self.allocator.free(d.wire);
         self.outbox.deinit(self.allocator);
+        for (self.cmd_queue.items) |c| freeCommand(self.allocator, c);
+        self.cmd_queue.deinit(self.allocator);
         self.connected.deinit();
         self.peer_scores.deinit();
         self.scratch_peers.deinit(self.allocator);
@@ -485,9 +603,11 @@ pub const Gossipsub = struct {
     }
 
     pub fn setClockMs(self: *Gossipsub, t: i64) void {
-        self.lock();
-        defer self.unlock();
-        self.clock_ms = t;
+        if (self.onOwnerThread()) {
+            self.clock_ms = t;
+            return;
+        }
+        self.postCommand(.{ .set_clock = t });
     }
 
     fn historyWindowMs(self: *const Gossipsub) i64 {
@@ -1031,6 +1151,12 @@ pub const Gossipsub = struct {
     }
 
     fn appendOutKind(self: *Gossipsub, wire: []u8, to: ?identity.PeerId, kind: OutDeliveryKind) (errors.GossipsubError || std.mem.Allocator.Error)!void {
+        // Sole outbox writer entry point (owner thread).  The outbox is consumed
+        // by the drive thread (`popOutboxDelivery`), so guard the shared
+        // ArrayList here and there with `outbox_lock`.  Internal cap helpers
+        // called below do NOT lock (no nesting).
+        self.outbox_lock.lock();
+        defer self.outbox_lock.unlock();
         if (to) |p| {
             self.enforcePerPeerCap(p);
         }
@@ -1082,6 +1208,12 @@ pub const Gossipsub = struct {
     }
 
     pub fn subscribe(self: *Gossipsub, topic: []const u8) (rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (self.onOwnerThread()) return self.subscribeInner(topic);
+        const t = try self.allocator.dupe(u8, topic);
+        self.postCommand(.{ .subscribe = .{ .topic = t } });
+    }
+
+    fn subscribeInner(self: *Gossipsub, topic: []const u8) (rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         self.lock();
         defer self.unlock();
         if (self.subs.contains(topic)) return;
@@ -1099,6 +1231,12 @@ pub const Gossipsub = struct {
     }
 
     pub fn unsubscribe(self: *Gossipsub, topic: []const u8) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (self.onOwnerThread()) return self.unsubscribeInner(topic);
+        const t = try self.allocator.dupe(u8, topic);
+        self.postCommand(.{ .unsubscribe = .{ .topic = t } });
+    }
+
+    fn unsubscribeInner(self: *Gossipsub, topic: []const u8) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         self.lock();
         defer self.unlock();
         if (!self.subs.contains(topic)) return;
@@ -1127,7 +1265,18 @@ pub const Gossipsub = struct {
         self.syncMeshPeers();
     }
 
+    /// Post a publish to the owner thread (actor).  Fire-and-forget: the actual
+    /// encode/mesh-forward happens in `publishInner` on the owner; encode errors
+    /// become logs rather than caller-visible returns (best-effort gossip).
     pub fn publish(self: *Gossipsub, topic: []const u8, payload: []const u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (self.onOwnerThread()) return self.publishInner(topic, payload);
+        const t = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(t);
+        const d = try self.allocator.dupe(u8, payload);
+        self.postCommand(.{ .publish = .{ .topic = t, .data = d } });
+    }
+
+    fn publishInner(self: *Gossipsub, topic: []const u8, payload: []const u8) (msg_mod.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         self.lock();
         defer self.unlock();
         const inner = try msg_mod.encode(self.allocator, .{ .topic = topic, .data = payload });
@@ -1145,12 +1294,22 @@ pub const Gossipsub = struct {
     }
 
     pub fn onPeerConnected(self: *Gossipsub, peer: identity.PeerId) void {
+        if (self.onOwnerThread()) return self.onPeerConnectedInner(peer);
+        self.postCommand(.{ .peer_connected = peer });
+    }
+
+    fn onPeerConnectedInner(self: *Gossipsub, peer: identity.PeerId) void {
         self.lock();
         defer self.unlock();
         self.connected.put(peer, {}) catch return;
     }
 
     pub fn onPeerDisconnected(self: *Gossipsub, peer: identity.PeerId) void {
+        if (self.onOwnerThread()) return self.onPeerDisconnectedInner(peer);
+        self.postCommand(.{ .peer_disconnected = peer });
+    }
+
+    fn onPeerDisconnectedInner(self: *Gossipsub, peer: identity.PeerId) void {
         self.lock();
         defer self.unlock();
         _ = self.connected.remove(peer);
@@ -1452,6 +1611,12 @@ pub const Gossipsub = struct {
     }
 
     pub fn handleInboundRpc(self: *Gossipsub, sender: identity.PeerId, frame: []const u8) (rpc.Error || msg_mod.Error || control.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (self.onOwnerThread()) return self.handleInboundRpcInner(sender, frame);
+        const f = try self.allocator.dupe(u8, frame);
+        self.postCommand(.{ .inbound_rpc = .{ .sender = sender, .frame = f } });
+    }
+
+    fn handleInboundRpcInner(self: *Gossipsub, sender: identity.PeerId, frame: []const u8) (rpc.Error || msg_mod.Error || control.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         self.lock();
         defer self.unlock();
         // The three sections of an RPC frame (subscriptions, control, publish)
@@ -1549,6 +1714,13 @@ pub const Gossipsub = struct {
     }
 
     pub fn heartbeat(self: *Gossipsub) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        // The owner runs heartbeat on its own timer (`heartbeatTick`); a
+        // cross-thread caller is a no-op.  Direct calls on the owner thread
+        // (and the single-threaded test harness) apply inline.
+        if (self.onOwnerThread()) return self.heartbeatInner();
+    }
+
+    fn heartbeatInner(self: *Gossipsub) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         self.lock();
         defer self.unlock();
         self.dup.prune(self.clock_ms);
@@ -1594,9 +1766,10 @@ pub const Gossipsub = struct {
 
     /// Sum of per-topic mesh sizes (a peer in multiple topics is counted multiple times).
     pub fn meshPeers(self: *const Gossipsub) u64 {
-        self.lock();
-        defer self.unlock();
-        return self.meshPeersInner();
+        // Owner reads exact state; other threads read the lock-free snapshot the
+        // owner refreshes after each command batch / heartbeat.
+        if (self.onOwnerThread()) return self.meshPeersInner();
+        return self.mesh_peer_count.load(.monotonic);
     }
     fn meshPeersInner(self: *const Gossipsub) u64 {
         var it = self.mesh.iterator();
@@ -1724,8 +1897,10 @@ pub const Gossipsub = struct {
     }
 
     pub fn popOutboxDelivery(self: *Gossipsub) ?OutDelivery {
-        self.lock();
-        defer self.unlock();
+        // Consumer side (drive thread); mutually exclusive with the owner's
+        // `appendOutKind` via `outbox_lock`.
+        self.outbox_lock.lock();
+        defer self.outbox_lock.unlock();
         if (self.outbox.items.len == 0) return null;
         return self.outbox.orderedRemove(0);
     }
