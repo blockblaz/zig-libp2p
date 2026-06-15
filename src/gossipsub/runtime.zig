@@ -272,38 +272,30 @@ const IDontWantEntry = struct {
     expires_ms: i64,
 };
 
-/// Coarse **recursive** spin-lock guarding all `Gossipsub` public entry points.
-/// This Zig exposes only `std.Io.Mutex` (which needs an `Io` handle gossipsub
-/// does not carry), but the contention here is between *raw OS threads* — the
-/// QuicRuntime drive thread, the embedder's clock thread, and the consensus
-/// thread — so an atomic spin-lock is the right primitive. Critical sections
-/// are short (map/list ops, RPC encode) and contention is low.
+/// Coarse spin-lock guarding all `Gossipsub` public entry points.  This Zig
+/// exposes only `std.Io.Mutex` (which needs an `Io` handle gossipsub does not
+/// carry), but the contention here is between *raw OS threads* — the QuicRuntime
+/// gossip-worker thread (`handleInboundRpc`), drive thread
+/// (`drainGossipsubOutbox`, peer up/down, heartbeat), and the consensus thread
+/// (`publish`, `meshPeers` reads) — so an atomic spin-lock is the right
+/// primitive.  Critical sections are short (map/list ops, RPC encode).
 ///
-/// It must be **recursive** because `handleInboundRpc` invokes the embedder's
-/// `topic_validator` callback while holding the lock, and that callback may
-/// call back into a public method (e.g. zeam's validator reads `meshPeers()`).
-/// Re-entry on the *same* thread is safe — no other thread can be mutating the
-/// shared maps at that point — so we let the owner re-acquire while still
-/// excluding every other thread.
+/// **Non-recursive** (actor migration, stage 1).  It was previously recursive
+/// solely because `handleInboundRpc` invoked the embedder's (possibly
+/// re-entrant) `topic_validator` while holding the lock.  That call now runs
+/// with the lock released (see `handleInboundRpc`), and no public method calls
+/// another locking public method internally (they use non-locking `*Inner`
+/// helpers), so re-entry can no longer occur and the owner/depth bookkeeping is
+/// unnecessary.
 const SpinLock = struct {
-    /// Owning OS thread id, or 0 when unlocked. (Thread ids are never 0.)
-    owner: std.atomic.Value(u64) = .init(0),
-    /// Re-entrancy depth; only ever touched by the owning thread.
-    depth: u32 = 0,
+    locked: std.atomic.Value(bool) = .init(false),
     fn lock(self: *SpinLock) void {
-        const tid: u64 = std.Thread.getCurrentId();
-        if (self.owner.load(.monotonic) == tid) {
-            self.depth += 1;
-            return;
-        }
-        while (self.owner.cmpxchgWeak(0, tid, .acquire, .monotonic) != null) {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
             std.Thread.yield() catch std.atomic.spinLoopHint();
         }
-        self.depth = 1;
     }
     fn unlock(self: *SpinLock) void {
-        self.depth -= 1;
-        if (self.depth == 0) self.owner.store(0, .release);
+        self.locked.store(false, .release);
     }
 };
 
