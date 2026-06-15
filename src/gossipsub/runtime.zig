@@ -1523,7 +1523,19 @@ pub const Gossipsub = struct {
             // Application-layer validator (#84). Spec maps `reject` to behaviour-score P4
             // penalty; `ignore` drops without scoring.
             if (self.cfg.topic_validator) |vfn| {
-                switch (vfn(self.cfg.validator_ctx, topic, data)) {
+                // The validator may be expensive (e.g. zeam's hash-signature
+                // block verification, ~seconds).  Release the gossipsub lock
+                // across the callback so it does not block the heartbeat,
+                // outbox drain, or other peers' inbound RPCs for the whole
+                // validation.  `topic`/`data` point into the caller-local
+                // `decoded` message (not shared gossipsub state), so they stay
+                // valid; the dup cache was already updated above, so a
+                // concurrent duplicate is still suppressed.  State touched after
+                // re-locking is re-read under the lock.
+                self.unlock();
+                const verdict = vfn(self.cfg.validator_ctx, topic, data);
+                self.lock();
+                switch (verdict) {
                     .accept => {},
                     .reject => {
                         self.inbound_dropped_validator_reject += 1;

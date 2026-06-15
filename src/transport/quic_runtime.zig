@@ -568,6 +568,35 @@ fn freeHookWork(a: std.mem.Allocator, w: HookWork) void {
     }
 }
 
+/// Minimal atomic spin lock for the cross-thread inbound-gossip work queue.
+/// Producer (drive thread) and consumer (gossip worker thread) are raw OS
+/// threads, so this guards the queue independently of any `Io` instance.
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+    fn lock(self: *SpinLock) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+    fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
+/// One reassembled inbound gossipsub RPC frame, handed from the drive thread to
+/// the gossip worker for off-thread validation + forwarding.  `frame` is heap
+/// owned (a copy of the stream accumulator slice) and freed by the worker.
+const InboundGossipWork = struct {
+    sender: identity.PeerId,
+    frame: []u8,
+};
+
+/// Caps on the inbound gossip work backlog.  If the embedder's validator can't
+/// keep up, drop the oldest work rather than grow unbounded — the network stays
+/// live (the point of offloading) even if validation lags.
+const inbound_gossip_work_cap_entries: usize = 1024;
+const inbound_gossip_work_cap_bytes: usize = 64 * 1024 * 1024;
+
 pub const QuicRuntime = struct {
     allocator: std.mem.Allocator,
     host: *host_mod.Host,
@@ -630,6 +659,18 @@ pub const QuicRuntime = struct {
     drive_thread: ?std.Thread = null,
     shutdown_requested: std.atomic.Value(bool) = .init(false),
     started: bool = false,
+
+    /// Inbound gossip processing is offloaded from the drive thread to this
+    /// worker: embedder validators (e.g. zeam's hash-signature block
+    /// validation) can take seconds, and running them inline on the drive
+    /// thread starves QUIC recv/ACK I/O → the peer's RTT explodes and the mesh
+    /// wedges (see `driveLoop`).  The drive thread enqueues reassembled
+    /// `/meshsub` frames; `gossipWorkerLoop` validates + forwards them
+    /// off-thread so QUIC I/O keeps flowing.
+    gossip_work: std.ArrayList(InboundGossipWork) = .empty,
+    gossip_work_lock: SpinLock = .{},
+    gossip_work_bytes: usize = 0,
+    gossip_worker_thread: ?std.Thread = null,
 
     /// Cached raw Identify protobuf for inbound `/ipfs/id/1.0.0` replies.
     identify_reply_wire: ?[]u8 = null,
@@ -753,6 +794,10 @@ pub const QuicRuntime = struct {
         for (self.hook_queue.items) |w| freeHookWork(self.allocator, w);
         self.hook_queue.deinit(self.allocator);
 
+        // Inbound gossip work queue: `stop()` already joined the worker and
+        // freed the frames; just release the backing storage.
+        self.gossip_work.deinit(self.allocator);
+
         self.relay_live.deinit();
         self.dcutr_live.deinit();
         if (self.relay_addrs_buf) |b| self.allocator.free(b);
@@ -829,6 +874,12 @@ pub const QuicRuntime = struct {
         self.started = true;
         self.shutdown_requested.store(false, .release);
         self.drive_thread = try std.Thread.spawn(.{}, driveTrampoline, .{self});
+        self.gossip_worker_thread = std.Thread.spawn(.{}, gossipWorkerTrampoline, .{self}) catch |err| blk: {
+            // Worker is an optimization; if it can't spawn, fall back to inline
+            // processing on the drive thread (the pre-offload behaviour).
+            log.warn("quic_runtime: gossip worker spawn failed ({s}); inbound gossip will run on the drive thread", .{@errorName(err)});
+            break :blk null;
+        };
     }
 
     pub fn stop(self: *QuicRuntime) void {
@@ -838,6 +889,16 @@ pub const QuicRuntime = struct {
             t.join();
             self.drive_thread = null;
         }
+        if (self.gossip_worker_thread) |t| {
+            t.join();
+            self.gossip_worker_thread = null;
+        }
+        // Free any inbound gossip frames left unprocessed at shutdown.
+        self.gossip_work_lock.lock();
+        for (self.gossip_work.items) |w| self.allocator.free(w.frame);
+        self.gossip_work.clearRetainingCapacity();
+        self.gossip_work_bytes = 0;
+        self.gossip_work_lock.unlock();
         self.started = false;
     }
 
@@ -1092,6 +1153,72 @@ pub const QuicRuntime = struct {
         self.driveLoop() catch |err| {
             log.err("quic_runtime: drive loop exited with {s}", .{@errorName(err)});
         };
+    }
+
+    fn gossipWorkerTrampoline(self: *QuicRuntime) void {
+        self.gossipWorkerLoop();
+    }
+
+    /// Off-drive-thread inbound gossip processing.  Pops reassembled `/meshsub`
+    /// frames the drive thread enqueued and runs the (possibly slow) embedder
+    /// validator + mesh forwarding via `host.handleGossipRpc`.  Keeping this off
+    /// the drive thread is what lets QUIC recv/ACK keep flowing during a
+    /// seconds-long block validation.
+    fn gossipWorkerLoop(self: *QuicRuntime) void {
+        while (!self.shutdown_requested.load(.acquire)) {
+            if (self.popInboundGossip()) |w| {
+                self.host.handleGossipRpc(w.sender, w.frame) catch |err| {
+                    log.warn("quic_runtime: handleGossipRpc (worker) failed: {s}", .{@errorName(err)});
+                };
+                self.allocator.free(w.frame);
+            } else {
+                // Idle: brief passive wait to avoid busy-spinning the core.
+                // libc nanosleep (Zig 0.16 dropped `std.Thread.sleep`).
+                var req = std.c.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_us };
+                var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+                _ = std.c.nanosleep(&req, &rem);
+            }
+        }
+    }
+
+    fn popInboundGossip(self: *QuicRuntime) ?InboundGossipWork {
+        self.gossip_work_lock.lock();
+        defer self.gossip_work_lock.unlock();
+        if (self.gossip_work.items.len == 0) return null;
+        const w = self.gossip_work.orderedRemove(0);
+        self.gossip_work_bytes -|= w.frame.len;
+        return w;
+    }
+
+    /// Drive-thread producer: copy a reassembled gossip frame onto the worker
+    /// queue.  Drops (with a warning) if the worker has fallen far behind, so a
+    /// slow validator can't grow the backlog without bound — the network stays
+    /// live regardless.  Falls back to inline processing if the worker thread
+    /// never started.
+    fn enqueueInboundGossip(self: *QuicRuntime, sender: identity.PeerId, frame_view: []const u8) void {
+        if (self.gossip_worker_thread == null) {
+            // No worker (spawn failed): preserve original inline behaviour.
+            self.host.handleGossipRpc(sender, frame_view) catch |err| {
+                log.warn("quic_runtime: handleGossipRpc (inline) failed: {s}", .{@errorName(err)});
+            };
+            return;
+        }
+        self.gossip_work_lock.lock();
+        defer self.gossip_work_lock.unlock();
+        if (self.gossip_work.items.len >= inbound_gossip_work_cap_entries or
+            self.gossip_work_bytes +| frame_view.len > inbound_gossip_work_cap_bytes)
+        {
+            log.warn("quic_runtime: inbound gossip work backlog full ({d} entries, {d} bytes); dropping frame", .{
+                self.gossip_work.items.len, self.gossip_work_bytes,
+            });
+            return;
+        }
+        const frame = self.allocator.dupe(u8, frame_view) catch return;
+        self.gossip_work.append(self.allocator, .{ .sender = sender, .frame = frame }) catch {
+            self.allocator.free(frame);
+            return;
+        };
+        self.gossip_work_bytes +|= frame.len;
     }
 
     fn driveLoop(self: *QuicRuntime) !void {
@@ -2509,9 +2636,13 @@ pub const QuicRuntime = struct {
                             continue;
                         }
                         const frame_bytes = tail[dec.len .. dec.len + frame_len];
-                        self.host.handleGossipRpc(sender_peer, frame_bytes) catch |err| {
-                            log.warn("quic_runtime: handleGossipRpc failed: {s}", .{@errorName(err)});
-                        };
+                        // Offload validation + forwarding to the gossip worker
+                        // so a slow embedder validator (e.g. zeam's hash-sig
+                        // block check) can't block this drive thread's QUIC
+                        // recv/ACK I/O.  `frame_bytes` is a view into the stream
+                        // accumulator (reused next loop), so the worker queue
+                        // takes a copy.
+                        self.enqueueInboundGossip(sender_peer, frame_bytes);
                         consumed += frame_total;
                     }
                     if (drop_stream) {
