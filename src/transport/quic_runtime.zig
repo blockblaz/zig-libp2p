@@ -2481,6 +2481,21 @@ pub const QuicRuntime = struct {
         while (i < self.inbound_streams.items.len) {
             const ist = self.inbound_streams.items[i];
 
+            // 0. Drop streams whose underlying QUIC connection is gone before we
+            //    touch `ist.raw` (which holds a reference into that conn).  On a
+            //    remote close / drain, zquic eventually reaps the ConnState; an
+            //    InboundStream left dangling here then deref'd a freed `ist.raw`
+            //    in step 1 → `Segmentation fault at 0xaa…`.  The conn state is
+            //    kept alive through draining + 3·PTO (see
+            //    detectOutboundConnectionClose) and this loop runs every drive
+            //    tick, so reading `phase`/`draining` here is safe and always
+            //    catches the close long before the reap.  `removeInboundStreamAt`
+            //    releases the (still-valid) raw slot and frees the stream.
+            if (ist.conn.draining or ist.conn.phase == .closed) {
+                self.removeInboundStreamAt(i);
+                continue;
+            }
+
             // 1. Multistream handshake: responder side.
             //
             // Bytes pulled from the raw stream live in `ms_acc`, which we own
