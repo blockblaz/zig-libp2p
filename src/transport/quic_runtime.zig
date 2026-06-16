@@ -2983,13 +2983,22 @@ pub const QuicRuntime = struct {
                 req.handshake_done = true;
             }
 
-            // 3. Write the SSZ request once.
+            // 3. Write the SSZ request once, then half-close the send side.
+            //    The libp2p req/resp convention is request → CloseWrite(FIN);
+            //    go-libp2p responders (e.g. gean) read the request to EOF before
+            //    replying, so without the FIN they block and we hit
+            //    StreamTimedOut. rust-libp2p (ethlambda) replies eagerly so the
+            //    FIN is a no-op there. The FIN is sent here — right after the
+            //    request bytes at the correct offset — NOT at finishOutboundReq
+            //    (a late empty-FIN there previously corrupted the same-stream
+            //    read and broke zeam↔zeam + gossip).
             if (!req.request_written) {
                 var w = req.raw.writer();
                 wire_framing.writeUnaryRequestFlush(a, &w, req.payload) catch |err| {
                     log.warn("quic_runtime: writeUnaryRequestFlush failed: {s}", .{@errorName(err)});
                     continue;
                 };
+                req.raw.finishSend();
                 req.request_written = true;
             }
 

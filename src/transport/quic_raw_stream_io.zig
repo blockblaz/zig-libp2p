@@ -178,6 +178,17 @@ pub const RawAppBidiClient = struct {
         return buf.len - self.read_cursor;
     }
 
+    /// Half-close the send direction: emit a STREAM FIN (empty payload) at the
+    /// current `send_offset`, leaving the receive side open for the response.
+    /// The libp2p req/resp convention is that the requester writes its request
+    /// then closes its write side; go-libp2p responders read the request to EOF
+    /// before replying, so without this FIN they block and the request times
+    /// out. rust-libp2p replies eagerly so this is a no-op for it. Send only —
+    /// the caller keeps reading the response via `reader()`.
+    pub fn finishSend(self: *RawAppBidiClient) void {
+        _ = self.client.sendRawStreamData(self.stream_id, self.send_offset, &[_]u8{}, true);
+    }
+
     /// Send `data` on the raw stream with FIN set on the last chunk (go-libp2p identify expects EOF).
     pub fn writeAllFin(self: *RawAppBidiClient, data: []const u8) void {
         if (data.len == 0) {
