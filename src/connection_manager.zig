@@ -437,32 +437,21 @@ pub const ConnectionManager = struct {
                 }
             }
         } else if (direction == .outbound and reason != .local_close) {
-            // Outbound leg died but an inbound leg is still up so
-            // `peerActiveCount > 0` and `tick` would skip this peer. The
-            // libp2p QUIC publish path only writes on the outbound dial
-            // leg (zig-libp2p `quic_runtime.persistent_gossip` is keyed
-            // off the outbound slot) — losing it breaks gossip publish to
-            // this peer even though req/resp on the inbound stream still
-            // works. Submit the redial directly here so the publish mesh
-            // recovers without waiting for the inbound to die too.
-            if (self.known.getPtr(peer)) |st| {
-                if (!st.dial_inflight and st.failure_count < max_reconnect_failures) {
-                    log.warn(
-                        "onConnectionClosed: outbound died for known peer (inbound still up, count={d}); resubmitting dial",
-                        .{count},
-                    );
-                    self.swarm.submit(.{ .dial = .{
-                        .addr = st.dial_str,
-                        .expected_peer = peer,
-                    } }) catch {
-                        // Transient swarm submit failure (queue full,
-                        // shutting down). `tick` will retry once the
-                        // inbound also drops or the queue drains.
-                    };
-                    st.dial_inflight = true;
-                    st.next_dial_deadline_ms = std.math.maxInt(i64);
-                }
-            }
+            // Outbound leg died but an inbound leg is still up (count > 0).
+            // Since zig-libp2p#214 the persistent /meshsub publish stream falls
+            // back to the inbound connection
+            // (`quic_runtime.ensurePersistentGossipStream`), so losing the
+            // outbound no longer breaks gossip publish to this peer — we must
+            // NOT eagerly resubmit the dial. Doing so recreated a duplicate
+            // connection that the peer immediately remote-closed, looping
+            // indefinitely (the duplicate-connection churn this issue fixes).
+            // The peer stays reachable over the inbound leg; if it later drops
+            // too, the `count == 0` branch above applies the normal reconnect
+            // backoff.
+            log.debug(
+                "onConnectionClosed: outbound died for known peer (inbound still up, count={d}); publish falls back to inbound, no redial",
+                .{count},
+            );
         }
     }
 };

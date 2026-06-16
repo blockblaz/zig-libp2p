@@ -1554,32 +1554,62 @@ pub const QuicRuntime = struct {
     /// have one. On a fresh open, queue SUBSCRIBE for every topic we've
     /// joined so the peer learns of our subscriptions on its first read.
     ///
-    /// **Outbound dial only:** gossip publishes must ride the QUIC connection
-    /// zeam/libp2p initiated toward the peer. rust-libp2p attributes inbound
-    /// gossipsub RPCs to the dialer leg; opening the persistent stream on a
-    /// peer-initiated inbound connection delivers the first few frames then
-    /// stalls once the outbound leg comes up.
+    /// **Connection selection (issue #214):** prefer the outbound dial leg
+    /// (rust-libp2p attributes gossipsub RPCs to the dialer leg, so it is the
+    /// preferred carrier when both legs exist). When there is no outbound
+    /// connection, fall back to the **inbound** (peer-dialed) connection and
+    /// open a *server-initiated* bidi stream via `Server.openRawAppStream`
+    /// (zquic #171). This lets gossip publish survive the loss of the outbound
+    /// leg instead of dropping every frame until a redial completes — the fix
+    /// for the duplicate-connection redial churn. If an outbound dial later
+    /// completes, `onVerifiedPeerOutbound` migrates the stream back to the
+    /// outbound leg (its `g.raw == .inbound` branch).
     fn ensurePersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) ?*PersistentGossipStream {
         if (self.persistent_gossip.get(peer)) |existing| return existing;
 
-        const slot = self.outbound_by_peer.get(peer) orelse return null;
         const a = self.allocator;
+        var peer_buf: [128]u8 = undefined;
 
         var raw: PublishBidiStream = undefined;
         var stream_id: u64 = undefined;
-        const sid = slot.outbound.nextLocalBidiStream() catch |err| {
-            var peer_buf: [128]u8 = undefined;
-            log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=outbound err={s}", .{
-                peerBase58(peer, &peer_buf),
-                @errorName(err),
-            });
+        var leg: []const u8 = undefined;
+
+        if (self.outbound_by_peer.get(peer)) |slot| {
+            const sid = slot.outbound.nextLocalBidiStream() catch |err| {
+                log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=outbound err={s}", .{
+                    peerBase58(peer, &peer_buf),
+                    @errorName(err),
+                });
+                return null;
+            };
+            stream_id = sid;
+            raw = .{ .outbound = .{
+                .client = slot.outbound.client,
+                .stream_id = sid,
+            } };
+            leg = "outbound";
+        } else if (self.inbound_by_peer.get(peer)) |ic| {
+            // Server-initiated bidi stream on the inbound leg (zquic #171).
+            // `openRawAppStream` registers the receive slot so the peer's
+            // multistream-select reply reassembles into it and the connection
+            // participates in the reap-pin UAF guard while the stream is live.
+            const sid = self.listener.server.openRawAppStream(ic.conn) catch |err| {
+                log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=inbound err={s}", .{
+                    peerBase58(peer, &peer_buf),
+                    @errorName(err),
+                });
+                return null;
+            };
+            stream_id = sid;
+            raw = .{ .inbound = .{
+                .server = self.listener.server,
+                .conn = ic.conn,
+                .stream_id = sid,
+            } };
+            leg = "inbound";
+        } else {
             return null;
-        };
-        stream_id = sid;
-        raw = .{ .outbound = .{
-            .client = slot.outbound.client,
-            .stream_id = sid,
-        } };
+        }
 
         const g = a.create(PersistentGossipStream) catch return null;
         g.* = .{
@@ -1591,10 +1621,10 @@ pub const QuicRuntime = struct {
             a.destroy(g);
             return null;
         };
-        var peer_buf: [128]u8 = undefined;
-        log.debug("quic_runtime: opened persistent /meshsub stream peer={s} stream_id={d} leg=outbound", .{
+        log.debug("quic_runtime: opened persistent /meshsub stream peer={s} stream_id={d} leg={s}", .{
             peerBase58(peer, &peer_buf),
             stream_id,
+            leg,
         });
         return g;
     }
@@ -3700,6 +3730,160 @@ test "QuicRuntime: two instances exchange a gossipsub message over UDP loopback"
         _ = std.c.nanosleep(&req, &rem);
     }
     try testing.expect(saw_payload);
+}
+
+test "QuicRuntime: gossip publishes over the inbound leg when no outbound exists (issue #214)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+
+    var bundle_a = try buildTestBundle(a, "ia", 0xA1);
+    defer bundle_a.deinit(a);
+    var bundle_b = try buildTestBundle(a, "ib", 0xB2);
+    defer bundle_b.deinit(a);
+
+    // The validator fires on B (the receiver). A publishes to B over A's
+    // *inbound* leg (B dialed A; A never dials B).
+    const capture_b = try a.create(GossipCapture);
+    defer a.destroy(capture_b);
+    capture_b.* = .{};
+
+    var host_a = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_a.peer,
+        .gossipsub = .{ .local_peer_id = bundle_a.peer },
+    });
+    defer host_a.destroy();
+    try host_a.startBackground();
+    try testing.expect(host_a.waitUntilReady(5_000));
+
+    var rt_a = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_a,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_a.cert_pem, .key_pem = bundle_a.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_a.destroy();
+
+    var host_b = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_b.peer,
+        .gossipsub = .{
+            .local_peer_id = bundle_b.peer,
+            .topic_validator = gossipRecordValidator,
+            .validator_ctx = capture_b,
+        },
+    });
+    defer host_b.destroy();
+    try host_b.startBackground();
+    try testing.expect(host_b.waitUntilReady(5_000));
+
+    var rt_b = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_b,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_b.cert_pem, .key_pem = bundle_b.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_b.destroy();
+
+    try rt_a.start();
+    try rt_b.start();
+
+    const a_port = rt_a.boundUdpPortIpv4() orelse return error.NoBoundPort;
+
+    // B dials A — so A only ever has an INBOUND connection to B.
+    var a_peer_b58_buf: [128]u8 = undefined;
+    const a_peer_b58 = try bundle_a.peer.toBase58(&a_peer_b58_buf);
+    const a_ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ a_port, a_peer_b58 });
+    defer a.free(a_ma_str);
+    var a_ma = try multiaddr.Multiaddr.fromString(a, a_ma_str);
+    defer a_ma.deinit();
+    try rt_b.registerKnownPeer(&a_ma, bundle_a.peer);
+
+    const Drainer = struct {
+        fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+            const deadline_ms = wall_time.milliTimestamp() + 30_000;
+            while (wall_time.milliTimestamp() < deadline_ms) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(100) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                ev.deinit(h.allocator);
+            }
+        }
+    };
+    var drain_done = std.atomic.Value(bool).init(false);
+    var a_drainer = try std.Thread.spawn(.{}, Drainer.run, .{ host_a, &drain_done });
+    defer a_drainer.join();
+    var b_drainer = try std.Thread.spawn(.{}, Drainer.run, .{ host_b, &drain_done });
+    defer b_drainer.join();
+    defer drain_done.store(true, .release);
+
+    // Wait for B's outbound dial to land.
+    {
+        var connected = false;
+        const deadline_ms = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            if (rt_b.outbound_by_peer.get(bundle_a.peer)) |_| {
+                connected = true;
+                break;
+            }
+            var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+        try testing.expect(connected);
+    }
+
+    try host_a.subscribe("test/topic");
+    try host_b.subscribe("test/topic");
+
+    // B publishes first so A learns B's peer id and registers the inbound
+    // connection (`inbound_by_peer[B]`), which is what A's publish then rides.
+    try host_b.publish("test/topic", "BOOT-FROM-B");
+
+    // Wait until A has recorded the inbound connection to B (and, as the test
+    // requires, has NO outbound to B — A never dialed B).
+    {
+        var learned = false;
+        const deadline_ms = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            if (rt_a.inbound_by_peer.get(bundle_b.peer)) |_| {
+                if (rt_a.outbound_by_peer.get(bundle_b.peer) == null) {
+                    learned = true;
+                    break;
+                }
+            }
+            var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+        try testing.expect(learned);
+    }
+
+    // A publishes — with only an inbound connection to B, this exercises the
+    // server-initiated raw-app bidi publish stream (the #214 path).
+    try host_a.publish("test/topic", "FROM-A-OVER-INBOUND");
+
+    var saw_payload = false;
+    const deadline_ms = wall_time.milliTimestamp() + 20_000;
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        if (capture_b.get()) |bytes| {
+            try testing.expectEqualStrings("FROM-A-OVER-INBOUND", bytes);
+            saw_payload = true;
+            break;
+        }
+        var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+    try testing.expect(saw_payload);
+
+    // Confirm the publish really rode the inbound leg: A still has no outbound
+    // to B, so the delivered gossip could only have used the inbound stream.
+    try testing.expect(rt_a.outbound_by_peer.get(bundle_b.peer) == null);
 }
 
 /// Validator-context that just counts how many distinct payloads arrived,
