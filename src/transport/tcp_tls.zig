@@ -7,6 +7,7 @@ const libp2p_tls = @import("../security/libp2p_tls.zig");
 const peer_id_mod = @import("peer_id");
 
 pub const stream_upgrade = @import("tcp_tls/stream_upgrade.zig");
+pub const sni = @import("tcp_tls/sni.zig");
 
 /// Multistream-select id negotiated before the TLS handshake.
 pub const multistream_protocol_id: []const u8 = libp2p_tls.multistream_protocol_id;
@@ -32,6 +33,9 @@ pub const negotiateInitiator = stream_upgrade.negotiateInitiator;
 pub const negotiateResponder = stream_upgrade.negotiateResponder;
 pub const certKeyPairFromPem = stream_upgrade.certKeyPairFromPem;
 pub const toTransportError = stream_upgrade.toTransportError;
+pub const default_tls_server_name = sni.default_server_name;
+pub const serverNameFromMultiaddr = sni.serverNameFromMultiaddr;
+pub const resolveTlsServerName = sni.resolveTlsServerName;
 
 test "multistream_select_line ends with newline" {
     try std.testing.expect(std.mem.endsWith(u8, multistream_select_line, "\n"));

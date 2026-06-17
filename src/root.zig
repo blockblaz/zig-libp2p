@@ -107,6 +107,7 @@ pub const zquic = @import("zquic");
 
 test {
     _ = @import("wire_boundaries.zig");
+    _ = @import("transport/tcp_tls/sni.zig");
     _ = @import("transport/yamux/root.zig");
     _ = @import("transport/yamux/frame.zig");
     _ = @import("transport/yamux/session.zig");
