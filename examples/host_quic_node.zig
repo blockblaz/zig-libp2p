@@ -41,7 +41,7 @@ fn onConnectionEstablished(ctx_opaque: ?*anyopaque, slot: usize, conn: *anyopaqu
     // the handshake completes (see `transport.quic_peer_identity`); here we
     // just synthesize one so the example compiles.
     const peer = zl.identity.PeerId.random() catch return;
-    ctx.host.onConnectionEstablished(conn_id, peer, .inbound) catch {};
+    ctx.host.onConnectionEstablished(conn_id, peer, .inbound, .{}) catch {};
 }
 
 fn onConnectionClosed(ctx_opaque: ?*anyopaque, slot: usize) void {
@@ -73,7 +73,7 @@ pub fn main() !void {
     // Drain whatever the bring-up queued (subscribe broadcasts, peer_connected,
     // log lines from the swarm worker) so the example finishes cleanly.
     var ctx = NodeCtx{ .host = host };
-    try host.onConnectionEstablished(99, try zl.identity.PeerId.random(), .outbound);
+    try host.onConnectionEstablished(99, try zl.identity.PeerId.random(), .outbound, .{});
     var drained_count: u32 = 0;
     while (host.nextEvent(100) catch null) |evt| {
         var e = evt;

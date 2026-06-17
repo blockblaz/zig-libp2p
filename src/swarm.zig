@@ -131,6 +131,12 @@ pub const RelayReservationKind = enum {
     lost,
 };
 
+pub const DcutrFailReason = enum {
+    exchange_failed,
+    punch_failed,
+    max_attempts_exceeded,
+};
+
 /// Swarm → embedder events. Owned memory is released with [`Event.deinit`].
 pub const Event = union(enum) {
     gossip_message: GossipMessage,
@@ -155,6 +161,18 @@ pub const Event = union(enum) {
         relay: identity.PeerId,
         kind: RelayReservationKind,
         expire_unix: ?u64 = null,
+    },
+    /// Direct connection upgrade succeeded (#205).
+    dcutr_succeeded: struct {
+        peer: identity.PeerId,
+        relayed_conn_id: u64,
+        direct_conn_id: u64,
+    },
+    /// Direct connection upgrade failed (#205).
+    dcutr_failed: struct {
+        peer: identity.PeerId,
+        relayed_conn_id: u64,
+        reason: DcutrFailReason,
     },
     log: struct {
         level: LogLevel,
@@ -185,6 +203,8 @@ pub const Event = union(enum) {
             .connection_trim_recommended,
             .identify_push_peer,
             .relay_reservation,
+            .dcutr_succeeded,
+            .dcutr_failed,
             .swarm_closed,
             => {},
         }

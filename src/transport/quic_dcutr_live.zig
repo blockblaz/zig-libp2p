@@ -6,6 +6,7 @@ const log = std.log.scoped(.quic_dcutr);
 
 const identity = @import("../identity.zig");
 const dcutr = @import("../dcutr/root.zig");
+const dcutr_retry = @import("../dcutr/retry.zig");
 const dcutr_punch = @import("dcutr_punch.zig");
 const quic = @import("quic.zig");
 const quic_endpoint = @import("quic_endpoint.zig");
@@ -22,6 +23,13 @@ pub const Error = dcutr.coordinator.Error || dcutr_punch.Error || std.mem.Alloca
 pub const Config = struct {
     enable: bool = true,
     local_obs_addrs: []const []const u8 = &.{},
+    max_attempts: u32 = dcutr_retry.max_attempts,
+};
+
+pub const FailReason = enum {
+    exchange_failed,
+    punch_failed,
+    max_attempts_exceeded,
 };
 
 pub const TlsPemRef = struct {
@@ -36,12 +44,25 @@ pub const RuntimeHooks = struct {
     tls_pem_paths: *const fn (ctx: ?*anyopaque) TlsPemRef,
     tls_pem_bytes: *const fn (ctx: ?*anyopaque) TlsPemRef,
     use_pem_bytes: *const fn (ctx: ?*anyopaque) bool,
-    on_direct_connected: *const fn (ctx: ?*anyopaque, peer: identity.PeerId) void,
+    on_direct_connected: *const fn (
+        ctx: ?*anyopaque,
+        peer: identity.PeerId,
+        relayed_conn_id: u64,
+        direct_conn_id: u64,
+    ) void,
     close_relayed: *const fn (ctx: ?*anyopaque, peer: identity.PeerId) void,
+    on_dcutr_failed: ?*const fn (
+        ctx: ?*anyopaque,
+        peer: identity.PeerId,
+        relayed_conn_id: u64,
+        reason: FailReason,
+    ) void = null,
+    next_conn_id: *const fn (ctx: ?*anyopaque) u64,
 };
 
 const PunchDial = struct {
     peer: identity.PeerId,
+    relayed_conn_id: u64,
     addrs: [][]u8,
     fire_at_ms: i64,
     started: bool = false,
@@ -76,12 +97,24 @@ const StreamLeg = union(enum) {
 
 const StreamExchange = struct {
     peer: identity.PeerId,
+    relayed_conn_id: u64,
     raw: StreamLeg,
+    outbound_client: ?*ZIo.Client = null,
     coordinator: dcutr.coordinator.Coordinator,
     role: dcutr.coordinator.Role,
+    attempt: u32 = 0,
     handshake_sent: bool = false,
     handshake_done: bool = false,
     phase: enum { handshake, connect, sync, done, failed } = .handshake,
+};
+
+const PendingUpgrade = struct {
+    peer: identity.PeerId,
+    relayed_conn_id: u64,
+    role: dcutr.coordinator.Role,
+    client: *ZIo.Client,
+    attempt: u32,
+    next_attempt_ms: i64,
 };
 
 pub const LiveDcutr = struct {
@@ -90,6 +123,7 @@ pub const LiveDcutr = struct {
     hooks: RuntimeHooks,
     pending_punches: std.ArrayList(*PunchDial) = .empty,
     exchanges: std.ArrayList(*StreamExchange) = .empty,
+    pending_upgrades: std.ArrayList(PendingUpgrade) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config, hooks: RuntimeHooks) LiveDcutr {
         return .{
@@ -112,31 +146,67 @@ pub const LiveDcutr = struct {
             self.allocator.destroy(ex);
         }
         self.exchanges.deinit(self.allocator);
+        self.pending_upgrades.deinit(self.allocator);
     }
 
-    pub fn startInitiator(
+    /// Queue a DCUtR upgrade on a relayed connection (#205).
+    pub fn scheduleRelayedUpgrade(
         self: *LiveDcutr,
         peer: identity.PeerId,
+        relayed_conn_id: u64,
+        role: dcutr.coordinator.Role,
         raw: quic_raw_stream_io.RawAppBidiClient,
     ) Error!void {
         const ex = try self.allocator.create(StreamExchange);
         ex.* = .{
             .peer = peer,
+            .relayed_conn_id = relayed_conn_id,
             .raw = .{ .outbound = raw },
-            .coordinator = dcutr.coordinator.Coordinator.init(self.allocator, .{}, .initiator),
-            .role = .initiator,
+            .outbound_client = raw.client,
+            .coordinator = dcutr.coordinator.Coordinator.init(self.allocator, .{}, role),
+            .role = role,
         };
         try self.exchanges.append(self.allocator, ex);
+    }
+
+    pub fn scheduleRelayedUpgradeLater(
+        self: *LiveDcutr,
+        peer: identity.PeerId,
+        relayed_conn_id: u64,
+        role: dcutr.coordinator.Role,
+        client: *ZIo.Client,
+        attempt: u32,
+        next_attempt_ms: i64,
+    ) Error!void {
+        try self.pending_upgrades.append(self.allocator, .{
+            .peer = peer,
+            .relayed_conn_id = relayed_conn_id,
+            .role = role,
+            .client = client,
+            .attempt = attempt,
+            .next_attempt_ms = next_attempt_ms,
+        });
+    }
+
+    pub fn startInitiator(
+        self: *LiveDcutr,
+        peer: identity.PeerId,
+        relayed_conn_id: u64,
+        raw: quic_raw_stream_io.RawAppBidiClient,
+    ) Error!void {
+        try self.scheduleRelayedUpgrade(peer, relayed_conn_id, .initiator, raw);
     }
 
     pub fn startResponderInbound(
         self: *LiveDcutr,
         peer: identity.PeerId,
+        relayed_conn_id: u64,
         raw: quic_raw_stream_io.RawAppBidiServer,
     ) Error!void {
         const ex = try self.allocator.create(StreamExchange);
         ex.* = .{
             .peer = peer,
+            .relayed_conn_id = relayed_conn_id,
             .raw = .{ .inbound = raw },
             .coordinator = dcutr.coordinator.Coordinator.init(self.allocator, .{}, .responder),
             .role = .responder,
@@ -146,17 +216,93 @@ pub const LiveDcutr = struct {
 
     pub fn advance(self: *LiveDcutr) void {
         if (!self.cfg.enable) return;
+        self.advancePendingUpgrades();
         self.advanceExchanges();
         self.advancePunches();
+    }
+
+    fn advancePendingUpgrades(self: *LiveDcutr) void {
+        const now = self.hooks.now_ms();
+        var i: usize = 0;
+        while (i < self.pending_upgrades.items.len) {
+            const pu = self.pending_upgrades.items[i];
+            if (now < pu.next_attempt_ms) {
+                i += 1;
+                continue;
+            }
+            const sid = ZIo.rawAllocateNextLocalBidiStream(&pu.client.conn) catch {
+                self.failUpgrade(pu.peer, pu.relayed_conn_id, pu.attempt + 1, pu.client, pu.role);
+                _ = self.pending_upgrades.swapRemove(i);
+                continue;
+            };
+            self.scheduleRelayedUpgrade(pu.peer, pu.relayed_conn_id, pu.role, .{
+                .client = pu.client,
+                .stream_id = sid,
+            }) catch {
+                self.failUpgrade(pu.peer, pu.relayed_conn_id, pu.attempt + 1, pu.client, pu.role);
+            };
+            _ = self.pending_upgrades.swapRemove(i);
+        }
+    }
+
+    fn failUpgrade(
+        self: *LiveDcutr,
+        peer: identity.PeerId,
+        relayed_conn_id: u64,
+        completed_attempt: u32,
+        client: *ZIo.Client,
+        role: dcutr.coordinator.Role,
+    ) void {
+        if (completed_attempt >= self.cfg.max_attempts) {
+            if (self.hooks.on_dcutr_failed) |cb| {
+                cb(self.hooks.ctx, peer, relayed_conn_id, .max_attempts_exceeded);
+            }
+            return;
+        }
+        const seed: u64 = @bitCast(@as(i64, wall_time.milliTimestamp()));
+        const delay = dcutr_retry.delayMs(completed_attempt -| 1, seed);
+        self.scheduleRelayedUpgradeLater(
+            peer,
+            relayed_conn_id,
+            role,
+            client,
+            completed_attempt,
+            self.hooks.now_ms() + delay,
+        ) catch {
+            if (self.hooks.on_dcutr_failed) |cb| {
+                cb(self.hooks.ctx, peer, relayed_conn_id, .max_attempts_exceeded);
+            }
+        };
+    }
+
+    fn handleFailedExchange(self: *LiveDcutr, ex: *StreamExchange) void {
+        if (ex.phase != .failed) return;
+        const completed_attempt = ex.attempt + 1;
+        const client = ex.outbound_client;
+        const peer = ex.peer;
+        const relayed_conn_id = ex.relayed_conn_id;
+        const role = ex.role;
+        ex.coordinator.deinit();
+        self.allocator.destroy(ex);
+        if (client) |c| {
+            self.failUpgrade(peer, relayed_conn_id, completed_attempt, c, role);
+        } else if (self.hooks.on_dcutr_failed) |cb| {
+            cb(self.hooks.ctx, peer, relayed_conn_id, .exchange_failed);
+        }
     }
 
     fn advanceExchanges(self: *LiveDcutr) void {
         var i: usize = 0;
         while (i < self.exchanges.items.len) {
             const ex = self.exchanges.items[i];
-            if (ex.phase == .done or ex.phase == .failed) {
+            if (ex.phase == .done) {
                 ex.coordinator.deinit();
                 self.allocator.destroy(ex);
+                _ = self.exchanges.swapRemove(i);
+                continue;
+            }
+            if (ex.phase == .failed) {
+                self.handleFailedExchange(ex);
                 _ = self.exchanges.swapRemove(i);
                 continue;
             }
@@ -239,7 +385,7 @@ pub const LiveDcutr = struct {
                 if (ex.coordinator.pollDial(wall_time.milliTimestamp())) |req_in| {
                     var req = req_in;
                     defer req.deinit(self.allocator);
-                    self.schedulePunch(ex.peer, req.addrs, req.fire_at_ms);
+                    self.schedulePunch(ex.peer, ex.relayed_conn_id, req.addrs, req.fire_at_ms);
                 }
                 ex.phase = .done;
             },
@@ -286,14 +432,20 @@ pub const LiveDcutr = struct {
                     return;
                 };
                 defer req.deinit(self.allocator);
-                self.schedulePunch(ex.peer, req.addrs, req.fire_at_ms);
+                self.schedulePunch(ex.peer, ex.relayed_conn_id, req.addrs, req.fire_at_ms);
                 ex.phase = .done;
             },
             else => {},
         }
     }
 
-    fn schedulePunch(self: *LiveDcutr, peer: identity.PeerId, addrs: []const []const u8, fire_at_ms: i64) void {
+    fn schedulePunch(
+        self: *LiveDcutr,
+        peer: identity.PeerId,
+        relayed_conn_id: u64,
+        addrs: []const []const u8,
+        fire_at_ms: i64,
+    ) void {
         const p = self.allocator.create(PunchDial) catch return;
         var list = std.ArrayList([]u8).empty;
         for (addrs) |a| {
@@ -301,6 +453,7 @@ pub const LiveDcutr = struct {
         }
         p.* = .{
             .peer = peer,
+            .relayed_conn_id = relayed_conn_id,
             .addrs = list.toOwnedSlice(self.allocator) catch return,
             .fire_at_ms = fire_at_ms,
         };
@@ -323,12 +476,28 @@ pub const LiveDcutr = struct {
             if (!p.started) {
                 p.started = true;
                 self.firePunchDial(p);
+                if (p.outbound == null) {
+                    if (self.hooks.on_dcutr_failed) |cb| {
+                        cb(self.hooks.ctx, p.peer, p.relayed_conn_id, .punch_failed);
+                    }
+                    for (p.addrs) |a| self.allocator.free(a);
+                    self.allocator.free(p.addrs);
+                    self.allocator.destroy(p);
+                    _ = self.pending_punches.swapRemove(i);
+                    continue;
+                }
             }
             if (p.outbound) |*ob| {
                 var recv: [4096]u8 = undefined;
                 ob.drive(&recv, 0) catch {};
                 if (ob.client.conn.phase == .connected) {
-                    self.hooks.on_direct_connected(self.hooks.ctx, p.peer);
+                    const direct_conn_id = self.hooks.next_conn_id(self.hooks.ctx);
+                    self.hooks.on_direct_connected(
+                        self.hooks.ctx,
+                        p.peer,
+                        p.relayed_conn_id,
+                        direct_conn_id,
+                    );
                     self.hooks.close_relayed(self.hooks.ctx, p.peer);
                     ob.deinit();
                     p.outbound = null;
@@ -410,15 +579,23 @@ test "LiveDcutr init smoke" {
             }
         }.f,
         .on_direct_connected = struct {
-            fn f(ctx: ?*anyopaque, peer: identity.PeerId) void {
+            fn f(ctx: ?*anyopaque, peer: identity.PeerId, relayed_conn_id: u64, direct_conn_id: u64) void {
                 _ = ctx;
                 _ = peer;
+                _ = relayed_conn_id;
+                _ = direct_conn_id;
             }
         }.f,
         .close_relayed = struct {
             fn f(ctx: ?*anyopaque, peer: identity.PeerId) void {
                 _ = ctx;
                 _ = peer;
+            }
+        }.f,
+        .next_conn_id = struct {
+            fn f(ctx: ?*anyopaque) u64 {
+                _ = ctx;
+                return 1;
             }
         }.f,
     });

@@ -26,6 +26,8 @@ pub const ConnectionFailureResult = union(enum) {
 pub const PeerConnectedPayload = struct {
     peer: identity.PeerId,
     direction: Direction,
+    /// True when the session rides a circuit-relay v2 hop (#205).
+    via_relay: bool = false,
 };
 
 pub const PeerDisconnectedPayload = struct {

@@ -385,8 +385,9 @@ pub const Host = struct {
         conn_id: connection_manager_mod.ConnectionId,
         peer: identity.PeerId,
         direction: peer_events.Direction,
+        opts: connection_manager_mod.ConnectionEstablishedOptions,
     ) (std.mem.Allocator.Error || swarm_mod.SubmitError)!void {
-        try self.connection_manager.onConnectionEstablished(conn_id, peer, direction);
+        try self.connection_manager.onConnectionEstablished(conn_id, peer, direction, opts);
         self.gossipsub.onPeerConnected(peer);
     }
 
@@ -518,7 +519,7 @@ test "Host transport hooks update both connection_manager and gossipsub" {
     defer host.destroy();
 
     const peer = try identity.PeerId.random();
-    try host.onConnectionEstablished(1, peer, .outbound);
+    try host.onConnectionEstablished(1, peer, .outbound, .{});
     try testing.expect(host.gossipsub.connected.contains(peer));
 
     // Drain the peer_connected event queued by ConnectionManager.
@@ -548,8 +549,8 @@ test "Host dirty identify advert queues identify_push_peer for connected peers" 
 
     const peer_a = try identity.PeerId.random();
     const peer_b = try identity.PeerId.random();
-    try host.onConnectionEstablished(1, peer_a, .outbound);
-    try host.onConnectionEstablished(2, peer_b, .inbound);
+    try host.onConnectionEstablished(1, peer_a, .outbound, .{});
+    try host.onConnectionEstablished(2, peer_b, .inbound, .{});
 
     // Drain peer_connected events from connection manager.
     try host.startBackground();
@@ -628,7 +629,7 @@ test "Host identify push dispatch bypasses swarm queue" {
     host.setIdentifyPushDispatch(.{ .ctx = ctx, .dispatch = on_push });
 
     const peer = try identity.PeerId.random();
-    try host.onConnectionEstablished(1, peer, .outbound);
+    try host.onConnectionEstablished(1, peer, .outbound, .{});
     try host.sendIdentifyPush(peer);
     try testing.expect(saw_push);
 

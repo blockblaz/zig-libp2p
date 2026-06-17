@@ -222,6 +222,7 @@ const PeerIdContext = struct {
 const PeerIdMap = std.HashMap(identity.PeerId, *OutboundConn, PeerIdContext, std.hash_map.default_max_load_percentage);
 const InboundPeerMap = std.HashMap(identity.PeerId, InboundConnRef, PeerIdContext, std.hash_map.default_max_load_percentage);
 const PersistentGossipMap = std.HashMap(identity.PeerId, *PersistentGossipStream, PeerIdContext, std.hash_map.default_max_load_percentage);
+const RelayedConnIdMap = std.HashMap(identity.PeerId, connection_manager_mod.ConnectionId, PeerIdContext, std.hash_map.default_max_load_percentage);
 
 const InboundConnRef = struct {
     slot: usize,
@@ -667,6 +668,8 @@ pub const QuicRuntime = struct {
 
     relay_live: quic_relay_live.LiveRelay,
     dcutr_live: quic_dcutr_live.LiveDcutr,
+    /// Inbound relay-bridge conn ids (#205); outbound circuit dials use [`quic_relay_live.RelayVirtualConn`].
+    relayed_conn_by_peer: RelayedConnIdMap,
     relay_addrs_buf: ?[]u8 = null,
     auto_reserve_pending: bool = false,
 
@@ -730,6 +733,7 @@ pub const QuicRuntime = struct {
             .on_relayed_dial_failed = relayHookRelayedDialFailed,
             .next_conn_id = relayHookNextConnId,
             .on_relay_reservation = relayHookRelayReservation,
+            .on_inbound_relay_bridge = relayHookInboundBridge,
         };
         const dcutr_hooks = quic_dcutr_live.RuntimeHooks{
             .ctx = self,
@@ -740,6 +744,8 @@ pub const QuicRuntime = struct {
             .use_pem_bytes = dcutrHookUsePemBytes,
             .on_direct_connected = dcutrHookDirectConnected,
             .close_relayed = dcutrHookCloseRelayed,
+            .on_dcutr_failed = dcutrHookFailed,
+            .next_conn_id = relayHookNextConnId,
         };
 
         self.* = .{
@@ -763,6 +769,7 @@ pub const QuicRuntime = struct {
                 .enable = opts.dcutr.enable,
                 .local_obs_addrs = opts.dcutr.local_obs_addrs,
             }, dcutr_hooks),
+            .relayed_conn_by_peer = RelayedConnIdMap.init(a),
             .persistent_gossip = PersistentGossipMap.init(a),
             .subscribed_topics = std.StringHashMap(void).init(a),
         };
@@ -825,6 +832,7 @@ pub const QuicRuntime = struct {
 
         self.relay_live.deinit();
         self.dcutr_live.deinit();
+        self.relayed_conn_by_peer.deinit();
         if (self.relay_addrs_buf) |b| self.allocator.free(b);
         if (self.identify_reply_wire) |w| self.allocator.free(w);
 
@@ -2312,7 +2320,7 @@ pub const QuicRuntime = struct {
         };
 
         slot.notified = true;
-        self.host.onConnectionEstablished(slot.conn_id, verified, .outbound) catch |err| {
+        self.host.onConnectionEstablished(slot.conn_id, verified, .outbound, .{}) catch |err| {
             log.warn("quic_runtime: onConnectionEstablished failed: {s}", .{@errorName(err)});
         };
 
@@ -2534,9 +2542,59 @@ pub const QuicRuntime = struct {
 
     fn relayHookRelayedConnected(ctx: ?*anyopaque, target: identity.PeerId, conn_id: connection_manager_mod.ConnectionId) void {
         const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        self.host.onConnectionEstablished(conn_id, target, .outbound) catch |err| {
+        self.host.onConnectionEstablished(conn_id, target, .outbound, .{ .via_relay = true }) catch |err| {
             log.warn("quic_runtime: relayed onConnectionEstablished failed: {s}", .{@errorName(err)});
         };
+        self.tryScheduleDcutrFromVirtual(target, conn_id);
+    }
+
+    fn relayHookInboundBridge(
+        ctx: ?*anyopaque,
+        remote_peer: identity.PeerId,
+        conn_id: connection_manager_mod.ConnectionId,
+        stop_client: *ZIo.Client,
+    ) void {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        self.relayed_conn_by_peer.put(remote_peer, conn_id) catch {
+            log.warn("quic_runtime: relayed_conn_by_peer put failed", .{});
+        };
+        self.host.onConnectionEstablished(conn_id, remote_peer, .inbound, .{ .via_relay = true }) catch |err| {
+            log.warn("quic_runtime: inbound relay bridge onConnectionEstablished failed: {s}", .{@errorName(err)});
+        };
+        self.tryScheduleDcutrInitiator(remote_peer, conn_id, stop_client);
+    }
+
+    fn tryScheduleDcutrFromVirtual(self: *QuicRuntime, peer: identity.PeerId, relayed_conn_id: connection_manager_mod.ConnectionId) void {
+        if (!self.opts.dcutr.enable) return;
+        const vc = self.relay_live.relay_virtual.get(peer) orelse return;
+        const sid = ZIo.rawAllocateNextLocalBidiStream(&vc.raw.client.conn) catch return;
+        self.dcutr_live.scheduleRelayedUpgrade(peer, relayed_conn_id, .initiator, .{
+            .client = vc.raw.client,
+            .stream_id = sid,
+        }) catch |err| {
+            log.warn("quic_runtime: DCUtR schedule failed peer={any} err={s}", .{ peer, @errorName(err) });
+        };
+    }
+
+    fn tryScheduleDcutrInitiator(
+        self: *QuicRuntime,
+        peer: identity.PeerId,
+        relayed_conn_id: connection_manager_mod.ConnectionId,
+        client: *ZIo.Client,
+    ) void {
+        if (!self.opts.dcutr.enable) return;
+        const sid = ZIo.rawAllocateNextLocalBidiStream(&client.conn) catch return;
+        self.dcutr_live.scheduleRelayedUpgrade(peer, relayed_conn_id, .initiator, .{
+            .client = client,
+            .stream_id = sid,
+        }) catch |err| {
+            log.warn("quic_runtime: DCUtR inbound schedule failed peer={any} err={s}", .{ peer, @errorName(err) });
+        };
+    }
+
+    fn relayedConnIdForPeer(self: *QuicRuntime, peer: identity.PeerId) connection_manager_mod.ConnectionId {
+        if (self.relay_live.relay_virtual.get(peer)) |vc| return vc.conn_id;
+        return self.relayed_conn_by_peer.get(peer) orelse 0;
     }
 
     fn relayHookRelayedDialFailed(ctx: ?*anyopaque, target: ?identity.PeerId) void {
@@ -2594,15 +2652,50 @@ pub const QuicRuntime = struct {
         return self.tls_pem_resolved == .bytes;
     }
 
-    fn dcutrHookDirectConnected(ctx: ?*anyopaque, peer: identity.PeerId) void {
+    fn dcutrHookDirectConnected(
+        ctx: ?*anyopaque,
+        peer: identity.PeerId,
+        relayed_conn_id: connection_manager_mod.ConnectionId,
+        direct_conn_id: connection_manager_mod.ConnectionId,
+    ) void {
         const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        log.info("quic_runtime: DCUtR direct connection to peer (relay upgrade)", .{});
-        _ = peer;
-        _ = self;
+        _ = self.relayed_conn_by_peer.remove(peer);
+        self.host.onConnectionEstablished(direct_conn_id, peer, .outbound, .{}) catch |err| {
+            log.warn("quic_runtime: DCUtR direct onConnectionEstablished failed: {s}", .{@errorName(err)});
+        };
+        self.host.swarm.queueEvent(.{ .dcutr_succeeded = .{
+            .peer = peer,
+            .relayed_conn_id = relayed_conn_id,
+            .direct_conn_id = direct_conn_id,
+        } }) catch |err| {
+            log.warn("quic_runtime: dcutr_succeeded event queue failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn dcutrHookFailed(
+        ctx: ?*anyopaque,
+        peer: identity.PeerId,
+        relayed_conn_id: connection_manager_mod.ConnectionId,
+        reason: quic_dcutr_live.FailReason,
+    ) void {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const swarm_reason: swarm_mod.DcutrFailReason = switch (reason) {
+            .exchange_failed => .exchange_failed,
+            .punch_failed => .punch_failed,
+            .max_attempts_exceeded => .max_attempts_exceeded,
+        };
+        self.host.swarm.queueEvent(.{ .dcutr_failed = .{
+            .peer = peer,
+            .relayed_conn_id = relayed_conn_id,
+            .reason = swarm_reason,
+        } }) catch |err| {
+            log.warn("quic_runtime: dcutr_failed event queue failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn dcutrHookCloseRelayed(ctx: ?*anyopaque, peer: identity.PeerId) void {
         const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        _ = self.relayed_conn_by_peer.remove(peer);
         if (self.relay_live.relay_virtual.fetchRemove(peer)) |kv| {
             self.allocator.destroy(kv.value);
         }
@@ -2790,7 +2883,7 @@ pub const QuicRuntime = struct {
                     self.inbound_conn_peer[ist.slot] = sender;
                     self.inbound_by_peer.put(sender, .{ .slot = ist.slot, .conn = ist.conn }) catch {};
                     const cid = self.inbound_conn_ids[ist.slot];
-                    self.host.onConnectionEstablished(cid, sender, .inbound) catch |err| {
+                    self.host.onConnectionEstablished(cid, sender, .inbound, .{}) catch |err| {
                         log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
                     };
                 }
@@ -2945,7 +3038,8 @@ pub const QuicRuntime = struct {
                 },
                 proto_dcutr => {
                     if (!ist.relay_control_done) {
-                        self.dcutr_live.startResponderInbound(sender_peer, ist.raw) catch {
+                        const relayed_conn_id = self.relayedConnIdForPeer(sender_peer);
+                        self.dcutr_live.startResponderInbound(sender_peer, relayed_conn_id, ist.raw) catch {
                             self.removeInboundStreamAt(i);
                             continue;
                         };
