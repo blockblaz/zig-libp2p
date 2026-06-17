@@ -149,7 +149,7 @@ Ethereum consensus, so some libp2p features are intentionally out of scope.
 |------|:------:|-------|
 | ping (`/ipfs/ping/1.0.0`) | ✅ | interop go ✅ · rust ✅ |
 | identify (`/ipfs/id/1.0.0`) | ✅ | `identify` |
-| identify-push (`/ipfs/id/push/1.0.0`) | 🚧 | inbound handled; auto-trigger on change pending ([#202](https://github.com/ch4r10t33r/zig-libp2p/issues/202)) |
+| identify-push (`/ipfs/id/push/1.0.0`) | ✅ | `identify`, `host`; auto-push on advert change (`identify_push_peer` events) |
 | Request/response (length-prefixed, SSZ-snappy) | ✅ | `req_resp`; interop go ✅ · rust ✅ |
 
 ### Not yet implemented

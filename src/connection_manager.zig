@@ -147,6 +147,25 @@ pub const ConnectionManager = struct {
         return self.peerActiveCount(peer) > 0;
     }
 
+    /// Invoke `cb` for each peer with at least one active connection (#202).
+    pub fn forEachConnectedPeer(
+        self: *const ConnectionManager,
+        ctx: anytype,
+        comptime cb: fn (ctx: @TypeOf(ctx), peer: identity.PeerId) void,
+    ) void {
+        var it = self.peer_active.keyIterator();
+        while (it.next()) |kp| cb(ctx, kp.*);
+    }
+
+    /// Append all currently connected peers to `out` (#202).
+    pub fn collectConnectedPeers(
+        self: *const ConnectionManager,
+        out: *std.ArrayList(identity.PeerId),
+    ) std.mem.Allocator.Error!void {
+        var it = self.peer_active.keyIterator();
+        while (it.next()) |kp| try out.append(self.allocator, kp.*);
+    }
+
     /// Inferred from [`multiaddrDialString`] plus the local error tags. The dependency's
     /// `ProtocolIterator.next` error set drifted in Zig 0.16, so we let the compiler
     /// infer it rather than spell out every transitively-added variant.
@@ -486,6 +505,39 @@ test "strip p2p from dial string" {
     const s = try multiaddrDialString(a, &ma);
     defer a.free(s);
     try std.testing.expectEqualStrings("/ip4/127.0.0.1/udp/4001/quic-v1", s);
+}
+
+test "forEachConnectedPeer and collectConnectedPeers" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    const peer_a = try identity.PeerId.random();
+    const peer_b = try identity.PeerId.random();
+    try cm.onConnectionEstablished(1, peer_a, .outbound);
+    try cm.onConnectionEstablished(2, peer_b, .inbound);
+
+    var count: usize = 0;
+    const Ctx = struct {
+        var n: *usize = undefined;
+        fn cb(ctx: *usize, _: identity.PeerId) void {
+            ctx.* += 1;
+        }
+    };
+    Ctx.n = &count;
+    cm.forEachConnectedPeer(&count, Ctx.cb);
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    var peers: std.ArrayList(identity.PeerId) = .empty;
+    defer peers.deinit(a);
+    try cm.collectConnectedPeers(&peers);
+    try std.testing.expectEqual(@as(usize, 2), peers.items.len);
 }
 
 test "connection manager emits single peer_connected for two conns" {

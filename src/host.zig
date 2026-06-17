@@ -31,6 +31,15 @@ const gs_rpc = @import("gossipsub/rpc.zig");
 const gs_msg = @import("gossipsub/message.zig");
 const gs_control = @import("gossipsub/control.zig");
 const errors_mod = @import("errors.zig");
+const identify_mod = @import("identify.zig");
+const identify_ad_mod = @import("identify_advertisement.zig");
+
+/// Max [`swarm.Event.identify_push_peer`] events queued per [`Host.runPeriodicTicks`] (#202).
+pub const default_max_identify_push_per_tick: u32 = 64;
+
+pub const IdentifyConfig = struct {
+    max_push_per_tick: u32 = default_max_identify_push_per_tick,
+};
 
 /// Union of every typed error the gossipsub runtime can surface, in one alias
 /// so Host method signatures stay legible.
@@ -63,6 +72,8 @@ pub const HostConfig = struct {
     req_resp: req_resp_runtime.ReqRespConfig = .{},
     /// Connection-manager trim policy. Defaults to "unlimited" (`null` knobs).
     connection_limits: connection_manager_mod.ConnectionLimits = .{},
+    /// Identify Push auto-trigger batching (#202).
+    identify: IdentifyConfig = .{},
 };
 
 pub const InitError = error{
@@ -86,6 +97,11 @@ pub const Host = struct {
     /// is small but we keep it on the heap so callers can hand `&host.connection_manager`
     /// to the transport layer without worrying about Host moves).
     connection_manager: *connection_manager_mod.ConnectionManager,
+    /// Local Identify advertisement inputs (listen addrs, protocols, SPR).
+    identify_ad: identify_ad_mod.Advertisement,
+    identify_addr_scratch: std.ArrayList([]const u8) = .empty,
+    identify_proto_scratch: std.ArrayList([]const u8) = .empty,
+    identify_max_push_per_tick: u32,
 
     pub fn create(cfg: HostConfig) InitError!*Host {
         const allocator = cfg.allocator;
@@ -130,6 +146,8 @@ pub const Host = struct {
             .gossipsub = gs,
             .req_resp = rr,
             .connection_manager = cm,
+            .identify_ad = identify_ad_mod.Advertisement.init(allocator),
+            .identify_max_push_per_tick = cfg.identify.max_push_per_tick,
         };
         return self;
     }
@@ -143,6 +161,9 @@ pub const Host = struct {
         self.connection_manager.deinit();
         self.allocator.destroy(self.connection_manager);
         self.gossipsub.deinit();
+        self.identify_ad.deinit();
+        self.identify_addr_scratch.deinit(self.allocator);
+        self.identify_proto_scratch.deinit(self.allocator);
         self.swarm.deinit();
         self.allocator.destroy(self.swarm);
         self.allocator.destroy(self);
@@ -189,6 +210,68 @@ pub const Host = struct {
         try self.gossipsub.heartbeat();
         try self.req_resp.tick(now_ms);
         try self.connection_manager.tick(now_ms);
+        try self.flushIdentifyPushIfDirty();
+    }
+
+    fn flushIdentifyPushIfDirty(self: *Host) std.mem.Allocator.Error!void {
+        if (!self.identify_ad.takeDirty()) return;
+        var peers: std.ArrayList(identity.PeerId) = .empty;
+        defer peers.deinit(self.allocator);
+        try self.connection_manager.collectConnectedPeers(&peers);
+        const cap = @min(peers.items.len, @as(usize, self.identify_max_push_per_tick));
+        for (peers.items[0..cap]) |peer| {
+            try self.swarm.queueEvent(.{ .identify_push_peer = peer });
+        }
+        if (peers.items.len > cap) self.identify_ad.markDirty();
+    }
+
+    // ── Identify (#202) ───────────────────────────────────────────────────
+
+    pub fn setListenAddrs(self: *Host, addrs: []const []const u8) std.mem.Allocator.Error!void {
+        try self.identify_ad.setListenAddrs(addrs);
+    }
+
+    pub fn addListenAddr(self: *Host, addr: []const u8) std.mem.Allocator.Error!void {
+        try self.identify_ad.addListenAddr(addr);
+    }
+
+    pub fn removeListenAddr(self: *Host, addr: []const u8) void {
+        self.identify_ad.removeListenAddr(addr);
+    }
+
+    pub fn addProtocol(self: *Host, proto: []const u8) std.mem.Allocator.Error!void {
+        try self.identify_ad.addProtocol(proto);
+    }
+
+    pub fn removeProtocol(self: *Host, proto: []const u8) void {
+        self.identify_ad.removeProtocol(proto);
+    }
+
+    pub fn setIdentifyPublicKey(self: *Host, key: ?[]const u8) std.mem.Allocator.Error!void {
+        try self.identify_ad.setPublicKey(key);
+    }
+
+    pub fn setSignedPeerRecord(self: *Host, spr: ?[]const u8, seq: u64) std.mem.Allocator.Error!void {
+        try self.identify_ad.setSignedPeerRecord(spr, seq);
+    }
+
+    pub fn markIdentifyDirty(self: *Host) void {
+        self.identify_ad.markDirty();
+    }
+
+    /// Wire payload for [`identify_mod.Identify.sendPush`] on
+    /// [`swarm_mod.Event.identify_push_peer`] streams.
+    pub fn identifyReplyParams(self: *Host) identify_mod.ReplyParams {
+        return self.identify_ad.replyParamsInto(
+            &self.identify_addr_scratch,
+            &self.identify_proto_scratch,
+        );
+    }
+
+    /// Queue one Identify Push for `peer` when a connection is active (#202).
+    pub fn sendIdentifyPush(self: *Host, peer: identity.PeerId) std.mem.Allocator.Error!void {
+        if (!self.connection_manager.hasActiveConnection(peer)) return;
+        try self.swarm.queueEvent(.{ .identify_push_peer = peer });
     }
 
     // ── Pub/sub ────────────────────────────────────────────────────────────
@@ -424,4 +507,76 @@ test "Host transport hooks update both connection_manager and gossipsub" {
 
     try host.onConnectionClosed(1_000, 1, peer, .remote_close);
     try testing.expect(!host.gossipsub.connected.contains(peer));
+}
+
+test "Host dirty identify advert queues identify_push_peer for connected peers" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const me = try identity.PeerId.random();
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+        .identify = .{ .max_push_per_tick = 8 },
+    });
+    defer host.destroy();
+
+    const peer_a = try identity.PeerId.random();
+    const peer_b = try identity.PeerId.random();
+    try host.onConnectionEstablished(1, peer_a, .outbound);
+    try host.onConnectionEstablished(2, peer_b, .inbound);
+
+    // Drain peer_connected events from connection manager.
+    try host.startBackground();
+    _ = host.waitUntilReady(5_000);
+    while (true) {
+        var ev = host.nextEvent(100) catch break;
+        defer ev.deinit(a);
+        if (std.meta.activeTag(ev) == .peer_connected) continue;
+        break;
+    }
+
+    try host.addListenAddr("/ip4/127.0.0.1/udp/4001/quic-v1");
+    try host.runPeriodicTicks(0);
+
+    var saw_a = false;
+    var saw_b = false;
+    while (true) {
+        var ev = host.nextEvent(100) catch break;
+        defer ev.deinit(a);
+        switch (ev) {
+            .identify_push_peer => |p| {
+                if (p.eql(&peer_a)) saw_a = true;
+                if (p.eql(&peer_b)) saw_b = true;
+            },
+            .swarm_closed => break,
+            else => {},
+        }
+        if (saw_a and saw_b) break;
+    }
+    try testing.expect(saw_a);
+    try testing.expect(saw_b);
+}
+
+test "Host.sendIdentifyPush skips disconnected peer" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const me = try identity.PeerId.random();
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+    });
+    defer host.destroy();
+
+    const peer = try identity.PeerId.random();
+    try host.sendIdentifyPush(peer);
+    try host.startBackground();
+    _ = host.waitUntilReady(5_000);
+    const ev = host.nextEvent(50);
+    try testing.expect(ev == error.Timeout);
 }
