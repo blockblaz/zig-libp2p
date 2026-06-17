@@ -2571,7 +2571,7 @@ pub const QuicRuntime = struct {
         self.dcutr_live.scheduleRelayedUpgrade(peer, relayed_conn_id, .initiator, .{
             .client = vc.raw.client,
             .stream_id = sid,
-        }) catch |err| {
+        }, 0) catch |err| {
             log.warn("quic_runtime: DCUtR schedule failed peer={any} err={s}", .{ peer, @errorName(err) });
         };
     }
@@ -2587,7 +2587,7 @@ pub const QuicRuntime = struct {
         self.dcutr_live.scheduleRelayedUpgrade(peer, relayed_conn_id, .initiator, .{
             .client = client,
             .stream_id = sid,
-        }) catch |err| {
+        }, 0) catch |err| {
             log.warn("quic_runtime: DCUtR inbound schedule failed peer={any} err={s}", .{ peer, @errorName(err) });
         };
     }

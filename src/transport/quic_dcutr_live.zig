@@ -156,6 +156,7 @@ pub const LiveDcutr = struct {
         relayed_conn_id: u64,
         role: dcutr.coordinator.Role,
         raw: quic_raw_stream_io.RawAppBidiClient,
+        attempt: u32,
     ) Error!void {
         const ex = try self.allocator.create(StreamExchange);
         ex.* = .{
@@ -165,6 +166,10 @@ pub const LiveDcutr = struct {
             .outbound_client = raw.client,
             .coordinator = dcutr.coordinator.Coordinator.init(self.allocator, .{}, role),
             .role = role,
+            // Carry the retry count so a failed exchange escalates the backoff
+            // and eventually gives up at `max_attempts` instead of retrying
+            // forever (#205).
+            .attempt = attempt,
         };
         try self.exchanges.append(self.allocator, ex);
     }
@@ -194,7 +199,7 @@ pub const LiveDcutr = struct {
         relayed_conn_id: u64,
         raw: quic_raw_stream_io.RawAppBidiClient,
     ) Error!void {
-        try self.scheduleRelayedUpgrade(peer, relayed_conn_id, .initiator, raw);
+        try self.scheduleRelayedUpgrade(peer, relayed_conn_id, .initiator, raw, 0);
     }
 
     pub fn startResponderInbound(
@@ -238,7 +243,7 @@ pub const LiveDcutr = struct {
             self.scheduleRelayedUpgrade(pu.peer, pu.relayed_conn_id, pu.role, .{
                 .client = pu.client,
                 .stream_id = sid,
-            }) catch {
+            }, pu.attempt) catch {
                 self.failUpgrade(pu.peer, pu.relayed_conn_id, pu.attempt + 1, pu.client, pu.role);
             };
             _ = self.pending_upgrades.swapRemove(i);
@@ -600,4 +605,95 @@ test "LiveDcutr init smoke" {
         }.f,
     });
     defer d.deinit();
+}
+
+// Regression for #205: the retry attempt counter must be carried through
+// `scheduleRelayedUpgrade` so the backoff escalates and DCUtR eventually gives
+// up at `max_attempts` instead of retrying forever. `failUpgrade` is the
+// decision point: < max_attempts schedules a later retry carrying the count,
+// >= max_attempts reports `max_attempts_exceeded` and stops.
+test "LiveDcutr retry gives up at max_attempts" {
+    const a = std.testing.allocator;
+    const tlsStub = struct {
+        fn pem(ctx: ?*anyopaque) TlsPemRef {
+            _ = ctx;
+            return .{ .cert = "", .key = "" };
+        }
+    };
+    const Recorder = struct {
+        last_reason: ?FailReason = null,
+        fn onFailed(ctx: ?*anyopaque, peer: identity.PeerId, relayed_conn_id: u64, reason: FailReason) void {
+            _ = peer;
+            _ = relayed_conn_id;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.last_reason = reason;
+        }
+    };
+    var rec: Recorder = .{};
+    var d = LiveDcutr.init(a, .{ .enable = true, .max_attempts = 3 }, .{
+        .ctx = &rec,
+        .now_ms = struct {
+            fn f() i64 {
+                return 0;
+            }
+        }.f,
+        .listener_port_v4 = struct {
+            fn f(ctx: ?*anyopaque) ?u16 {
+                _ = ctx;
+                return null;
+            }
+        }.f,
+        .tls_pem_paths = tlsStub.pem,
+        .tls_pem_bytes = tlsStub.pem,
+        .use_pem_bytes = struct {
+            fn f(ctx: ?*anyopaque) bool {
+                _ = ctx;
+                return false;
+            }
+        }.f,
+        .on_direct_connected = struct {
+            fn f(ctx: ?*anyopaque, peer: identity.PeerId, relayed_conn_id: u64, direct_conn_id: u64) void {
+                _ = ctx;
+                _ = peer;
+                _ = relayed_conn_id;
+                _ = direct_conn_id;
+            }
+        }.f,
+        .close_relayed = struct {
+            fn f(ctx: ?*anyopaque, peer: identity.PeerId) void {
+                _ = ctx;
+                _ = peer;
+            }
+        }.f,
+        .on_dcutr_failed = Recorder.onFailed,
+        .next_conn_id = struct {
+            fn f(ctx: ?*anyopaque) u64 {
+                _ = ctx;
+                return 1;
+            }
+        }.f,
+    });
+    defer d.deinit();
+
+    const peer = std.mem.zeroes(identity.PeerId);
+    // The give-up path does not dereference the client, and the retry path only
+    // stores the pointer; a dummy is safe for both.
+    const dummy_client: *ZIo.Client = undefined;
+
+    // completed_attempt 1 and 2 (< max_attempts) schedule a later retry that
+    // carries the escalating count; nothing is reported as failed yet.
+    d.failUpgrade(peer, 1, 1, dummy_client, .initiator);
+    try std.testing.expectEqual(@as(usize, 1), d.pending_upgrades.items.len);
+    try std.testing.expectEqual(@as(u32, 1), d.pending_upgrades.items[0].attempt);
+    try std.testing.expect(rec.last_reason == null);
+
+    d.failUpgrade(peer, 2, 2, dummy_client, .initiator);
+    try std.testing.expectEqual(@as(usize, 2), d.pending_upgrades.items.len);
+    try std.testing.expectEqual(@as(u32, 2), d.pending_upgrades.items[1].attempt);
+    try std.testing.expect(rec.last_reason == null);
+
+    // completed_attempt == max_attempts gives up: reported failed, no new retry.
+    d.failUpgrade(peer, 3, 3, dummy_client, .initiator);
+    try std.testing.expectEqual(@as(usize, 2), d.pending_upgrades.items.len);
+    try std.testing.expectEqual(FailReason.max_attempts_exceeded, rec.last_reason.?);
 }
