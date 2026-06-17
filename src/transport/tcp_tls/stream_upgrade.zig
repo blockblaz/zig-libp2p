@@ -5,9 +5,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const pid = @import("peer_id");
+const multiaddr = @import("multiaddr");
 const errors = @import("../../errors.zig");
 const libp2p_tls = @import("../../security/libp2p_tls.zig");
 const sm = @import("../stream_multistream.zig");
+const sni = @import("sni.zig");
 const zquic_tls = @import("zquic_tls");
 
 const Io = std.Io;
@@ -246,6 +248,8 @@ pub const HandshakeResult = struct {
 /// Initiator: multistream `/tls/1.0.0`, TLS 1.3 + libp2p cert verification.
 ///
 /// Pass `client_auth` when the responder requests a client certificate (libp2p mTLS).
+/// `dial_multiaddr` supplies the TLS SNI host (DNS / IP / `/p2p`); defaults to
+/// `"libp2p"` when null or unparseable (#208). `tls_sni_override` wins when set.
 pub fn negotiateInitiator(
     allocator: std.mem.Allocator,
     r: *Io.Reader,
@@ -253,13 +257,18 @@ pub fn negotiateInitiator(
     now_sec: i64,
     expected_remote: ?pid.PeerId,
     client_auth: ?*CertKeyPair,
+    dial_multiaddr: ?multiaddr.Multiaddr,
+    tls_sni_override: ?[]const u8,
 ) UpgradeError!HandshakeResult {
     var tls_seed = std.ArrayList(u8).empty;
     try sm.initiatorHandshakeMultistream(r, w, libp2p_tls.multistream_protocol_id, allocator, &tls_seed);
 
+    var sni_buf: [128]u8 = undefined;
+    const tls_host = sni.resolveTlsServerName(dial_multiaddr, tls_sni_override, &sni_buf);
+
     var send_buf: [output_buffer_len]u8 = undefined;
     var nb = zquic_tls.nonblock.Client.init(.{
-        .host = "libp2p",
+        .host = tls_host,
         .root_ca = Certificate.Bundle.empty,
         .insecure_skip_verify = true,
         .alpn = libp2p_tls.quic_application_layer_protocol,
@@ -444,7 +453,7 @@ test "TLS 1.3 + multistream over TCP loopback" {
     var r = net.Stream.reader(client, io, &scratch_r);
     var w = net.Stream.writer(client, io, &scratch_w);
 
-    var hs = try negotiateInitiator(a, &r.interface, &w.interface, now_sec, expected_remote, &owned.pair);
+    var hs = try negotiateInitiator(a, &r.interface, &w.interface, now_sec, expected_remote, &owned.pair, null, null);
     defer hs.channel.deinit(a);
     const remote = hs.remote_peer_id orelse return error.TestExpectedEqual;
     try std.testing.expect(remote.eql(&expected_remote));
@@ -526,7 +535,7 @@ test "negotiateResponder rejects when initiator omits client cert (mTLS required
 
     // client_auth = null → server sees empty Certificate → TlsCertificateRequired
     // inside the vendor, surfaced as TlsHandshakeFailed by driveNonblockHandshake.
-    _ = negotiateInitiator(a, &r.interface, &w.interface, bundle.now_sec, null, null) catch {};
+    _ = negotiateInitiator(a, &r.interface, &w.interface, bundle.now_sec, null, null, null, null) catch {};
 
     thr.join();
     // (defer thr.join() above will run again; join is idempotent on a finished thread.)
@@ -612,7 +621,7 @@ test "negotiateResponder rejects when client peer-id != expected_remote" {
 
     // Initiator presents bundle's own cert; server-side libp2p verify will
     // see that the leaf's PeerId != wrong_remote and reject.
-    _ = negotiateInitiator(a, &r.interface, &w.interface, bundle.now_sec, null, &bundle.owned.pair) catch {};
+    _ = negotiateInitiator(a, &r.interface, &w.interface, bundle.now_sec, null, &bundle.owned.pair, null, null) catch {};
 
     thr.join();
 
