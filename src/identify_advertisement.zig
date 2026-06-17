@@ -1,8 +1,10 @@
 //! Local Identify advertisement state and dirty tracking (#202).
 //!
-//! The transport layer opens `/ipfs/id/push/1.0.0` streams when the embedder
-//! drains [`swarm.Event.identify_push_peer`]; this module owns the wire payload
-//! inputs (listen addrs, protocol set, signed peer record).
+//! QUIC [`transport.quic_runtime.QuicRuntime`] registers
+//! [`host.Host.setIdentifyPushDispatch`] and opens `/ipfs/id/push/1.0.0`
+//! streams directly; other embedders drain [`swarm.Event.identify_push_peer`].
+//! This module owns the wire payload inputs (listen addrs, protocol set,
+//! signed peer record).
 
 const std = @import("std");
 const identify_mod = @import("identify.zig");

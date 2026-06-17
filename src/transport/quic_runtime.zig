@@ -404,6 +404,18 @@ const OutboundPublish = struct {
     wire: []u8,
 };
 
+/// One-shot outbound `/ipfs/id/push/1.0.0` stream (#202 QUIC wiring).
+const OutboundIdentifyPush = struct {
+    peer: identity.PeerId,
+    stream_id: u64,
+    raw: PublishBidiStream,
+    handshake_sent: bool = false,
+    handshake_done: bool = false,
+    wire_written: bool = false,
+    finished: bool = false,
+    wire: []u8,
+};
+
 /// Persistent per-peer outbound `/meshsub/1.1.0` stream — exactly one stream
 /// per peer for the connection's lifetime. All gossipsub RPCs (SUBSCRIBE,
 /// GRAFT, PRUNE, IHAVE, IWANT, **publish**) multiplex onto this stream
@@ -619,6 +631,9 @@ pub const QuicRuntime = struct {
     /// and we've FIN'd the stream.
     outbound_publishes: std.AutoHashMap(u64, *OutboundPublish),
     next_publish_id: u64 = 1,
+    /// Outbound identify-push streams (one per push per peer).
+    outbound_identify_pushes: std.AutoHashMap(u64, *OutboundIdentifyPush),
+    next_identify_push_id: u64 = 1,
 
     /// Persistent per-peer `/meshsub/1.1.0` streams keyed by remote peer id
     /// (#183). Opened on connection establishment, alive until peer
@@ -737,6 +752,7 @@ pub const QuicRuntime = struct {
             .inbound_streams = .empty,
             .outbound_requests = std.AutoHashMap(u64, *OutboundRequest).init(a),
             .outbound_publishes = std.AutoHashMap(u64, *OutboundPublish).init(a),
+            .outbound_identify_pushes = std.AutoHashMap(u64, *OutboundIdentifyPush).init(a),
             .channel_to_inbound = std.AutoHashMap(u64, *InboundStream).init(a),
             .relay_live = quic_relay_live.LiveRelay.init(a, opts.host.swarm.local_peer, .{
                 .enable_server = opts.relay.enable_server,
@@ -766,6 +782,14 @@ pub const QuicRuntime = struct {
         if (opts.relay.auto_reserve_relay != null) {
             self.auto_reserve_pending = true;
         }
+
+        self.host.setIdentifyPushDispatch(.{
+            .ctx = self,
+            .dispatch = identifyPushDispatch,
+        });
+        self.seedHostIdentifyAdvertisement() catch |err| {
+            log.warn("quic_runtime: seed host identify advertisement failed: {s}", .{@errorName(err)});
+        };
 
         // Install the swarm CommandDispatchHook by patching it onto the
         // already-constructed swarm. host.zig owns the swarm but doesn't
@@ -840,6 +864,13 @@ pub const QuicRuntime = struct {
         }
         self.outbound_publishes.deinit();
 
+        var ipit = self.outbound_identify_pushes.valueIterator();
+        while (ipit.next()) |p| {
+            self.allocator.free(p.*.wire);
+            self.allocator.destroy(p.*);
+        }
+        self.outbound_identify_pushes.deinit();
+
         // Free persistent gossip streams + their outbox bytes.
         var git = self.persistent_gossip.valueIterator();
         while (git.next()) |g| {
@@ -854,6 +885,8 @@ pub const QuicRuntime = struct {
         self.subscribed_topics.deinit();
 
         self.channel_to_inbound.deinit();
+
+        self.host.setIdentifyPushDispatch(null);
 
         // Unlink the hook so swarm doesn't keep calling into freed memory.
         self.host.swarm.command_dispatch = null;
@@ -1308,6 +1341,10 @@ pub const QuicRuntime = struct {
             // Advance outbound gossipsub publish streams.
             self.advanceOutboundPublishes() catch |err| {
                 log.warn("quic_runtime: advanceOutboundPublishes: {s}", .{@errorName(err)});
+            };
+
+            self.advanceOutboundIdentifyPushes() catch |err| {
+                log.warn("quic_runtime: advanceOutboundIdentifyPushes: {s}", .{@errorName(err)});
             };
 
             self.relay_live.advance();
@@ -2043,6 +2080,109 @@ pub const QuicRuntime = struct {
         try self.outbound_publishes.put(pub_id, op);
     }
 
+    fn identifyPushDispatch(ctx: *anyopaque, peer: identity.PeerId) void {
+        const rt: *QuicRuntime = @ptrCast(@alignCast(ctx));
+        rt.startOutboundIdentifyPush(peer) catch |err| {
+            log.warn("quic_runtime: startOutboundIdentifyPush failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn seedHostIdentifyAdvertisement(self: *QuicRuntime) !void {
+        if (self.bound_port_v4) |port| {
+            const ma = try std.fmt.allocPrint(self.allocator, "/ip4/0.0.0.0/udp/{d}/quic-v1", .{port});
+            defer self.allocator.free(ma);
+            try self.host.addListenAddr(ma);
+        }
+        for (supported_protocols) |proto| {
+            try self.host.addProtocol(proto);
+        }
+        const pk = try self.hostPublicKeyProtoOwned();
+        defer self.allocator.free(pk);
+        try self.host.setIdentifyPublicKey(pk);
+    }
+
+    fn hostPublicKeyProtoOwned(self: *QuicRuntime) ![]u8 {
+        const a = self.allocator;
+        var cert_pem_owned: ?[]u8 = null;
+        defer if (cert_pem_owned) |p| a.free(p);
+        const cert_pem = switch (self.tls_pem_resolved) {
+            .paths => |paths| blk: {
+                cert_pem_owned = try readTlsCertPemFromPath(a, paths.cert_path);
+                break :blk cert_pem_owned.?;
+            },
+            .bytes => |b| b.cert_pem,
+        };
+        return try hostPublicKeyProtoFromCertPem(a, cert_pem);
+    }
+
+    fn buildIdentifyPushWire(self: *QuicRuntime) ![]u8 {
+        const a = self.allocator;
+        const params = self.host.identifyReplyParams();
+        var pk_owned: ?[]u8 = null;
+        defer if (pk_owned) |p| a.free(p);
+        const public_key = if (params.public_key) |pk| pk else blk: {
+            pk_owned = try self.hostPublicKeyProtoOwned();
+            break :blk pk_owned.?;
+        };
+        const protocols = if (params.protocols.len > 0) params.protocols else &supported_protocols;
+        const msg = identify_mod.MessageView{
+            .public_key = public_key,
+            .listen_addrs = params.listen_addrs,
+            .protocols = protocols,
+            .signed_peer_record = params.signed_peer_record,
+        };
+        return try identify_mod.encode(a, msg);
+    }
+
+    const OpenedPushStream = struct {
+        stream_id: u64,
+        raw: PublishBidiStream,
+    };
+
+    fn openPushStreamForPeer(self: *QuicRuntime, peer: identity.PeerId) !OpenedPushStream {
+        if (self.outbound_by_peer.get(peer)) |slot| {
+            const sid = try slot.outbound.nextLocalBidiStream();
+            return .{
+                .stream_id = sid,
+                .raw = .{ .outbound = .{
+                    .client = slot.outbound.client,
+                    .stream_id = sid,
+                } },
+            };
+        }
+        if (self.inbound_by_peer.get(peer)) |ic| {
+            const sid = try self.listener.server.openRawAppStream(ic.conn);
+            return .{
+                .stream_id = sid,
+                .raw = .{ .inbound = .{
+                    .server = self.listener.server,
+                    .conn = ic.conn,
+                    .stream_id = sid,
+                } },
+            };
+        }
+        return error.NotConnected;
+    }
+
+    fn startOutboundIdentifyPush(self: *QuicRuntime, peer: identity.PeerId) !void {
+        const opened = self.openPushStreamForPeer(peer) catch |err| switch (err) {
+            error.NotConnected => return,
+            else => return err,
+        };
+        const wire = try self.buildIdentifyPushWire();
+        const push_id = self.next_identify_push_id;
+        self.next_identify_push_id += 1;
+
+        const op = try self.allocator.create(OutboundIdentifyPush);
+        op.* = .{
+            .peer = peer,
+            .stream_id = opened.stream_id,
+            .raw = opened.raw,
+            .wire = wire,
+        };
+        try self.outbound_identify_pushes.put(push_id, op);
+    }
+
     fn handleDial(self: *QuicRuntime, addr_str: []const u8, expected_peer: ?identity.PeerId) void {
         const a = self.allocator;
 
@@ -2497,16 +2637,7 @@ pub const QuicRuntime = struct {
     fn ensureIdentifyReplyWire(self: *QuicRuntime) ![]const u8 {
         if (self.identify_reply_wire) |w| return w;
         const a = self.allocator;
-        var cert_pem_owned: ?[]u8 = null;
-        defer if (cert_pem_owned) |p| a.free(p);
-        const cert_pem = switch (self.tls_pem_resolved) {
-            .paths => |paths| blk: {
-                cert_pem_owned = try readTlsCertPemFromPath(a, paths.cert_path);
-                break :blk cert_pem_owned.?;
-            },
-            .bytes => |b| b.cert_pem,
-        };
-        const host_pk = try hostPublicKeyProtoFromCertPem(a, cert_pem);
+        const host_pk = try self.hostPublicKeyProtoOwned();
         defer a.free(host_pk);
         const msg = identify_mod.MessageView{
             .public_key = host_pk,
@@ -3155,6 +3286,82 @@ pub const QuicRuntime = struct {
 
         for (to_remove.items) |id| {
             if (self.outbound_publishes.fetchRemove(id)) |kv| {
+                a.free(kv.value.wire);
+                a.destroy(kv.value);
+            }
+        }
+    }
+
+    fn advanceOutboundIdentifyPushes(self: *QuicRuntime) !void {
+        const a = self.allocator;
+        var to_remove: std.ArrayList(u64) = .empty;
+        defer to_remove.deinit(a);
+
+        var it = self.outbound_identify_pushes.iterator();
+        while (it.next()) |e| {
+            const op = e.value_ptr.*;
+            if (op.finished) {
+                try to_remove.append(a, e.key_ptr.*);
+                continue;
+            }
+
+            if (!op.handshake_sent) {
+                var out: std.ArrayList(u8) = .empty;
+                defer out.deinit(a);
+                stream_multistream.appendFirstStreamInitiatorHandshakeFramed(
+                    &out,
+                    a,
+                    identify_push_protocol_id,
+                    .delimited,
+                ) catch |err| {
+                    log.warn("quic_runtime: identify push handshake build failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                var w = op.raw.writer();
+                std.Io.Writer.writeAll(&w, out.items) catch |err| {
+                    log.warn("quic_runtime: identify push handshake write failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                std.Io.Writer.flush(&w) catch {};
+                op.handshake_sent = true;
+            }
+
+            if (!op.handshake_done) {
+                if (op.raw.unreadRecvLen() == 0) continue;
+                var r = op.raw.reader();
+                var w = op.raw.writer();
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(
+                    &r,
+                    &w,
+                    identify_push_protocol_id,
+                    a,
+                    null,
+                ) catch |err| switch (err) {
+                    error.ProtocolNegotiationFailed, error.DialFailed => continue,
+                    else => {
+                        log.warn("quic_runtime: identify push read ack failed: {s}", .{@errorName(err)});
+                        continue;
+                    },
+                };
+                op.handshake_done = true;
+            }
+
+            if (!op.wire_written) {
+                var w = op.raw.writer();
+                std.Io.Writer.writeAll(&w, op.wire) catch |err| {
+                    log.warn("quic_runtime: identify push wire write failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                std.Io.Writer.flush(&w) catch {};
+                op.wire_written = true;
+                op.raw.finStream();
+                op.finished = true;
+                try to_remove.append(a, e.key_ptr.*);
+            }
+        }
+
+        for (to_remove.items) |id| {
+            if (self.outbound_identify_pushes.fetchRemove(id)) |kv| {
                 a.free(kv.value.wire);
                 a.destroy(kv.value);
             }
