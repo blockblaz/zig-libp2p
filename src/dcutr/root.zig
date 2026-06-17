@@ -8,7 +8,10 @@ pub const CoordinatorConfig = coordinator.Config;
 pub const DirectDialRequest = coordinator.DirectDialRequest;
 pub const protocol_id = wire.protocol_id;
 
+pub const retry = @import("retry.zig");
+
 test {
     _ = @import("wire.zig");
     _ = @import("coordinator.zig");
+    _ = @import("retry.zig");
 }

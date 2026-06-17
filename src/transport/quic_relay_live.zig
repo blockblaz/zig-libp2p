@@ -137,6 +137,13 @@ pub const RuntimeHooks = struct {
         kind: ReservationEventKind,
         expire_unix: ?u64,
     ) void = null,
+    /// Inbound stop bridge completed (#205): remote peer, conn id, stop-leg client.
+    on_inbound_relay_bridge: ?*const fn (
+        ctx: ?*anyopaque,
+        remote_peer: identity.PeerId,
+        conn_id: u64,
+        stop_client: *ZIo.Client,
+    ) void = null,
 };
 
 pub const ReservationEventKind = enum {
@@ -517,6 +524,12 @@ pub const LiveRelay = struct {
                     so.failed = true;
                     continue;
                 };
+                const conn_id = self.hooks.next_conn_id(self.hooks.ctx);
+                if (self.hooks.on_inbound_relay_bridge) |cb| {
+                    cb(self.hooks.ctx, so.hop_peer, conn_id, so.raw.client);
+                } else {
+                    self.hooks.on_relayed_connected(self.hooks.ctx, so.hop_peer, conn_id);
+                }
                 self.allocator.free(so.initiator_wire);
                 self.allocator.destroy(so);
                 _ = self.stop_opens.swapRemove(i);

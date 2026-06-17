@@ -19,6 +19,10 @@ const log = std.log.scoped(.connection_manager);
 
 pub const ConnectionId = u64;
 
+pub const ConnectionEstablishedOptions = struct {
+    via_relay: bool = false,
+};
+
 /// At most this many consecutive failures (failed dials or non-local closes) before giving up.
 pub const max_reconnect_failures: u8 = 5;
 
@@ -285,6 +289,7 @@ pub const ConnectionManager = struct {
         conn_id: ConnectionId,
         peer: identity.PeerId,
         direction: peer_events.Direction,
+        opts: ConnectionEstablishedOptions,
     ) !void {
         if (self.known.getPtr(peer)) |st| {
             st.dial_inflight = false;
@@ -303,6 +308,7 @@ pub const ConnectionManager = struct {
             try self.swarm.queueEvent(.{ .peer_connected = .{
                 .peer = peer,
                 .direction = direction,
+                .via_relay = opts.via_relay,
             } });
         }
 
@@ -540,8 +546,8 @@ test "forEachConnectedPeer and collectConnectedPeers" {
 
     const peer_a = try identity.PeerId.random();
     const peer_b = try identity.PeerId.random();
-    try cm.onConnectionEstablished(1, peer_a, .outbound);
-    try cm.onConnectionEstablished(2, peer_b, .inbound);
+    try cm.onConnectionEstablished(1, peer_a, .outbound, .{});
+    try cm.onConnectionEstablished(2, peer_b, .inbound, .{});
 
     var count: usize = 0;
     const Ctx = struct {
@@ -577,8 +583,8 @@ test "connection manager emits single peer_connected for two conns" {
 
     const peer = peerIdFromMultiaddr(&ma).?;
 
-    try cm.onConnectionEstablished(1, peer, .outbound);
-    try cm.onConnectionEstablished(2, peer, .inbound);
+    try cm.onConnectionEstablished(1, peer, .outbound, .{});
+    try cm.onConnectionEstablished(2, peer, .inbound, .{});
 
     var ev1 = try swarm.nextEvent(100);
     defer ev1.deinit(a);
@@ -617,7 +623,7 @@ test "tick submits dial after remote close backoff" {
     try cm.registerKnownPeer(&ma, null);
     const peer = peerIdFromMultiaddr(&ma).?;
 
-    try cm.onConnectionEstablished(1, peer, .outbound);
+    try cm.onConnectionEstablished(1, peer, .outbound, .{});
     try cm.onConnectionClosed(10_000, 1, .remote_close);
 
     // `registerKnownPeer` now eager-submits the first dial via the swarm,
@@ -675,7 +681,7 @@ test "local close does not set reconnect backoff" {
     try cm.registerKnownPeer(&ma, null);
     const peer = peerIdFromMultiaddr(&ma).?;
 
-    try cm.onConnectionEstablished(1, peer, .outbound);
+    try cm.onConnectionEstablished(1, peer, .outbound, .{});
     _ = try swarm.nextEvent(100);
     try cm.onConnectionClosed(5_000, 1, .local_close);
     _ = try swarm.nextEvent(100);
@@ -725,7 +731,7 @@ test "connection manager notifies ReqResp on last disconnect" {
     const stream_rid: u64 = 77;
     _ = try rr.registerInboundChannel(peer, .status, stream_rid, 0);
 
-    try cm.onConnectionEstablished(1, peer, .outbound);
+    try cm.onConnectionEstablished(1, peer, .outbound, .{});
     try cm.onConnectionClosed(1000, 1, .remote_close);
 
     // onConnectionEstablished queues peer_connected; drain it first so the next
@@ -770,11 +776,11 @@ test "trim recommends close when per-peer cap is exceeded" {
     cm.setLimits(.{ .max_per_peer = 2 });
 
     const peer = try identity.PeerId.random();
-    try cm.onConnectionEstablished(1, peer, .inbound);
-    try cm.onConnectionEstablished(2, peer, .outbound);
+    try cm.onConnectionEstablished(1, peer, .inbound, .{});
+    try cm.onConnectionEstablished(2, peer, .outbound, .{});
     try std.testing.expectEqual(@as(u64, 0), cm.trimRecommendationCount());
 
-    try cm.onConnectionEstablished(3, peer, .inbound);
+    try cm.onConnectionEstablished(3, peer, .inbound, .{});
     try std.testing.expectEqual(@as(u64, 1), cm.trimRecommendationCount());
 
     var ev_trim = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
@@ -796,12 +802,12 @@ test "trim recommends oldest conns down to low_watermark when high_watermark cro
 
     var peers: [3]identity.PeerId = undefined;
     for (&peers) |*p| p.* = try identity.PeerId.random();
-    try cm.onConnectionEstablished(10, peers[0], .inbound);
-    try cm.onConnectionEstablished(11, peers[1], .inbound);
+    try cm.onConnectionEstablished(10, peers[0], .inbound, .{});
+    try cm.onConnectionEstablished(11, peers[1], .inbound, .{});
     try std.testing.expectEqual(@as(u64, 0), cm.trimRecommendationCount());
 
     // 3rd conn hits the high watermark; expect 2 trim recommendations (down to 1).
-    try cm.onConnectionEstablished(12, peers[2], .inbound);
+    try cm.onConnectionEstablished(12, peers[2], .inbound, .{});
     try std.testing.expectEqual(@as(u64, 2), cm.trimRecommendationCount());
 
     var saw_10 = false;
@@ -829,12 +835,12 @@ test "trim already-recommended conn is not re-recommended" {
     cm.setLimits(.{ .max_per_peer = 1 });
 
     const peer = try identity.PeerId.random();
-    try cm.onConnectionEstablished(1, peer, .inbound);
-    try cm.onConnectionEstablished(2, peer, .outbound);
+    try cm.onConnectionEstablished(1, peer, .inbound, .{});
+    try cm.onConnectionEstablished(2, peer, .outbound, .{});
     try std.testing.expectEqual(@as(u64, 1), cm.trimRecommendationCount());
 
     // Third connection: oldest non-recommended is conn 2 (conn 1 was already recommended).
-    try cm.onConnectionEstablished(3, peer, .outbound);
+    try cm.onConnectionEstablished(3, peer, .outbound, .{});
     try std.testing.expectEqual(@as(u64, 2), cm.trimRecommendationCount());
 }
 
@@ -850,8 +856,8 @@ test "trim entry is cleaned on close" {
     cm.setLimits(.{ .max_per_peer = 1 });
 
     const peer = try identity.PeerId.random();
-    try cm.onConnectionEstablished(1, peer, .inbound);
-    try cm.onConnectionEstablished(2, peer, .inbound);
+    try cm.onConnectionEstablished(1, peer, .inbound, .{});
+    try cm.onConnectionEstablished(2, peer, .inbound, .{});
     try std.testing.expectEqual(@as(usize, 1), cm.trim_recommended.count());
 
     try cm.onConnectionClosed(0, 1, .remote_close);
