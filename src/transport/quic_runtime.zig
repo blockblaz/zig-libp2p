@@ -47,6 +47,7 @@ const varint = @import("../varint.zig");
 
 const relay_mod = @import("../relay/root.zig");
 const dcutr_mod = @import("../dcutr/root.zig");
+const autonat_mod = @import("../autonat/root.zig");
 const identify_mod = @import("../identify.zig");
 const ping_mod = @import("../ping.zig");
 const libp2p_tls = @import("../security/libp2p_tls.zig");
@@ -87,8 +88,9 @@ const max_inbound_req_acc_bytes: usize = (wire_framing.ExchangeLimits{}).max_acc
 
 const identify_protocol_id: []const u8 = std.mem.trimEnd(u8, identify_mod.protocol_line, "\n");
 const identify_push_protocol_id: []const u8 = std.mem.trimEnd(u8, identify_mod.push_protocol_line, "\n");
+const autonat_protocol_id: []const u8 = autonat_mod.v1_multistream_protocol_id;
 
-const supported_protocols: [13][]const u8 = .{
+const supported_protocols: [14][]const u8 = .{
     // Meshsub variants first, highest version preferred so rust-libp2p's offer of the
     // newest version is accepted on the first round. Any of these maps to the same
     // gossipsub-1.1 dispatch path because newer wire fields are protobuf-additive and
@@ -103,6 +105,7 @@ const supported_protocols: [13][]const u8 = .{
     relay_mod.wire.hop_protocol_id,
     relay_mod.wire.stop_protocol_id,
     dcutr_mod.wire.protocol_id,
+    autonat_protocol_id,
     identify_protocol_id,
     ping_mod.multistream_protocol_id,
     identify_push_protocol_id,
@@ -116,9 +119,10 @@ const proto_meshsub: usize = 0;
 const proto_relay_hop: usize = 7;
 const proto_relay_stop: usize = 8;
 const proto_dcutr: usize = 9;
-const proto_identify: usize = 10;
-const proto_ping: usize = 11;
-const proto_identify_push: usize = 12;
+const proto_autonat: usize = 10;
+const proto_identify: usize = 11;
+const proto_ping: usize = 12;
+const proto_identify_push: usize = 13;
 
 /// Map a `supported_protocols` index returned by the multistream responder onto the
 /// canonical per-protocol dispatch index. Today this only collapses the four meshsub
@@ -193,6 +197,7 @@ pub const QuicRuntimeOptions = struct {
     relay: RelayRuntimeOptions = .{},
     /// DCUtR hole punching over relayed connections (#91).
     dcutr: DcutrRuntimeOptions = .{},
+    autonat: AutonatRuntimeOptions = .{},
 };
 
 pub const RelayRuntimeOptions = struct {
@@ -206,6 +211,10 @@ pub const DcutrRuntimeOptions = struct {
     enable: bool = true,
     /// Observed addresses sent in DCUtR CONNECT (defaults to listen addr).
     local_obs_addrs: []const []const u8 = &.{},
+};
+
+pub const AutonatRuntimeOptions = struct {
+    enable: bool = true,
 };
 
 const PeerIdContext = struct {
@@ -415,6 +424,19 @@ const OutboundIdentifyPush = struct {
     wire_written: bool = false,
     finished: bool = false,
     wire: []u8,
+};
+
+/// One-shot outbound `/libp2p/autonat/1.0.0` probe stream (#206).
+const OutboundAutonatProbe = struct {
+    peer: identity.PeerId,
+    stream_id: u64,
+    raw: PublishBidiStream,
+    handshake_sent: bool = false,
+    handshake_done: bool = false,
+    probe_written: bool = false,
+    response_done: bool = false,
+    finished: bool = false,
+    probe_wire: []u8,
 };
 
 /// Persistent per-peer outbound `/meshsub/1.1.0` stream — exactly one stream
@@ -635,6 +657,9 @@ pub const QuicRuntime = struct {
     /// Outbound identify-push streams (one per push per peer).
     outbound_identify_pushes: std.AutoHashMap(u64, *OutboundIdentifyPush),
     next_identify_push_id: u64 = 1,
+    outbound_autonat_probes: std.AutoHashMap(u64, *OutboundAutonatProbe),
+    next_autonat_probe_id: u64 = 1,
+    autonat_server: autonat_mod.Server,
 
     /// Persistent per-peer `/meshsub/1.1.0` streams keyed by remote peer id
     /// (#183). Opened on connection establishment, alive until peer
@@ -760,6 +785,8 @@ pub const QuicRuntime = struct {
             .outbound_requests = std.AutoHashMap(u64, *OutboundRequest).init(a),
             .outbound_publishes = std.AutoHashMap(u64, *OutboundPublish).init(a),
             .outbound_identify_pushes = std.AutoHashMap(u64, *OutboundIdentifyPush).init(a),
+            .outbound_autonat_probes = std.AutoHashMap(u64, *OutboundAutonatProbe).init(a),
+            .autonat_server = autonat_mod.Server.init(a, .{}, autonatDialBack),
             .channel_to_inbound = std.AutoHashMap(u64, *InboundStream).init(a),
             .relay_live = quic_relay_live.LiveRelay.init(a, opts.host.swarm.local_peer, .{
                 .enable_server = opts.relay.enable_server,
@@ -791,10 +818,18 @@ pub const QuicRuntime = struct {
             self.auto_reserve_pending = true;
         }
 
+        self.autonat_server.dial_back_ctx = self;
+
         self.host.setIdentifyPushDispatch(.{
             .ctx = self,
             .dispatch = identifyPushDispatch,
         });
+        if (opts.autonat.enable) {
+            self.host.setAutonatProbeDispatch(.{
+                .ctx = self,
+                .dispatch = autonatProbeDispatch,
+            });
+        }
         self.seedHostIdentifyAdvertisement() catch |err| {
             log.warn("quic_runtime: seed host identify advertisement failed: {s}", .{@errorName(err)});
         };
@@ -879,6 +914,13 @@ pub const QuicRuntime = struct {
             self.allocator.destroy(p.*);
         }
         self.outbound_identify_pushes.deinit();
+
+        var apit = self.outbound_autonat_probes.valueIterator();
+        while (apit.next()) |p| {
+            self.allocator.free(p.*.probe_wire);
+            self.allocator.destroy(p.*);
+        }
+        self.outbound_autonat_probes.deinit();
 
         // Free persistent gossip streams + their outbox bytes.
         var git = self.persistent_gossip.valueIterator();
@@ -1354,6 +1396,10 @@ pub const QuicRuntime = struct {
 
             self.advanceOutboundIdentifyPushes() catch |err| {
                 log.warn("quic_runtime: advanceOutboundIdentifyPushes: {s}", .{@errorName(err)});
+            };
+
+            self.advanceOutboundAutonatProbes() catch |err| {
+                log.warn("quic_runtime: advanceOutboundAutonatProbes: {s}", .{@errorName(err)});
             };
 
             self.relay_live.advance();
@@ -2093,6 +2139,50 @@ pub const QuicRuntime = struct {
         const rt: *QuicRuntime = @ptrCast(@alignCast(ctx));
         rt.startOutboundIdentifyPush(peer) catch |err| {
             log.warn("quic_runtime: startOutboundIdentifyPush failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn autonatProbeDispatch(ctx: *anyopaque, peer: identity.PeerId) void {
+        const rt: *QuicRuntime = @ptrCast(@alignCast(ctx));
+        rt.startOutboundAutonatProbe(peer) catch |err| {
+            log.warn("quic_runtime: startOutboundAutonatProbe failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn autonatDialBack(ctx: ?*anyopaque, addr_bytes: []const u8, nonce: u64) autonat_mod.DialBackResult {
+        _ = nonce;
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        self.handleDial(addr_bytes, null);
+        return .ok;
+    }
+
+    fn startOutboundAutonatProbe(self: *QuicRuntime, peer: identity.PeerId) !void {
+        const probe = self.host.takeAutonatProbeForPeer(peer) orelse return;
+        errdefer self.host.freeAutonatProbeMessage(probe.wire_message);
+
+        const opened = try self.openPushStreamForPeer(peer);
+        const probe_id = self.next_autonat_probe_id;
+        self.next_autonat_probe_id += 1;
+
+        const op = try self.allocator.create(OutboundAutonatProbe);
+        op.* = .{
+            .peer = peer,
+            .stream_id = opened.stream_id,
+            .raw = opened.raw,
+            .probe_wire = try self.allocator.dupe(u8, probe.wire_message),
+        };
+        self.host.freeAutonatProbeMessage(probe.wire_message);
+        try self.outbound_autonat_probes.put(probe_id, op);
+    }
+
+    fn recordInboundIdentifyProtocols(self: *QuicRuntime, peer: identity.PeerId, wire_bytes: []const u8) void {
+        var msg = identify_mod.decodeOwned(self.allocator, wire_bytes, .standard) catch return;
+        defer msg.deinit(self.allocator);
+        var protos: std.ArrayList([]const u8) = .empty;
+        defer protos.deinit(self.allocator);
+        for (msg.protocols) |p| protos.append(self.allocator, p) catch return;
+        self.host.recordPeerProtocols(peer, protos.items) catch {
+            log.warn("quic_runtime: recordPeerProtocols failed", .{});
         };
     }
 
@@ -3047,7 +3137,54 @@ pub const QuicRuntime = struct {
                     }
                     i += 1;
                 },
+                proto_autonat => {
+                    self.drainMsTailInto(ist, &ist.req_acc, max_inbound_req_acc_bytes);
+                    const recv_buf = ist.raw.recvBuffer();
+                    if (recv_buf) |rb| {
+                        if (rb.len > ist.raw.read_cursor) {
+                            try self.appendInboundAccBounded(
+                                &ist.req_acc,
+                                rb[ist.raw.read_cursor..],
+                                max_inbound_req_acc_bytes,
+                            );
+                            ist.raw.read_cursor = rb.len;
+                        }
+                    }
+                    if (ist.req_acc.items.len < 4) {
+                        if (ist.raw.finReceived()) {
+                            self.removeInboundStreamAt(i);
+                        } else {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    var r = std.Io.Reader.fixed(ist.req_acc.items);
+                    var w = ist.raw.writer();
+                    const observed: autonat_mod.IpAddr = .{ .v4 = .{ 0, 0, 0, 0 } };
+                    self.autonat_server.handleV1Stream(&r, &w, observed, false) catch {
+                        self.removeInboundStreamAt(i);
+                        continue;
+                    };
+                    ist.raw.writeAllFin(&.{});
+                    self.removeInboundStreamAt(i);
+                    continue;
+                },
                 proto_identify => {
+                    self.drainMsTailInto(ist, &ist.req_acc, max_inbound_req_acc_bytes);
+                    const recv_buf = ist.raw.recvBuffer();
+                    if (recv_buf) |rb| {
+                        if (rb.len > ist.raw.read_cursor) {
+                            try self.appendInboundAccBounded(
+                                &ist.req_acc,
+                                rb[ist.raw.read_cursor..],
+                                max_inbound_req_acc_bytes,
+                            );
+                            ist.raw.read_cursor = rb.len;
+                        }
+                    }
+                    if (ist.req_acc.items.len > 0) {
+                        self.recordInboundIdentifyProtocols(sender_peer, ist.req_acc.items);
+                    }
                     const wire = self.ensureIdentifyReplyWire() catch |err| {
                         log.warn("quic_runtime: identify reply build failed: {s}", .{@errorName(err)});
                         self.removeInboundStreamAt(i);
@@ -3075,13 +3212,20 @@ pub const QuicRuntime = struct {
                     continue;
                 },
                 proto_identify_push => {
-                    // rust-libp2p identify opens `/ipfs/id/push/1.0.0` after the
-                    // initial exchange to push listen-addrs updates. Receive-only:
-                    // drain any pushed protobuf and half-close cleanly.
                     self.drainMsTailInto(ist, &ist.req_acc, max_inbound_req_acc_bytes);
                     const recv_buf = ist.raw.recvBuffer();
                     if (recv_buf) |rb| {
-                        if (rb.len > ist.raw.read_cursor) ist.raw.read_cursor = rb.len;
+                        if (rb.len > ist.raw.read_cursor) {
+                            try self.appendInboundAccBounded(
+                                &ist.req_acc,
+                                rb[ist.raw.read_cursor..],
+                                max_inbound_req_acc_bytes,
+                            );
+                            ist.raw.read_cursor = rb.len;
+                        }
+                    }
+                    if (ist.req_acc.items.len > 0) {
+                        self.recordInboundIdentifyProtocols(sender_peer, ist.req_acc.items);
                     }
                     ist.req_acc.clearRetainingCapacity();
                     ist.raw.writeAllFin(&.{});
@@ -3479,6 +3623,86 @@ pub const QuicRuntime = struct {
         for (to_remove.items) |id| {
             if (self.outbound_identify_pushes.fetchRemove(id)) |kv| {
                 a.free(kv.value.wire);
+                a.destroy(kv.value);
+            }
+        }
+    }
+
+    fn advanceOutboundAutonatProbes(self: *QuicRuntime) !void {
+        const a = self.allocator;
+        var to_remove: std.ArrayList(u64) = .empty;
+        defer to_remove.deinit(a);
+
+        var it = self.outbound_autonat_probes.iterator();
+        while (it.next()) |e| {
+            const op = e.value_ptr.*;
+            if (op.finished) {
+                try to_remove.append(a, e.key_ptr.*);
+                continue;
+            }
+
+            if (!op.handshake_sent) {
+                var out: std.ArrayList(u8) = .empty;
+                defer out.deinit(a);
+                stream_multistream.appendFirstStreamInitiatorHandshakeFramed(
+                    &out,
+                    a,
+                    autonat_protocol_id,
+                    .delimited,
+                ) catch continue;
+                var w = op.raw.writer();
+                std.Io.Writer.writeAll(&w, out.items) catch continue;
+                std.Io.Writer.flush(&w) catch {};
+                op.handshake_sent = true;
+            }
+
+            if (!op.handshake_done) {
+                if (op.raw.unreadRecvLen() == 0) continue;
+                var r = op.raw.reader();
+                var w = op.raw.writer();
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(
+                    &r,
+                    &w,
+                    autonat_protocol_id,
+                    a,
+                    null,
+                ) catch continue;
+                op.handshake_done = true;
+            }
+
+            if (!op.probe_written) {
+                var buf: [8192]u8 = undefined;
+                var fw = std.Io.Writer.fixed(&buf);
+                autonat_mod.wire.writeLengthPrefixed(&fw, op.probe_wire) catch continue;
+                var w = op.raw.writer();
+                std.Io.Writer.writeAll(&w, buf[0..fw.end]) catch continue;
+                std.Io.Writer.flush(&w) catch {};
+                op.probe_written = true;
+            }
+
+            if (!op.response_done) {
+                if (op.raw.unreadRecvLen() < 4) continue;
+                var r = op.raw.reader();
+                const resp_frame = autonat_mod.wire.readLengthPrefixedAlloc(&r, a, autonat_mod.wire.Limits.standard.max_frame_bytes) catch continue;
+                defer a.free(resp_frame);
+                const msg = autonat_mod.wire.decodeV1Owned(a, resp_frame, .standard) catch continue;
+                defer autonat_mod.wire.freeV1Owned(a, msg);
+                switch (msg) {
+                    .dial_response => |dr| {
+                        self.host.handleAutonatV1Response(dr) catch {};
+                    },
+                    else => {},
+                }
+                op.response_done = true;
+                op.raw.finStream();
+                op.finished = true;
+                try to_remove.append(a, e.key_ptr.*);
+            }
+        }
+
+        for (to_remove.items) |id| {
+            if (self.outbound_autonat_probes.fetchRemove(id)) |kv| {
+                a.free(kv.value.probe_wire);
                 a.destroy(kv.value);
             }
         }

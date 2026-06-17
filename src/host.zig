@@ -33,6 +33,20 @@ const gs_control = @import("gossipsub/control.zig");
 const errors_mod = @import("errors.zig");
 const identify_mod = @import("identify.zig");
 const identify_ad_mod = @import("identify_advertisement.zig");
+const autonat_mod = @import("autonat/root.zig");
+const peer_protocols_mod = @import("peer_protocols.zig");
+const kad_dht_mod = @import("kad_dht/root.zig");
+
+pub const AutonatHostConfig = struct {
+    enable: bool = false,
+    client: autonat_mod.ClientConfig = .{},
+};
+
+/// Optional transport hook for outbound AutoNAT probes (#206).
+pub const AutonatProbeDispatch = struct {
+    ctx: *anyopaque,
+    dispatch: *const fn (ctx: *anyopaque, peer: identity.PeerId) void,
+};
 
 /// Max [`swarm.Event.identify_push_peer`] events queued per [`Host.runPeriodicTicks`] (#202).
 pub const default_max_identify_push_per_tick: u32 = 64;
@@ -82,6 +96,8 @@ pub const HostConfig = struct {
     connection_limits: connection_manager_mod.ConnectionLimits = .{},
     /// Identify Push auto-trigger batching (#202).
     identify: IdentifyConfig = .{},
+    /// AutoNAT vote aggregation + active probing (#206).
+    autonat: AutonatHostConfig = .{},
 };
 
 pub const InitError = error{
@@ -111,6 +127,12 @@ pub const Host = struct {
     identify_proto_scratch: std.ArrayList([]const u8) = .empty,
     identify_max_push_per_tick: u32,
     identify_push_dispatch: ?IdentifyPushDispatch = null,
+    autonat_client: ?autonat_mod.Client = null,
+    peer_protocols: peer_protocols_mod.Store,
+    autonat_probe_dispatch: ?AutonatProbeDispatch = null,
+    kad_dht_client: ?*kad_dht_mod.Client = null,
+    autonat_addr_scratch: std.ArrayList([]const u8) = .empty,
+    last_autonat_node_status: autonat_mod.NatStatus = .unknown,
 
     pub fn create(cfg: HostConfig) InitError!*Host {
         const allocator = cfg.allocator;
@@ -149,6 +171,11 @@ pub const Host = struct {
         cm.setLimits(cfg.connection_limits);
         cm.setReqResp(rr);
 
+        var autonat_client: ?autonat_mod.Client = null;
+        if (cfg.autonat.enable) {
+            autonat_client = autonat_mod.Client.init(allocator, cfg.autonat.client);
+        }
+
         self.* = .{
             .allocator = allocator,
             .swarm = swarm,
@@ -157,6 +184,8 @@ pub const Host = struct {
             .connection_manager = cm,
             .identify_ad = identify_ad_mod.Advertisement.init(allocator),
             .identify_max_push_per_tick = cfg.identify.max_push_per_tick,
+            .autonat_client = autonat_client,
+            .peer_protocols = peer_protocols_mod.Store.init(allocator),
         };
         return self;
     }
@@ -173,6 +202,9 @@ pub const Host = struct {
         self.identify_ad.deinit();
         self.identify_addr_scratch.deinit(self.allocator);
         self.identify_proto_scratch.deinit(self.allocator);
+        if (self.autonat_client) |*c| c.deinit();
+        self.peer_protocols.deinit();
+        self.autonat_addr_scratch.deinit(self.allocator);
         self.swarm.deinit();
         self.allocator.destroy(self.swarm);
         self.allocator.destroy(self);
@@ -220,6 +252,110 @@ pub const Host = struct {
         try self.req_resp.tick(now_ms);
         try self.connection_manager.tick(now_ms);
         try self.flushIdentifyPushIfDirty();
+        try self.tickAutonat(now_ms);
+    }
+
+    fn tickAutonat(self: *Host, now_ms: i64) std.mem.Allocator.Error!void {
+        const client = blk: {
+            if (self.autonat_client) |*c| break :blk c;
+            return;
+        };
+
+        self.autonat_addr_scratch.clearRetainingCapacity();
+        const params = self.identify_ad.replyParamsInto(
+            &self.autonat_addr_scratch,
+            &self.identify_proto_scratch,
+        );
+        const listen_addrs = params.listen_addrs;
+
+        var connected: std.ArrayList(identity.PeerId) = .empty;
+        defer connected.deinit(self.allocator);
+        try self.connection_manager.collectConnectedPeers(&connected);
+
+        var servers: std.ArrayList(identity.PeerId) = .empty;
+        defer servers.deinit(self.allocator);
+        try self.peer_protocols.collectAutonatServers(connected.items, &servers);
+
+        client.scheduleActiveProbes(now_ms, self.swarm.local_peer, servers.items, listen_addrs) catch {};
+
+        for (servers.items) |peer| {
+            if (!client.hasPendingProbe(peer)) continue;
+            try self.queueAutonatProbe(peer);
+        }
+
+        const changes = client.takeReachabilityChanges();
+        defer client.freeReachabilityChanges(changes);
+        for (changes) |ch| {
+            try self.swarm.queueEvent(.{ .reachability_changed = .{
+                .addr = try self.allocator.dupe(u8, ch.addr),
+                .status = ch.status,
+            } });
+        }
+
+        const node_status = client.natStatus();
+        if (node_status != self.last_autonat_node_status) {
+            self.last_autonat_node_status = node_status;
+            if (self.kad_dht_client) |kad| {
+                kad.setMode(kad_dht_mod.mode.fromNatStatus(node_status));
+            }
+        }
+    }
+
+    fn queueAutonatProbe(self: *Host, peer: identity.PeerId) std.mem.Allocator.Error!void {
+        if (self.autonat_probe_dispatch) |d| {
+            d.dispatch(d.ctx, peer);
+            return;
+        }
+        try self.swarm.queueEvent(.{ .autonat_probe_peer = peer });
+    }
+
+    pub fn setAutonatProbeDispatch(self: *Host, dispatch: ?AutonatProbeDispatch) void {
+        self.autonat_probe_dispatch = dispatch;
+    }
+
+    pub fn setKadDhtClient(self: *Host, client: ?*kad_dht_mod.Client) void {
+        self.kad_dht_client = client;
+    }
+
+    pub fn recordPeerProtocols(self: *Host, peer: identity.PeerId, protocols: []const []const u8) std.mem.Allocator.Error!void {
+        try self.peer_protocols.setProtocols(peer, protocols);
+    }
+
+    pub fn takeAutonatProbeForPeer(self: *Host, peer: identity.PeerId) ?autonat_mod.OutboundProbe {
+        if (self.autonat_client) |*c| return c.takePendingProbe(peer);
+        return null;
+    }
+
+    pub fn freeAutonatProbeMessage(self: *Host, msg: []const u8) void {
+        if (self.autonat_client) |*c| c.freeProbeMessage(msg);
+    }
+
+    pub fn handleAutonatV1Response(self: *Host, resp: autonat_mod.wire.V1DialResponse) std.mem.Allocator.Error!void {
+        const client = blk: {
+            if (self.autonat_client) |*c| break :blk c;
+            return;
+        };
+        self.autonat_addr_scratch.clearRetainingCapacity();
+        const params = self.identify_ad.replyParamsInto(
+            &self.autonat_addr_scratch,
+            &self.identify_proto_scratch,
+        );
+        try client.handleV1DialResponse(resp, params.listen_addrs);
+        const changes = client.takeReachabilityChanges();
+        defer client.freeReachabilityChanges(changes);
+        for (changes) |ch| {
+            try self.swarm.queueEvent(.{ .reachability_changed = .{
+                .addr = try self.allocator.dupe(u8, ch.addr),
+                .status = ch.status,
+            } });
+        }
+        const node_status = client.natStatus();
+        if (node_status != self.last_autonat_node_status) {
+            self.last_autonat_node_status = node_status;
+            if (self.kad_dht_client) |kad| {
+                kad.setMode(kad_dht_mod.mode.fromNatStatus(node_status));
+            }
+        }
     }
 
     fn flushIdentifyPushIfDirty(self: *Host) std.mem.Allocator.Error!void {
@@ -400,6 +536,7 @@ pub const Host = struct {
     ) (std.mem.Allocator.Error || swarm_mod.SubmitError)!void {
         try self.connection_manager.onConnectionClosed(now_ms, conn_id, reason);
         self.gossipsub.onPeerDisconnected(peer);
+        self.peer_protocols.removePeer(peer);
     }
 
     pub fn onDialFailure(

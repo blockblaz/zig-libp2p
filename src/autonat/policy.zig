@@ -1,4 +1,4 @@
-//! NAT reachability policy, address validation, and probe aggregation (#92).
+//! NAT reachability policy, address validation, and probe aggregation (#92, #206).
 
 const std = @import("std");
 const multiaddr = @import("multiaddr");
@@ -15,9 +15,14 @@ pub const IpAddr = union(enum) {
 };
 
 pub const Config = struct {
-    /// Spec heuristic: >3 successful dials → public; >3 failures → private.
-    success_threshold: u32 = 3,
+    /// Last-K probe window size per address / node tracker (#206).
+    window_size: u32 = 6,
+    /// Quorum: ≥ this many successes in the window → public (#206).
+    confidence_threshold: u32 = 3,
+    /// Quorum: ≥ this many failures in the window → private (#206).
     failure_threshold: u32 = 3,
+    /// Legacy alias kept for embedders/tests.
+    success_threshold: u32 = 3,
     /// Default probe peer count (issue #92).
     default_probe_peers: u32 = 4,
 };
@@ -27,45 +32,92 @@ pub const ProbeOutcome = enum {
     failure,
 };
 
-/// Per-address probe counters for v2-style reachability.
-pub const AddressReachability = struct {
-    successes: u32 = 0,
-    failures: u32 = 0,
+/// Fixed-size ring of the last K probe outcomes (#206).
+pub const WindowTracker = struct {
+    ring: [8]ProbeOutcome = undefined,
+    len: u8 = 0,
+    head: u8 = 0,
 
-    pub fn record(self: *AddressReachability, outcome: ProbeOutcome) void {
-        switch (outcome) {
-            .success => self.successes +|= 1,
-            .failure => self.failures +|= 1,
+    pub fn record(self: *WindowTracker, outcome: ProbeOutcome) void {
+        if (self.len < 8) {
+            self.ring[self.len] = outcome;
+            self.len += 1;
+            return;
         }
+        self.ring[self.head] = outcome;
+        self.head = (self.head + 1) % 8;
     }
 
-    pub fn status(self: AddressReachability, cfg: Config) NatStatus {
-        if (self.successes > cfg.success_threshold) return .public;
-        if (self.failures > cfg.failure_threshold) return .private;
+    pub fn reset(self: *WindowTracker) void {
+        self.len = 0;
+        self.head = 0;
+    }
+
+    pub fn count(self: WindowTracker, outcome: ProbeOutcome) u32 {
+        var n: u32 = 0;
+        const cap: u8 = 8;
+        if (self.len < cap) {
+            for (self.ring[0..self.len]) |slot| {
+                if (slot == outcome) n += 1;
+            }
+            return n;
+        }
+        var i: u8 = 0;
+        while (i < cap) : (i += 1) {
+            const idx = (self.head + i) % cap;
+            if (self.ring[idx] == outcome) n += 1;
+        }
+        return n;
+    }
+
+    pub fn status(self: WindowTracker, cfg: Config) NatStatus {
+        const successes = self.count(.success);
+        const failures = self.count(.failure);
+        if (successes >= cfg.confidence_threshold) return .public;
+        if (failures >= cfg.failure_threshold) return .private;
         return .unknown;
     }
 };
 
-/// Node-level NAT status from aggregated v1 probes (any public addr → public).
+/// Per-address probe window for v2-style reachability (#206).
+pub const AddressReachability = struct {
+    tracker: WindowTracker = .{},
+
+    pub fn init() AddressReachability {
+        return .{};
+    }
+
+    pub fn record(self: *AddressReachability, outcome: ProbeOutcome) void {
+        self.tracker.record(outcome);
+    }
+
+    pub fn status(self: AddressReachability, cfg: Config) NatStatus {
+        return self.tracker.status(cfg);
+    }
+
+    pub fn reset(self: *AddressReachability) void {
+        self.tracker.reset();
+    }
+};
+
+/// Node-level NAT status from aggregated v1 probes (#206 sliding window).
 pub const ReachabilityTracker = struct {
-    successes: u32 = 0,
-    failures: u32 = 0,
+    tracker: WindowTracker = .{},
+
+    pub fn init() ReachabilityTracker {
+        return .{};
+    }
 
     pub fn record(self: *ReachabilityTracker, outcome: ProbeOutcome) void {
-        switch (outcome) {
-            .success => self.successes +|= 1,
-            .failure => self.failures +|= 1,
-        }
+        self.tracker.record(outcome);
     }
 
     pub fn natStatus(self: ReachabilityTracker, cfg: Config) NatStatus {
-        if (self.successes > cfg.success_threshold) return .public;
-        if (self.failures > cfg.failure_threshold) return .private;
-        return .unknown;
+        return self.tracker.status(cfg);
     }
 
     pub fn reset(self: *ReachabilityTracker) void {
-        self.* = .{};
+        self.tracker.reset();
     }
 };
 
@@ -81,11 +133,8 @@ pub fn isPrivateIp(ip: IpAddr) bool {
             return false;
         },
         .v6 => |b| {
-            // ::1
             if (std.mem.allEqual(u8, &b, 0) and b[15] == 1) return true;
-            // fe80::/10 link-local
             if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true;
-            // fc00::/7 unique local
             if ((b[0] & 0xfe) == 0xfc) return true;
             return false;
         },
@@ -151,21 +200,17 @@ pub fn ipAddrsEqual(a: IpAddr, b: IpAddr) bool {
     };
 }
 
-/// v1 security: only dial addrs whose IP matches the requester's observed IP.
-/// Returns true if `addr_bytes` is allowed for dial-back.
 pub fn v1DialAddrAllowed(allocator: std.mem.Allocator, observed_ip: IpAddr, addr: []const u8) bool {
     const target = extractIpFromMultiaddr(allocator, addr) catch return false;
     const ip = target orelse return false;
     return ipAddrsEqual(observed_ip, ip);
 }
 
-/// v2: reject private addresses in client requests.
 pub fn v2ClientAddrAllowed(allocator: std.mem.Allocator, addr: []const u8) bool {
     const ip = extractIpFromMultiaddr(allocator, addr) catch return false;
     return ip != null and !isPrivateIp(ip.?);
 }
 
-/// Select first dialable address index for v2 server (skips private addrs).
 pub fn selectV2DialAddrIndex(allocator: std.mem.Allocator, addrs: []const []const u8) ?u32 {
     for (addrs, 0..) |a, i| {
         if (v2ClientAddrAllowed(allocator, a)) return @intCast(i);
@@ -173,7 +218,6 @@ pub fn selectV2DialAddrIndex(allocator: std.mem.Allocator, addrs: []const []cons
     return null;
 }
 
-/// Whether amplification cost applies (selected addr IP ≠ observed IP).
 pub fn v2NeedsAmplificationCost(allocator: std.mem.Allocator, observed_ip: IpAddr, addr: []const u8) bool {
     const target = extractIpFromMultiaddr(allocator, addr) catch return true;
     const ip = target orelse return true;
@@ -186,20 +230,28 @@ test "private ip detection" {
     try std.testing.expect(!isPrivateIp(.{ .v4 = .{ 8, 8, 8, 8 } }));
 }
 
-test "reachability thresholds" {
-    const cfg: Config = .{};
-    var t: ReachabilityTracker = .{};
-    t.record(.failure);
-    t.record(.failure);
-    t.record(.failure);
-    t.record(.failure);
-    try std.testing.expectEqual(NatStatus.private, t.natStatus(cfg));
-    t.reset();
+test "window quorum resists single flip" {
+    const cfg: Config = .{ .window_size = 6, .confidence_threshold = 3, .failure_threshold = 3 };
+    var t = ReachabilityTracker.init();
     t.record(.success);
+    try std.testing.expectEqual(NatStatus.unknown, t.natStatus(cfg));
+    t.record(.failure);
+    t.record(.failure);
+    try std.testing.expectEqual(NatStatus.unknown, t.natStatus(cfg));
     t.record(.success);
     t.record(.success);
     t.record(.success);
     try std.testing.expectEqual(NatStatus.public, t.natStatus(cfg));
+}
+
+test "window private quorum" {
+    const cfg: Config = .{};
+    var t = ReachabilityTracker.init();
+    t.record(.failure);
+    t.record(.failure);
+    try std.testing.expectEqual(NatStatus.unknown, t.natStatus(cfg));
+    t.record(.failure);
+    try std.testing.expectEqual(NatStatus.private, t.natStatus(cfg));
 }
 
 test "v1 dial addr must match observed ip" {
