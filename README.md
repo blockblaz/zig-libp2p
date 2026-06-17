@@ -72,28 +72,96 @@ zig build examples
 ./zig-out/bin/example-host-quic-node
 ```
 
-## Supported protocols
+## libp2p spec coverage
 
-| Specification | Module | Cross-impl interop |
-|---------------|--------|--------------------|
-| QUIC v1 (RFC 9000/9001) | `transport.quic_*` + `zquic` | go ✅ · rust ✅ |
-| libp2p TLS 1.3 over QUIC (RFC 0001) | `security.libp2p_tls`, `security.libp2p_tls_cert` | go ✅ · rust ✅ |
-| libp2p TLS over TCP (`/tls/1.0.0`) | `transport.tcp_tls` | manual |
-| TCP transport | `transport.tcp` | — |
-| WebSocket (`/ws`, RFC 6455) | `transport.ws*` | unit-tested |
-| Noise XX (`/noise`) — RSA, ECDSA-P256, secp256k1, ed25519 | `security.noise` | manual |
-| Yamux + Mplex multiplexing | `transport.yamux`, `transport.mplex` | — |
-| Multistream-select (delimited) | `transport.stream_multistream` | ✅ |
-| Ping (`/ipfs/ping/1.0.0`) | `ping` | go ✅ · rust ✅ |
-| Identify (`/ipfs/id/1.0.0`) + RFC 0002 signed peer records | `identify` | ✅ |
-| Gossipsub v1.1 (StrictNoSign) | `gossipsub.*` | go ✅ · rust ✅ |
-| Request/response + SSZ-snappy | `req_resp.*` | go ✅ · rust ✅ |
-| AutoNAT v1/v2 | `autonat` | in-memory smoke ✅ |
-| Kademlia DHT | `kad_dht` | in-memory smoke ✅ |
-| Host · Swarm · Connection manager · Metrics | `host`, `swarm`, `connection_manager`, `metrics` | — |
+Coverage of the [libp2p specifications](https://github.com/libp2p/specs),
+organized by spec area. zig-libp2p targets the subset required by lean /
+Ethereum consensus, so some libp2p features are intentionally out of scope.
 
-The live cross-impl status matrix is in
-[`interop_quic/README.md`](interop_quic/README.md).
+**Legend:** ✅ implemented · 🚧 partial / experimental · ⬜ planned · ⛔ out of scope
+
+### Transports
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| TCP | ✅ | `transport.tcp` |
+| QUIC v1 (RFC 9000/9001) | ✅ | primary transport, via `zquic`; interop go ✅ · rust ✅ |
+| WebSocket — `/ws` (RFC 6455) | ✅ | `transport.ws*`; unit-tested |
+| Secure WebSocket — `/wss` | ⬜ | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
+| WebTransport | ⬜ | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
+| WebRTC | ⬜ | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
+
+### Secure channels
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| TLS 1.3 (libp2p TLS, RFC 0001) | ✅ | over QUIC and TCP (`/tls/1.0.0`); interop go ✅ · rust ✅ |
+| Noise (`/noise`, XX) | ✅ | RSA, ECDSA-P256, secp256k1, ed25519 identities |
+
+### Stream multiplexing
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| QUIC native streams | ✅ | default for the QUIC transport |
+| yamux | ✅ | `transport.yamux` |
+| mplex | ✅ | `transport.mplex` |
+
+### Protocol negotiation
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| multistream-select 1.0 | ✅ | `transport.stream_multistream` |
+
+### Peer identity
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| Peer IDs / keypairs | ✅ | `identity`, `keypair` |
+| Signed peer records (RFC 0002) | ✅ | `identify.verifySignedPeerRecord` |
+
+### Publish / subscribe
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| gossipsub v1.1 (StrictNoSign) | ✅ | mesh, scoring, PX, IDONTWANT, direct peers, FANOUT; interop go ✅ · rust ✅ |
+| floodsub | ⛔ | superseded by gossipsub |
+
+### Peer discovery & content routing
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| Bootstrap (static dial) | ✅ | `connect_peers` via `connection_manager` |
+| Kademlia DHT | 🚧 | `kad_dht`; in-memory smoke. Record validators / lifecycle pending ([#198](https://github.com/ch4r10t33r/zig-libp2p/issues/198), [#203](https://github.com/ch4r10t33r/zig-libp2p/issues/203)) |
+| mDNS (LAN discovery) | ⬜ | [#207](https://github.com/ch4r10t33r/zig-libp2p/issues/207) |
+| Rendezvous | ⬜ | [#209](https://github.com/ch4r10t33r/zig-libp2p/issues/209) |
+
+### NAT traversal
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| AutoNAT v1/v2 | 🚧 | `autonat`; in-memory smoke. Vote aggregation + active probing pending ([#206](https://github.com/ch4r10t33r/zig-libp2p/issues/206)) |
+| Circuit Relay v2 | 🚧 | `relay`; reservation + hop wire done. Host dial-path integration pending ([#204](https://github.com/ch4r10t33r/zig-libp2p/issues/204)) |
+| DCUtR (hole punching) | 🚧 | `dcutr`; exchange wire done. Auto-trigger on relayed conns pending ([#205](https://github.com/ch4r10t33r/zig-libp2p/issues/205)) |
+
+### Utility & application protocols
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| ping (`/ipfs/ping/1.0.0`) | ✅ | interop go ✅ · rust ✅ |
+| identify (`/ipfs/id/1.0.0`) | ✅ | `identify` |
+| identify-push (`/ipfs/id/push/1.0.0`) | 🚧 | inbound handled; auto-trigger on change pending ([#202](https://github.com/ch4r10t33r/zig-libp2p/issues/202)) |
+| Request/response (length-prefixed, SSZ-snappy) | ✅ | `req_resp`; interop go ✅ · rust ✅ |
+
+### Not yet implemented
+
+| Spec | Status | Notes |
+|------|:------:|-------|
+| Private networks (PSK / pnet) | ⬜ | [#171](https://github.com/ch4r10t33r/zig-libp2p/issues/171) |
+| Resource manager (scope-based limits) | ⬜ | [#169](https://github.com/ch4r10t33r/zig-libp2p/issues/169) |
+
+The live cross-impl interop matrix is in
+[`interop_quic/README.md`](interop_quic/README.md); the full module map is
+[`src/root.zig`](src/root.zig).
 
 ## Interoperability
 
@@ -133,21 +201,14 @@ See [`examples/README.md`](examples/README.md) for the complete list.
 - **Async swarm design** — [`docs/async-swarm.md`](docs/async-swarm.md)
 - **zeam integration notes** — [`docs/zeam-parity.md`](docs/zeam-parity.md)
 
-## Project status & roadmap
+## Roadmap
 
-zig-libp2p deliberately implements the libp2p subset required by lean/Ethereum
-consensus. The following are out of the current scope; contributions on the
-linked issues are welcome.
+Per-protocol gaps are tracked in the spec-coverage tables above. The broader
+milestones toward a stable release:
 
-| Area | Status | Tracking |
-|------|--------|----------|
-| Circuit Relay v2 + DCUtR hole punching | not planned for 1.0 | [#91](https://github.com/ch4r10t33r/zig-libp2p/issues/91) |
-| Secure WebSocket / WebTransport / WebRTC | WebSocket landed; rest deferred | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
-| Resource manager (scope-based limits) | planned | [#169](https://github.com/ch4r10t33r/zig-libp2p/issues/169) |
-| Private networks (PSK / pnet) | planned | [#171](https://github.com/ch4r10t33r/zig-libp2p/issues/171) |
-| Async swarm (`std.Io` co-scheduled) | planned | [#57](https://github.com/ch4r10t33r/zig-libp2p/issues/57) |
-| Third-party security audit | planned | [#170](https://github.com/ch4r10t33r/zig-libp2p/issues/170) |
-| 1.0-RC API freeze + semver | planned | [#172](https://github.com/ch4r10t33r/zig-libp2p/issues/172) |
+- **1.0-RC API freeze + semver** — [#172](https://github.com/ch4r10t33r/zig-libp2p/issues/172)
+- **Third-party security audit + disclosure policy** — [#170](https://github.com/ch4r10t33r/zig-libp2p/issues/170)
+- **Async swarm** (`std.Io` co-scheduled, moving off the threaded runtime) — [#57](https://github.com/ch4r10t33r/zig-libp2p/issues/57)
 
 Spec-compliance umbrella: [#80](https://github.com/ch4r10t33r/zig-libp2p/issues/80).
 
