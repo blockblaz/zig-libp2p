@@ -41,6 +41,14 @@ pub const IdentifyConfig = struct {
     max_push_per_tick: u32 = default_max_identify_push_per_tick,
 };
 
+/// Optional transport hook: when set, [`queueIdentifyPush`] invokes this
+/// instead of enqueueing [`swarm.Event.identify_push_peer`] (used by
+/// [`transport.quic_runtime.QuicRuntime`]).
+pub const IdentifyPushDispatch = struct {
+    ctx: *anyopaque,
+    dispatch: *const fn (ctx: *anyopaque, peer: identity.PeerId) void,
+};
+
 /// Union of every typed error the gossipsub runtime can surface, in one alias
 /// so Host method signatures stay legible.
 pub const GossipsubError = gs_rpc.Error || gs_msg.Error || gs_control.Error ||
@@ -102,6 +110,7 @@ pub const Host = struct {
     identify_addr_scratch: std.ArrayList([]const u8) = .empty,
     identify_proto_scratch: std.ArrayList([]const u8) = .empty,
     identify_max_push_per_tick: u32,
+    identify_push_dispatch: ?IdentifyPushDispatch = null,
 
     pub fn create(cfg: HostConfig) InitError!*Host {
         const allocator = cfg.allocator;
@@ -220,9 +229,23 @@ pub const Host = struct {
         try self.connection_manager.collectConnectedPeers(&peers);
         const cap = @min(peers.items.len, @as(usize, self.identify_max_push_per_tick));
         for (peers.items[0..cap]) |peer| {
-            try self.swarm.queueEvent(.{ .identify_push_peer = peer });
+            try self.queueIdentifyPush(peer);
         }
         if (peers.items.len > cap) self.identify_ad.markDirty();
+    }
+
+    fn queueIdentifyPush(self: *Host, peer: identity.PeerId) std.mem.Allocator.Error!void {
+        if (self.identify_push_dispatch) |d| {
+            d.dispatch(d.ctx, peer);
+            return;
+        }
+        try self.swarm.queueEvent(.{ .identify_push_peer = peer });
+    }
+
+    /// Register a transport that opens `/ipfs/id/push/1.0.0` directly (QUIC
+    /// runtime). Cleared automatically when the transport is destroyed.
+    pub fn setIdentifyPushDispatch(self: *Host, dispatch: ?IdentifyPushDispatch) void {
+        self.identify_push_dispatch = dispatch;
     }
 
     // ── Identify (#202) ───────────────────────────────────────────────────
@@ -271,7 +294,7 @@ pub const Host = struct {
     /// Queue one Identify Push for `peer` when a connection is active (#202).
     pub fn sendIdentifyPush(self: *Host, peer: identity.PeerId) std.mem.Allocator.Error!void {
         if (!self.connection_manager.hasActiveConnection(peer)) return;
-        try self.swarm.queueEvent(.{ .identify_push_peer = peer });
+        try self.queueIdentifyPush(peer);
     }
 
     // ── Pub/sub ────────────────────────────────────────────────────────────
@@ -579,4 +602,43 @@ test "Host.sendIdentifyPush skips disconnected peer" {
     _ = host.waitUntilReady(5_000);
     const ev = host.nextEvent(50);
     try testing.expect(ev == error.Timeout);
+}
+
+test "Host identify push dispatch bypasses swarm queue" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const me = try identity.PeerId.random();
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+    });
+    defer host.destroy();
+
+    var saw_push = false;
+    const ctx = &saw_push;
+    const on_push = struct {
+        fn cb(ctx_ptr: *anyopaque, _: identity.PeerId) void {
+            const flag: *bool = @ptrCast(@alignCast(ctx_ptr));
+            flag.* = true;
+        }
+    }.cb;
+    host.setIdentifyPushDispatch(.{ .ctx = ctx, .dispatch = on_push });
+
+    const peer = try identity.PeerId.random();
+    try host.onConnectionEstablished(1, peer, .outbound);
+    try host.sendIdentifyPush(peer);
+    try testing.expect(saw_push);
+
+    try host.startBackground();
+    _ = host.waitUntilReady(5_000);
+    while (host.nextEvent(100) catch null) |evt| {
+        var e = evt;
+        defer e.deinit(a);
+        try testing.expect(std.meta.activeTag(e) != .identify_push_peer);
+        if (std.meta.activeTag(e) == .peer_connected) continue;
+        break;
+    }
 }
