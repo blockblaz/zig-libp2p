@@ -729,6 +729,7 @@ pub const QuicRuntime = struct {
             .on_relayed_connected = relayHookRelayedConnected,
             .on_relayed_dial_failed = relayHookRelayedDialFailed,
             .next_conn_id = relayHookNextConnId,
+            .on_relay_reservation = relayHookRelayReservation,
         };
         const dcutr_hooks = quic_dcutr_live.RuntimeHooks{
             .ctx = self,
@@ -2548,6 +2549,27 @@ pub const QuicRuntime = struct {
         const cid = self.next_conn_id;
         self.next_conn_id += 1;
         return cid;
+    }
+
+    fn relayHookRelayReservation(
+        ctx: ?*anyopaque,
+        relay: identity.PeerId,
+        kind: quic_relay_live.ReservationEventKind,
+        expire_unix: ?u64,
+    ) void {
+        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const swarm_kind: swarm_mod.RelayReservationKind = switch (kind) {
+            .acquired => .acquired,
+            .refreshed => .refreshed,
+            .lost => .lost,
+        };
+        self.host.swarm.queueEvent(.{ .relay_reservation = .{
+            .relay = relay,
+            .kind = swarm_kind,
+            .expire_unix = expire_unix,
+        } }) catch |err| {
+            log.warn("quic_runtime: relay_reservation event queue failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn dcutrHookListenerPort(ctx: ?*anyopaque) ?u16 {

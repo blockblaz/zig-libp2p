@@ -130,6 +130,19 @@ pub const RuntimeHooks = struct {
     on_relayed_dial_failed: *const fn (ctx: ?*anyopaque, target: ?identity.PeerId) void,
     /// Next connection id allocator.
     next_conn_id: *const fn (ctx: ?*anyopaque) u64,
+    /// Reservation acquired / refreshed / lost (#204).
+    on_relay_reservation: ?*const fn (
+        ctx: ?*anyopaque,
+        relay: identity.PeerId,
+        kind: ReservationEventKind,
+        expire_unix: ?u64,
+    ) void = null,
+};
+
+pub const ReservationEventKind = enum {
+    acquired,
+    refreshed,
+    lost,
 };
 
 pub const LiveRelay = struct {
@@ -144,6 +157,8 @@ pub const LiveRelay = struct {
     stop_opens: std.ArrayList(*StopOpen) = .empty,
     circuit_dials: std.ArrayList(*CircuitDial) = .empty,
     relay_virtual: std.AutoHashMap(identity.PeerId, *RelayVirtualConn),
+    /// Unix seconds; skip refresh attempts until this time after a failure (#204).
+    reserve_refresh_backoff_until: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -350,7 +365,29 @@ pub const LiveRelay = struct {
 
     fn advanceReservationRefresh(self: *LiveRelay) void {
         if (!self.cfg.enable_client) return;
-        if (!self.client.pollRefresh(@intCast(wall_time.unixTimestamp()))) return;
+        const now: u64 = @intCast(wall_time.unixTimestamp());
+        if (self.reserve_refresh_backoff_until > now) return;
+        const res = self.client.reservation orelse return;
+        if (!self.client.pollRefresh(now)) return;
+        if (self.hooks.outbound_client(self.hooks.ctx, res.relay_peer) == null) return;
+
+        self.reserveOnRelay(res.relay_peer) catch |err| {
+            log.warn("relay: reservation refresh failed relay={any} err={s}", .{ res.relay_peer, @errorName(err) });
+            self.reserve_refresh_backoff_until = now + 30;
+            self.notifyRelayReservation(res.relay_peer, .lost, null);
+            return;
+        };
+    }
+
+    fn notifyRelayReservation(
+        self: *LiveRelay,
+        relay_peer: identity.PeerId,
+        kind: ReservationEventKind,
+        expire_unix: ?u64,
+    ) void {
+        if (self.hooks.on_relay_reservation) |cb| {
+            cb(self.hooks.ctx, relay_peer, kind, expire_unix);
+        }
     }
 
     fn advanceStopOpens(self: *LiveRelay) void {
@@ -655,6 +692,7 @@ pub const LiveRelay = struct {
 
     /// Reserve a slot on `relay` (opens hop stream on existing conn to relay).
     pub fn reserveOnRelay(self: *LiveRelay, relay_peer: identity.PeerId) Error!void {
+        const had_reservation = self.client.reservation != null;
         const client = self.hooks.outbound_client(self.hooks.ctx, relay_peer) orelse return error.ConnectFailed;
         const sid = self.hooks.next_bidi_stream(self.hooks.ctx, relay_peer) orelse return error.ConnectFailed;
         var raw: quic_raw_stream_io.RawAppBidiClient = .{ .client = client, .stream_id = sid };
@@ -672,6 +710,13 @@ pub const LiveRelay = struct {
         try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, relay.wire.hop_protocol_id, self.allocator, null);
 
         try self.client.reserveOnStream(&r, &w, relay_peer);
+        const expire = self.client.reservation.?.expire_unix;
+        self.reserve_refresh_backoff_until = 0;
+        self.notifyRelayReservation(
+            relay_peer,
+            if (had_reservation) .refreshed else .acquired,
+            expire,
+        );
     }
 };
 

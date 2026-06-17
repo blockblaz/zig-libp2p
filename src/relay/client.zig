@@ -17,7 +17,8 @@ pub const Error = wire.Error || error{
 pub const Config = struct {
     limits: wire.Limits = .standard,
     /// Refresh reservation when fewer than this many seconds remain.
-    refresh_before_sec: u64 = 300,
+    /// Relay servers in this repo grant 120s; default 30s re-reserves in time.
+    refresh_before_sec: u64 = 30,
 };
 
 pub const ReservationState = struct {
@@ -145,4 +146,19 @@ test "client reserve request round trip" {
     const req = try client.buildReserveRequest();
     defer a.free(req);
     try std.testing.expect(req.len > 0);
+}
+
+test "pollRefresh inside refresh_before window" {
+    const a = std.testing.allocator;
+    var client = Client.init(a, .{ .refresh_before_sec = 30 });
+    defer client.deinit();
+    const relay = try identity.PeerId.random();
+    client.reservation = .{
+        .expire_unix = 200,
+        .addrs = &.{},
+        .relay_peer = relay,
+    };
+    try std.testing.expect(!client.pollRefresh(100));
+    try std.testing.expect(client.pollRefresh(175));
+    try std.testing.expect(client.pollRefresh(200));
 }
