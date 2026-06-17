@@ -13,6 +13,7 @@ const identity = @import("identity.zig");
 const peer_events = @import("peer_events.zig");
 const req_resp_runtime = @import("req_resp/runtime.zig");
 const swarm_mod = @import("swarm.zig");
+const circuit_addr = @import("relay/circuit_addr.zig");
 
 const log = std.log.scoped(.connection_manager);
 
@@ -488,6 +489,11 @@ fn peerIdFromMultiaddr(ma: *const multiaddr.Multiaddr) ?identity.PeerId {
 }
 
 fn multiaddrDialString(allocator: std.mem.Allocator, ma: *const multiaddr.Multiaddr) ![]u8 {
+    if (circuit_addr.isCircuit(ma)) {
+        var split = try circuit_addr.splitCircuit(allocator, ma);
+        defer split.deinit();
+        return try split.toString(allocator);
+    }
     var out = multiaddr.Multiaddr.init(allocator);
     defer out.deinit();
     var iter = ma.iterator();
@@ -505,6 +511,20 @@ test "strip p2p from dial string" {
     const s = try multiaddrDialString(a, &ma);
     defer a.free(s);
     try std.testing.expectEqualStrings("/ip4/127.0.0.1/udp/4001/quic-v1", s);
+}
+
+test "circuit multiaddr dial string preserves p2p-circuit path" {
+    const a = std.testing.allocator;
+    const relay = try identity.PeerId.random();
+    const target = try identity.PeerId.random();
+    var relay_ma = try multiaddr.Multiaddr.fromString(a, "/ip4/203.0.113.1/udp/4001/quic-v1");
+    defer relay_ma.deinit();
+    try relay_ma.push(.{ .P2P = relay });
+    var circuit_ma = try circuit_addr.RelayedAddr.build(a, &relay_ma, target);
+    defer circuit_ma.deinit();
+    const s = try multiaddrDialString(a, &circuit_ma);
+    defer a.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "/p2p-circuit") != null);
 }
 
 test "forEachConnectedPeer and collectConnectedPeers" {

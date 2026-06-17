@@ -125,6 +125,12 @@ pub const TrimReason = enum {
     over_per_peer_cap,
 };
 
+pub const RelayReservationKind = enum {
+    acquired,
+    refreshed,
+    lost,
+};
+
 /// Swarm → embedder events. Owned memory is released with [`Event.deinit`].
 pub const Event = union(enum) {
     gossip_message: GossipMessage,
@@ -144,6 +150,12 @@ pub const Event = union(enum) {
     },
     /// Open `/ipfs/id/push/1.0.0` to `peer` with [`host.Host.identifyReplyParams`] (#202).
     identify_push_peer: identity.PeerId,
+    /// Circuit relay v2 reservation lifecycle (#204).
+    relay_reservation: struct {
+        relay: identity.PeerId,
+        kind: RelayReservationKind,
+        expire_unix: ?u64 = null,
+    },
     log: struct {
         level: LogLevel,
         message: []const u8,
@@ -172,6 +184,7 @@ pub const Event = union(enum) {
             .peer_connection_failed,
             .connection_trim_recommended,
             .identify_push_peer,
+            .relay_reservation,
             .swarm_closed,
             => {},
         }
