@@ -1,5 +1,5 @@
 //! Gossipsub mesh runtime (incremental, #39): subscriptions, peer presence, per-topic mesh,
-//! heartbeat GRAFT/PRUNE toward Zeam `mesh_n` / `mesh_n_low` / `mesh_n_high`, inbound control,
+//! fanout peer sets for unsubscribed-topic publishes (#200), heartbeat GRAFT/PRUNE toward Zeam `mesh_n` / `mesh_n_low` / `mesh_n_high`, inbound control,
 //! publish forwarding, duplicate cache, lazy gossip IHAVE toward non-mesh peers, IWANT fulfillment
 //! from a bounded pull cache, and a targeted outbox with global plus per-peer caps (lazy IHAVE
 //! dropped first on overflow). Optional [`setPeerBehaviourScore`] orders GRAFT targets, PRUNE
@@ -135,6 +135,8 @@ pub const GossipsubConfig = struct {
     prune_backoff_cap_ms: i64 = gs_cfg.prune_backoff_cap_ms,
     /// Back-off after `unsubscribe` before `subscribe` on the same topic (#83).
     unsubscribe_backoff_ms: i64 = gs_cfg.unsubscribe_backoff_ms,
+    /// Fanout peer-set TTL for publishes on topics we do not subscribe to (#200).
+    fanout_ttl_ms: i64 = gs_cfg.fanout_ttl_ms,
     /// Hard upper bound on tracked `(peer, topic)` back-off entries; oldest evicted first.
     max_backoff_entries: usize = 4096,
     /// Defense-in-depth: when set, inbound publishes carrying both `from` and `seqno`
@@ -208,6 +210,7 @@ pub const GossipsubConfig = struct {
         if (c.prune_backoff_default_ms < 0) return error.InvalidGossipParams;
         if (c.prune_backoff_cap_ms < c.prune_backoff_default_ms) return error.InvalidGossipParams;
         if (c.unsubscribe_backoff_ms < 0) return error.InvalidGossipParams;
+        if (c.fanout_ttl_ms <= 0) return error.InvalidGossipParams;
         if (c.seqno_dedup_enabled and c.max_seqno_dedup_entries == 0) return error.InvalidGossipParams;
         if (c.seqno_dedup_enabled and c.seqno_dedup_ttl_ms <= 0) return error.InvalidGossipParams;
         if (c.idontwant_runtime_enabled and c.max_idontwant_entries == 0) return error.InvalidGossipParams;
@@ -240,6 +243,12 @@ const TopicMesh = struct {
     fn deinit(self: *TopicMesh) void {
         self.peers.deinit();
     }
+};
+
+/// Transient publish targets for topics we are not subscribed to (#200).
+const FanoutEntry = struct {
+    peers: TopicMesh,
+    last_published_ms: i64,
 };
 
 /// Application-layer validation outcome for an inbound gossipsub publish (#84).
@@ -354,6 +363,8 @@ pub const Gossipsub = struct {
     dup: duplicate_cache.DuplicateCache,
     subs: std.StringHashMap(void),
     mesh: std.StringHashMap(TopicMesh),
+    /// Publish targets for topics we do not subscribe to (#200).
+    fanout: std.StringHashMap(FanoutEntry),
     /// Peers that sent a SUBSCRIBE RPC for a topic (used to narrow GRAFT targets).
     remote_interest: std.StringHashMap(TopicMesh),
     connected: std.HashMap(identity.PeerId, void, connection_manager.PeerIdContext, std.hash_map.default_max_load_percentage),
@@ -521,6 +532,7 @@ pub const Gossipsub = struct {
             .dup = duplicate_cache.DuplicateCache.init(allocator),
             .subs = std.StringHashMap(void).init(allocator),
             .mesh = std.StringHashMap(TopicMesh).init(allocator),
+            .fanout = std.StringHashMap(FanoutEntry).init(allocator),
             .remote_interest = std.StringHashMap(TopicMesh).init(allocator),
             .connected = .init(allocator),
             .clock_ms = 0,
@@ -576,6 +588,12 @@ pub const Gossipsub = struct {
             e.value_ptr.deinit();
         }
         self.mesh.deinit();
+        var fit = self.fanout.iterator();
+        while (fit.next()) |e| {
+            e.value_ptr.peers.deinit();
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.fanout.deinit();
         var rit = self.remote_interest.iterator();
         while (rit.next()) |e| {
             e.value_ptr.deinit();
@@ -1223,6 +1241,7 @@ pub const Gossipsub = struct {
         }
         try self.subs.put(topic, {});
         errdefer _ = self.subs.fetchRemove(topic);
+        try self.promoteFanoutToMesh(topic);
         try self.ensureTopicMesh(topic);
         const w = try rpc.encodeSubscribe(self.allocator, topic, true);
         errdefer self.allocator.free(w);
@@ -1290,7 +1309,27 @@ pub const Gossipsub = struct {
 
         const wire = try rpc.encodePublish(self.allocator, inner);
         errdefer self.allocator.free(wire);
-        try self.appendOut(wire, null);
+
+        if (self.subs.contains(topic)) {
+            try self.ensureTopicMesh(topic);
+            const mp = self.mesh.getPtr(topic).?;
+            var pit = mp.peers.keyIterator();
+            while (pit.next()) |kp| {
+                try self.appendPublishWire(wire, kp.*, id);
+            }
+            self.allocator.free(wire);
+        } else {
+            try self.populateFanoutIfNeeded(topic);
+            const fe = self.fanout.getPtr(topic) orelse {
+                self.allocator.free(wire);
+                return;
+            };
+            var fit = fe.peers.peers.keyIterator();
+            while (fit.next()) |kp| {
+                try self.appendPublishWire(wire, kp.*, id);
+            }
+            self.allocator.free(wire);
+        }
     }
 
     pub fn onPeerConnected(self: *Gossipsub, peer: identity.PeerId) void {
@@ -1321,6 +1360,10 @@ pub const Gossipsub = struct {
         var rit = self.remote_interest.iterator();
         while (rit.next()) |e| {
             _ = e.value_ptr.peers.remove(peer);
+        }
+        var fout = self.fanout.iterator();
+        while (fout.next()) |e| {
+            _ = e.value_ptr.peers.peers.remove(peer);
         }
         self.clearBackoffForPeer(peer);
         self.syncMeshPeers();
@@ -1403,6 +1446,84 @@ pub const Gossipsub = struct {
         // Direct peers always sort to the front; otherwise score-desc, then bytes.
         self.sortPeersDirectThenScoreDescThenBytes(self.scratch_peers.items);
         return self.scratch_peers.items;
+    }
+
+    fn candidatesForFanoutSelection(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error![]identity.PeerId {
+        self.scratch_peers.clearRetainingCapacity();
+        var cit = self.connected.keyIterator();
+        while (cit.next()) |kp| {
+            const p = kp.*;
+            if (p.eql(&self.cfg.local_peer_id)) continue;
+            if (!self.direct_peers.contains(p) and self.isPeerBackedOffInner(p, topic)) continue;
+            try self.scratch_peers.append(self.allocator, p);
+        }
+        self.sortPeersDirectThenScoreDescThenBytes(self.scratch_peers.items);
+        return self.scratch_peers.items;
+    }
+
+    fn ensureFanoutEntry(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error!*FanoutEntry {
+        if (self.fanout.getPtr(topic)) |fe| return fe;
+        const topic_owned = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(topic_owned);
+        try self.fanout.put(topic_owned, .{
+            .peers = TopicMesh.init(self.allocator),
+            .last_published_ms = 0,
+        });
+        return self.fanout.getPtr(topic).?;
+    }
+
+    fn populateFanoutIfNeeded(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error!void {
+        const fe = try self.ensureFanoutEntry(topic);
+        if (fe.peers.peers.count() == 0) {
+            const cand = try self.candidatesForFanoutSelection(topic);
+            const n = @min(@as(usize, self.cfg.mesh_n), cand.len);
+            for (cand[0..n]) |peer| {
+                try fe.peers.peers.put(peer, {});
+            }
+        }
+        fe.last_published_ms = self.clock_ms;
+    }
+
+    fn pruneFanout(self: *Gossipsub) void {
+        var stale: std.ArrayList([]const u8) = .empty;
+        defer stale.deinit(self.allocator);
+        var it = self.fanout.iterator();
+        while (it.next()) |e| {
+            if (self.clock_ms - e.value_ptr.last_published_ms > self.cfg.fanout_ttl_ms) {
+                stale.append(self.allocator, e.key_ptr.*) catch continue;
+            }
+        }
+        for (stale.items) |topic| {
+            if (self.fanout.fetchRemove(topic)) |kv| {
+                var entry = kv.value;
+                entry.peers.deinit();
+                self.allocator.free(kv.key);
+            }
+        }
+    }
+
+    fn promoteFanoutToMesh(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error!void {
+        if (self.fanout.fetchRemove(topic)) |kv| {
+            try self.ensureTopicMesh(topic);
+            const mp = self.mesh.getPtr(topic).?;
+            var entry = kv.value;
+            var pit = entry.peers.peers.keyIterator();
+            while (pit.next()) |kp| {
+                try mp.peers.put(kp.*, {});
+            }
+            entry.peers.deinit();
+            self.allocator.free(kv.key);
+        }
+    }
+
+    fn appendPublishWire(self: *Gossipsub, wire: []const u8, dest: identity.PeerId, mid: [20]u8) (errors.GossipsubError || std.mem.Allocator.Error)!void {
+        if (self.peerWantsNotPublish(dest, mid)) {
+            self.suppressed_outbound_idontwant += 1;
+            return;
+        }
+        const w = try self.allocator.dupe(u8, wire);
+        errdefer self.allocator.free(w);
+        try self.appendOut(w, dest);
     }
 
     fn sortPeersDirectThenScoreDescThenBytes(self: *Gossipsub, peers: []identity.PeerId) void {
@@ -1728,6 +1849,7 @@ pub const Gossipsub = struct {
         self.pruneRecentSeen();
         self.pruneBackoff();
         self.pruneTopicUnsubscribeCooldown();
+        self.pruneFanout();
 
         var sit = self.subs.iterator();
         while (sit.next()) |e| {
@@ -2156,9 +2278,11 @@ test "Gossipsub init rejects zero max_outbox_entries" {
 test "publish returns PublishQueueFull when outbox is full" {
     const a = std.testing.allocator;
     const me = try identity.PeerId.random();
-    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .max_outbox_entries = 1 });
+    const peer = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .max_outbox_entries = 1, .mesh_n_low = 1, .mesh_n = 1 });
     defer g.deinit();
 
+    g.onPeerConnected(peer);
     try g.publish("t", "one");
     try std.testing.expectError(error.PublishQueueFull, g.publish("t", "two"));
 }
@@ -3679,4 +3803,104 @@ test "PX entry without envelope is rejected under strict policy" {
 
     try std.testing.expectEqual(@as(u64, 1), g.pxEnvelopeMissingRejectedCount());
     try std.testing.expectEqual(@as(usize, 0), g.dialSuggestionCount());
+}
+
+test "fanout publish targets mesh_n peers when unsubscribed (#200)" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const p1 = try identity.PeerId.random();
+    const p2 = try identity.PeerId.random();
+    const p3 = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 2, .mesh_n_high = 12 });
+    defer g.deinit();
+
+    g.onPeerConnected(p1);
+    g.onPeerConnected(p2);
+    g.onPeerConnected(p3);
+
+    try g.publish("attestation", "payload");
+
+    var targets: [3]bool = .{ false, false, false };
+    var deliveries: usize = 0;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        try std.testing.expect(d.to != null);
+        deliveries += 1;
+        const to = d.to.?;
+        if (to.eql(&p1)) targets[0] = true;
+        if (to.eql(&p2)) targets[1] = true;
+        if (to.eql(&p3)) targets[2] = true;
+    }
+    try std.testing.expectEqual(@as(usize, 2), deliveries);
+    var selected: usize = 0;
+    for (targets) |hit| {
+        if (hit) selected += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), selected);
+}
+
+test "fanout reuses peers on second publish before TTL (#200)" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const peer = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 12 });
+    defer g.deinit();
+    g.onPeerConnected(peer);
+
+    try g.publish("t", "one");
+    const d1 = g.popOutboxDelivery().?;
+    defer a.free(d1.wire);
+    try std.testing.expect(d1.to != null and d1.to.?.eql(&peer));
+
+    try g.publish("t", "two");
+    const d2 = g.popOutboxDelivery().?;
+    defer a.free(d2.wire);
+    try std.testing.expect(d2.to != null and d2.to.?.eql(&peer));
+}
+
+test "fanout entry pruned after TTL on heartbeat (#200)" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const peer = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .mesh_n_low = 1,
+        .mesh_n = 1,
+        .mesh_n_high = 12,
+        .fanout_ttl_ms = 1_000,
+    });
+    defer g.deinit();
+    g.setClockMs(0);
+    g.onPeerConnected(peer);
+
+    try g.publish("t", "one");
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+
+    g.onPeerDisconnected(peer);
+    g.setClockMs(2_000);
+    try g.heartbeat();
+
+    try g.publish("t", "two");
+    try std.testing.expectEqual(@as(?OutDelivery, null), g.popOutboxDelivery());
+}
+
+test "subscribe promotes fanout peers into mesh (#200)" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const peer = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 1, .mesh_n = 1, .mesh_n_high = 12 });
+    defer g.deinit();
+    g.onPeerConnected(peer);
+
+    try g.publish("t", "warm");
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+
+    try g.subscribe("t");
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+
+    try std.testing.expectEqual(@as(?usize, 1), g.meshPeerCountForTopic("t"));
 }

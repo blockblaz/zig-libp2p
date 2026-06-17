@@ -35,3 +35,7 @@ pub const prune_backoff_cap_ms: i64 = 15 * 60_000;
 /// Back-off after local `unsubscribe` before the same topic may be subscribed again
 /// (libp2p gossipsub v1.1 `UnsubscribeBackoff`, default 10 s).
 pub const unsubscribe_backoff_ms: i64 = 10_000;
+
+/// TTL for fanout peer sets on topics we publish to but do not subscribe to
+/// (libp2p gossipsub v1.1 `FANOUT_TTL`, default 60 s).
+pub const fanout_ttl_ms: i64 = 60_000;
