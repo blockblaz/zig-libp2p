@@ -880,6 +880,17 @@ pub const QuicRuntime = struct {
             log.warn("quic_runtime: gossip worker spawn failed ({s}); inbound gossip will run on the drive thread", .{@errorName(err)});
             break :blk null;
         };
+        // Block until the worker has claimed gossipsub ownership. Without this,
+        // start() can return while owner_tid is still 0, so an embedder
+        // subscribe/publish on the calling thread sees onOwnerThread()==true,
+        // mutates `subs`/`mesh` inline, and races the worker's heartbeat over
+        // the same maps → SIGSEGV (gossipsub interop crash). The worker claims
+        // ownership as its first action, so this wait is brief.
+        if (self.gossip_worker_thread != null) {
+            while (!self.host.gossipsub.ownerClaimed()) {
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        }
     }
 
     pub fn stop(self: *QuicRuntime) void {

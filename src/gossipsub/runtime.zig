@@ -452,7 +452,16 @@ pub const Gossipsub = struct {
     /// Claim the calling thread as the gossipsub owner.  Called once by the
     /// QuicRuntime gossip worker before it starts draining commands.
     pub fn claimOwnerThread(self: *Gossipsub) void {
-        self.owner_tid.store(std.Thread.getCurrentId(), .monotonic);
+        self.owner_tid.store(std.Thread.getCurrentId(), .release);
+    }
+
+    /// True once a worker thread has claimed ownership. The QuicRuntime blocks
+    /// in `start()` until this holds, so embedder `subscribe`/`publish` calls
+    /// made right after start() post commands to the owner instead of mutating
+    /// state inline (the `owner_tid == 0` window) and racing the worker's
+    /// heartbeat — the gossipsub interop SIGSEGV.
+    pub fn ownerClaimed(self: *const Gossipsub) bool {
+        return self.owner_tid.load(.acquire) != 0;
     }
 
     /// True when a mutator may run inline (we are the owner thread, or no owner
@@ -582,6 +591,10 @@ pub const Gossipsub = struct {
             self.allocator.free(e.data);
         }
         self.pull_fifo.deinit(self.allocator);
+        // `subs` owns the canonical topic keys; `mesh`/`remote_interest` share
+        // the same pointers, so free the keys here and only deinit those maps.
+        var skit = self.subs.keyIterator();
+        while (skit.next()) |k| self.allocator.free(k.*);
         self.subs.deinit();
         var mit = self.mesh.iterator();
         while (mit.next()) |e| {
@@ -1239,11 +1252,19 @@ pub const Gossipsub = struct {
         if (self.topic_unsubscribed_until.fetchRemove(topic)) |kv| {
             self.allocator.free(kv.key);
         }
-        try self.subs.put(topic, {});
-        errdefer _ = self.subs.fetchRemove(topic);
-        try self.promoteFanoutToMesh(topic);
-        try self.ensureTopicMesh(topic);
-        const w = try rpc.encodeSubscribe(self.allocator, topic, true);
+        // Own the topic key. `subs` is the canonical owner; `mesh` and
+        // `remote_interest` re-anchor on this same slice, and gossipsub frees it
+        // on unsubscribe + deinit. The caller's `topic` is NOT retained — the
+        // actor command path frees its copy immediately after this returns, so
+        // storing it directly dangled the map keys and crashed the heartbeat's
+        // `mesh.getPtr` hashing freed bytes (gossipsub interop SIGSEGV).
+        const owned = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(owned);
+        try self.promoteFanoutToMesh(owned);
+        try self.subs.put(owned, {});
+        errdefer _ = self.subs.fetchRemove(owned);
+        try self.ensureTopicMesh(owned);
+        const w = try rpc.encodeSubscribe(self.allocator, owned, true);
         errdefer self.allocator.free(w);
         try self.appendOut(w, null);
         self.syncMeshPeers();
@@ -1269,7 +1290,9 @@ pub const Gossipsub = struct {
         errdefer self.allocator.free(topic_owned);
         try self.topic_unsubscribed_until.put(topic_owned, expires_ms);
 
-        _ = self.subs.fetchRemove(topic);
+        // `subs` owns the canonical topic key; `mesh`/`remote_interest` anchor
+        // on the same slice. Remove from all three, then free the key once.
+        const owned_key: ?[]const u8 = if (self.subs.fetchRemove(topic)) |kv| kv.key else null;
         if (self.mesh.fetchRemove(topic)) |kv| {
             var tm = kv.value;
             tm.deinit();
@@ -1278,6 +1301,7 @@ pub const Gossipsub = struct {
             var tm = kv.value;
             tm.deinit();
         }
+        if (owned_key) |k| self.allocator.free(k);
         const w = try rpc.encodeSubscribe(self.allocator, topic, false);
         errdefer self.allocator.free(w);
         try self.appendOut(w, null);
@@ -2027,6 +2051,33 @@ pub const Gossipsub = struct {
         return self.outbox.orderedRemove(0);
     }
 };
+
+test "subscribe owns its topic key — caller may free the slice (interop SIGSEGV regression)" {
+    // The actor command path dupes the topic and frees that copy immediately
+    // after `subscribeInner` runs. If subscribeInner stored the caller's slice
+    // as the `subs`/`mesh` key, the next heartbeat's `mesh.getPtr(topic)` would
+    // hash freed bytes and crash (the zig↔zig gossipsub interop SIGSEGV).
+    // subscribeInner must dupe and own the key.
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    const topic = try a.dupe(u8, "/interop/b3");
+    try g.subscribe(topic);
+    // Free the caller's copy: gossipsub must hold its own owned key now.
+    a.free(topic);
+
+    // Heartbeat iterates `subs` and looks up `mesh` by the stored key — UAF on
+    // the freed slice before the fix; safe now.
+    try g.heartbeatInner();
+    try std.testing.expect(g.subs.contains("/interop/b3"));
+
+    // Unsubscribe must free the owned key exactly once (testing allocator
+    // would flag a leak or double-free otherwise).
+    try g.unsubscribe("/interop/b3");
+    try std.testing.expect(!g.subs.contains("/interop/b3"));
+}
 
 test "gossipsub subscribe, graft mesh, dedup, forward" {
     const a = std.testing.allocator;
