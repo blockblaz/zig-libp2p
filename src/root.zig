@@ -138,6 +138,7 @@ test {
     _ = @import("transport/quic_dcutr_live.zig");
     _ = @import("relay/scenario.zig");
     _ = @import("identify.zig");
+    _ = @import("identify_advertisement.zig");
     _ = @import("autonat/root.zig");
     _ = @import("connection_manager.zig");
     _ = @import("metrics.zig");

@@ -142,6 +142,8 @@ pub const Event = union(enum) {
         conn_id: u64,
         reason: TrimReason,
     },
+    /// Open `/ipfs/id/push/1.0.0` to `peer` with [`host.Host.identifyReplyParams`] (#202).
+    identify_push_peer: identity.PeerId,
     log: struct {
         level: LogLevel,
         message: []const u8,
@@ -169,6 +171,7 @@ pub const Event = union(enum) {
             .peer_disconnected,
             .peer_connection_failed,
             .connection_trim_recommended,
+            .identify_push_peer,
             .swarm_closed,
             => {},
         }
