@@ -2,7 +2,7 @@
 
 Proposal for reorganizing the repo into a more meaningful structure. Intended as an incremental plan, not a big-bang rename.
 
-**Status:** phases 0–2 implemented; phases 3–5 pending  
+**Status:** phases 0–5 implemented  
 **Audience:** maintainers and contributors
 
 ---
@@ -23,13 +23,16 @@ The **public API** (`@import("zig_libp2p")`) via `root.zig` works well for consu
 
 ---
 
-## Implemented (phases 0–2)
+## Implemented (phases 0–5)
 
 | Phase | Done |
 |-------|------|
 | **0** | `harness/tcp/` + `harness/quic/`, `fixtures/`, `harness/README.md`, CI + `build.zig` path updates |
 | **1** | `src/protocols/` — autonat, kad_dht, relay, dcutr, gossipsub, req_resp, discovery, identify, ping, gossip |
 | **2** | `src/core/`, `src/primitives/`, `src/internal/`; compatibility shims at legacy `src/` paths |
+| **3** | `transport/quic/` — split `quic_runtime.zig` into `config.zig`, `conn_table.zig`, `runtime.zig`; QUIC sources under `transport/quic/` with legacy shims at `transport/quic_*.zig` |
+| **4** | `build/deps.zig`, `examples.zig`, `fuzz.zig`, `soak.zig`, `interop.zig`; `zig build soak-test` step ([#235](https://github.com/blockblaz/zig-libp2p/issues/235)) |
+| **5** | `vendor/zquic_{tls,rsa}` at repo root (outside `src/`); `src/vendor/zquic_tls/root.zig` shim; RSA test fixture at `src/testdata/zquic_rsa/` for `@embedFile` |
 
 See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for the layer diagram.
 
@@ -47,7 +50,7 @@ Not “everything QUIC-related in one folder.”
 
 ---
 
-## Current `src/` layout (after phases 0–2)
+## Current `src/` layout (after phases 0–5)
 
 ```
 src/
@@ -83,44 +86,50 @@ src/
 │   ├── dcutr/
 │   └── discovery/           # mDNS, (rendezvous when merged)
 │
-├── transport/               # Transports + muxers (quic_runtime split pending)
+├── transport/
+│   ├── quic/                # QUIC stack (config, conn_table, runtime, endpoint, …)
+│   ├── quic_*.zig             # legacy shims → transport/quic/*
+│   ├── tcp.zig, ws.zig, …
+│   └── yamux/, mplex/
+│
 ├── security/
 ├── internal/                  # wire_boundaries.zig
-├── vendor/
+├── testdata/                  # @embedFile fixtures (e.g. zquic_rsa RSA key)
+├── vendor/zquic_tls/          # shim only; canonical tree at repo-root vendor/
 ├── root.zig                   # Public facade + legacy shims at src/*.zig
-└── *.zig shims                # pub usingnamespace → canonical paths
+└── *.zig shims                # explicit pub const re-exports (Zig 0.16)
 ```
 
 ---
 
-## Proposed repo root (non-`src/`)
+## Repo root (non-`src/`)
 
 ```
 zig-libp2p/
 ├── src/
+├── vendor/                    # zquic_tls, zquic_rsa (outside src/ — avoids duplicate module paths)
 ├── examples/
-├── harness/                   # ✅ merged interop + interop_quic
+├── harness/                   # merged interop + interop_quic
 │   ├── quic/
 │   ├── tcp/
 │   └── README.md
-├── fixtures/                  # ✅ was test/fixtures
+├── fixtures/                  # was test/fixtures
 ├── docs/
 ├── bench/
-├── build/                     # pending phase 4
+├── build/                     # deps, examples, fuzz, soak, interop helpers
+│   ├── deps.zig
+│   ├── examples.zig
+│   ├── fuzz.zig
+│   ├── soak.zig
+│   └── interop.zig
 └── build.zig
 ```
 
 ---
 
-## Remaining work
+## Phase summary
 
-| Phase | Scope | Status |
-|-------|--------|--------|
-| **3** | Split `quic_runtime.zig` into `transport/quic/` | pending |
-| **4** | `build/` split + `soak-test` step ([#235](https://github.com/blockblaz/zig-libp2p/issues/235)) | pending |
-| **5** | `vendor/` to repo root; nested public API polish before 1.0 | pending |
-
-Each phase: **no behavior change**; `zig build test` + interop matrix green.
+All phases complete. Each phase was **no behavior change**; `zig build test` + interop matrix green.
 
 ---
 

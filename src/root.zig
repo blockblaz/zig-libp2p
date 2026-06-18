@@ -69,12 +69,12 @@ pub const req_resp = struct {
 };
 
 pub const transport = struct {
-    pub const quic_v1 = @import("transport/quic_v1.zig");
-    pub const quic = @import("transport/quic.zig");
-    pub const quic_raw_stream_io = @import("transport/quic_raw_stream_io.zig");
-    pub const quic_endpoint = @import("transport/quic_endpoint.zig");
-    pub const quic_peer_identity = @import("transport/quic_peer_identity.zig");
-    pub const quic_runtime = @import("transport/quic_runtime.zig");
+    pub const quic_v1 = @import("transport/quic/v1.zig");
+    pub const quic = @import("transport/quic/quic.zig");
+    pub const quic_raw_stream_io = @import("transport/quic/raw_stream_io.zig");
+    pub const quic_endpoint = @import("transport/quic/endpoint.zig");
+    pub const quic_peer_identity = @import("transport/quic/peer_identity.zig");
+    pub const quic_runtime = @import("transport/quic/runtime.zig");
     pub const stream_multistream = @import("transport/stream_multistream.zig");
     pub const tcp = @import("transport/tcp.zig");
     pub const tcp_tls = @import("transport/tcp_tls.zig");
@@ -87,8 +87,8 @@ pub const transport = struct {
     pub const mplex = @import("transport/mplex/root.zig");
     pub const circuit_transport = @import("transport/circuit_transport.zig");
     pub const dcutr_punch = @import("transport/dcutr_punch.zig");
-    pub const quic_relay_live = @import("transport/quic_relay_live.zig");
-    pub const quic_dcutr_live = @import("transport/quic_dcutr_live.zig");
+    pub const quic_relay_live = @import("transport/quic/relay_live.zig");
+    pub const quic_dcutr_live = @import("transport/quic/dcutr_live.zig");
 };
 
 pub const security = struct {
@@ -193,8 +193,8 @@ test {
     _ = @import("dcutr/root.zig");
     _ = @import("transport/circuit_transport.zig");
     _ = @import("transport/dcutr_punch.zig");
-    _ = @import("transport/quic_relay_live.zig");
-    _ = @import("transport/quic_dcutr_live.zig");
+    _ = @import("transport/quic/relay_live.zig");
+    _ = @import("transport/quic/dcutr_live.zig");
     _ = @import("relay/scenario.zig");
     _ = @import("identify.zig");
     _ = @import("identify_advertisement.zig");
@@ -227,11 +227,11 @@ test {
     _ = @import("transport/tcp_tls.zig");
     _ = @import("transport/over_cap.zig");
     _ = @import("transport/multistream_negotiate.zig");
-    _ = @import("transport/quic.zig");
+    _ = @import("transport/quic/quic.zig");
     _ = @import("transport/quic_peer_identity.zig");
-    _ = @import("transport/quic_raw_stream_io.zig");
-    _ = @import("transport/quic_runtime.zig");
-    _ = @import("transport/quic_v1.zig");
+    _ = @import("transport/quic/raw_stream_io.zig");
+    _ = @import("transport/quic/runtime.zig");
+    _ = @import("transport/quic/v1.zig");
     _ = @import("transport/stream_multistream.zig");
     _ = @import("transport/transport_error.zig");
     _ = @import("transport/zquic_feed_addr.zig");

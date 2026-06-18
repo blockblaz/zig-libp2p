@@ -1,117 +1,31 @@
 const std = @import("std");
 
-const examples: []const struct {
-    exe_name: []const u8,
-    root: []const u8,
-} = &.{
-    .{ .exe_name = "example-varint", .root = "examples/varint.zig" },
-    .{ .exe_name = "example-addr-list-csv", .root = "examples/addr_list_csv.zig" },
-    .{ .exe_name = "example-multistream-negotiate", .root = "examples/multistream_negotiate.zig" },
-    .{ .exe_name = "example-gossipsub-mesh", .root = "examples/gossipsub_mesh.zig" },
-    .{ .exe_name = "example-ping-membuf", .root = "examples/ping_membuf.zig" },
-    .{ .exe_name = "example-autonat-membuf", .root = "examples/autonat_membuf.zig" },
-    .{ .exe_name = "example-kad-dht-membuf", .root = "examples/kad_dht_membuf.zig" },
-    .{ .exe_name = "example-relay-membuf", .root = "examples/relay_membuf.zig" },
-    .{ .exe_name = "example-dcutr-membuf", .root = "examples/dcutr_membuf.zig" },
-    .{ .exe_name = "example-swarm-tick", .root = "examples/swarm_tick.zig" },
-    .{ .exe_name = "example-req-resp-tcp-status", .root = "examples/req_resp_tcp_status.zig" },
-    .{ .exe_name = "example-quic-ping-loopback", .root = "examples/quic_ping_loopback.zig" },
-    .{ .exe_name = "example-host-quic-node", .root = "examples/host_quic_node.zig" },
-    .{ .exe_name = "interop-quic-node", .root = "examples/interop_quic_node.zig" },
-    .{ .exe_name = "gen-libp2p-cert", .root = "examples/gen_libp2p_cert.zig" },
-};
+const deps_mod = @import("build/deps.zig");
+const examples_mod = @import("build/examples.zig");
+const fuzz_mod = @import("build/fuzz.zig");
+const soak_mod = @import("build/soak.zig");
+const interop_mod = @import("build/interop.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const multiaddr_dep = b.dependency("multiaddr", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const snappyz = b.dependency("zig_snappy", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("snappyz");
-
-    const snappyframesz = b.dependency("snappyframesz", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("snappyframesz.zig");
-
-    const peer_id_mod = b.dependency("peer_id", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("peer-id");
-
-    const zquic_mod = b.dependency("zquic", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("zquic");
-    // Vendored copy of zquic's pure-Zig RSA (PKCS#1 v1.5) to avoid Zig 0.16
-    // compiling the same `vendor/tls/...` paths in both `zquic` and a second module.
-    const zquic_rsa_mod = b.createModule(.{
-        .root_source_file = b.path("src/vendor/zquic_rsa/rsa.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const zig_varint_mod = b.dependency("zig_varint", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("zig_varint");
-
-    // zquic's public module does not export stream TLS `nonblock` handshake types (#86).
-    const zquic_tls_mod = b.createModule(.{
-        .root_source_file = b.path("src/vendor/zquic_tls/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-
-    const mod = b.addModule("zig_libp2p", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        // `transport/quic_runtime.zig` (and its loopback test) reaches into
-        // `std.c` for file I/O — implicit on macOS, must be explicit on
-        // Linux. Setting on the module so the same flag applies to both
-        // `addTest` and any downstream consumer that pulls
-        // `transport.quic_runtime` in.
-        .link_libc = true,
-    });
-    mod.addImport("multiaddr", multiaddr_dep.module("multiaddr"));
-    mod.addImport("snappyz", snappyz);
-    mod.addImport("snappyframesz", snappyframesz);
-    mod.addImport("peer_id", peer_id_mod);
-    mod.addImport("zquic", zquic_mod);
-    mod.addImport("zquic_rsa", zquic_rsa_mod);
-    mod.addImport("zquic_tls", zquic_tls_mod);
-    mod.addImport("zig_varint", zig_varint_mod);
+    const d = deps_mod.createDeps(b, target, optimize);
 
     const unit_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = d.mod,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    const wire_fuzz_tests = b.addTest(.{
-        .name = "wire-fuzz",
-        .root_module = mod,
-        .filters = &.{"wire fuzz"},
-    });
-    const run_wire_fuzz = b.addRunArtifact(wire_fuzz_tests);
-    const fuzz_step = b.step("fuzz", "Run `wire fuzz …` tests (std.testing.fuzz smoke); long libFuzzer runs: zig build test --fuzz (#44)");
-    fuzz_step.dependOn(&run_wire_fuzz.step);
+    _ = fuzz_mod.addFuzzStep(b, d.mod);
+    _ = soak_mod.addSoakStep(b, d.mod);
 
-    // Microbenchmark binary (#19). Tiny, deterministic, grep-friendly output;
-    // CI builds it under the test step so a compile regression is caught.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_mod.addImport("zig_libp2p", mod);
+    bench_mod.addImport("zig_libp2p", d.mod);
     const bench_exe = b.addExecutable(.{
         .name = "zig-libp2p-bench",
         .root_module = bench_mod,
@@ -124,83 +38,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run library unit tests, smoke-run most examples, compile TCP status example");
     test_step.dependOn(&run_unit_tests.step);
 
-    const examples_step = b.step("examples", "Build example programs (installed to prefix/bin)");
-
-    // Run example smoke tests one after another. Parallel runs were observed to hang
-    // indefinitely (likely Io.Threaded + TCP accept/dial ordering under load).
-    //
-    // The TCP status binary is only compiled under `zig build test`, not executed: the
-    // same Io.Threaded + accept/dial pattern can stall CI on Linux as well as locally on Darwin.
-    var prev_example_run: ?*std.Build.Step = null;
-
-    for (examples) |ex| {
-        const ex_mod = b.createModule(.{
-            .root_source_file = b.path(ex.root),
-            .target = target,
-            .optimize = optimize,
-        });
-        ex_mod.addImport("zig_libp2p", mod);
-        // interop-quic-node needs multiaddr + zquic directly: it builds the
-        // dial multiaddr itself and references zquic's ConnState type for
-        // the QuicListener inbound-stream lifecycle hook.
-        if (std.mem.eql(u8, ex.exe_name, "interop-quic-node")) {
-            ex_mod.addImport("multiaddr", multiaddr_dep.module("multiaddr"));
-            ex_mod.addImport("zquic", zquic_mod);
-        }
-
-        const exe = b.addExecutable(.{
-            .name = ex.exe_name,
-            .root_module = ex_mod,
-        });
-        const install_ex = b.addInstallArtifact(exe, .{});
-        b.getInstallStep().dependOn(&install_ex.step);
-        examples_step.dependOn(&install_ex.step);
-
-        exe.step.dependOn(&run_unit_tests.step);
-        if (prev_example_run) |prev| exe.step.dependOn(prev);
-
-        const smoke_run = !std.mem.eql(u8, ex.exe_name, "example-req-resp-tcp-status") and
-            !std.mem.eql(u8, ex.exe_name, "interop-quic-node") and
-            !std.mem.eql(u8, ex.exe_name, "gen-libp2p-cert");
-        if (smoke_run) {
-            const run_ex = b.addRunArtifact(exe);
-            run_ex.step.dependOn(&exe.step);
-            if (prev_example_run) |prev| run_ex.step.dependOn(prev);
-            prev_example_run = &run_ex.step;
-            test_step.dependOn(&run_ex.step);
-        } else {
-            test_step.dependOn(&exe.step);
-            prev_example_run = &exe.step;
-        }
-    }
-
-    const interop_mod = b.createModule(.{
-        .root_source_file = b.path("harness/tcp/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    interop_mod.addImport("zig_libp2p", mod);
-    interop_mod.addImport("multiaddr", multiaddr_dep.module("multiaddr"));
-
-    const interop_exe = b.addExecutable(.{
-        .name = "transport-interop",
-        .root_module = interop_mod,
-    });
-    const install_interop = b.addInstallArtifact(interop_exe, .{});
-    const interop_step = b.step("interop", "Build unified-testing transport interop binary");
-    interop_step.dependOn(&install_interop.step);
-
-    const interop_matrix_cmd = b.addSystemCommand(&.{
-        "bash",
-        "harness/quic/run_matrix.sh",
-        "zig,go-libp2p",
-        "handshake,ping",
-    });
-    interop_matrix_cmd.step.dependOn(b.getInstallStep());
-    const interop_matrix_step = b.step(
-        "interop-matrix",
-        "Run QUIC cross-impl matrix (requires interop-quic-node-go under harness/quic/impls/go-libp2p/)",
-    );
-    interop_matrix_step.dependOn(&interop_matrix_cmd.step);
+    _ = examples_mod.addExamples(b, d, target, optimize, test_step, &run_unit_tests.step);
+    _ = interop_mod.addInteropSteps(b, d, target, optimize);
 }

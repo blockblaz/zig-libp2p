@@ -1,0 +1,426 @@
+//! Per-connection QUIC runtime tables and stream state.
+
+const std = @import("std");
+
+const identity = @import("../../primitives/identity.zig");
+const protocol_mod = @import("../../primitives/protocol.zig");
+const connection_manager_mod = @import("../../core/connection_manager.zig");
+const quic_endpoint = @import("endpoint.zig");
+const quic_raw_stream_io = @import("raw_stream_io.zig");
+const zquic = @import("zquic");
+const ZIo = zquic.transport.io;
+
+pub const PeerIdContext = struct {
+    pub fn hash(_: PeerIdContext, key: identity.PeerId) u64 {
+        var buf: [128]u8 = undefined;
+        const b = key.toBytes(&buf) catch return 0;
+        return std.hash.Wyhash.hash(0, b);
+    }
+    pub fn eql(_: PeerIdContext, a: identity.PeerId, b: identity.PeerId) bool {
+        return a.eql(&b);
+    }
+};
+
+pub const PeerIdMap = std.HashMap(identity.PeerId, *OutboundConn, PeerIdContext, std.hash_map.default_max_load_percentage);
+pub const InboundPeerMap = std.HashMap(identity.PeerId, InboundConnRef, PeerIdContext, std.hash_map.default_max_load_percentage);
+pub const PersistentGossipMap = std.HashMap(identity.PeerId, *PersistentGossipStream, PeerIdContext, std.hash_map.default_max_load_percentage);
+pub const RelayedConnIdMap = std.HashMap(identity.PeerId, connection_manager_mod.ConnectionId, PeerIdContext, std.hash_map.default_max_load_percentage);
+
+pub const InboundConnRef = struct {
+    slot: usize,
+    conn: *ZIo.ConnState,
+};
+
+/// Tracked outbound connection: one QUIC connection per (remote peer).
+pub const OutboundConn = struct {
+    outbound: quic_endpoint.QuicOutbound,
+    /// Whether [`host_mod.Host.onConnectionEstablished`] has fired for this slot.
+    notified: bool = false,
+    conn_id: connection_manager_mod.ConnectionId,
+    peer_id: ?identity.PeerId = null,
+    /// Last observed *effective* connection state, sampled at the end of every
+    /// [`QuicRuntime.driveLoop`] iteration by [`detectOutboundConnectionClose`].
+    /// `notified == true && prev_closed == false && current_closed == true` is how we
+    /// detect that the remote QUIC peer sent `CONNECTION_CLOSE` (or that we hit a
+    /// transport idle-timeout).
+    ///
+    /// `current_closed` is true when either `conn.phase == .closed` **or**
+    /// `conn.draining` — zquic sets `draining = true` on every CONNECTION_CLOSE
+    /// receipt and only later (after the 3×PTO draining deadline) reaps the
+    /// connection; if we wait for `.closed` we miss the disconnect entirely on the
+    /// client (outbound) side. Without this signal `outbound_by_peer` retains a
+    /// dead entry, the host never sees `onConnectionClosed`, and
+    /// `connection_manager` never schedules a redial. Mirrors the listener-side
+    /// [`QuicListener.syncSeenFlags`] sweep.
+    prev_closed: bool = false,
+    /// Tracks which server-initiated bidi stream IDs on this outbound QUIC connection have
+    /// already been surfaced as inbound streams. Server-initiated bidi streams (IDs 1, 5, 9…)
+    /// are opened by the remote peer on the connection zeam dialled; without this tracking they
+    /// would be silently ignored because only the listener's lifecycle callback detects new
+    /// inbound streams. See [`QuicRuntime.dispatchOutboundPeerStreams`].
+    peer_stream_reported: std.bit_set.StaticBitSet(quic_endpoint.max_tracked_peer_bidi_streams) =
+        std.bit_set.StaticBitSet(quic_endpoint.max_tracked_peer_bidi_streams).initEmpty(),
+};
+
+/// Per-inbound-stream state: tracks where in the per-protocol read flow we are.
+pub const InboundStream = struct {
+    /// Listener connection slot index. Set to `inbound_slot_none` for streams that arrived on
+    /// an outbound (client-side) QUIC connection: those connections are already fully
+    /// established so the normal connection-notification path must be skipped.
+    slot: usize,
+    conn: *ZIo.ConnState,
+    stream_id: u64,
+    raw: quic_raw_stream_io.RawAppBidiServer,
+    handshake_done: bool = false,
+    protocol_index: ?usize = null,
+    /// channel_id once we've called `host.registerInboundReqRespChannel`.
+    channel_id: ?u64 = null,
+    request_id_for_channel: u64 = 0,
+    /// Set after the responder half-closes (FIN) following `finishResponseStream`.
+    /// The zquic raw-app slot is released once this is true and the peer FINs.
+    response_fin_sent: bool = false,
+    sender_peer: ?identity.PeerId = null,
+    /// Pre-verified peer identity for streams on outbound connections. When non-null the TLS
+    /// verification step during multistream negotiation is skipped — the peer was already
+    /// authenticated when the outbound connection was established.
+    known_peer_id: ?identity.PeerId = null,
+    /// Accumulated bytes for an in-progress unary request. Cleared once a
+    /// complete request is parsed and the inbound channel registered.
+    req_acc: std.ArrayList(u8) = .empty,
+    /// Accumulated bytes for in-progress gossipsub frames on a `/meshsub/1.1.0`
+    /// stream. Each frame is `uvarint(len) + RPC protobuf` and the stream MAY
+    /// carry multiple frames. Bytes are consumed as full frames are decoded.
+    gossip_acc: std.ArrayList(u8) = .empty,
+    /// Accumulated bytes for one circuit-relay hop/stop length-prefixed frame.
+    relay_acc: std.ArrayList(u8) = .empty,
+    /// When true, hop/stop/dcutr control frame was handled; stream may bridge.
+    relay_control_done: bool = false,
+    /// Cumulative bytes pulled from the raw recv buffer for multistream-select;
+    /// persisted across drive ticks so a partial negotiation (DialFailed) does
+    /// not lose bytes the responder helper already consumed.
+    ms_acc: std.ArrayList(u8) = .empty,
+    /// Bytes left over after multistream-select succeeded (e.g. ping payload
+    /// flushed in the same STREAM frame as the handshake ack).
+    ms_tail: std.ArrayList(u8) = .empty,
+};
+
+pub const OutboundRequest = struct {
+    /// The peer this request is destined for.
+    peer: identity.PeerId,
+    request_id: u64,
+    proto: protocol_mod.LeanSupportedProtocol,
+    stream_id: u64,
+    raw: quic_raw_stream_io.RawAppBidiClient,
+    handshake_sent: bool = false,
+    handshake_done: bool = false,
+    request_written: bool = false,
+    finished: bool = false,
+    /// SSZ payload to send (heap-owned).
+    payload: []u8,
+    /// Accumulated response bytes (for incremental decode).
+    resp_acc: std.ArrayList(u8) = .empty,
+};
+
+/// Multistream I/O for a locally opened `/meshsub/1.1.0` publish stream.
+pub const PublishBidiStream = union(enum) {
+    outbound: quic_raw_stream_io.RawAppBidiClient,
+    inbound: quic_raw_stream_io.RawAppBidiServer,
+
+    pub fn reader(self: *PublishBidiStream) std.Io.Reader {
+        return switch (self.*) {
+            .outbound => |*c| c.reader(),
+            .inbound => |*s| s.reader(),
+        };
+    }
+
+    pub fn writer(self: *PublishBidiStream) std.Io.Writer {
+        return switch (self.*) {
+            .outbound => |*c| c.writer(),
+            .inbound => |*s| s.writer(),
+        };
+    }
+
+    pub fn unreadRecvLen(self: *const PublishBidiStream) usize {
+        return switch (self.*) {
+            .outbound => |*c| c.unreadRecvLen(),
+            .inbound => |*s| s.unreadRecvLen(),
+        };
+    }
+
+    pub fn finStream(self: *PublishBidiStream) void {
+        switch (self.*) {
+            .outbound => |*c| _ = c.client.sendRawStreamData(c.stream_id, c.send_offset, &[_]u8{}, true),
+            .inbound => |*s| {
+                if (s.client) |c| {
+                    _ = c.sendRawStreamData(s.stream_id, s.send_offset, &[_]u8{}, true);
+                } else {
+                    _ = s.server.sendRawStreamData(s.conn, s.stream_id, s.send_offset, &[_]u8{}, true);
+                }
+            },
+        }
+    }
+
+    /// Single-shot raw-stream send that returns the number of bytes zquic
+    /// accepted (queued for transmission).  A return value of `0` means
+    /// **transient backpressure** — the zquic per-stream pending queue is at
+    /// its cap and the caller must hold the unsent bytes and retry on a
+    /// later tick.  This is the equivalent of `Poll::Pending` from quinn's
+    /// `SendStream::poll_write` (rust-libp2p treats it the same way and
+    /// suspends the writer task without dropping the stream).
+    ///
+    /// `send_offset` is advanced by the accepted byte count so the next call
+    /// continues at the right STREAM frame offset; partial sends never
+    /// re-emit accepted bytes.
+    pub fn sendChunk(self: *PublishBidiStream, chunk: []const u8, fin: bool) usize {
+        return switch (self.*) {
+            .outbound => |*c| blk: {
+                const accepted = c.client.sendRawStreamData(c.stream_id, c.send_offset, chunk, fin);
+                c.send_offset += @intCast(accepted);
+                break :blk accepted;
+            },
+            .inbound => |*s| blk: {
+                if (s.client) |c| {
+                    const accepted = c.sendRawStreamData(s.stream_id, s.send_offset, chunk, fin);
+                    s.send_offset += @intCast(accepted);
+                    break :blk accepted;
+                }
+                const accepted = s.server.sendRawStreamData(s.conn, s.stream_id, s.send_offset, chunk, fin);
+                s.send_offset += @intCast(accepted);
+                break :blk accepted;
+            },
+        };
+    }
+};
+
+/// In-flight gossipsub publish on a `/meshsub/1.1.0` stream. One per peer per
+/// message (`per-message stream` pattern — open, multistream-select, write one
+/// length-prefixed RPC frame, close).
+pub const OutboundPublish = struct {
+    peer: identity.PeerId,
+    stream_id: u64,
+    raw: PublishBidiStream,
+    handshake_sent: bool = false,
+    handshake_done: bool = false,
+    frame_written: bool = false,
+    finished: bool = false,
+    /// `uvarint(len) + RPC protobuf` wire bytes (heap-owned).
+    wire: []u8,
+};
+
+/// One-shot outbound `/ipfs/id/push/1.0.0` stream (#202 QUIC wiring).
+pub const OutboundIdentifyPush = struct {
+    peer: identity.PeerId,
+    stream_id: u64,
+    raw: PublishBidiStream,
+    handshake_sent: bool = false,
+    handshake_done: bool = false,
+    wire_written: bool = false,
+    finished: bool = false,
+    wire: []u8,
+};
+
+/// One-shot outbound `/libp2p/autonat/1.0.0` probe stream (#206).
+pub const OutboundAutonatProbe = struct {
+    peer: identity.PeerId,
+    stream_id: u64,
+    raw: PublishBidiStream,
+    handshake_sent: bool = false,
+    handshake_done: bool = false,
+    probe_written: bool = false,
+    response_done: bool = false,
+    finished: bool = false,
+    probe_wire: []u8,
+};
+
+/// Persistent per-peer outbound `/meshsub/1.1.0` stream — exactly one stream
+/// per peer for the connection's lifetime. All gossipsub RPCs (SUBSCRIBE,
+/// GRAFT, PRUNE, IHAVE, IWANT, **publish**) multiplex onto this stream
+/// back-to-back without FIN.
+///
+/// **Why only one stream:** rust-libp2p's gossipsub handler caps inbound
+/// substreams per connection at `MAX_SUBSTREAM_ATTEMPTS = 1`
+/// (`MaxInboundSubstreams` in `GossipsubHandlerError`). Opening a second
+/// `/meshsub` stream — whether for a publish (per-message-stream pattern) or
+/// to retry after a wedge — trips that limit, the rust handler is disabled,
+/// and **all** gossip on that connection dies permanently.
+///
+/// Consequently this code never:
+///   * opens a per-message publish stream (publishes ride this stream too);
+///   * recreates the stream after a wedge (a wedge means the peer's gossip
+///     handler is broken — opening a new stream cannot fix it).
+///
+/// On wedge: the stream is marked `broken`, outbox is dropped, and the
+/// underlying QUIC connection is closed locally so `connection_manager`
+/// redials and `ensurePersistentGossipStream` opens a fresh stream.
+///
+/// Wedge is declared by any of:
+///   * `markPersistentGossipBroken` on a handshake or keepalive write/flush
+///     failure (synchronous error from the writer).
+///   * `outbox_stuck_since_ms` in [`advancePersistentGossipStreams`] exceeding
+///     [`persistent_gossip_outbox_stuck_timeout_ms`] (proactive trigger fires
+///     before zquic's 60 s no-ACK conn-lost timer so libp2p drives recovery
+///     on its own clock rather than waiting for the transport to give up —
+///     a single 20 s wedge per peer used to drop 30+ slots of gossip,
+///     starving the FFG supermajority and stalling finalization).
+pub const PersistentGossipStream = struct {
+    peer: identity.PeerId,
+    stream_id: u64,
+    raw: PublishBidiStream,
+    handshake_sent: bool = false,
+    handshake_done: bool = false,
+    /// True once the peer's `/multistream/1.0.0` header has been consumed by
+    /// [`stream_multistream.initiatorMeshsubFallbackStep`]. The header is read
+    /// once; subsequent ticks read only protocol-ack tokens.
+    ms_header_done: bool = false,
+    /// Index into [`meshsub_offer_fallbacks`] of the `/meshsub` version we are
+    /// currently offering. Advances each time the responder answers `na`, so a
+    /// peer that doesn't support the newest version negotiates down instead of
+    /// tearing the connection down (lantern / go-libp2p interop).
+    offer_idx: usize = 0,
+    /// Set when the multistream-select handshake or a frame write fails.
+    /// Once broken, the stream is never revived for the remainder of the
+    /// underlying QUIC connection's lifetime; new outbox enqueues are dropped
+    /// and the drain loop skips this entry.
+    broken: bool = false,
+    /// Queue of `uvarint(len) + RPC protobuf` frames waiting to be flushed
+    /// once the multistream-select handshake completes. Bytes are heap-owned;
+    /// drained in FIFO order. Capped at [`persistent_gossip_outbox_cap`] so a
+    /// peer that never reads cannot make us hold unbounded memory before the
+    /// QUIC keepalive notices and tears down the connection.
+    outbox: std.ArrayList([]u8) = .empty,
+    /// Wall-clock time of the most recent successful flush on this stream.
+    /// Used by [`maybeSendPersistentGossipKeepalive`] to emit an empty-control
+    /// RPC every [`persistent_gossip_keepalive_interval_ms`] when the stream
+    /// is otherwise idle. Without this, rust-libp2p's gossipsub handler
+    /// receives no application-layer traffic on stable-mesh topics and the
+    /// connection is torn down with an error close once its idle timer
+    /// fires — independent of QUIC-layer keepalive PINGs which only refresh
+    /// the transport idle timer, not the libp2p handler's keep-alive.
+    /// Seeded at handshake completion so the first keepalive fires one full
+    /// interval later, not immediately on connect.
+    last_write_ms: i64 = 0,
+    /// Wall-clock time of the first drain tick where `sendChunk` returned 0
+    /// (transient backpressure from zquic's full per-stream pending queue)
+    /// without having accepted any bytes in the current tick. Cleared back
+    /// to `null` on any drain tick that accepts > 0 bytes.
+    ///
+    /// When this stays non-null for at least
+    /// [`persistent_gossip_outbox_stuck_timeout_ms`], the stream is marked
+    /// broken (see [`markPersistentGossipBroken`]), which tears down the
+    /// underlying QUIC connection and lets `connection_manager` redial. The
+    /// alternative — waiting for zquic's 60 s no-ACK conn-lost timeout — left
+    /// gossip silent for a full minute per wedge, dropped every block from
+    /// the affected peer during that window, and was the direct cause of
+    /// asymmetric attestation aggregation (zeam aggregator seeing only 2/3
+    /// instead of 3/3 of validators, blocking FFG supermajority and stalling
+    /// finalization).
+    outbox_stuck_since_ms: ?i64 = null,
+};
+
+/// Hard cap on queued outbox frames per peer before the persistent gossip
+/// stream is marked broken. Picked to accommodate ~30 seconds of gossip on a
+/// healthy mainnet topic without unbounded growth on a wedged peer.
+pub const persistent_gossip_outbox_cap: usize = 1024;
+
+/// Interval at which an empty-control gossipsub RPC is pushed onto an
+/// otherwise-idle persistent `/meshsub` stream. The frame is a no-op at the
+/// gossipsub layer (one `ControlMessage` field with all sub-fields absent)
+/// but generates real wire traffic, which is what rust-libp2p's connection
+/// handler needs to keep the connection alive on a stable mesh topic.
+///
+/// 20s is comfortably under rust-libp2p's default `idle_timeout` for both
+/// gossipsub (60s) and the underlying `libp2p-quic` (30s effective) so we
+/// always refresh both timers with at least 10s of slack before they fire.
+pub const persistent_gossip_keepalive_interval_ms: i64 = 20_000;
+
+/// Maximum time the persistent gossip outbox is allowed to be fully stuck
+/// (every drain tick returns 0 accepted bytes from zquic) before we declare
+/// the stream wedged and trigger recovery via [`markPersistentGossipBroken`].
+///
+/// Picked to fire strictly *before* zquic's 60 s no-ACK conn-lost timeout so
+/// libp2p drives recovery on its own clock instead of waiting for the
+/// transport to give up. 20 s is also long enough to ride out brief cwnd
+/// collapses without bouncing healthy connections — a 20 s outbox stall in
+/// steady state implies the peer has stopped reading the stream, which is
+/// terminal for a `/meshsub/1.1.0` stream that rust-libp2p caps at one
+/// substream per connection (see [`PersistentGossipStream`] doc).
+pub const persistent_gossip_outbox_stuck_timeout_ms: i64 = 20_000;
+
+/// A queued command from the swarm hook to the drive thread.
+pub const HookWork = union(enum) {
+    dial: struct {
+        addr: []u8,
+        expected_peer: ?identity.PeerId,
+    },
+    send_request: struct {
+        peer: identity.PeerId,
+        proto: protocol_mod.LeanSupportedProtocol,
+        request_id: u64,
+        payload: []u8,
+    },
+    send_response_chunk: struct {
+        peer: identity.PeerId,
+        request_id: u64,
+        chunk: []u8,
+    },
+    send_end_of_stream: struct {
+        peer: identity.PeerId,
+        request_id: u64,
+    },
+    send_error_response: struct {
+        peer: identity.PeerId,
+        request_id: u64,
+    },
+    publish: struct {
+        topic: []u8,
+        payload: []u8,
+    },
+    /// gossipsub SUBSCRIBE — broadcast to every connected peer on its
+    /// persistent `/meshsub/1.1.0` stream (#183).
+    subscribe: struct {
+        topic: []u8,
+    },
+};
+
+pub fn freeHookWork(a: std.mem.Allocator, w: HookWork) void {
+    switch (w) {
+        .dial => |d| a.free(d.addr),
+        .send_request => |r| a.free(r.payload),
+        .send_response_chunk => |r| a.free(r.chunk),
+        .publish => |p| {
+            a.free(p.topic);
+            a.free(p.payload);
+        },
+        .subscribe => |s| a.free(s.topic),
+        .send_end_of_stream, .send_error_response => {},
+    }
+}
+
+/// Minimal atomic spin lock for the cross-thread inbound-gossip work queue.
+/// Producer (drive thread) and consumer (gossip worker thread) are raw OS
+/// threads, so this guards the queue independently of any `Io` instance.
+pub const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+    pub fn lock(self: *SpinLock) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+    pub fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
+/// One reassembled inbound gossipsub RPC frame, handed from the drive thread to
+/// the gossip worker for off-thread validation + forwarding.  `frame` is heap
+/// owned (a copy of the stream accumulator slice) and freed by the worker.
+pub const InboundGossipWork = struct {
+    sender: identity.PeerId,
+    frame: []u8,
+};
+
+/// Caps on the inbound gossip work backlog.  If the embedder's validator can't
+/// keep up, drop the oldest work rather than grow unbounded — the network stays
+/// live (the point of offloading) even if validation lags.
+pub const inbound_gossip_work_cap_entries: usize = 1024;
+pub const inbound_gossip_work_cap_bytes: usize = 64 * 1024 * 1024;

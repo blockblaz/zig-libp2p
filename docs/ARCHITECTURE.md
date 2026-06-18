@@ -1,7 +1,7 @@
 # Architecture
 
 How zig-libp2p layers fit together. The on-disk layout mirrors this model after the
-[repository rationalization](REPO_LAYOUT.md) (phases 0–2).
+[repository rationalization](REPO_LAYOUT.md) (phases 0–5).
 
 ## Layer stack
 
@@ -18,7 +18,7 @@ How zig-libp2p layers fit together. The on-disk layout mirrors this model after 
         ▼                   ▼                   ▼
 ┌───────────────┐   ┌───────────────┐   ┌───────────────────┐
 │ protocols/    │   │ transport/    │   │ security/         │
-│ gossipsub     │   │ quic, tcp, ws │   │ libp2p TLS, noise │
+│ gossipsub     │   │ quic/, tcp, ws│   │ libp2p TLS, noise │
 │ req_resp      │   │ yamux, mplex  │   └───────────────────┘
 │ kad_dht, …    │   └───────────────┘
 └───────────────┘
@@ -32,7 +32,7 @@ How zig-libp2p layers fit together. The on-disk layout mirrors this model after 
 ## Runtime flow (QUIC node)
 
 1. **Embedder** creates a `Host` (`core/host.zig`) with local key material from `primitives/identity.zig`.
-2. **Transport** (`transport/quic_runtime.zig`) owns UDP listen/dial, TLS handshake, and per-connection stream I/O.
+2. **Transport** (`transport/quic/runtime.zig`, with `config.zig` + `conn_table.zig`) owns UDP listen/dial, TLS handshake, and per-connection stream I/O.
 3. **Multistream-select** (`transport/stream_multistream.zig`) negotiates protocol IDs on each stream.
 4. **Protocol handlers** dispatch to `protocols/*` (ping, identify, gossipsub RPC, req/resp, AutoNAT, relay, DCUtR, DHT).
 5. **Swarm** (`core/swarm.zig`) surfaces connection and discovery events; **ConnectionManager** tracks dial/backoff policy.
@@ -52,13 +52,20 @@ nested paths are also available:
 - `zig_libp2p.primitives.identity`
 - `zig_libp2p.protocols.kad_dht` (via the flat `kad_dht` alias today)
 
-Legacy shim files under `src/*.zig` and `src/<protocol>/` forward to the new locations so internal
-imports keep working during migration.
+Legacy shim files under `src/*.zig`, `src/<protocol>/`, and `src/transport/quic_*.zig` forward to
+the new locations so internal imports keep working during migration.
+
+## Build helpers
+
+`build.zig` delegates to `build/deps.zig` (module wiring), `build/examples.zig` (example table +
+smoke runs), `build/fuzz.zig`, `build/soak.zig` (`zig build soak-test`), and `build/interop.zig`.
 
 ## Non-public code
 
 - `internal/wire_boundaries.zig` — fuzz/smoke helpers for wire parsers (not part of the embedder API).
-- `src/vendor/` — vendored TLS/RSA pieces required for Zig 0.16 builds (see REPO_LAYOUT.md phase 5).
+- `vendor/` at repo root — vendored `zquic_tls` / `zquic_rsa` trees (outside `src/` to avoid Zig 0.16
+  duplicate module path errors when both `zquic` and `zig_libp2p` compile the same TLS tree).
+  `src/vendor/zquic_tls/root.zig` is a shim for any legacy import path.
 
 ## Harnesses
 
