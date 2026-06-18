@@ -1,9 +1,9 @@
 # zig-libp2p
 
 [![project-libp2p](https://img.shields.io/badge/project-libp2p-yellow.svg?style=flat-square)](https://libp2p.io/)
-[![CI](https://img.shields.io/github/actions/workflow/status/ch4r10t33r/zig-libp2p/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/ch4r10t33r/zig-libp2p/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/blockblaz/zig-libp2p/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/blockblaz/zig-libp2p/actions/workflows/ci.yml)
 [![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?style=flat-square)](https://ziglang.org/)
-[![Release](https://img.shields.io/github/v/tag/ch4r10t33r/zig-libp2p?style=flat-square&label=release&sort=semver)](https://github.com/ch4r10t33r/zig-libp2p/releases)
+[![Release](https://img.shields.io/github/v/tag/blockblaz/zig-libp2p?style=flat-square&label=release&sort=semver)](https://github.com/blockblaz/zig-libp2p/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 
 A pure-Zig implementation of [libp2p](https://libp2p.io/), the modular peer-to-peer
@@ -17,7 +17,7 @@ client, but the `Host` API is client-agnostic and usable by any Zig project that
 needs a libp2p node.
 
 > **Status: pre-1.0.** The public API is still evolving toward a 1.0 freeze
-> ([#172](https://github.com/ch4r10t33r/zig-libp2p/issues/172)). Pin a release
+> ([#172](https://github.com/blockblaz/zig-libp2p/issues/172)). Pin a release
 > tag in your `build.zig.zon` and review the [changelog](CHANGELOG.md) before
 > upgrading.
 
@@ -47,7 +47,7 @@ needs a libp2p node.
 Add the dependency to your `build.zig.zon` (pin a released tag):
 
 ```sh
-zig fetch --save "https://github.com/ch4r10t33r/zig-libp2p/archive/refs/tags/v0.1.95.tar.gz"
+zig fetch --save "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.1.95.tar.gz"
 ```
 
 Then wire it into `build.zig`:
@@ -87,9 +87,9 @@ Ethereum consensus, so some libp2p features are intentionally out of scope.
 | TCP | ✅ | `transport.tcp` |
 | QUIC v1 (RFC 9000/9001) | ✅ | primary transport, via `zquic`; interop go ✅ · rust ✅ |
 | WebSocket — `/ws` (RFC 6455) | ✅ | `transport.ws*`; unit-tested |
-| Secure WebSocket — `/wss` | ⬜ | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
-| WebTransport | ⬜ | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
-| WebRTC | ⬜ | [#94](https://github.com/ch4r10t33r/zig-libp2p/issues/94) |
+| Secure WebSocket — `/wss` | ⬜ | [#94](https://github.com/blockblaz/zig-libp2p/issues/94) |
+| WebTransport | ⬜ | [#94](https://github.com/blockblaz/zig-libp2p/issues/94) |
+| WebRTC | ⬜ | [#94](https://github.com/blockblaz/zig-libp2p/issues/94) |
 
 ### Secure channels
 
@@ -131,17 +131,17 @@ Ethereum consensus, so some libp2p features are intentionally out of scope.
 | Spec | Status | Notes |
 |------|:------:|-------|
 | Bootstrap (static dial) | ✅ | `connect_peers` via `connection_manager` |
-| Kademlia DHT | 🚧 | `kad_dht`; in-memory smoke. Record validators / lifecycle pending ([#198](https://github.com/ch4r10t33r/zig-libp2p/issues/198), [#203](https://github.com/ch4r10t33r/zig-libp2p/issues/203)) |
-| mDNS (LAN discovery) | ⬜ | [#207](https://github.com/ch4r10t33r/zig-libp2p/issues/207) |
-| Rendezvous | ⬜ | [#209](https://github.com/ch4r10t33r/zig-libp2p/issues/209) |
+| Kademlia DHT | 🚧 | `kad_dht`; in-memory smoke. Record validators / lifecycle pending ([#198](https://github.com/blockblaz/zig-libp2p/issues/198), [#203](https://github.com/blockblaz/zig-libp2p/issues/203)) |
+| mDNS (LAN discovery) | ⬜ | [#207](https://github.com/blockblaz/zig-libp2p/issues/207) |
+| Rendezvous | ⬜ | [#209](https://github.com/blockblaz/zig-libp2p/issues/209) |
 
 ### NAT traversal
 
 | Spec | Status | Notes |
 |------|:------:|-------|
-| AutoNAT v1 | ✅ | `autonat`; active probing, dial-back verification, sliding-window vote aggregation ([#206](https://github.com/ch4r10t33r/zig-libp2p/issues/206)). v2 wire codecs present; v2 transport wiring pending |
-| Circuit Relay v2 | 🚧 | `relay`, QUIC runtime; `/p2p-circuit` dial + reservation refresh ([#204](https://github.com/ch4r10t33r/zig-libp2p/issues/204)) |
-| DCUtR (hole punching) | ✅ | `dcutr`; auto-trigger on relayed connections with retry ([#205](https://github.com/ch4r10t33r/zig-libp2p/issues/205)) |
+| AutoNAT v1 | ✅ | `autonat`; active probing, dial-back verification, sliding-window vote aggregation ([#206](https://github.com/blockblaz/zig-libp2p/issues/206)). v2 wire codecs present; v2 transport wiring pending |
+| Circuit Relay v2 | 🚧 | `relay`, QUIC runtime; `/p2p-circuit` dial + reservation refresh ([#204](https://github.com/blockblaz/zig-libp2p/issues/204)) |
+| DCUtR (hole punching) | ✅ | `dcutr`; auto-trigger on relayed connections with retry ([#205](https://github.com/blockblaz/zig-libp2p/issues/205)) |
 
 ### Utility & application protocols
 
@@ -156,8 +156,8 @@ Ethereum consensus, so some libp2p features are intentionally out of scope.
 
 | Spec | Status | Notes |
 |------|:------:|-------|
-| Private networks (PSK / pnet) | ⬜ | [#171](https://github.com/ch4r10t33r/zig-libp2p/issues/171) |
-| Resource manager (scope-based limits) | ⬜ | [#169](https://github.com/ch4r10t33r/zig-libp2p/issues/169) |
+| Private networks (PSK / pnet) | ⬜ | [#171](https://github.com/blockblaz/zig-libp2p/issues/171) |
+| Resource manager (scope-based limits) | ⬜ | [#169](https://github.com/blockblaz/zig-libp2p/issues/169) |
 
 The live cross-impl interop matrix is in
 [`interop_quic/README.md`](interop_quic/README.md); the full module map is
@@ -206,11 +206,11 @@ See [`examples/README.md`](examples/README.md) for the complete list.
 Per-protocol gaps are tracked in the spec-coverage tables above. The broader
 milestones toward a stable release:
 
-- **1.0-RC API freeze + semver** — [#172](https://github.com/ch4r10t33r/zig-libp2p/issues/172)
-- **Third-party security audit + disclosure policy** — [#170](https://github.com/ch4r10t33r/zig-libp2p/issues/170)
-- **Async swarm** (`std.Io` co-scheduled, moving off the threaded runtime) — [#57](https://github.com/ch4r10t33r/zig-libp2p/issues/57)
+- **1.0-RC API freeze + semver** — [#172](https://github.com/blockblaz/zig-libp2p/issues/172)
+- **Third-party security audit + disclosure policy** — [#170](https://github.com/blockblaz/zig-libp2p/issues/170)
+- **Async swarm** (`std.Io` co-scheduled, moving off the threaded runtime) — [#57](https://github.com/blockblaz/zig-libp2p/issues/57)
 
-Spec-compliance umbrella: [#80](https://github.com/ch4r10t33r/zig-libp2p/issues/80).
+Spec-compliance umbrella: [#80](https://github.com/blockblaz/zig-libp2p/issues/80).
 
 ## Development
 
@@ -234,7 +234,7 @@ in the interop matrix.
 
 Wire-size limits and the threat model are documented in
 [`docs/SECURITY.md`](docs/SECURITY.md). A coordinated-disclosure policy is
-tracked in [#170](https://github.com/ch4r10t33r/zig-libp2p/issues/170); until it
+tracked in [#170](https://github.com/blockblaz/zig-libp2p/issues/170); until it
 lands, please report vulnerabilities privately to the maintainer rather than via
 public issues.
 
