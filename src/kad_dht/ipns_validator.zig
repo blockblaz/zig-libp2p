@@ -492,3 +492,42 @@ test "rfc3339 parses to epoch milliseconds" {
     try std.testing.expectEqual(@as(?i64, null), parseRfc3339Ms("2020-01-01 00:00:00Z"));
     try std.testing.expectEqual(@as(?i64, null), parseRfc3339Ms("2020-01-01T00:00:00")); // no Z
 }
+
+// Cross-implementation interop vector: a real IPNS record marshaled by go
+// (boxo `ipns.NewRecord` + `MarshalRecord`) for a deterministic Ed25519 key
+// (seed = 0x42×32), value `/ipfs/bafybeig…`, sequence 7, EOL 2099-12-31. The
+// name below is go's canonical base36 CIDv1 libp2p-key form. Regenerate with
+// `scripts/gen-ipns-vector`. This proves the validator accepts records produced
+// by the reference implementation — not only by our own `buildSignedRecord`.
+const boxo_ipns_name = "/ipns/k51qzi5uqu5dh0hmqwzu47an7qt7e1h5lyer5kjjntgl9e4qwb07kctxsovmdu";
+const boxo_ipns_record_b64 =
+    "CkEvaXBmcy9iYWZ5YmVpZ2R5cnp0NXNmcDd1ZG03aHU3NnVoN3kyNm5mM2VmdXlscWFiZjNvY2xn" ++
+    "dHF5NTVmYnpkaRJAt3DvX1QnNiYj9KZ0f2L+m0UsoQ/Xf3voJeo2dryiiY+Z04tj5rCFDxMug48" ++
+    "dvTRriKoWiuv/qUDwfsqwjUqDDRgAIhQyMDk5LTEyLTMxVDIzOjU5OjU5WigHMIDA4oXjaEJALzco" ++
+    "TtKujP6f9JhQVAmuIj9FK75ZQR6t2ekanLt3dtb0Foyyn3OzMb1Z63RK3OCZBpZb46sjC50jxes" ++
+    "vLrk2DEqNAaVjVFRMGwAAA0YwuKAAZVZhbHVlWEEvaXBmcy9iYWZ5YmVpZ2R5cnp0NXNmcDd1ZG03" ++
+    "aHU3NnVoN3kyNm5mM2VmdXlscWFiZjNvY2xndHF5NTVmYnpkaWhTZXF1ZW5jZQdoVmFsaWRpdHlU" ++
+    "MjA5OS0xMi0zMVQyMzo1OTo1OVpsVmFsaWRpdHlUeXBlAA==";
+
+test "ipns validator accepts a go (boxo) reference record" {
+    const a = std.testing.allocator;
+    const dec = std.base64.standard.Decoder;
+    const n = try dec.calcSizeForSlice(boxo_ipns_record_b64);
+    const rec = try a.alloc(u8, n);
+    defer a.free(rec);
+    try dec.decode(rec, boxo_ipns_record_b64);
+
+    var reg = record_validator.Registry.init(a);
+    defer reg.deinit();
+    var alloc_slot = a;
+    try register(&reg, &alloc_slot);
+
+    // Accept under the record's EOL (2099); reject once that validity elapses.
+    try std.testing.expect(reg.validate(boxo_ipns_name, rec, null, 0) == .accept);
+    const after_eol_ms: i64 = 4_200_000_000_000; // ~2103
+    try std.testing.expect(reg.validate(boxo_ipns_name, rec, null, after_eol_ms) == .reject);
+
+    // The parsed sequence must match what go signed (7).
+    const entry = parseEntry(rec).?;
+    try std.testing.expectEqual(@as(?u64, 7), entry.sequence);
+}
