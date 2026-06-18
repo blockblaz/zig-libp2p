@@ -137,8 +137,22 @@ pub fn initiatorHandshakeMultistream(
     Io.Writer.writeAll(w, out.items) catch |e| return terr.fromMultistreamStreamLayer(e);
     Io.Writer.flush(w) catch |e| return terr.fromMultistreamStreamLayer(e);
 
-    return initiatorHandshakeMultistreamReadPhase(r, w, protocol_id, allocator, tail);
+    return initiatorHandshakeMultistreamReadPhase(r, w, protocol_id, allocator, tail, null);
 }
+
+/// Accumulator for multi-tick initiator read phases. Callers that retry
+/// [`initiatorHandshakeMultistreamReadPhase`] after driving I/O must pass the
+/// same state so partial multistream tokens are not discarded between ticks.
+pub const InitiatorReadPhaseState = struct {
+    acc: std.ArrayList(u8) = .empty,
+    peer_framing: ?neg.Framing = null,
+    header_done: bool = false,
+
+    pub fn deinit(self: *InitiatorReadPhaseState, allocator: std.mem.Allocator) void {
+        self.acc.deinit(allocator);
+        self.* = .{};
+    }
+};
 
 /// Initiator: after [`appendFirstStreamInitiatorHandshake`] was written and flushed, read peer header and protocol ack.
 pub fn initiatorHandshakeMultistreamReadPhase(
@@ -147,23 +161,27 @@ pub fn initiatorHandshakeMultistreamReadPhase(
     protocol_id: []const u8,
     allocator: std.mem.Allocator,
     tail: ?*std.ArrayList(u8),
+    persistent: ?*InitiatorReadPhaseState,
 ) StreamHandshakeError!void {
     _ = w;
-    var acc = std.ArrayList(u8).empty;
-    defer acc.deinit(allocator);
-    var peer_framing: ?neg.Framing = null;
+    var local_state: InitiatorReadPhaseState = .{};
+    defer if (persistent == null) local_state.deinit(allocator);
+    const state = persistent orelse &local_state;
 
-    while (true) {
-        var rem: []const u8 = acc.items;
-        if (neg.initiatorReadPeerMultistream(&rem, neg.default_max_body_len)) |_| {
-            try compactConsumed(&acc, allocator, rem);
-            break;
-        } else |err| switch (err) {
-            error.MissingNewline => {
-                try readMoreHandshake(&acc, r, allocator);
-                notePeerFraming(&peer_framing, acc.items);
-            },
-            else => return terr.fromMultistreamStreamLayer(err),
+    if (!state.header_done) {
+        while (true) {
+            var rem: []const u8 = state.acc.items;
+            if (neg.initiatorReadPeerMultistream(&rem, neg.default_max_body_len)) |_| {
+                try compactConsumed(&state.acc, allocator, rem);
+                state.header_done = true;
+                break;
+            } else |err| switch (err) {
+                error.MissingNewline => {
+                    try readMoreHandshake(&state.acc, r, allocator);
+                    notePeerFraming(&state.peer_framing, state.acc.items);
+                },
+                else => return terr.fromMultistreamStreamLayer(err),
+            }
         }
     }
     // Auto-detect on the multistream header line is safe — that line is 19
@@ -172,16 +190,16 @@ pub fn initiatorHandshakeMultistreamReadPhase(
     // the protocol-ack token MAY be 47 bytes (delimited length 0x2F = '/'),
     // which would mis-classify if we kept auto-detecting per token. See
     // [`neg.readNegotiationToken`] for the full collision discussion.
-    const framing = peer_framing orelse .legacy;
+    const framing = state.peer_framing orelse .legacy;
 
     while (true) {
-        var rem: []const u8 = acc.items;
+        var rem: []const u8 = state.acc.items;
         if (neg.initiatorReadProtocolAckFramed(&rem, protocol_id, neg.default_max_body_len, framing)) |_| {
-            try compactConsumed(&acc, allocator, rem);
-            preserveAccTailOnly(&acc, tail);
+            try compactConsumed(&state.acc, allocator, rem);
+            preserveAccTailOnly(&state.acc, tail);
             return;
         } else |err| switch (err) {
-            error.MissingNewline => try readMoreHandshake(&acc, r, allocator),
+            error.MissingNewline => try readMoreHandshake(&state.acc, r, allocator),
             else => return terr.fromMultistreamStreamLayer(err),
         }
     }
@@ -563,7 +581,7 @@ test "initiatorHandshakeMultistreamReadPhase handles 47-byte delimited ack (leng
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
 
-    try initiatorHandshakeMultistreamReadPhase(&r, &aw.writer, proto_47, a, null);
+    try initiatorHandshakeMultistreamReadPhase(&r, &aw.writer, proto_47, a, null, null);
 }
 
 test "responderHandshakeMultistreamAmong preserves trailing app bytes (go MSSelect)" {

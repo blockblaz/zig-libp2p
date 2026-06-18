@@ -558,7 +558,7 @@ fn quicLoopbackOnePingOnStream(
     {
         var r = raw_c.reader();
         var w = raw_c.writer();
-        try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, allocator, null);
+        try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, allocator, null, null);
     }
 
     var pay: [ping.payload_len]u8 = undefined;

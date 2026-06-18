@@ -337,7 +337,7 @@ pub const LiveDcutr = struct {
                 }
                 var r = ex.raw.reader();
                 var w = ex.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, dcutr.wire.protocol_id, self.allocator, null) catch {
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, dcutr.wire.protocol_id, self.allocator, null, null) catch {
                     ex.phase = .failed;
                     continue;
                 };

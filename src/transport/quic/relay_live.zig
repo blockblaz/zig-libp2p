@@ -434,7 +434,7 @@ pub const LiveRelay = struct {
                 }
                 var r = so.raw.reader();
                 var w = so.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, relay.wire.stop_protocol_id, self.allocator, null) catch {
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, relay.wire.stop_protocol_id, self.allocator, null, null) catch {
                     so.failed = true;
                     continue;
                 };
@@ -640,7 +640,7 @@ pub const LiveRelay = struct {
                         }
                         var r = hop.reader();
                         var w = hop.writer();
-                        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, relay.wire.hop_protocol_id, self.allocator, null) catch {
+                        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, relay.wire.hop_protocol_id, self.allocator, null, null) catch {
                             cd.phase = .failed;
                             continue;
                         };
@@ -720,7 +720,7 @@ pub const LiveRelay = struct {
         const need = try stream_multistream.responderSuccessReplyWireLen(relay.wire.hop_protocol_id);
         while (raw.unreadRecvLen() < need) {}
         var r = raw.reader();
-        try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, relay.wire.hop_protocol_id, self.allocator, null);
+        try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, relay.wire.hop_protocol_id, self.allocator, null, null);
 
         try self.client.reserveOnStream(&r, &w, relay_peer);
         const expire = self.client.reservation.?.expire_unix;

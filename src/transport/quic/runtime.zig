@@ -2866,7 +2866,7 @@ pub const QuicRuntime = struct {
                 if (req.raw.unreadRecvLen() == 0) continue;
                 var r = req.raw.reader();
                 var w = req.raw.writer();
-                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, req.proto.protocolId(), a, null) catch |err| switch (err) {
+                stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, req.proto.protocolId(), a, null, null) catch |err| switch (err) {
                     error.ProtocolNegotiationFailed, error.DialFailed => continue,
                     else => {
                         log.warn("quic_runtime: read init ack failed: {s}", .{@errorName(err)});
@@ -3087,6 +3087,7 @@ pub const QuicRuntime = struct {
                     config.identify_push_protocol_id,
                     a,
                     null,
+                    null,
                 ) catch |err| switch (err) {
                     error.ProtocolNegotiationFailed, error.DialFailed => continue,
                     else => {
@@ -3156,6 +3157,7 @@ pub const QuicRuntime = struct {
                     &w,
                     config.autonat_protocol_id,
                     a,
+                    null,
                     null,
                 ) catch continue;
                 op.handshake_done = true;
