@@ -211,6 +211,7 @@ pub const Event = union(enum) {
             .peer_discovered => |*pd| {
                 for (pd.addrs) |addr| a.free(addr);
                 a.free(pd.addrs);
+                if (pd.namespace) |ns| a.free(ns);
             },
             .rpc_response_end,
             .rpc_error_response,

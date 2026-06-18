@@ -44,10 +44,13 @@ pub const PeerConnectionFailedPayload = struct {
 
 pub const DiscoverySource = enum {
     mdns,
+    rendezvous,
 };
 
 pub const PeerDiscoveredPayload = struct {
     peer: identity.PeerId,
     addrs: [][]const u8,
     source: DiscoverySource,
+    /// Rendezvous namespace when [`source`] is `.rendezvous` (#209).
+    namespace: ?[]const u8 = null,
 };

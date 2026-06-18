@@ -24,6 +24,7 @@ pub const ping_wire_quic = @import("protocols/ping/ping_wire_quic.zig");
 pub const identify = @import("protocols/identify/identify.zig");
 
 pub const autonat = @import("protocols/autonat/root.zig");
+pub const rendezvous = @import("protocols/rendezvous/root.zig");
 pub const kad_dht = @import("protocols/kad_dht/root.zig");
 pub const discovery = @import("protocols/discovery/root.zig");
 pub const relay = @import("protocols/relay/root.zig");
@@ -135,6 +136,7 @@ pub const protocols = struct {
     pub const ping_wire_quic = @import("protocols/ping/ping_wire_quic.zig");
     pub const identify = @import("protocols/identify/identify.zig");
     pub const autonat = @import("protocols/autonat/root.zig");
+    pub const rendezvous = @import("protocols/rendezvous/root.zig");
     pub const kad_dht = @import("protocols/kad_dht/root.zig");
     pub const discovery = @import("protocols/discovery/root.zig");
     pub const relay = @import("protocols/relay/root.zig");
@@ -187,6 +189,7 @@ test {
     _ = @import("gossipsub/duplicate_cache.zig");
     _ = @import("gossipsub/message_id.zig");
     _ = @import("autonat/root.zig");
+    _ = @import("rendezvous/root.zig");
     _ = @import("kad_dht/root.zig");
     _ = @import("discovery/root.zig");
     _ = @import("relay/root.zig");
