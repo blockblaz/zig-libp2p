@@ -132,7 +132,7 @@ Ethereum consensus, so some libp2p features are intentionally out of scope.
 |------|:------:|-------|
 | Bootstrap (static dial) | ✅ | `connect_peers` via `connection_manager` |
 | Kademlia DHT | 🚧 | `kad_dht`, `host`; lifecycle ([#203](https://github.com/blockblaz/zig-libp2p/issues/203)) — mode switch, republish, disconnect eviction. Record validators pending ([#198](https://github.com/blockblaz/zig-libp2p/issues/198)) |
-| mDNS (LAN discovery) | ⬜ | [#207](https://github.com/blockblaz/zig-libp2p/issues/207) |
+| mDNS (LAN discovery) | ✅ | `discovery.mdns`, `host`; `peer_discovered` events ([#207](https://github.com/blockblaz/zig-libp2p/issues/207)) |
 | Rendezvous | ⬜ | [#209](https://github.com/blockblaz/zig-libp2p/issues/209) |
 
 ### NAT traversal
@@ -197,7 +197,7 @@ See [`examples/README.md`](examples/README.md) for the complete list.
 
 - **API surface** — [`src/root.zig`](src/root.zig)
 - **Security model & wire limits** — [`docs/SECURITY.md`](docs/SECURITY.md)
-- **AutoNAT** — [`docs/AUTONAT.md`](docs/AUTONAT.md) · **Kademlia DHT** — [`docs/KAD_DHT.md`](docs/KAD_DHT.md)
+- **AutoNAT** — [`docs/AUTONAT.md`](docs/AUTONAT.md) · **Kademlia DHT** — [`docs/KAD_DHT.md`](docs/KAD_DHT.md) · **mDNS** — [`docs/MDNS.md`](docs/MDNS.md)
 - **Async swarm design** — [`docs/async-swarm.md`](docs/async-swarm.md)
 - **zeam integration notes** — [`docs/zeam-parity.md`](docs/zeam-parity.md)
 

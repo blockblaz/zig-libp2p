@@ -41,3 +41,13 @@ pub const PeerConnectionFailedPayload = struct {
     direction: Direction,
     result: ConnectionFailureResult,
 };
+
+pub const DiscoverySource = enum {
+    mdns,
+};
+
+pub const PeerDiscoveredPayload = struct {
+    peer: identity.PeerId,
+    addrs: [][]const u8,
+    source: DiscoverySource,
+};

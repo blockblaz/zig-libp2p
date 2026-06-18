@@ -36,10 +36,16 @@ const identify_ad_mod = @import("identify_advertisement.zig");
 const autonat_mod = @import("autonat/root.zig");
 const peer_protocols_mod = @import("peer_protocols.zig");
 const kad_dht_mod = @import("kad_dht/root.zig");
+const discovery_mod = @import("discovery/root.zig");
 
 pub const AutonatHostConfig = struct {
     enable: bool = false,
     client: autonat_mod.ClientConfig = .{},
+};
+
+pub const MdnsHostConfig = struct {
+    enable: bool = false,
+    config: discovery_mod.mdns.Config = .{},
 };
 
 /// Optional transport hook for outbound AutoNAT probes (#206).
@@ -98,6 +104,8 @@ pub const HostConfig = struct {
     identify: IdentifyConfig = .{},
     /// AutoNAT vote aggregation + active probing (#206).
     autonat: AutonatHostConfig = .{},
+    /// mDNS LAN peer discovery (#207).
+    mdns: MdnsHostConfig = .{},
 };
 
 pub const InitError = error{
@@ -131,6 +139,7 @@ pub const Host = struct {
     peer_protocols: peer_protocols_mod.Store,
     autonat_probe_dispatch: ?AutonatProbeDispatch = null,
     kad_dht_client: ?*kad_dht_mod.Client = null,
+    mdns_service: ?*discovery_mod.mdns.Service = null,
     autonat_addr_scratch: std.ArrayList([]const u8) = .empty,
     /// External addresses other peers reported observing us from (identify
     /// `observed_addr`). Used as AutoNAT probe candidates — listen addrs are
@@ -181,6 +190,14 @@ pub const Host = struct {
             autonat_client = autonat_mod.Client.init(allocator, cfg.autonat.client);
         }
 
+        var mdns_service: ?*discovery_mod.mdns.Service = null;
+        if (cfg.mdns.enable) {
+            const m = try allocator.create(discovery_mod.mdns.Service);
+            errdefer allocator.destroy(m);
+            m.* = discovery_mod.mdns.Service.init(allocator, cfg.local_peer, cfg.mdns.config) catch return error.SwarmInitFailed;
+            mdns_service = m;
+        }
+
         self.* = .{
             .allocator = allocator,
             .swarm = swarm,
@@ -192,6 +209,7 @@ pub const Host = struct {
             .autonat_client = autonat_client,
             .peer_protocols = peer_protocols_mod.Store.init(allocator),
             .observed_addrs = std.StringHashMap(void).init(allocator),
+            .mdns_service = mdns_service,
         };
         return self;
     }
@@ -209,6 +227,10 @@ pub const Host = struct {
         self.identify_addr_scratch.deinit(self.allocator);
         self.identify_proto_scratch.deinit(self.allocator);
         if (self.autonat_client) |*c| c.deinit();
+        if (self.mdns_service) |m| {
+            m.deinit();
+            self.allocator.destroy(m);
+        }
         self.peer_protocols.deinit();
         self.autonat_addr_scratch.deinit(self.allocator);
         var oit = self.observed_addrs.keyIterator();
@@ -248,7 +270,7 @@ pub const Host = struct {
     /// scheduling). Background-mode embedders don't call this; the worker
     /// handles command dispatch and the embedder calls
     /// [`runPeriodicTicks`] from its own clock instead.
-    pub fn tick(self: *Host, command_budget: u32, now_ms: i64) (GossipsubError || req_resp_runtime.Error || std.mem.Allocator.Error || swarm_mod.SubmitError)!void {
+    pub fn tick(self: *Host, command_budget: u32, now_ms: i64) (GossipsubError || req_resp_runtime.Error || std.mem.Allocator.Error || swarm_mod.SubmitError || discovery_mod.mdns.Error)!void {
         _ = self.swarm.tick(command_budget);
         try self.runPeriodicTicks(now_ms);
     }
@@ -256,7 +278,7 @@ pub const Host = struct {
     /// Runs the periodic per-subsystem ticks: gossipsub heartbeat, req/resp
     /// timeout sweep, connection-manager dial scheduling. Call once per
     /// heartbeat interval (default 700ms) from your reactor.
-    pub fn runPeriodicTicks(self: *Host, now_ms: i64) (GossipsubError || req_resp_runtime.Error || std.mem.Allocator.Error || swarm_mod.SubmitError)!void {
+    pub fn runPeriodicTicks(self: *Host, now_ms: i64) (GossipsubError || req_resp_runtime.Error || std.mem.Allocator.Error || swarm_mod.SubmitError || discovery_mod.mdns.Error)!void {
         self.gossipsub.setClockMs(now_ms);
         try self.gossipsub.heartbeat();
         try self.req_resp.tick(now_ms);
@@ -264,6 +286,34 @@ pub const Host = struct {
         try self.flushIdentifyPushIfDirty();
         try self.tickAutonat(now_ms);
         try self.tickKadDht(now_ms);
+        try self.tickMdns(now_ms);
+    }
+
+    fn tickMdns(self: *Host, now_ms: i64) (std.mem.Allocator.Error || swarm_mod.SubmitError || discovery_mod.mdns.Error)!void {
+        const m = self.mdns_service orelse return;
+        try m.setListenAddrs(self.identify_ad.listen_addrs.items);
+        const discoveries = try m.tick(now_ms);
+        defer m.freeDiscoveries(discoveries);
+        for (discoveries) |d| {
+            for (d.addrs) |addr| {
+                var ma = multiaddr_mod.Multiaddr.fromString(self.allocator, addr) catch continue;
+                defer ma.deinit();
+                self.registerKnownPeer(&ma, d.peer) catch {};
+            }
+            const owned_addrs = try self.allocator.alloc([]const u8, d.addrs.len);
+            errdefer {
+                for (owned_addrs) |a| self.allocator.free(a);
+                self.allocator.free(owned_addrs);
+            }
+            for (d.addrs, 0..) |addr, i| {
+                owned_addrs[i] = try self.allocator.dupe(u8, addr);
+            }
+            try self.swarm.queueEvent(.{ .peer_discovered = .{
+                .peer = d.peer,
+                .addrs = owned_addrs,
+                .source = .mdns,
+            } });
+        }
     }
 
     fn tickKadDht(self: *Host, now_ms: i64) std.mem.Allocator.Error!void {
@@ -980,4 +1030,49 @@ test "Host autonat reachability promotes kad to server mode" {
     try host.recordObservedAddr("/ip4/203.0.113.9/udp/4001/quic-v1");
     try host.handleAutonatV1Response(.{ .status = .ok, .addr = "/ip4/203.0.113.9/udp/4001/quic-v1" });
     try testing.expect(kad.dhtMode() == .server);
+}
+
+test "Host mdns discovery registers peer and emits peer_discovered" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const me = try identity.PeerId.random();
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+        .mdns = .{ .enable = true, .config = .{ .live_sockets = false, .discovery_cooldown_ms = 0 } },
+    });
+    defer host.destroy();
+
+    const remote = try identity.PeerId.random();
+    var remote_b58_buf: [128]u8 = undefined;
+    const remote_b58 = try remote.toBase58(&remote_b58_buf);
+    const addr = try std.fmt.allocPrint(a, "/ip4/192.168.1.44/udp/4001/quic-v1/p2p/{s}", .{remote_b58});
+    defer a.free(addr);
+    const txt = try std.fmt.allocPrint(a, "dnsaddr={s}", .{addr});
+    defer a.free(txt);
+
+    const m = host.mdns_service.?;
+    const packet = try discovery_mod.mdns.buildTxtResponsePacket(a, txt);
+    defer a.free(packet);
+    try m.handleDatagram(packet, 1_000);
+    try host.runPeriodicTicks(1_000);
+
+    try testing.expect(host.knownPeerStatus(remote) != null);
+
+    try host.startBackground();
+    _ = host.waitUntilReady(5_000);
+    var saw_discovered = false;
+    while (true) {
+        const ev = host.nextEvent(200) catch break;
+        var e = ev;
+        defer e.deinit(a);
+        if (std.meta.activeTag(e) == .peer_discovered) {
+            saw_discovered = true;
+            break;
+        }
+    }
+    try testing.expect(saw_discovered);
 }
