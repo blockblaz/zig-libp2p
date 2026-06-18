@@ -55,6 +55,12 @@ pub const Config = struct {
     port: u16 = 5353,
     /// When false, skip opening UDP sockets (unit tests inject datagrams).
     live_sockets: bool = true,
+    /// Accept discovered `dnsaddr` records that resolve to public/global IPs.
+    /// Off by default: mDNS is link-local, so a discovered peer should advertise
+    /// a private / link-local address. Rejecting public targets stops an on-link
+    /// peer from steering us into dialing arbitrary internet hosts (#207). Enable
+    /// only on networks where LAN peers legitimately carry public IPs.
+    allow_public_addrs: bool = false,
 };
 
 pub const Error = dns_wire.Error || std.mem.Allocator.Error || identity.ParseError || error{
@@ -306,6 +312,10 @@ pub const Service = struct {
 
         var ma = multiaddr_mod.Multiaddr.fromString(self.allocator, addr_str) catch return;
         defer ma.deinit();
+        // mDNS is link-local: reject discovered targets outside private ranges
+        // unless explicitly opted in, so an on-link peer cannot make us dial an
+        // arbitrary public host (#207).
+        if (!self.cfg.allow_public_addrs and !isLanScopedAddr(&ma)) return;
         const peer = peerFromMultiaddr(&ma) orelse return;
         if (peer.eql(&self.local_peer)) return;
 
@@ -487,6 +497,36 @@ pub fn isAcceptableDiscoveredAddr(addr: []const u8) bool {
     return isAdvertisableAddr(addr);
 }
 
+/// Whether `ma`'s first IP is on the local link / a private range — the only
+/// addresses a LAN-scoped mDNS peer should legitimately advertise (#207).
+pub fn isLanScopedAddr(ma: *const multiaddr_mod.Multiaddr) bool {
+    var iter = ma.iterator();
+    while (iter.next() catch return false) |proto| {
+        switch (proto) {
+            .Ip4 => |a| return isPrivateV4(a.bytes),
+            .Ip6 => |a| return isPrivateV6(a.bytes),
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn isPrivateV4(b: [4]u8) bool {
+    if (b[0] == 10) return true; // 10/8
+    if (b[0] == 172 and b[1] >= 16 and b[1] <= 31) return true; // 172.16/12
+    if (b[0] == 192 and b[1] == 168) return true; // 192.168/16
+    if (b[0] == 169 and b[1] == 254) return true; // 169.254/16 link-local
+    if (b[0] == 127) return true; // loopback (already filtered upstream)
+    return false;
+}
+
+fn isPrivateV6(b: [16]u8) bool {
+    if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7 unique-local
+    if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
+    if (std.mem.allEqual(u8, b[0..15], 0) and b[15] == 1) return true; // ::1
+    return false;
+}
+
 pub fn peerFromMultiaddr(ma: *const multiaddr_mod.Multiaddr) ?identity.PeerId {
     var iter = ma.iterator();
     while (iter.next() catch return null) |proto| {
@@ -520,6 +560,40 @@ test "parse dnsaddr TXT into peer discovery" {
     defer svc.freeDiscoveries(discoveries);
     try std.testing.expect(discoveries.len >= 1);
     try std.testing.expect(discoveries[0].peer.eql(&remote));
+}
+
+test "public discovered addr rejected by default, accepted when opted in" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const local = try identity.PeerId.random();
+    const remote = try identity.PeerId.random();
+    var remote_b58_buf: [128]u8 = undefined;
+    const remote_b58 = try remote.toBase58(&remote_b58_buf);
+    const txt = try std.fmt.allocPrint(a, "dnsaddr=/ip4/8.8.8.8/udp/4001/quic-v1/p2p/{s}", .{remote_b58});
+    defer a.free(txt);
+    const packet = try buildTxtResponse(a, txt);
+    defer a.free(packet);
+
+    // Default: a public-IP target is dropped (no LAN peer should advertise it).
+    {
+        var svc = try Service.init(a, local, .{ .live_sockets = false });
+        defer svc.deinit();
+        try svc.handleDatagram(packet, 1_000);
+        const found = try svc.tick(1_000);
+        defer svc.freeDiscoveries(found);
+        try std.testing.expectEqual(@as(usize, 0), found.len);
+    }
+
+    // Opt in: the same target is accepted.
+    {
+        var svc = try Service.init(a, local, .{ .live_sockets = false, .allow_public_addrs = true });
+        defer svc.deinit();
+        try svc.handleDatagram(packet, 1_000);
+        const found = try svc.tick(1_000);
+        defer svc.freeDiscoveries(found);
+        try std.testing.expect(found.len >= 1);
+        try std.testing.expect(found[0].peer.eql(&remote));
+    }
 }
 
 test "query/response round trip between two services" {

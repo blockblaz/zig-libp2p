@@ -65,8 +65,14 @@ For tests or custom reactors, set `.live_sockets = false` and feed datagrams wit
 | `response_cooldown_ms` | 1_000 | Rate-limit outbound mDNS responses |
 | `interface_index` | `null` | Optional multicast interface index |
 | `live_sockets` | `true` | Disable for unit tests |
+| `allow_public_addrs` | `false` | Accept discovered `dnsaddr` records pointing at public/global IPs |
 
 Loopback and wildcard listen addrs are not advertised or accepted on ingest.
+Because mDNS is link-local, discovered `dnsaddr` records that resolve to a
+public/global IP are also rejected by default — a private / link-local / ULA
+address is expected — so an on-link peer cannot steer the node into dialing an
+arbitrary internet host. Set `allow_public_addrs = true` for networks where LAN
+peers legitimately carry public IPs.
 
 ## Acceptance (#207)
 
