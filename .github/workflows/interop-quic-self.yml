@@ -10,7 +10,7 @@ on:
   pull_request:
     paths:
       - "examples/interop_quic_node.zig"
-      - "interop_quic/**"
+      - "harness/quic/**"
       - "src/transport/**"
       - "src/ping.zig"
       - "src/multistream*.zig"
@@ -40,13 +40,13 @@ jobs:
         run: sudo apt-get install -y openssl
 
       - name: Self-test handshake
-        run: interop_quic/self_test.sh handshake
+        run: harness/quic/self_test.sh handshake
         env:
           PORT: "14242"
           DEADLINE_MS: "20000"
 
       - name: Self-test ping
-        run: interop_quic/self_test.sh ping
+        run: harness/quic/self_test.sh ping
         env:
           PORT: "14243"
           DEADLINE_MS: "20000"

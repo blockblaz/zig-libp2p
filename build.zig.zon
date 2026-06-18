@@ -34,9 +34,13 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "build",
+        "bench",
         "docs",
         "src",
         "examples",
-        "tests",
+        "harness",
+        "fixtures",
+        "vendor",
     },
 }

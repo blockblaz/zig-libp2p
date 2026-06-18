@@ -379,7 +379,7 @@ test "verifySignedPayload RSA host round-trip (#87)" {
     var mux = std.ArrayList([]const u8).empty;
     defer mux.deinit(a);
 
-    const kp = try zquic_rsa.KeyPair.fromDer(@embedFile("../../vendor/zquic_rsa/testdata/id_rsa.der"));
+    const kp = try zquic_rsa.KeyPair.fromDer(@embedFile("../../testdata/zquic_rsa/id_rsa.der"));
     const rsa_pkcs1 = try encodePkcs1RsaPublicKeyDer(a, kp.public);
     defer a.free(rsa_pkcs1);
 

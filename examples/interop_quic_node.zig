@@ -710,11 +710,13 @@ fn clientOneReqRespInitiator(
         Io.Writer.flush(&w) catch return 1;
     }
 
+    var ms_state: stream_multistream.InitiatorReadPhaseState = .{};
+    defer ms_state.deinit(a);
     while (wall_time.milliTimestamp() < deadline_ms) {
         outbound.drive(recv_buf, 5) catch {};
         var r = raw.reader();
         var w = raw.writer();
-        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, reqresp_protocol_id, a, null) catch |err| {
+        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, reqresp_protocol_id, a, null, &ms_state) catch |err| {
             switch (err) {
                 error.ProtocolNegotiationFailed, error.DialFailed => continue,
                 else => return 1,
@@ -787,12 +789,14 @@ fn clientOnePingInitiator(
     }
     outbound.drive(recv_buf, 5) catch {};
 
+    var ms_state: stream_multistream.InitiatorReadPhaseState = .{};
+    defer ms_state.deinit(a);
     while (wall_time.milliTimestamp() < deadline_ms) {
         outbound.drive(recv_buf, 5) catch {};
         respondInboundIdentifyStreamsClient(outbound, recv_buf, sid, a, identify_payload, &inbound_slots);
         var r = raw.reader();
         var w = raw.writer();
-        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, a, null) catch |err| {
+        stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, ping.multistream_protocol_id, a, null, &ms_state) catch |err| {
             switch (err) {
                 error.ProtocolNegotiationFailed, error.DialFailed => continue,
                 else => {
@@ -1242,7 +1246,7 @@ fn clientRelayReserve(
         if (raw.unreadRecvLen() >= need) break;
     }
     var r = raw.reader();
-    try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, zl.relay.wire.hop_protocol_id, a, null);
+    try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, zl.relay.wire.hop_protocol_id, a, null, null);
     try client.reserveOnStream(&r, &w, relay_peer);
     std.debug.print("interop_quic_node[client]: relay reserve ok\n", .{});
     return 0;
@@ -1273,7 +1277,7 @@ fn clientDcutrExchange(
         if (raw.unreadRecvLen() >= need) break;
     }
     var r = raw.reader();
-    try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, zl.dcutr.wire.protocol_id, a, null);
+    try stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, zl.dcutr.wire.protocol_id, a, null, null);
     _ = try coord.runInitiatorExchange(&r, &w, &obs);
     std.debug.print("interop_quic_node[client]: dcutr exchange ok\n", .{});
     return 0;

@@ -2,9 +2,9 @@
 
 const std = @import("std");
 const Io = std.Io;
-const identity = @import("../identity.zig");
-const relay = @import("../relay/root.zig");
-const bridge = @import("../relay/bridge.zig");
+const identity = @import("../primitives/identity.zig");
+const relay = @import("../protocols/relay/root.zig");
+const bridge = @import("../protocols/relay/bridge.zig");
 
 pub const Error = bridge.Error || relay.circuit_addr.Error || error{
     RelayDialFailed,

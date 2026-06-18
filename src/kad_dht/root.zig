@@ -1,63 +1,41 @@
-//! libp2p Kademlia DHT (kad-dht) — routing, queries, and wire handlers (#93).
-//!
-//! Protocol: `/ipfs/kad/1.0.0` (and per-network variants such as `/lan/kad/1.0.0`).
-//! Spec: https://github.com/libp2p/specs/tree/master/kad-dht
-//!
-//! Transport stream I/O and outbound RPC dials remain embedder-owned via
-//! [`server.Server.handleStream`] and [`query.QueryPeerFn`].
+//! Compatibility shim for legacy import paths (Zig 0.16).
+const _shim_src = @import("../protocols/kad_dht/root.zig");
 
-pub const keyspace = @import("keyspace.zig");
-pub const mode = @import("mode.zig");
-pub const routing_table = @import("routing_table.zig");
-pub const wire = @import("wire.zig");
-pub const record_store = @import("record_store.zig");
-pub const record_validator = @import("record_validator.zig");
-pub const ipns_validator = @import("ipns_validator.zig");
-pub const query = @import("query.zig");
-pub const server = @import("server.zig");
-pub const client = @import("client.zig");
-
-pub const Key = keyspace.Key;
-pub const Mode = mode.Mode;
-pub const NatStatus = @import("../autonat/root.zig").NatStatus;
-pub const modeFromNatStatus = mode.fromNatStatus;
-
-pub const RoutingTable = routing_table.RoutingTable;
-pub const RoutingConfig = routing_table.Config;
-pub const RecordStore = record_store.RecordStore;
-pub const RecordConfig = record_store.Config;
-pub const PutResult = record_store.PutResult;
-pub const RecordValidator = record_validator.Registry;
-pub const ValidationResult = record_validator.ValidationResult;
-pub const ValidationStats = record_validator.Stats;
-pub const QueryEngine = query.QueryEngine;
-pub const QueryConfig = query.Config;
-pub const QueryPeerFn = query.QueryPeerFn;
-pub const Server = server.Server;
-pub const ServerConfig = server.Config;
-pub const Client = client.Client;
-pub const ClientConfig = client.Config;
-pub const BootstrapPeer = client.BootstrapPeer;
-
-pub const protocol_line = wire.protocol_line;
-pub const protocol_id = wire.protocol_id;
-pub const lan_protocol_line = wire.lan_protocol_line;
-
-pub const MessageType = wire.MessageType;
-pub const MessageView = wire.MessageView;
-pub const MessageOwned = wire.MessageOwned;
-pub const PeerView = wire.PeerView;
-pub const RecordView = wire.RecordView;
-
-test {
-    _ = @import("keyspace.zig");
-    _ = @import("mode.zig");
-    _ = @import("routing_table.zig");
-    _ = @import("wire.zig");
-    _ = @import("record_store.zig");
-    _ = @import("record_validator.zig");
-    _ = @import("ipns_validator.zig");
-    _ = @import("query.zig");
-    _ = @import("server.zig");
-    _ = @import("client.zig");
-}
+pub const BootstrapPeer = _shim_src.BootstrapPeer;
+pub const Client = _shim_src.Client;
+pub const ClientConfig = _shim_src.ClientConfig;
+pub const Key = _shim_src.Key;
+pub const MessageOwned = _shim_src.MessageOwned;
+pub const MessageType = _shim_src.MessageType;
+pub const MessageView = _shim_src.MessageView;
+pub const Mode = _shim_src.Mode;
+pub const NatStatus = _shim_src.NatStatus;
+pub const PeerView = _shim_src.PeerView;
+pub const PutResult = _shim_src.PutResult;
+pub const QueryConfig = _shim_src.QueryConfig;
+pub const QueryEngine = _shim_src.QueryEngine;
+pub const QueryPeerFn = _shim_src.QueryPeerFn;
+pub const RecordConfig = _shim_src.RecordConfig;
+pub const RecordStore = _shim_src.RecordStore;
+pub const RecordValidator = _shim_src.RecordValidator;
+pub const RecordView = _shim_src.RecordView;
+pub const RoutingConfig = _shim_src.RoutingConfig;
+pub const RoutingTable = _shim_src.RoutingTable;
+pub const Server = _shim_src.Server;
+pub const ServerConfig = _shim_src.ServerConfig;
+pub const ValidationResult = _shim_src.ValidationResult;
+pub const ValidationStats = _shim_src.ValidationStats;
+pub const client = _shim_src.client;
+pub const ipns_validator = _shim_src.ipns_validator;
+pub const keyspace = _shim_src.keyspace;
+pub const lan_protocol_line = _shim_src.lan_protocol_line;
+pub const mode = _shim_src.mode;
+pub const modeFromNatStatus = _shim_src.modeFromNatStatus;
+pub const protocol_id = _shim_src.protocol_id;
+pub const protocol_line = _shim_src.protocol_line;
+pub const query = _shim_src.query;
+pub const record_store = _shim_src.record_store;
+pub const record_validator = _shim_src.record_validator;
+pub const routing_table = _shim_src.routing_table;
+pub const server = _shim_src.server;
+pub const wire = _shim_src.wire;

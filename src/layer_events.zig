@@ -1,28 +1,6 @@
-//! Event-shaped error carriers for embedder loops (#45): `kind` fields use layered error sets so
-//! callers can `switch` without `anyerror`.
+//! Compatibility shim for legacy import paths (Zig 0.16).
+const _shim_src = @import("./core/layer_events.zig");
 
-const std = @import("std");
-const errors = @import("errors.zig");
-
-/// Req/resp (or stream codec) failure surfaced as an event.
-pub const ReqRespFailure = struct {
-    kind: errors.ReqRespError,
-};
-
-/// Gossipsub codec / mesh reservation failure surfaced as an event.
-pub const GossipsubFailure = struct {
-    kind: errors.GossipsubError,
-};
-
-/// Transport dial / listen / security / QUIC mapping failure surfaced as an event.
-pub const TransportFailure = struct {
-    kind: errors.TransportError,
-};
-
-test "req resp failure kind is switchable" {
-    const e: ReqRespFailure = .{ .kind = error.InvalidData };
-    switch (e.kind) {
-        error.InvalidData => {},
-        else => try std.testing.expect(false),
-    }
-}
+pub const GossipsubFailure = _shim_src.GossipsubFailure;
+pub const ReqRespFailure = _shim_src.ReqRespFailure;
+pub const TransportFailure = _shim_src.TransportFailure;

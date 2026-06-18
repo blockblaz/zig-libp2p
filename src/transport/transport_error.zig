@@ -1,7 +1,7 @@
 //! Map `std.Io.net`, multistream-select I/O, and **zquic** failures into [`errors.TransportError`] (#45 follow-up).
 
 const std = @import("std");
-const errors = @import("../errors.zig");
+const errors = @import("../primitives/errors.zig");
 const neg = @import("multistream_negotiate.zig");
 const libp2p_tls = @import("../security/libp2p_tls.zig");
 const libp2p_noise = @import("../security/noise/libp2p_noise.zig");

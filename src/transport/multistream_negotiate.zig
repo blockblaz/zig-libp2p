@@ -4,8 +4,8 @@
 //! so a peer cannot force unbounded buffering.
 
 const std = @import("std");
-const ms = @import("../multistream.zig");
-const proto_wire = @import("../protobuf/wire.zig");
+const ms = @import("../primitives/multistream.zig");
+const proto_wire = @import("../primitives/protobuf/wire.zig");
 
 /// go-multistream v0.5+ length-prefixes each token as `uvarint(len+1) + token + '\n'`.
 /// Legacy libp2p stacks use bare `token + '\n'` lines only.
