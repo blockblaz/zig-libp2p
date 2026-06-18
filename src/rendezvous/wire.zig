@@ -6,7 +6,6 @@ const std = @import("std");
 const Io = std.Io;
 const proto = @import("../protobuf/wire.zig");
 const varint = @import("../varint.zig");
-const wall_time = @import("../wall_time.zig");
 
 pub const protocol_line: []const u8 = "/rendezvous/1.0.0\n";
 pub const protocol_id: []const u8 = std.mem.trimEnd(u8, protocol_line, "\n");
@@ -179,18 +178,19 @@ pub const Cookie = struct {
         self.* = .{ .id = 0 };
     }
 
-    pub fn forNamespace(allocator: std.mem.Allocator, ns: []const u8) Error!Cookie {
+    /// Construct a namespace cookie with a caller-supplied id. The id is
+    /// assigned by the server's monotonic counter (see `store.Store`), not
+    /// derived here — a timestamp-seeded PRNG used to collide within a second.
+    pub fn forNamespace(allocator: std.mem.Allocator, id: u64, ns: []const u8) Error!Cookie {
         if (ns.len > max_namespace_len) return error.InvalidNamespace;
-        var prng = std.Random.DefaultPrng.init(@intCast(@max(1, wall_time.unixTimestamp())));
         return .{
-            .id = prng.random().int(u64),
+            .id = id,
             .namespace = try allocator.dupe(u8, ns),
         };
     }
 
-    pub fn forAllNamespaces(_: std.mem.Allocator) Error!Cookie {
-        var prng = std.Random.DefaultPrng.init(@intCast(@max(1, wall_time.unixTimestamp())));
-        return .{ .id = prng.random().int(u64), .namespace = null };
+    pub fn forAllNamespaces(_: std.mem.Allocator, id: u64) Error!Cookie {
+        return .{ .id = id, .namespace = null };
     }
 
     pub fn encodeWire(self: *const Cookie, allocator: std.mem.Allocator) Error![]u8 {
@@ -339,6 +339,9 @@ pub fn encode(allocator: std.mem.Allocator, msg: MessageView) Error![]u8 {
 
 fn decodeRegisterOwned(allocator: std.mem.Allocator, wire_bytes: []const u8, limits: Limits) Error!RegisterOwned {
     var out: RegisterOwned = .{};
+    // Free anything duped so far if a later field fails to parse — these run on
+    // untrusted frames, so a malformed record must not leak (#209).
+    errdefer out.deinit(allocator);
     var off: usize = 0;
     while (off < wire_bytes.len) {
         const key = try proto.decodeFieldKey(wire_bytes[off..]);
@@ -407,6 +410,7 @@ pub fn decodeOwned(allocator: std.mem.Allocator, wire_bytes: []const u8, limits:
         .register_response => blk: {
             const inner = register_response_bytes orelse return error.MissingRequiredField;
             var out: RegisterResponseOwned = .{ .status = .e_internal_error };
+            errdefer out.deinit(allocator);
             var ioff: usize = 0;
             while (ioff < inner.len) {
                 const key = try proto.decodeFieldKey(inner[ioff..]);
@@ -431,6 +435,7 @@ pub fn decodeOwned(allocator: std.mem.Allocator, wire_bytes: []const u8, limits:
         .unregister => blk: {
             const inner = unregister_bytes orelse return error.MissingRequiredField;
             var out: UnregisterOwned = .{};
+            errdefer out.deinit(allocator);
             var ioff: usize = 0;
             while (ioff < inner.len) {
                 const key = try proto.decodeFieldKey(inner[ioff..]);
@@ -444,6 +449,7 @@ pub fn decodeOwned(allocator: std.mem.Allocator, wire_bytes: []const u8, limits:
         .discover => blk: {
             const inner = discover_bytes orelse return error.MissingRequiredField;
             var out: DiscoverOwned = .{};
+            errdefer out.deinit(allocator);
             var ioff: usize = 0;
             while (ioff < inner.len) {
                 const key = try proto.decodeFieldKey(inner[ioff..]);
@@ -475,6 +481,10 @@ pub fn decodeOwned(allocator: std.mem.Allocator, wire_bytes: []const u8, limits:
                 regs.deinit(allocator);
             }
             var out: DiscoverResponseOwned = .{ .registrations = &.{} };
+            errdefer {
+                if (out.cookie) |x| allocator.free(x);
+                if (out.status_text) |x| allocator.free(x);
+            }
             var ioff: usize = 0;
             while (ioff < inner.len) {
                 const key = try proto.decodeFieldKey(inner[ioff..]);
@@ -534,7 +544,7 @@ pub fn readLengthPrefixedAlloc(r: *Io.Reader, allocator: std.mem.Allocator, max_
 
 test "cookie wire roundtrip matches rust layout" {
     const a = std.testing.allocator;
-    var cookie = try Cookie.forNamespace(a, "foo");
+    var cookie = try Cookie.forNamespace(a, 0xDEADBEEF, "foo");
     defer cookie.deinit(a);
     const wire_bytes = try cookie.encodeWire(a);
     defer a.free(wire_bytes);
@@ -543,6 +553,15 @@ test "cookie wire roundtrip matches rust layout" {
     defer parsed.deinit(a);
     try std.testing.expectEqual(cookie.id, parsed.id);
     try std.testing.expectEqualStrings("foo", parsed.namespace.?);
+}
+
+test "decodeRegisterOwned does not leak on truncated field" {
+    // Valid namespace (field 1) duped, then a signed-peer-record (field 2)
+    // declaring 5 bytes with only 2 present → Truncated. The dup must be freed
+    // (the testing allocator flags a leak otherwise) (#209).
+    const a = std.testing.allocator;
+    const crafted = [_]u8{ 0x0A, 0x03, 'a', 'b', 'c', 0x12, 0x05, 0x00, 0x00 };
+    try std.testing.expectError(error.Truncated, decodeRegisterOwned(a, &crafted, .standard));
 }
 
 test "register encode/decode roundtrip" {

@@ -131,6 +131,7 @@ test {
     _ = @import("gossipsub/duplicate_cache.zig");
     _ = @import("gossipsub/message_id.zig");
     _ = @import("autonat/root.zig");
+    _ = @import("rendezvous/root.zig");
     _ = @import("kad_dht/root.zig");
     _ = @import("discovery/root.zig");
     _ = @import("relay/root.zig");

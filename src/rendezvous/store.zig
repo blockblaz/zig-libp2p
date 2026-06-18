@@ -3,7 +3,6 @@
 const std = @import("std");
 const wire = @import("wire.zig");
 const identity = @import("../identity.zig");
-const wall_time = @import("../wall_time.zig");
 
 pub const Error = wire.Error || std.mem.Allocator.Error || error{Unavailable};
 
@@ -57,6 +56,17 @@ pub const Store = struct {
     entries: std.HashMap(u64, Entry, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage),
     peer_ns_to_id: std.StringHashMap(u64),
     cookies: std.ArrayList(CookieState) = .empty,
+    /// Monotonic id source for registrations and cookies. A timestamp-seeded
+    /// PRNG collided for everything created within the same wall-clock second,
+    /// silently overwriting (and leaking) registrations and breaking cookie
+    /// matching (#209).
+    next_id: u64 = 1,
+
+    fn nextId(self: *Store) u64 {
+        const id = self.next_id;
+        self.next_id += 1;
+        return id;
+    }
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Store {
         return .{
@@ -175,8 +185,7 @@ pub const Store = struct {
         defer self.allocator.free(index_key);
         if (self.peer_ns_to_id.get(index_key)) |old_id| self.removeById(old_id);
 
-        var prng = std.Random.DefaultPrng.init(@intCast(@max(1, wall_time.unixTimestamp())));
-        const id = prng.random().int(u64);
+        const id = self.nextId();
 
         const ns_owned = try self.allocator.dupe(u8, namespace);
         errdefer self.allocator.free(ns_owned);
@@ -245,8 +254,10 @@ pub const Store = struct {
             for (out_regs.items) |*r| r.deinit(self.allocator);
             out_regs.deinit(self.allocator);
         }
+        // Temporary id lists: their contents are copied into the cookie state
+        // below, so free them on success too (not just on error).
         var returned_ids = std.ArrayList(u64).empty;
-        errdefer returned_ids.deinit(self.allocator);
+        defer returned_ids.deinit(self.allocator);
 
         var it = self.entries.iterator();
         while (it.next()) |e| {
@@ -266,16 +277,16 @@ pub const Store = struct {
         }
 
         var all_ids = std.ArrayList(u64).empty;
-        errdefer all_ids.deinit(self.allocator);
+        defer all_ids.deinit(self.allocator);
         if (cookie_in) |c| {
             if (self.findCookie(c)) |state| try all_ids.appendSlice(self.allocator, state.returned_ids.items);
         }
         try all_ids.appendSlice(self.allocator, returned_ids.items);
 
-        const new_cookie = if (discover_ns) |dns|
-            try wire.Cookie.forNamespace(self.allocator, dns)
-        else
-            try wire.Cookie.forAllNamespaces(self.allocator);
+        const new_cookie = wire.Cookie{
+            .id = self.nextId(),
+            .namespace = if (discover_ns) |dns| try self.allocator.dupe(u8, dns) else null,
+        };
 
         var state = CookieState{ .cookie = new_cookie, .returned_ids = .empty };
         try state.returned_ids.appendSlice(self.allocator, all_ids.items);
@@ -308,8 +319,11 @@ test "cookie discover returns only delta" {
 
     const peer_a = try identity.PeerId.random();
     const peer_b = try identity.PeerId.random();
-    _ = try store.add(peer_a, "foo", "spr-a", wire.default_ttl_s, 0);
-    _ = try store.add(peer_b, "foo", "spr-b", wire.default_ttl_s, 0);
+    // `add` returns an owned Registration the caller must free.
+    var ra = try store.add(peer_a, "foo", "spr-a", wire.default_ttl_s, 0);
+    ra.deinit(a);
+    var rb = try store.add(peer_b, "foo", "spr-b", wire.default_ttl_s, 0);
+    rb.deinit(a);
 
     var first = try store.discover(null, null, null, 0);
     defer store.freeDiscoverResult(first);
