@@ -23,6 +23,7 @@ const lim = @import("wire_limits.zig");
 const message_id = @import("message_id.zig");
 const msg_mod = @import("message.zig");
 const rpc = @import("rpc.zig");
+const peer_score_mod = @import("peer_score.zig");
 
 const log = std.log.scoped(.gossipsub);
 
@@ -197,6 +198,9 @@ pub const GossipsubConfig = struct {
     graft_during_backoff_score_delta: i32 = -50,
     /// When set, [`Gossipsub`] updates `lean_gossip_mesh_peers` from [`meshPeers`] on membership changes and heartbeat (#43).
     metrics: ?*metrics_mod.Metrics = null,
+    /// libp2p gossipsub v1.1 peer scoring parameters (#199).
+    peer_scoring: peer_score_mod.Params = .{},
+    peer_scoring_enabled: bool = false,
 
     pub fn validate(c: GossipsubConfig) InitConfigError!void {
         if (c.mesh_n_low > c.mesh_n) return error.InvalidMeshKnobs;
@@ -400,7 +404,10 @@ pub const Gossipsub = struct {
     rng: std.Random.DefaultPrng,
     scratch_peers: std.ArrayList(identity.PeerId),
     /// Optional mesh / behaviour scores for candidate ordering (higher = preferred GRAFT target) (#39).
+    /// When [`peer_scoring_enabled`], [`score_tracker`] is the source of truth unless a manual
+    /// override was set via [`setPeerBehaviourScore`].
     peer_scores: std.HashMap(identity.PeerId, i32, connection_manager.PeerIdContext, std.hash_map.default_max_load_percentage),
+    score_tracker: peer_score_mod.Tracker,
     /// Active PRUNE back-off windows keyed by (peer, topic). Linear-scanned because the
     /// list stays bounded by `max_backoff_entries` and back-offs are short-lived.
     backoff: std.ArrayList(BackoffEntry),
@@ -564,6 +571,7 @@ pub const Gossipsub = struct {
             .rng = std.Random.DefaultPrng.init(seed),
             .scratch_peers = .empty,
             .peer_scores = .init(allocator),
+            .score_tracker = peer_score_mod.Tracker.init(allocator, config.peer_scoring),
             .backoff = .empty,
             .graft_refused_during_backoff = 0,
             .seqno_dedup = .empty,
@@ -618,6 +626,7 @@ pub const Gossipsub = struct {
         self.cmd_queue.deinit(self.allocator);
         self.connected.deinit();
         self.peer_scores.deinit();
+        self.score_tracker.deinit();
         self.scratch_peers.deinit(self.allocator);
         for (self.backoff.items) |b| self.allocator.free(b.topic);
         self.backoff.deinit(self.allocator);
@@ -960,9 +969,20 @@ pub const Gossipsub = struct {
 
     fn applyScoreDelta(self: *Gossipsub, peer: identity.PeerId, delta: i32) void {
         if (delta == 0) return;
+        if (self.cfg.peer_scoring_enabled) {
+            self.score_tracker.applyBehaviourDelta(peer, "*", @floatFromInt(delta));
+            return;
+        }
         const cur = self.peerBehaviourScoreInner(peer);
         const next: i32 = cur +| delta;
         self.peer_scores.put(peer, next) catch return;
+    }
+
+    pub fn setPeerDirection(self: *Gossipsub, peer: identity.PeerId, direction: peer_score_mod.Direction) void {
+        if (!self.cfg.peer_scoring_enabled) return;
+        self.lock();
+        defer self.unlock();
+        self.score_tracker.setDirection(peer, direction);
     }
 
     fn recordSeenForLazy(self: *Gossipsub, topic: []const u8, id: [20]u8) std.mem.Allocator.Error!void {
@@ -1030,6 +1050,7 @@ pub const Gossipsub = struct {
         offered_ids: [][]u8,
     ) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         if (!self.subs.contains(topic)) return;
+        if (self.cfg.peer_scoring_enabled and !self.score_tracker.allowsGossip(sender, topic, self.clock_ms)) return;
 
         var wanted_storage: std.ArrayList([20]u8) = .empty;
         defer wanted_storage.deinit(self.allocator);
@@ -1390,6 +1411,7 @@ pub const Gossipsub = struct {
             _ = e.value_ptr.peers.peers.remove(peer);
         }
         self.clearBackoffForPeer(peer);
+        if (self.cfg.peer_scoring_enabled) self.score_tracker.removePeer(peer);
         self.syncMeshPeers();
     }
 
@@ -1399,7 +1421,9 @@ pub const Gossipsub = struct {
         return self.peerBehaviourScoreInner(peer);
     }
     fn peerBehaviourScoreInner(self: *const Gossipsub, peer: identity.PeerId) i32 {
-        return self.peer_scores.get(peer) orelse 0;
+        if (self.peer_scores.get(peer)) |s| return s;
+        if (!self.cfg.peer_scoring_enabled) return 0;
+        return self.score_tracker.minTopicScore(peer, self.clock_ms);
     }
 
     /// Sets a behaviour score used for mesh GRAFT / PRUNE ordering and lazy IHAVE peer selection (#39).
@@ -1624,6 +1648,7 @@ pub const Gossipsub = struct {
             // splice attacker-chosen multiaddrs into our dial queue (see #201).
             for (prune.peers) |pi| {
                 const pb = pi.peer_id orelse continue;
+                if (self.cfg.peer_scoring_enabled and !self.score_tracker.allowsPx(sender, prune.topic, self.clock_ms)) continue;
                 if (pi.signed_peer_record) |spr| {
                     if (self.cfg.px_verify_signed_envelope) {
                         if (self.verifyPxEnvelope(pb, spr)) {
@@ -1702,6 +1727,7 @@ pub const Gossipsub = struct {
         while (pit.next()) |kp| {
             const dest = kp.*;
             if (dest.eql(&sender)) continue;
+            if (self.cfg.peer_scoring_enabled and !self.score_tracker.allowsPublishForward(dest, topic, self.clock_ms)) continue;
             if (self.peerWantsNotPublish(dest, mid)) {
                 self.suppressed_outbound_idontwant += 1;
                 continue;
@@ -1764,6 +1790,7 @@ pub const Gossipsub = struct {
     fn handleInboundRpcInner(self: *Gossipsub, sender: identity.PeerId, frame: []const u8) (rpc.Error || msg_mod.Error || control.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         self.lock();
         defer self.unlock();
+        if (self.cfg.peer_scoring_enabled and !self.score_tracker.allowsRpc(sender, self.clock_ms)) return;
         // The three sections of an RPC frame (subscriptions, control, publish)
         // are independent on the wire. A decode failure in one — for example, a
         // forward-incompatible field added by a peer running a newer gossipsub
@@ -1841,6 +1868,7 @@ pub const Gossipsub = struct {
                     .accept => {},
                     .reject => {
                         self.inbound_dropped_validator_reject += 1;
+                        if (self.cfg.peer_scoring_enabled) self.score_tracker.recordInvalidMessage(sender, topic);
                         self.applyScoreDelta(sender, self.cfg.validator_reject_score_delta);
                         continue;
                     },
@@ -1852,6 +1880,7 @@ pub const Gossipsub = struct {
                 }
             }
             self.inbound_delivered += 1;
+            if (self.cfg.peer_scoring_enabled) self.score_tracker.recordFirstDelivery(sender, topic);
             try self.recordSeenForLazy(topic, id);
             try self.rememberPullPayload(topic, id, data);
             try self.forwardPublishWithId(sender, topic, data, id);
@@ -1874,11 +1903,19 @@ pub const Gossipsub = struct {
         self.pruneBackoff();
         self.pruneTopicUnsubscribeCooldown();
         self.pruneFanout();
+        if (self.cfg.peer_scoring_enabled) self.score_tracker.decay(self.clock_ms);
 
         var sit = self.subs.iterator();
         while (sit.next()) |e| {
             const topic = e.key_ptr.*;
             const mp = self.mesh.getPtr(topic) orelse continue;
+
+            if (self.cfg.peer_scoring_enabled) {
+                self.scratch_peers.clearRetainingCapacity();
+                var mpit = mp.peers.keyIterator();
+                while (mpit.next()) |kp| self.scratch_peers.append(self.allocator, kp.*) catch {};
+                self.score_tracker.tickMeshMembership(topic, self.scratch_peers.items, self.cfg.heartbeat_interval_ms);
+            }
 
             var c = mp.peers.count();
             if (c < self.cfg.mesh_n_low) {
@@ -1903,6 +1940,37 @@ pub const Gossipsub = struct {
             c = mp.peers.count();
             if (c > self.cfg.mesh_n_high) {
                 try self.pruneMeshDownToN(topic, self.cfg.mesh_n);
+            }
+
+            if (self.cfg.peer_scoring_enabled) {
+                self.scratch_peers.clearRetainingCapacity();
+                var cit = self.connected.keyIterator();
+                while (cit.next()) |kp| try self.scratch_peers.append(self.allocator, kp.*);
+                var mesh_buf: [256]identity.PeerId = undefined;
+                var mi: usize = 0;
+                var mpit2 = mp.peers.keyIterator();
+                while (mpit2.next()) |kp| {
+                    if (mi >= mesh_buf.len) break;
+                    mesh_buf[mi] = kp.*;
+                    mi += 1;
+                }
+                const og = try self.score_tracker.opportunisticGraftCandidates(
+                    self.allocator,
+                    topic,
+                    self.scratch_peers.items,
+                    mesh_buf[0..mi],
+                    self.clock_ms,
+                );
+                defer self.allocator.free(og);
+                for (og) |target| {
+                    if (mp.peers.contains(target)) continue;
+                    const ctl = try control.encodeGraft(self.allocator, topic);
+                    defer self.allocator.free(ctl);
+                    const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
+                    errdefer self.allocator.free(rpcw);
+                    try self.appendOut(rpcw, target);
+                    try mp.peers.put(target, {});
+                }
             }
         }
 
@@ -3954,4 +4022,31 @@ test "subscribe promotes fanout peers into mesh (#200)" {
     while (g.popOutboxDelivery()) |d| a.free(d.wire);
 
     try std.testing.expectEqual(@as(?usize, 1), g.meshPeerCountForTopic("t"));
+}
+
+test "peer scoring graylists low-score inbound rpc" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    const peer = try identity.PeerId.random();
+
+    var g = try Gossipsub.init(a, .{
+        .local_peer_id = me,
+        .peer_scoring_enabled = true,
+        .peer_scoring = .{ .topic = .{ .graylist_threshold = -10 } },
+    });
+    defer g.deinit();
+    g.onPeerConnected(peer);
+    try g.subscribe("blocks");
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+
+    g.score_tracker.recordInvalidMessage(peer, "blocks");
+    g.score_tracker.recordInvalidMessage(peer, "blocks");
+
+    const before = g.inboundDeliveredCount();
+    const published = try msg_mod.encode(a, .{ .topic = "blocks", .data = "payload" });
+    defer a.free(published);
+    const frame = try rpc.encodePublish(a, published);
+    defer a.free(frame);
+    try g.handleInboundRpc(peer, frame);
+    try std.testing.expectEqual(before, g.inboundDeliveredCount());
 }

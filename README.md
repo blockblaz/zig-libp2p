@@ -123,7 +123,7 @@ Ethereum consensus, so some libp2p features are intentionally out of scope.
 
 | Spec | Status | Notes |
 |------|:------:|-------|
-| gossipsub v1.1 (StrictNoSign) | ✅ | mesh, scoring, PX, IDONTWANT, direct peers, FANOUT; interop go ✅ · rust ✅ |
+| gossipsub v1.1 (StrictNoSign) | ✅ | mesh, peer scoring ([#199](https://github.com/blockblaz/zig-libp2p/issues/199)), PX, IDONTWANT, direct peers, FANOUT; interop go ✅ · rust ✅ |
 | floodsub | ⛔ | superseded by gossipsub |
 
 ### Peer discovery & content routing
