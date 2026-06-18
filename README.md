@@ -139,7 +139,7 @@ Ethereum consensus, so some libp2p features are intentionally out of scope.
 
 | Spec | Status | Notes |
 |------|:------:|-------|
-| AutoNAT v1/v2 | 🚧 | `autonat`; in-memory smoke. Vote aggregation + active probing pending ([#206](https://github.com/ch4r10t33r/zig-libp2p/issues/206)) |
+| AutoNAT v1 | ✅ | `autonat`; active probing, dial-back verification, sliding-window vote aggregation ([#206](https://github.com/ch4r10t33r/zig-libp2p/issues/206)). v2 wire codecs present; v2 transport wiring pending |
 | Circuit Relay v2 | 🚧 | `relay`, QUIC runtime; `/p2p-circuit` dial + reservation refresh ([#204](https://github.com/ch4r10t33r/zig-libp2p/issues/204)) |
 | DCUtR (hole punching) | ✅ | `dcutr`; auto-trigger on relayed connections with retry ([#205](https://github.com/ch4r10t33r/zig-libp2p/issues/205)) |
 

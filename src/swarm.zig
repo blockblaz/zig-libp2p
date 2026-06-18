@@ -27,6 +27,7 @@ const metrics = @import("metrics.zig");
 const peer_events = @import("peer_events.zig");
 const protocol = @import("protocol.zig");
 const identity = @import("identity.zig");
+const autonat_mod = @import("autonat/root.zig");
 
 pub const command_capacity: usize = 8192;
 pub const commands_per_tick: u32 = 256;
@@ -174,6 +175,13 @@ pub const Event = union(enum) {
         relayed_conn_id: u64,
         reason: DcutrFailReason,
     },
+    /// Per-address reachability from AutoNAT (#206).
+    reachability_changed: struct {
+        addr: []const u8,
+        status: autonat_mod.NatStatus,
+    },
+    /// Open `/libp2p/autonat/1.0.0` to `peer` for an active probe (#206).
+    autonat_probe_peer: identity.PeerId,
     log: struct {
         level: LogLevel,
         message: []const u8,
@@ -195,6 +203,9 @@ pub const Event = union(enum) {
             .log => |*l| {
                 a.free(l.message);
             },
+            .reachability_changed => |r| {
+                a.free(r.addr);
+            },
             .rpc_response_end,
             .rpc_error_response,
             .peer_connected,
@@ -205,6 +216,7 @@ pub const Event = union(enum) {
             .relay_reservation,
             .dcutr_succeeded,
             .dcutr_failed,
+            .autonat_probe_peer,
             .swarm_closed,
             => {},
         }
