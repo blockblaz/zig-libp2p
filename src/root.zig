@@ -24,6 +24,7 @@ pub const ping_wire_quic = @import("ping_wire_quic.zig");
 pub const identify = @import("identify.zig");
 
 pub const autonat = @import("autonat/root.zig");
+pub const rendezvous = @import("rendezvous/root.zig");
 pub const kad_dht = @import("kad_dht/root.zig");
 pub const discovery = @import("discovery/root.zig");
 pub const relay = @import("relay/root.zig");
