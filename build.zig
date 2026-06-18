@@ -152,8 +152,9 @@ pub fn build(b: *std.Build) void {
             .name = ex.exe_name,
             .root_module = ex_mod,
         });
-        b.installArtifact(exe);
-        examples_step.dependOn(&exe.step);
+        const install_ex = b.addInstallArtifact(exe, .{});
+        b.getInstallStep().dependOn(&install_ex.step);
+        examples_step.dependOn(&install_ex.step);
 
         exe.step.dependOn(&run_unit_tests.step);
         if (prev_example_run) |prev| exe.step.dependOn(prev);
