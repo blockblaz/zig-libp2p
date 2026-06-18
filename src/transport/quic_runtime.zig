@@ -2152,27 +2152,87 @@ pub const QuicRuntime = struct {
     fn autonatDialBack(ctx: ?*anyopaque, addr_bytes: []const u8, nonce: u64) autonat_mod.DialBackResult {
         _ = nonce;
         const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        self.handleDial(addr_bytes, null);
-        return .ok;
+        // Real reachability check: only report `.ok` if the dial-back actually
+        // connects, otherwise `.dial_error`. Returning `.ok` unconditionally
+        // would make us a server that always votes "reachable" (#206).
+        return if (self.dialBackProbe(addr_bytes)) .ok else .dial_error;
+    }
+
+    /// AutoNAT v1 dial-back deadline (#206). Bounded short because this blocks
+    /// the runtime advance thread (consistent with `handleDial`'s blocking dial).
+    const autonat_dial_back_deadline_ms: i64 = 5_000;
+
+    /// Synchronously dial `addr_str` and report whether the QUIC handshake
+    /// completes within the deadline. The probe connection is always torn down
+    /// — it is never retained as a peer. Any parse/dial error returns false so
+    /// we never falsely claim reachability (#206).
+    fn dialBackProbe(self: *QuicRuntime, addr_str: []const u8) bool {
+        const a = self.allocator;
+        var ma = multiaddr.Multiaddr.fromString(a, addr_str) catch return false;
+        defer ma.deinit();
+
+        var dial_opts: quic.Libp2pZquicClientDialOptions = .{};
+        switch (self.tls_pem_resolved) {
+            .paths => |p| {
+                dial_opts.client_cert_path = p.cert_path;
+                dial_opts.client_key_path = p.key_path;
+            },
+            .bytes => |b| {
+                dial_opts.client_cert_pem = b.cert_pem;
+                dial_opts.client_key_pem = b.key_pem;
+            },
+        }
+
+        var outbound = quic_endpoint.QuicOutbound.dial(a, ma, dial_opts) catch return false;
+        defer outbound.deinit();
+
+        var recv_buf: [65536]u8 = undefined;
+        const deadline_ms = self.opts.now_ms_fn() + autonat_dial_back_deadline_ms;
+        while (self.opts.now_ms_fn() < deadline_ms) {
+            outbound.drive(&recv_buf, 5) catch {};
+            // Keep the listener drained so its TLS handshake responses move.
+            self.listener.drive(&recv_buf, 0) catch {};
+            if (outbound.client.conn.phase == .connected) return true;
+            if (self.shutdown_requested.load(.acquire)) return false;
+        }
+        return false;
+    }
+
+    /// The remote UDP source IP of an inbound connection, as the AutoNAT v1
+    /// observed address (#206).
+    fn observedIpFromConn(conn: *ZIo.ConnState) autonat_mod.IpAddr {
+        const peer = conn.peer;
+        return switch (peer.in.family) {
+            std.posix.AF.INET => .{ .v4 = @bitCast(peer.in.addr) },
+            std.posix.AF.INET6 => .{ .v6 = peer.in6.addr },
+            else => .{ .v4 = .{ 0, 0, 0, 0 } },
+        };
     }
 
     fn startOutboundAutonatProbe(self: *QuicRuntime, peer: identity.PeerId) !void {
         const probe = self.host.takeAutonatProbeForPeer(peer) orelse return;
-        errdefer self.host.freeAutonatProbeMessage(probe.wire_message);
+        // We took ownership of the probe message; always free it (we dup into
+        // the long-lived OutboundAutonatProbe below). `defer` — not `errdefer`
+        // after an explicit free — avoids the double-free on a failed `put`.
+        defer self.host.freeAutonatProbeMessage(probe.wire_message);
 
         const opened = try self.openPushStreamForPeer(peer);
-        const probe_id = self.next_autonat_probe_id;
-        self.next_autonat_probe_id += 1;
+
+        const probe_wire = try self.allocator.dupe(u8, probe.wire_message);
+        errdefer self.allocator.free(probe_wire);
 
         const op = try self.allocator.create(OutboundAutonatProbe);
+        errdefer self.allocator.destroy(op);
         op.* = .{
             .peer = peer,
             .stream_id = opened.stream_id,
             .raw = opened.raw,
-            .probe_wire = try self.allocator.dupe(u8, probe.wire_message),
+            .probe_wire = probe_wire,
         };
-        self.host.freeAutonatProbeMessage(probe.wire_message);
+
+        const probe_id = self.next_autonat_probe_id;
         try self.outbound_autonat_probes.put(probe_id, op);
+        self.next_autonat_probe_id += 1;
     }
 
     fn recordInboundIdentifyProtocols(self: *QuicRuntime, peer: identity.PeerId, wire_bytes: []const u8) void {
@@ -2184,6 +2244,11 @@ pub const QuicRuntime = struct {
         self.host.recordPeerProtocols(peer, protos.items) catch {
             log.warn("quic_runtime: recordPeerProtocols failed", .{});
         };
+        // The peer's `observed_addr` is its view of *our* external address —
+        // the only usable AutoNAT probe candidate (listen addrs are wildcards).
+        if (msg.observed_addr) |obs| {
+            self.host.recordObservedAddr(obs) catch {};
+        }
     }
 
     fn seedHostIdentifyAdvertisement(self: *QuicRuntime) !void {
@@ -3160,7 +3225,10 @@ pub const QuicRuntime = struct {
                     }
                     var r = std.Io.Reader.fixed(ist.req_acc.items);
                     var w = ist.raw.writer();
-                    const observed: autonat_mod.IpAddr = .{ .v4 = .{ 0, 0, 0, 0 } };
+                    // The real remote UDP source IP — the amplification guard
+                    // (`v1DialAddrAllowed`) only dials addrs matching it, so a
+                    // hardcoded 0.0.0.0 would bypass that protection (#206).
+                    const observed = observedIpFromConn(ist.conn);
                     self.autonat_server.handleV1Stream(&r, &w, observed, false) catch {
                         self.removeInboundStreamAt(i);
                         continue;

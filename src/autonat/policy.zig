@@ -32,20 +32,24 @@ pub const ProbeOutcome = enum {
     failure,
 };
 
-/// Fixed-size ring of the last K probe outcomes (#206).
+/// Fixed-size ring of recent probe outcomes (#206). The physical capacity caps
+/// `Config.window_size`; quorum is evaluated over the most recent
+/// `min(window_size, capacity)` outcomes.
 pub const WindowTracker = struct {
-    ring: [8]ProbeOutcome = undefined,
+    pub const capacity: u8 = 8;
+
+    ring: [capacity]ProbeOutcome = undefined,
     len: u8 = 0,
     head: u8 = 0,
 
     pub fn record(self: *WindowTracker, outcome: ProbeOutcome) void {
-        if (self.len < 8) {
+        if (self.len < capacity) {
             self.ring[self.len] = outcome;
             self.len += 1;
             return;
         }
         self.ring[self.head] = outcome;
-        self.head = (self.head + 1) % 8;
+        self.head = (self.head + 1) % capacity;
     }
 
     pub fn reset(self: *WindowTracker) void {
@@ -53,26 +57,27 @@ pub const WindowTracker = struct {
         self.head = 0;
     }
 
-    pub fn count(self: WindowTracker, outcome: ProbeOutcome) u32 {
-        var n: u32 = 0;
-        const cap: u8 = 8;
-        if (self.len < cap) {
-            for (self.ring[0..self.len]) |slot| {
-                if (slot == outcome) n += 1;
-            }
-            return n;
-        }
+    /// `i`-th most recent outcome (0 = newest). `i` must be `< self.len`.
+    fn recentAt(self: WindowTracker, i: u8) ProbeOutcome {
+        if (self.len < capacity) return self.ring[self.len - 1 - i];
+        return self.ring[(self.head + capacity - 1 - i) % capacity];
+    }
+
+    /// Count `outcome` among the most recent `window` outcomes.
+    pub fn countRecent(self: WindowTracker, outcome: ProbeOutcome, window: u32) u32 {
+        const n: u8 = @intCast(@min(@as(u32, self.len), window));
+        var c: u32 = 0;
         var i: u8 = 0;
-        while (i < cap) : (i += 1) {
-            const idx = (self.head + i) % cap;
-            if (self.ring[idx] == outcome) n += 1;
+        while (i < n) : (i += 1) {
+            if (self.recentAt(i) == outcome) c += 1;
         }
-        return n;
+        return c;
     }
 
     pub fn status(self: WindowTracker, cfg: Config) NatStatus {
-        const successes = self.count(.success);
-        const failures = self.count(.failure);
+        const window = @min(cfg.window_size, @as(u32, capacity));
+        const successes = self.countRecent(.success, window);
+        const failures = self.countRecent(.failure, window);
         if (successes >= cfg.confidence_threshold) return .public;
         if (failures >= cfg.failure_threshold) return .private;
         return .unknown;
@@ -211,6 +216,23 @@ pub fn v2ClientAddrAllowed(allocator: std.mem.Allocator, addr: []const u8) bool 
     return ip != null and !isPrivateIp(ip.?);
 }
 
+/// Wildcard / unspecified address (0.0.0.0, ::) — never a dial-back target.
+pub fn isUnspecifiedIp(ip: IpAddr) bool {
+    return switch (ip) {
+        .v4 => |b| std.mem.allEqual(u8, &b, 0),
+        .v6 => |b| std.mem.allEqual(u8, &b, 0),
+    };
+}
+
+/// Whether `addr` is a usable AutoNAT probe candidate: it must carry a concrete
+/// public IP. Listen wildcards (`/ip4/0.0.0.0/...`), loopback, and RFC 1918 /
+/// link-local addresses are rejected — asking a server to dial those back can
+/// never verify external reachability (#206).
+pub fn isDialableCandidate(allocator: std.mem.Allocator, addr: []const u8) bool {
+    const ip = (extractIpFromMultiaddr(allocator, addr) catch return false) orelse return false;
+    return !isUnspecifiedIp(ip) and !isPrivateIp(ip);
+}
+
 pub fn selectV2DialAddrIndex(allocator: std.mem.Allocator, addrs: []const []const u8) ?u32 {
     for (addrs, 0..) |a, i| {
         if (v2ClientAddrAllowed(allocator, a)) return @intCast(i);
@@ -252,6 +274,29 @@ test "window private quorum" {
     try std.testing.expectEqual(NatStatus.unknown, t.natStatus(cfg));
     t.record(.failure);
     try std.testing.expectEqual(NatStatus.private, t.natStatus(cfg));
+}
+
+test "sliding window evicts stale outcomes" {
+    // window_size=3 must flip public→private as old successes fall out of the
+    // window — a cumulative counter (old behavior) would stay public forever.
+    const cfg: Config = .{ .window_size = 3, .confidence_threshold = 3, .failure_threshold = 3 };
+    var t = ReachabilityTracker.init();
+    t.record(.success);
+    t.record(.success);
+    t.record(.success);
+    try std.testing.expectEqual(NatStatus.public, t.natStatus(cfg));
+    t.record(.failure);
+    t.record(.failure);
+    t.record(.failure);
+    try std.testing.expectEqual(NatStatus.private, t.natStatus(cfg));
+}
+
+test "dialable candidate rejects wildcard and private" {
+    const a = std.testing.allocator;
+    try std.testing.expect(isDialableCandidate(a, "/ip4/203.0.113.5/udp/4001/quic-v1"));
+    try std.testing.expect(!isDialableCandidate(a, "/ip4/0.0.0.0/udp/4001/quic-v1"));
+    try std.testing.expect(!isDialableCandidate(a, "/ip4/127.0.0.1/udp/4001/quic-v1"));
+    try std.testing.expect(!isDialableCandidate(a, "/ip4/10.0.0.1/udp/4001/quic-v1"));
 }
 
 test "v1 dial addr must match observed ip" {

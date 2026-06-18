@@ -132,6 +132,11 @@ pub const Host = struct {
     autonat_probe_dispatch: ?AutonatProbeDispatch = null,
     kad_dht_client: ?*kad_dht_mod.Client = null,
     autonat_addr_scratch: std.ArrayList([]const u8) = .empty,
+    /// External addresses other peers reported observing us from (identify
+    /// `observed_addr`). Used as AutoNAT probe candidates — listen addrs are
+    /// `/ip4/0.0.0.0/...` wildcards and cannot be dialed back (#206).
+    observed_addrs: std.StringHashMap(void),
+    autonat_candidate_scratch: std.ArrayList([]const u8) = .empty,
     last_autonat_node_status: autonat_mod.NatStatus = .unknown,
 
     pub fn create(cfg: HostConfig) InitError!*Host {
@@ -186,6 +191,7 @@ pub const Host = struct {
             .identify_max_push_per_tick = cfg.identify.max_push_per_tick,
             .autonat_client = autonat_client,
             .peer_protocols = peer_protocols_mod.Store.init(allocator),
+            .observed_addrs = std.StringHashMap(void).init(allocator),
         };
         return self;
     }
@@ -205,6 +211,10 @@ pub const Host = struct {
         if (self.autonat_client) |*c| c.deinit();
         self.peer_protocols.deinit();
         self.autonat_addr_scratch.deinit(self.allocator);
+        var oit = self.observed_addrs.keyIterator();
+        while (oit.next()) |k| self.allocator.free(k.*);
+        self.observed_addrs.deinit();
+        self.autonat_candidate_scratch.deinit(self.allocator);
         self.swarm.deinit();
         self.allocator.destroy(self.swarm);
         self.allocator.destroy(self);
@@ -261,12 +271,10 @@ pub const Host = struct {
             return;
         };
 
-        self.autonat_addr_scratch.clearRetainingCapacity();
-        const params = self.identify_ad.replyParamsInto(
-            &self.autonat_addr_scratch,
-            &self.identify_proto_scratch,
-        );
-        const listen_addrs = params.listen_addrs;
+        const candidates = try self.buildAutonatCandidates();
+        // No concrete public candidate addr → reachability is undeterminable;
+        // skip probing rather than asking servers to dial wildcards (#206).
+        if (candidates.len == 0) return;
 
         var connected: std.ArrayList(identity.PeerId) = .empty;
         defer connected.deinit(self.allocator);
@@ -276,7 +284,7 @@ pub const Host = struct {
         defer servers.deinit(self.allocator);
         try self.peer_protocols.collectAutonatServers(connected.items, &servers);
 
-        client.scheduleActiveProbes(now_ms, self.swarm.local_peer, servers.items, listen_addrs) catch {};
+        client.scheduleActiveProbes(now_ms, self.swarm.local_peer, servers.items, candidates) catch {};
 
         for (servers.items) |peer| {
             if (!client.hasPendingProbe(peer)) continue;
@@ -321,6 +329,52 @@ pub const Host = struct {
         try self.peer_protocols.setProtocols(peer, protocols);
     }
 
+    /// Cap on stored observed external addresses (#206). Bounds memory against
+    /// peers reporting many distinct `observed_addr` values.
+    const max_observed_addrs: usize = 16;
+
+    /// Record an external address a peer observed us from (identify
+    /// `observed_addr`). Deduped and bounded; used as an AutoNAT probe
+    /// candidate when it is a concrete public address (#206).
+    pub fn recordObservedAddr(self: *Host, addr: []const u8) std.mem.Allocator.Error!void {
+        if (self.autonat_client == null) return;
+        if (!autonat_mod.policy.isDialableCandidate(self.allocator, addr)) return;
+        if (self.observed_addrs.contains(addr)) return;
+        if (self.observed_addrs.count() >= max_observed_addrs) return;
+        const owned = try self.allocator.dupe(u8, addr);
+        errdefer self.allocator.free(owned);
+        try self.observed_addrs.put(owned, {});
+    }
+
+    /// Build the AutoNAT probe-candidate list into `autonat_candidate_scratch`:
+    /// observed external addrs plus any concrete/public operator announce addrs,
+    /// deduped. Wildcard/private addrs are filtered out (#206). Returned slices
+    /// borrow scratch storage valid until the next call.
+    fn buildAutonatCandidates(self: *Host) std.mem.Allocator.Error![]const []const u8 {
+        self.autonat_candidate_scratch.clearRetainingCapacity();
+        var oit = self.observed_addrs.keyIterator();
+        while (oit.next()) |k| {
+            try self.autonat_candidate_scratch.append(self.allocator, k.*);
+        }
+        self.autonat_addr_scratch.clearRetainingCapacity();
+        const params = self.identify_ad.replyParamsInto(
+            &self.autonat_addr_scratch,
+            &self.identify_proto_scratch,
+        );
+        for (params.listen_addrs) |addr| {
+            if (!autonat_mod.policy.isDialableCandidate(self.allocator, addr)) continue;
+            var dup = false;
+            for (self.autonat_candidate_scratch.items) |c| {
+                if (std.mem.eql(u8, c, addr)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) try self.autonat_candidate_scratch.append(self.allocator, addr);
+        }
+        return self.autonat_candidate_scratch.items;
+    }
+
     pub fn takeAutonatProbeForPeer(self: *Host, peer: identity.PeerId) ?autonat_mod.OutboundProbe {
         if (self.autonat_client) |*c| return c.takePendingProbe(peer);
         return null;
@@ -335,12 +389,8 @@ pub const Host = struct {
             if (self.autonat_client) |*c| break :blk c;
             return;
         };
-        self.autonat_addr_scratch.clearRetainingCapacity();
-        const params = self.identify_ad.replyParamsInto(
-            &self.autonat_addr_scratch,
-            &self.identify_proto_scratch,
-        );
-        try client.handleV1DialResponse(resp, params.listen_addrs);
+        const candidates = try self.buildAutonatCandidates();
+        try client.handleV1DialResponse(resp, candidates);
         const changes = client.takeReachabilityChanges();
         defer client.freeReachabilityChanges(changes);
         for (changes) |ch| {
@@ -570,6 +620,32 @@ test "Host.create / destroy round trip" {
     defer host.destroy();
 
     try testing.expect(host.gossipsub.cfg.local_peer_id.eql(&me));
+}
+
+test "Host autonat probe candidates come from observed addrs, filtered" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const me = try identity.PeerId.random();
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+        .autonat = .{ .enable = true },
+    });
+    defer host.destroy();
+
+    // Wildcard and private observed addrs are rejected; the public one becomes
+    // the sole (deduped) probe candidate — listen wildcards can't be dialed back.
+    try host.recordObservedAddr("/ip4/0.0.0.0/udp/4001/quic-v1");
+    try host.recordObservedAddr("/ip4/10.0.0.5/udp/4001/quic-v1");
+    try host.recordObservedAddr("/ip4/203.0.113.9/udp/4001/quic-v1");
+    try host.recordObservedAddr("/ip4/203.0.113.9/udp/4001/quic-v1");
+
+    const candidates = try host.buildAutonatCandidates();
+    try testing.expectEqual(@as(usize, 1), candidates.len);
+    try testing.expectEqualStrings("/ip4/203.0.113.9/udp/4001/quic-v1", candidates[0]);
 }
 
 test "Host.startBackground + waitUntilReady chains to swarm" {

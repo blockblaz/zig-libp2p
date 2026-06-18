@@ -64,6 +64,8 @@ pub const Client = struct {
         self.pending_probes.deinit(self.allocator);
         for (self.pending_changes.items) |c| self.allocator.free(c.addr);
         self.pending_changes.deinit(self.allocator);
+        var kit = self.addr_trackers.keyIterator();
+        while (kit.next()) |k| self.allocator.free(k.*);
         self.addr_trackers.deinit();
     }
 
@@ -72,8 +74,8 @@ pub const Client = struct {
     }
 
     pub fn addressStatus(self: *Client, addr_key: []const u8) policy.NatStatus {
-        const gop = self.addr_trackers.getPtr(addr_key) orelse return .unknown;
-        return gop.value.status(self.cfg.policy);
+        const tracker = self.addr_trackers.getPtr(addr_key) orelse return .unknown;
+        return tracker.status(self.cfg.policy);
     }
 
     /// Take queued reachability changes (caller frees addrs via [`freeReachabilityChange`]).
@@ -223,8 +225,18 @@ pub const Client = struct {
         };
         const prev_node = self.natStatus();
         self.tracker.record(outcome);
-        const gop = try self.addr_trackers.getOrPut(try self.allocator.dupe(u8, addr_key));
-        if (!gop.found_existing) gop.value_ptr.* = policy.AddressReachability.init();
+        // getOrPut with the borrowed key; on first insert replace the key slot
+        // with an owned dup so it survives the caller's buffer and is freed in
+        // deinit. Dup only on insert — duping unconditionally leaks on every
+        // repeat probe for an existing address.
+        const gop = try self.addr_trackers.getOrPut(addr_key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, addr_key) catch |e| {
+                self.addr_trackers.removeByPtr(gop.key_ptr);
+                return e;
+            };
+            gop.value_ptr.* = policy.AddressReachability.init();
+        }
         const prev_addr = gop.value_ptr.status(self.cfg.policy);
         gop.value_ptr.record(outcome);
         const next_addr = gop.value_ptr.status(self.cfg.policy);
@@ -280,6 +292,24 @@ test "scheduleActiveProbes queues pending" {
     const p1 = client.takePendingProbe(s1).?;
     defer client.freeProbeMessage(p1.wire_message);
     try std.testing.expectEqual(.v1, p0.version);
+}
+
+test "v2 addr tracker dups key once and frees on deinit" {
+    // Exercises the addr_trackers path under the GPA leak check: repeated
+    // probes for the same address must not leak a dup each call, and all keys
+    // must be freed at deinit.
+    const a = std.testing.allocator;
+    var client = Client.init(a, .{ .policy = .{ .confidence_threshold = 1, .failure_threshold = 3 } });
+    defer client.deinit();
+
+    const addr = "/ip4/203.0.113.7/udp/4001/quic-v1";
+    try client.handleV2DialResponse(.{ .status = .ok, .dial_status = .ok }, addr);
+    try client.handleV2DialResponse(.{ .status = .ok, .dial_status = .ok }, addr);
+    try client.handleV2DialResponse(.{ .status = .ok, .dial_status = .e_dial_error }, "/ip4/198.51.100.2/udp/4001/quic-v1");
+    try std.testing.expectEqual(policy.NatStatus.public, client.addressStatus(addr));
+
+    const changes = client.takeReachabilityChanges();
+    defer client.freeReachabilityChanges(changes);
 }
 
 test "v1 response quorum emits reachability change" {
