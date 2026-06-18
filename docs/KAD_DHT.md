@@ -1,6 +1,6 @@
 # Kademlia DHT (kad-dht)
 
-Implements libp2p Kademlia DHT wire codecs, routing table, iterative lookups, and record storage ([#93](https://github.com/ch4r10t33r/zig-libp2p/issues/93)). Spec: [libp2p/kad-dht](https://github.com/libp2p/specs/tree/master/kad-dht).
+Implements libp2p Kademlia DHT wire codecs, routing table, iterative lookups, and record storage ([#93](https://github.com/blockblaz/zig-libp2p/issues/93)). Host lifecycle wiring ([#203](https://github.com/blockblaz/zig-libp2p/issues/203)) connects AutoNAT mode promotion, provider republish, and routing-table eviction on disconnect. Spec: [libp2p/kad-dht](https://github.com/libp2p/specs/tree/master/kad-dht).
 
 ## Protocol
 
@@ -33,14 +33,36 @@ Import via `zig_libp2p.kad_dht`:
 | Provider TTL | 24 h |
 | Provider republish | 12 h |
 
-## Embedder wiring
+## Host integration (#203)
 
-Transport remains embedder-owned (same pattern as AutoNAT / Identify):
+Wire a `kad_dht.Client` into `Host` via [`setKadDhtClient`](../src/host.zig):
+
+```zig
+var kad = try zl.kad_dht.Client.init(allocator, local_id_b58, .{}, query_peer);
+host.setKadDhtClient(&kad);
+```
+
+When AutoNAT is enabled, `Host.runPeriodicTicks` promotes or demotes DHT mode:
+
+- **Public** → `kad.setMode(.server)`
+- **Private / unknown** → `kad.setMode(.client)`
+
+On each heartbeat, `Host` also:
+
+1. Calls `kad.republishProviders` for local provider keys past the republish window (uses Identify listen addrs).
+2. On `onConnectionClosed`, calls `kad.onPeerDisconnected` so dead peers are removed from the routing table.
+
+Outbound `ADD_PROVIDER` fan-out uses the embedder-supplied [`QueryPeerFn`](src/kad_dht/query.zig) on the client.
+
+## Manual / embedder wiring
+
+Transport remains embedder-owned when not using bundled QUIC kad streams:
 
 1. **Server mode:** negotiate `/ipfs/kad/1.0.0`, dispatch stream to `Server.handleStream`. Only server-mode peers are inserted into remote routing tables.
 2. **Client mode:** use `Client` + `QueryPeerFn` to open streams, write length-prefixed requests, read responses.
 3. **Bootstrap:** `Client.bootstrap` seeds configured peers then runs `findNode(local_id)`.
-4. **AutoNAT integration:** `kad_dht.modeFromNatStatus(autonat_client.natStatus())` selects client vs server mode.
+4. **Provider ads:** `Client.announceProvider` or `addLocalProvider` + periodic `republishProviders`.
+5. **AutoNAT integration:** `kad_dht.modeFromNatStatus(autonat_client.natStatus())` or rely on Host glue when `setKadDhtClient` is set.
 
 ```zig
 const zl = @import("zig_libp2p");
@@ -63,6 +85,15 @@ defer client.freeProviders(providers);
 
 [`examples/kad_dht_membuf.zig`](../examples/kad_dht_membuf.zig) — `FIND_NODE` round-trip through in-memory buffers (CI smoke-run).
 
-## Acceptance (issue #93)
+## Acceptance
 
-Library MVP covers routing table, wire codec, iterative lookups, provider store, and bootstrap API. Live-network acceptance (bootstrap.libp2p.io, cross-impl interop) remains embedder/manual validation.
+**#93 (library MVP):** routing table, wire codec, iterative lookups, provider store, bootstrap API.
+
+**#203 (lifecycle):**
+
+- AutoNAT status change → `kad.setMode` via Host glue (#206 + #203).
+- Periodic provider republish via `republishProviders` / `providersNeedingRepublish`.
+- `onConnectionClosed` → routing-table peer eviction.
+- In-memory integration tests for advertise / lookup / republish / mode promotion.
+
+Live-network acceptance (bootstrap.libp2p.io, cross-impl interop) remains embedder/manual validation.

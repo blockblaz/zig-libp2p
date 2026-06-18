@@ -263,6 +263,14 @@ pub const Host = struct {
         try self.connection_manager.tick(now_ms);
         try self.flushIdentifyPushIfDirty();
         try self.tickAutonat(now_ms);
+        try self.tickKadDht(now_ms);
+    }
+
+    fn tickKadDht(self: *Host, now_ms: i64) std.mem.Allocator.Error!void {
+        const kad = self.kad_dht_client orelse return;
+        const addrs = self.identify_ad.listen_addrs.items;
+        if (addrs.len == 0) return;
+        kad.republishProviders(addrs, now_ms) catch {};
     }
 
     fn tickAutonat(self: *Host, now_ms: i64) std.mem.Allocator.Error!void {
@@ -587,6 +595,11 @@ pub const Host = struct {
         try self.connection_manager.onConnectionClosed(now_ms, conn_id, reason);
         self.gossipsub.onPeerDisconnected(peer);
         self.peer_protocols.removePeer(peer);
+        if (self.kad_dht_client) |kad| {
+            var peer_b58: [128]u8 = undefined;
+            const peer_str = peer.toBase58(&peer_b58) catch return;
+            kad.onPeerDisconnected(peer_str);
+        }
     }
 
     pub fn onDialFailure(
@@ -855,4 +868,116 @@ test "Host identify push dispatch bypasses swarm queue" {
         if (std.meta.activeTag(e) == .peer_connected) continue;
         break;
     }
+}
+
+test "Host onConnectionClosed evicts kad routing-table peer" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const me = try identity.PeerId.random();
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+    });
+    defer host.destroy();
+
+    const KadCtx = struct {
+        fn noop(_: ?*anyopaque, _: []const u8, _: kad_dht_mod.MessageView, response_out: *kad_dht_mod.MessageOwned) !void {
+            response_out.* = .{ .msg_type = .find_node };
+        }
+    };
+
+    var peer_b58_buf: [128]u8 = undefined;
+    const me_b58 = try me.toBase58(&peer_b58_buf);
+    var kad = try kad_dht_mod.Client.init(a, me_b58, .{}, KadCtx.noop);
+    defer kad.deinit();
+    host.setKadDhtClient(&kad);
+
+    const remote = try identity.PeerId.random();
+    var remote_b58_buf: [128]u8 = undefined;
+    const remote_b58 = try remote.toBase58(&remote_b58_buf);
+    const addr = [_][]const u8{"/ip4/127.0.0.1/udp/4001/quic-v1"};
+    _ = try kad.routingTable().update(remote_b58, &addr, .server, 0);
+    try testing.expect(kad.routingTable().contains(remote_b58));
+
+    try host.onConnectionEstablished(1, remote, .outbound, .{});
+    try host.onConnectionClosed(1_000, 1, remote, .remote_close);
+    try testing.expect(!kad.routingTable().contains(remote_b58));
+}
+
+test "Host runPeriodicTicks republishes kad providers" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const me = try identity.PeerId.random();
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+    });
+    defer host.destroy();
+
+    const KadCtx = struct {
+        calls: usize = 0,
+        fn query(ctx: ?*anyopaque, _: []const u8, request: kad_dht_mod.MessageView, response_out: *kad_dht_mod.MessageOwned) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (request.msg_type == .add_provider) self.calls += 1;
+            response_out.* = .{ .msg_type = .add_provider };
+        }
+    };
+    var kad_ctx: KadCtx = .{};
+
+    var me_b58_buf: [128]u8 = undefined;
+    const me_b58 = try me.toBase58(&me_b58_buf);
+    var kad = try kad_dht_mod.Client.init(a, me_b58, .{
+        .records = .{ .provider_ttl_ms = 10_000, .provider_republish_ms = 100 },
+    }, KadCtx.query);
+    defer kad.deinit();
+    kad.setQueryContext(&kad_ctx);
+    host.setKadDhtClient(&kad);
+
+    const addr = [_][]const u8{"/ip4/203.0.113.9/udp/4001/quic-v1"};
+    _ = try kad.routingTable().update("peer-b", &addr, .server, 0);
+    try host.addListenAddr(addr[0]);
+    try kad.addLocalProvider("content-key", me_b58, &addr, 0);
+
+    try host.runPeriodicTicks(0);
+    try testing.expectEqual(@as(usize, 0), kad_ctx.calls);
+
+    try host.runPeriodicTicks(200);
+    try testing.expect(kad_ctx.calls >= 1);
+}
+
+test "Host autonat reachability promotes kad to server mode" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const me = try identity.PeerId.random();
+    var host = try Host.create(.{
+        .allocator = a,
+        .local_peer = me,
+        .gossipsub = .{ .local_peer_id = me },
+        .autonat = .{ .enable = true, .client = .{ .policy = .{ .confidence_threshold = 1, .failure_threshold = 99 } } },
+    });
+    defer host.destroy();
+
+    const KadCtx = struct {
+        fn noop(_: ?*anyopaque, _: []const u8, _: kad_dht_mod.MessageView, response_out: *kad_dht_mod.MessageOwned) !void {
+            response_out.* = .{ .msg_type = .find_node };
+        }
+    };
+    var me_b58_buf: [128]u8 = undefined;
+    const me_b58 = try me.toBase58(&me_b58_buf);
+    var kad = try kad_dht_mod.Client.init(a, me_b58, .{ .mode = .client }, KadCtx.noop);
+    defer kad.deinit();
+    host.setKadDhtClient(&kad);
+    try testing.expect(kad.dhtMode() == .client);
+
+    try host.recordObservedAddr("/ip4/203.0.113.9/udp/4001/quic-v1");
+    try host.handleAutonatV1Response(.{ .status = .ok, .addr = "/ip4/203.0.113.9/udp/4001/quic-v1" });
+    try testing.expect(kad.dhtMode() == .server);
 }
