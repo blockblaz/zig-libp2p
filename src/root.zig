@@ -25,6 +25,7 @@ pub const identify = @import("identify.zig");
 
 pub const autonat = @import("autonat/root.zig");
 pub const kad_dht = @import("kad_dht/root.zig");
+pub const discovery = @import("discovery/root.zig");
 pub const relay = @import("relay/root.zig");
 pub const dcutr = @import("dcutr/root.zig");
 
@@ -130,6 +131,7 @@ test {
     _ = @import("gossipsub/message_id.zig");
     _ = @import("autonat/root.zig");
     _ = @import("kad_dht/root.zig");
+    _ = @import("discovery/root.zig");
     _ = @import("relay/root.zig");
     _ = @import("dcutr/root.zig");
     _ = @import("transport/circuit_transport.zig");

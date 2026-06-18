@@ -182,6 +182,8 @@ pub const Event = union(enum) {
     },
     /// Open `/libp2p/autonat/1.0.0` to `peer` for an active probe (#206).
     autonat_probe_peer: identity.PeerId,
+    /// LAN peer discovered via mDNS (#207).
+    peer_discovered: peer_events.PeerDiscoveredPayload,
     log: struct {
         level: LogLevel,
         message: []const u8,
@@ -205,6 +207,10 @@ pub const Event = union(enum) {
             },
             .reachability_changed => |r| {
                 a.free(r.addr);
+            },
+            .peer_discovered => |*pd| {
+                for (pd.addrs) |addr| a.free(addr);
+                a.free(pd.addrs);
             },
             .rpc_response_end,
             .rpc_error_response,
