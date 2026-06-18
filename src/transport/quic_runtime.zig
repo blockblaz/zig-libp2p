@@ -20,14 +20,14 @@ const log = std.log.scoped(.quic_runtime);
 
 const multiaddr = @import("multiaddr");
 
-const errors_mod = @import("../errors.zig");
-const host_mod = @import("../host.zig");
-const identity = @import("../identity.zig");
-const peer_events = @import("../peer_events.zig");
-const protocol_mod = @import("../protocol.zig");
-const swarm_mod = @import("../swarm.zig");
-const connection_manager_mod = @import("../connection_manager.zig");
-const wall_time = @import("../wall_time.zig");
+const errors_mod = @import("../primitives/errors.zig");
+const host_mod = @import("../core/host.zig");
+const identity = @import("../primitives/identity.zig");
+const peer_events = @import("../core/peer_events.zig");
+const protocol_mod = @import("../primitives/protocol.zig");
+const swarm_mod = @import("../core/swarm.zig");
+const connection_manager_mod = @import("../core/connection_manager.zig");
+const wall_time = @import("../primitives/wall_time.zig");
 
 const quic = @import("quic.zig");
 const quic_v1 = @import("quic_v1.zig");
@@ -36,20 +36,20 @@ const quic_peer_identity = @import("quic_peer_identity.zig");
 const quic_raw_stream_io = @import("quic_raw_stream_io.zig");
 const stream_multistream = @import("stream_multistream.zig");
 
-const wire_framing = @import("../req_resp/wire_framing.zig");
-const snappy_wire = @import("../req_resp/snappy_wire.zig");
+const wire_framing = @import("../protocols/req_resp/wire_framing.zig");
+const snappy_wire = @import("../protocols/req_resp/snappy_wire.zig");
 
-const gossipsub_msg = @import("../gossipsub/message.zig");
-const gossipsub_rpc = @import("../gossipsub/rpc.zig");
-const gossipsub_cfg = @import("../gossipsub/config.zig");
-const gossipsub_wire_limits = @import("../gossipsub/wire_limits.zig");
-const varint = @import("../varint.zig");
+const gossipsub_msg = @import("../protocols/gossipsub/message.zig");
+const gossipsub_rpc = @import("../protocols/gossipsub/rpc.zig");
+const gossipsub_cfg = @import("../protocols/gossipsub/config.zig");
+const gossipsub_wire_limits = @import("../protocols/gossipsub/wire_limits.zig");
+const varint = @import("../primitives/varint.zig");
 
-const relay_mod = @import("../relay/root.zig");
-const dcutr_mod = @import("../dcutr/root.zig");
-const autonat_mod = @import("../autonat/root.zig");
-const identify_mod = @import("../identify.zig");
-const ping_mod = @import("../ping.zig");
+const relay_mod = @import("../protocols/relay/root.zig");
+const dcutr_mod = @import("../protocols/dcutr/root.zig");
+const autonat_mod = @import("../protocols/autonat/root.zig");
+const identify_mod = @import("../protocols/identify/identify.zig");
+const ping_mod = @import("../protocols/ping/ping.zig");
 const libp2p_tls = @import("../security/libp2p_tls.zig");
 const quic_relay_live = @import("quic_relay_live.zig");
 const quic_dcutr_live = @import("quic_dcutr_live.zig");
@@ -4219,7 +4219,7 @@ fn gossipRecordValidator(ctx: ?*anyopaque, topic: []const u8, data: []const u8) 
     return .accept;
 }
 
-const gossipsub_runtime_pkg = @import("../gossipsub/runtime.zig");
+const gossipsub_runtime_pkg = @import("../protocols/gossipsub/runtime.zig");
 
 test "QuicRuntime: two instances exchange a gossipsub message over UDP loopback" {
     if (builtin.single_threaded) return error.SkipZigTest;

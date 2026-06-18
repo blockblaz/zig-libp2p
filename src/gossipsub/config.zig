@@ -1,41 +1,16 @@
-//! Zeam / libp2p-gossipsub tuning constants (#39). Values match the behavioural contract in the
-//! tracking issue; the full mesh runtime is still being built out.
+//! Compatibility shim for legacy import paths (Zig 0.16).
+const _shim_src = @import("../protocols/gossipsub/config.zig");
 
-/// Target mesh size per topic.
-pub const mesh_n: u8 = 8;
-pub const mesh_n_low: u8 = 6;
-pub const mesh_n_high: u8 = 12;
-
-/// Random peers per heartbeat for lazy gossip (IHave).
-pub const gossip_lazy: u8 = 6;
-
-/// Heartbeat period in milliseconds.
-pub const heartbeat_interval_ms: i64 = 700;
-
-/// Duplicate suppression window in milliseconds.
-pub const duplicate_cache_ttl_ms: i64 = 24_000;
-
-/// Heartbeats worth of message IDs to remember for lazy gossip.
-pub const history_length: u8 = 6;
-
-/// Upper bound on serialized gossipsub message size (publish path), per #39.
-/// Matches ethlambda `MAX_COMPRESSED_PAYLOAD_SIZE` (consensus-specs max_message_size
-/// snappy headroom): `32 + 10 MiB + 10 MiB/6 + 1024` (~12 MiB).
-pub const max_payload_size_bytes: usize = 10 * 1024 * 1024;
-pub const max_transmit_size_bytes: usize = 32 + max_payload_size_bytes + max_payload_size_bytes / 6 + 1024;
-
-/// Default PRUNE back-off when a peer sends PRUNE without an explicit `backoff_seconds`
-/// (libp2p gossipsub v1.1 spec recommends 1 minute).
-pub const prune_backoff_default_ms: i64 = 60_000;
-
-/// Upper bound applied to peer-supplied `backoff_seconds` to prevent griefing via
-/// abusive long back-offs that would lock us out of a peer indefinitely.
-pub const prune_backoff_cap_ms: i64 = 15 * 60_000;
-
-/// Back-off after local `unsubscribe` before the same topic may be subscribed again
-/// (libp2p gossipsub v1.1 `UnsubscribeBackoff`, default 10 s).
-pub const unsubscribe_backoff_ms: i64 = 10_000;
-
-/// TTL for fanout peer sets on topics we publish to but do not subscribe to
-/// (libp2p gossipsub v1.1 `FANOUT_TTL`, default 60 s).
-pub const fanout_ttl_ms: i64 = 60_000;
+pub const duplicate_cache_ttl_ms = _shim_src.duplicate_cache_ttl_ms;
+pub const fanout_ttl_ms = _shim_src.fanout_ttl_ms;
+pub const gossip_lazy = _shim_src.gossip_lazy;
+pub const heartbeat_interval_ms = _shim_src.heartbeat_interval_ms;
+pub const history_length = _shim_src.history_length;
+pub const max_payload_size_bytes = _shim_src.max_payload_size_bytes;
+pub const max_transmit_size_bytes = _shim_src.max_transmit_size_bytes;
+pub const mesh_n = _shim_src.mesh_n;
+pub const mesh_n_high = _shim_src.mesh_n_high;
+pub const mesh_n_low = _shim_src.mesh_n_low;
+pub const prune_backoff_cap_ms = _shim_src.prune_backoff_cap_ms;
+pub const prune_backoff_default_ms = _shim_src.prune_backoff_default_ms;
+pub const unsubscribe_backoff_ms = _shim_src.unsubscribe_backoff_ms;

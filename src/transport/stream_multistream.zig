@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const Io = std.Io;
-const errors = @import("../errors.zig");
-const ms = @import("../multistream.zig");
+const errors = @import("../primitives/errors.zig");
+const ms = @import("../primitives/multistream.zig");
 const neg = @import("multistream_negotiate.zig");
 const terr = @import("transport_error.zig");
 
@@ -497,7 +497,7 @@ pub fn responderHandshakeMultistreamAmong(
 
 test "responderHandshakeMultistreamAmong matches second candidate" {
     const a = std.testing.allocator;
-    const ping_mod = @import("../ping.zig");
+    const ping_mod = @import("../protocols/ping/ping.zig");
     const wire = "/multistream/1.0.0\n" ++ "/ipfs/ping/1.0.0\n";
     var r = Io.Reader.fixed(wire);
     var aw: Io.Writer.Allocating = .init(a);
@@ -568,7 +568,7 @@ test "initiatorHandshakeMultistreamReadPhase handles 47-byte delimited ack (leng
 
 test "responderHandshakeMultistreamAmong preserves trailing app bytes (go MSSelect)" {
     const a = std.testing.allocator;
-    const ping_mod = @import("../ping.zig");
+    const ping_mod = @import("../protocols/ping/ping.zig");
     var wire = std.ArrayList(u8).empty;
     defer wire.deinit(a);
     try neg.initiatorSendMultistreamHeaderFramed(&wire, a, .delimited);

@@ -3,55 +3,55 @@
 //! Add this package in `build.zig.zon`, then `b.dependency("zig_libp2p", …)`
 //! and `dep.module("zig_libp2p")` on your executable or library module.
 
-pub const errors = @import("errors.zig");
-pub const metrics = @import("metrics.zig");
-pub const layer_events = @import("layer_events.zig");
-pub const peer_events = @import("peer_events.zig");
-pub const connection_manager = @import("connection_manager.zig");
-pub const swarm = @import("swarm.zig");
-pub const host = @import("host.zig");
+pub const errors = @import("primitives/errors.zig");
+pub const metrics = @import("primitives/metrics.zig");
+pub const layer_events = @import("core/layer_events.zig");
+pub const peer_events = @import("core/peer_events.zig");
+pub const connection_manager = @import("core/connection_manager.zig");
+pub const swarm = @import("core/swarm.zig");
+pub const host = @import("core/host.zig");
 /// Canonical node bundle from [#31](https://github.com/ch4r10t33r/zig-libp2p/issues/31); same as [`host.Host`](host.zig).
 pub const Node = host.Host;
 /// Configuration for [`Node`]($).
 pub const NodeConfig = host.HostConfig;
-pub const wall_time = @import("wall_time.zig");
-pub const protocol = @import("protocol.zig");
-pub const varint = @import("varint.zig");
-pub const addr_list = @import("addr_list.zig");
-pub const multistream = @import("multistream.zig");
-pub const ping = @import("ping.zig");
-pub const ping_wire_quic = @import("ping_wire_quic.zig");
-pub const identify = @import("identify.zig");
+pub const wall_time = @import("primitives/wall_time.zig");
+pub const protocol = @import("primitives/protocol.zig");
+pub const varint = @import("primitives/varint.zig");
+pub const addr_list = @import("primitives/addr_list.zig");
+pub const multistream = @import("primitives/multistream.zig");
+pub const ping = @import("protocols/ping/ping.zig");
+pub const ping_wire_quic = @import("protocols/ping/ping_wire_quic.zig");
+pub const identify = @import("protocols/identify/identify.zig");
 
-pub const autonat = @import("autonat/root.zig");
-pub const kad_dht = @import("kad_dht/root.zig");
-pub const discovery = @import("discovery/root.zig");
-pub const relay = @import("relay/root.zig");
-pub const dcutr = @import("dcutr/root.zig");
+pub const autonat = @import("protocols/autonat/root.zig");
+pub const kad_dht = @import("protocols/kad_dht/root.zig");
+pub const discovery = @import("protocols/discovery/root.zig");
+pub const relay = @import("protocols/relay/root.zig");
+pub const dcutr = @import("protocols/dcutr/root.zig");
 
 pub const gossip = struct {
-    pub const topic = @import("gossip/topic.zig");
+    pub const topic = @import("protocols/gossip/topic.zig");
 };
 
 pub const gossipsub = struct {
-    pub const config = @import("gossipsub/config.zig");
-    pub const message_id = @import("gossipsub/message_id.zig");
-    pub const duplicate_cache = @import("gossipsub/duplicate_cache.zig");
-    pub const runtime = @import("gossipsub/runtime.zig");
-    pub const rpc = @import("gossipsub/rpc.zig");
-    pub const control = @import("gossipsub/control.zig");
-    pub const message = @import("gossipsub/message.zig");
-    pub const wire_limits = @import("gossipsub/wire_limits.zig");
+    pub const config = @import("protocols/gossipsub/config.zig");
+    pub const message_id = @import("protocols/gossipsub/message_id.zig");
+    pub const duplicate_cache = @import("protocols/gossipsub/duplicate_cache.zig");
+    pub const runtime = @import("protocols/gossipsub/runtime.zig");
+    pub const rpc = @import("protocols/gossipsub/rpc.zig");
+    pub const control = @import("protocols/gossipsub/control.zig");
+    pub const message = @import("protocols/gossipsub/message.zig");
+    pub const wire_limits = @import("protocols/gossipsub/wire_limits.zig");
 };
 
 pub const protobuf = struct {
-    pub const wire = @import("protobuf/wire.zig");
+    pub const wire = @import("primitives/protobuf/wire.zig");
 };
 
 /// Libp2p peer IDs (`blockblaz/peer-id`), same pin as `multiaddr-zig`.
 pub const peer_id = @import("peer_id");
-pub const identity = @import("identity.zig");
-pub const keypair = @import("keypair.zig");
+pub const identity = @import("primitives/identity.zig");
+pub const keypair = @import("primitives/keypair.zig");
 
 /// Block Snappy (`zig_snappy`), same module name as in Zeam.
 pub const snappyz = @import("snappyz");
@@ -59,13 +59,13 @@ pub const snappyz = @import("snappyz");
 pub const snappyframesz = @import("snappyframesz");
 
 pub const req_resp = struct {
-    pub const frame = @import("req_resp/frame.zig");
-    pub const stream = @import("req_resp/stream.zig");
-    pub const snappy_wire = @import("req_resp/snappy_wire.zig");
-    pub const runtime = @import("req_resp/runtime.zig");
-    pub const wire_framing = @import("req_resp/wire_framing.zig");
-    pub const wire_tcp = @import("req_resp/wire_tcp.zig");
-    pub const wire_quic = @import("req_resp/wire_quic.zig");
+    pub const frame = @import("protocols/req_resp/frame.zig");
+    pub const stream = @import("protocols/req_resp/stream.zig");
+    pub const snappy_wire = @import("protocols/req_resp/snappy_wire.zig");
+    pub const runtime = @import("protocols/req_resp/runtime.zig");
+    pub const wire_framing = @import("protocols/req_resp/wire_framing.zig");
+    pub const wire_tcp = @import("protocols/req_resp/wire_tcp.zig");
+    pub const wire_quic = @import("protocols/req_resp/wire_quic.zig");
 };
 
 pub const transport = struct {
@@ -105,6 +105,63 @@ pub const security = struct {
 
 /// Pure-Zig QUIC/TLS stack ([zquic](https://github.com/ch4r10t33r/zquic)), Zig 0.16–pinned in `build.zig.zon`.
 pub const zquic = @import("zquic");
+
+/// Canonical nested module layout (flat aliases above remain until 1.0 freeze).
+pub const primitives = struct {
+    pub const errors = @import("primitives/errors.zig");
+    pub const metrics = @import("primitives/metrics.zig");
+    pub const wall_time = @import("primitives/wall_time.zig");
+    pub const protocol = @import("primitives/protocol.zig");
+    pub const varint = @import("primitives/varint.zig");
+    pub const addr_list = @import("primitives/addr_list.zig");
+    pub const multistream = @import("primitives/multistream.zig");
+    pub const identity = @import("primitives/identity.zig");
+    pub const keypair = @import("primitives/keypair.zig");
+    pub const protobuf = struct {
+        pub const wire = @import("primitives/protobuf/wire.zig");
+    };
+};
+
+pub const core = struct {
+    pub const host = @import("core/host.zig");
+    pub const swarm = @import("core/swarm.zig");
+    pub const connection_manager = @import("core/connection_manager.zig");
+    pub const peer_events = @import("core/peer_events.zig");
+    pub const layer_events = @import("core/layer_events.zig");
+};
+
+pub const protocols = struct {
+    pub const ping = @import("protocols/ping/ping.zig");
+    pub const ping_wire_quic = @import("protocols/ping/ping_wire_quic.zig");
+    pub const identify = @import("protocols/identify/identify.zig");
+    pub const autonat = @import("protocols/autonat/root.zig");
+    pub const kad_dht = @import("protocols/kad_dht/root.zig");
+    pub const discovery = @import("protocols/discovery/root.zig");
+    pub const relay = @import("protocols/relay/root.zig");
+    pub const dcutr = @import("protocols/dcutr/root.zig");
+    pub const gossip = struct {
+        pub const topic = @import("protocols/gossip/topic.zig");
+    };
+    pub const gossipsub = struct {
+        pub const config = @import("protocols/gossipsub/config.zig");
+        pub const message_id = @import("protocols/gossipsub/message_id.zig");
+        pub const duplicate_cache = @import("protocols/gossipsub/duplicate_cache.zig");
+        pub const runtime = @import("protocols/gossipsub/runtime.zig");
+        pub const rpc = @import("protocols/gossipsub/rpc.zig");
+        pub const control = @import("protocols/gossipsub/control.zig");
+        pub const message = @import("protocols/gossipsub/message.zig");
+        pub const wire_limits = @import("protocols/gossipsub/wire_limits.zig");
+    };
+    pub const req_resp = struct {
+        pub const frame = @import("protocols/req_resp/frame.zig");
+        pub const stream = @import("protocols/req_resp/stream.zig");
+        pub const snappy_wire = @import("protocols/req_resp/snappy_wire.zig");
+        pub const runtime = @import("protocols/req_resp/runtime.zig");
+        pub const wire_framing = @import("protocols/req_resp/wire_framing.zig");
+        pub const wire_tcp = @import("protocols/req_resp/wire_tcp.zig");
+        pub const wire_quic = @import("protocols/req_resp/wire_quic.zig");
+    };
+};
 
 test {
     _ = @import("wire_boundaries.zig");

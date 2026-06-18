@@ -175,7 +175,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const interop_mod = b.createModule(.{
-        .root_source_file = b.path("interop/main.zig"),
+        .root_source_file = b.path("harness/tcp/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -193,14 +193,14 @@ pub fn build(b: *std.Build) void {
 
     const interop_matrix_cmd = b.addSystemCommand(&.{
         "bash",
-        "interop_quic/run_matrix.sh",
+        "harness/quic/run_matrix.sh",
         "zig,go-libp2p",
         "handshake,ping",
     });
     interop_matrix_cmd.step.dependOn(b.getInstallStep());
     const interop_matrix_step = b.step(
         "interop-matrix",
-        "Run QUIC cross-impl matrix (requires interop-quic-node-go under interop_quic/impls/go-libp2p/)",
+        "Run QUIC cross-impl matrix (requires interop-quic-node-go under harness/quic/impls/go-libp2p/)",
     );
     interop_matrix_step.dependOn(&interop_matrix_cmd.step);
 }

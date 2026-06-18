@@ -4,16 +4,16 @@ const std = @import("std");
 const Io = std.Io;
 const log = std.log.scoped(.quic_dcutr);
 
-const identity = @import("../identity.zig");
-const dcutr = @import("../dcutr/root.zig");
-const dcutr_retry = @import("../dcutr/retry.zig");
+const identity = @import("../primitives/identity.zig");
+const dcutr = @import("../protocols/dcutr/root.zig");
+const dcutr_retry = @import("../protocols/dcutr/retry.zig");
 const dcutr_punch = @import("dcutr_punch.zig");
 const quic = @import("quic.zig");
 const quic_endpoint = @import("quic_endpoint.zig");
 const quic_raw_stream_io = @import("quic_raw_stream_io.zig");
 const stream_multistream = @import("stream_multistream.zig");
 const multiaddr = @import("multiaddr");
-const wall_time = @import("../wall_time.zig");
+const wall_time = @import("../primitives/wall_time.zig");
 
 const zquic = @import("zquic");
 const ZIo = zquic.transport.io;

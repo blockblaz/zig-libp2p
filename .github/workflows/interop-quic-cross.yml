@@ -7,8 +7,8 @@ name: Interop QUIC (cross-impl)
 on:
   pull_request:
     paths:
-      - "interop_quic/impls/**"
-      - "interop_quic/run_matrix.sh"
+      - "harness/quic/impls/**"
+      - "harness/quic/run_matrix.sh"
       - "examples/interop_quic_node.zig"
       - "build.zig"
       - ".github/workflows/interop-quic-cross.yml"
@@ -43,21 +43,21 @@ jobs:
         run: zig build -Doptimize=ReleaseFast
 
       - name: Build go-libp2p binary
-        working-directory: interop_quic/impls/go-libp2p
+        working-directory: harness/quic/impls/go-libp2p
         run: go build -trimpath -o interop-quic-node-go .
 
       - name: Build rust-libp2p binary
-        working-directory: interop_quic/impls/rust-libp2p
+        working-directory: harness/quic/impls/rust-libp2p
         run: cargo build --release --locked
 
       - name: Matrix — zig ↔ zig
-        run: bash interop_quic/run_matrix.sh zig handshake,ping,gossipsub,reqresp
+        run: bash harness/quic/run_matrix.sh zig handshake,ping,gossipsub,reqresp
 
       - name: Matrix — go-libp2p ↔ go-libp2p
-        run: bash interop_quic/run_matrix.sh go-libp2p handshake,ping,gossipsub,reqresp
+        run: bash harness/quic/run_matrix.sh go-libp2p handshake,ping,gossipsub,reqresp
 
       - name: Matrix — rust-libp2p ↔ rust-libp2p
-        run: bash interop_quic/run_matrix.sh rust-libp2p handshake,ping,gossipsub,reqresp
+        run: bash harness/quic/run_matrix.sh rust-libp2p handshake,ping,gossipsub,reqresp
 
   # Cross-impl: zig ↔ go-libp2p in both directions × {handshake, ping}.
   cross-impl:
@@ -80,14 +80,14 @@ jobs:
         run: zig build -Doptimize=ReleaseFast
 
       - name: Build go-libp2p binary
-        working-directory: interop_quic/impls/go-libp2p
+        working-directory: harness/quic/impls/go-libp2p
         run: go build -trimpath -o interop-quic-node-go .
 
       - name: Matrix — zig ↔ go-libp2p (handshake)
-        run: bash interop_quic/run_matrix.sh zig,go-libp2p handshake
+        run: bash harness/quic/run_matrix.sh zig,go-libp2p handshake
 
       - name: Matrix — zig ↔ go-libp2p (ping)
-        run: bash interop_quic/run_matrix.sh zig,go-libp2p ping
+        run: bash harness/quic/run_matrix.sh zig,go-libp2p ping
 
   # Full matrix on cron / manual only (rust cross-impl still evolving).
   cross-impl-full:
@@ -114,13 +114,13 @@ jobs:
         run: zig build -Doptimize=ReleaseFast
 
       - name: Build go-libp2p binary
-        working-directory: interop_quic/impls/go-libp2p
+        working-directory: harness/quic/impls/go-libp2p
         run: go build -trimpath -o interop-quic-node-go .
 
       - name: Build rust-libp2p binary
-        working-directory: interop_quic/impls/rust-libp2p
+        working-directory: harness/quic/impls/rust-libp2p
         run: cargo build --release --locked
 
       - name: Matrix — zig ↔ go-libp2p ↔ rust-libp2p
         continue-on-error: true
-        run: bash interop_quic/run_matrix.sh zig,go-libp2p,rust-libp2p handshake,ping,gossipsub,reqresp
+        run: bash harness/quic/run_matrix.sh zig,go-libp2p,rust-libp2p handshake,ping,gossipsub,reqresp

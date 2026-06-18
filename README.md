@@ -160,8 +160,9 @@ Ethereum consensus, so some libp2p features are intentionally out of scope.
 | Resource manager (scope-based limits) | ⬜ | [#169](https://github.com/blockblaz/zig-libp2p/issues/169) |
 
 The live cross-impl interop matrix is in
-[`interop_quic/README.md`](interop_quic/README.md); the full module map is
-[`src/root.zig`](src/root.zig).
+[`harness/quic/README.md`](harness/quic/README.md); the full module map is
+[`src/root.zig`](src/root.zig) and the layout rationale is
+[`docs/REPO_LAYOUT.md`](docs/REPO_LAYOUT.md).
 
 ## Interoperability
 
@@ -170,12 +171,12 @@ against go-libp2p (add `rust-libp2p` once its binary is built):
 
 ```sh
 zig build -Doptimize=ReleaseFast
-(cd interop_quic/impls/go-libp2p && go build -o interop-quic-node-go .)
-interop_quic/run_matrix.sh zig,go-libp2p handshake,ping,gossipsub,reqresp
+(cd harness/quic/impls/go-libp2p && go build -o interop-quic-node-go .)
+harness/quic/run_matrix.sh zig,go-libp2p handshake,ping,gossipsub,reqresp
 ```
 
 Or simply `zig build interop-matrix`. Harness details and the full status table
-live in [`interop_quic/README.md`](interop_quic/README.md).
+live in [`harness/README.md`](harness/README.md).
 
 ## Examples
 
@@ -195,7 +196,7 @@ See [`examples/README.md`](examples/README.md) for the complete list.
 
 ## Documentation
 
-- **API surface** — [`src/root.zig`](src/root.zig)
+- **Repository layout** — [`docs/REPO_LAYOUT.md`](docs/REPO_LAYOUT.md) · **Architecture** — [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **Security model & wire limits** — [`docs/SECURITY.md`](docs/SECURITY.md)
 - **AutoNAT** — [`docs/AUTONAT.md`](docs/AUTONAT.md) · **Kademlia DHT** — [`docs/KAD_DHT.md`](docs/KAD_DHT.md) · **mDNS** — [`docs/MDNS.md`](docs/MDNS.md)
 - **Async swarm design** — [`docs/async-swarm.md`](docs/async-swarm.md)

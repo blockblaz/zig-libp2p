@@ -1,21 +1,5 @@
-//! Wall-clock milliseconds (Zig 0.16 removed `std.time.milliTimestamp`).
+//! Compatibility shim for legacy import paths (Zig 0.16).
+const _shim_src = @import("./primitives/wall_time.zig");
 
-const builtin = @import("builtin");
-const std = @import("std");
-
-pub fn milliTimestamp() i64 {
-    if (comptime builtin.os.tag == .linux) {
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(.REALTIME, &ts);
-        return @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
-    } else {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-        return @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
-    }
-}
-
-/// UTC unix time in whole seconds.
-pub fn unixTimestamp() i64 {
-    return @divTrunc(milliTimestamp(), std.time.ms_per_s);
-}
+pub const milliTimestamp = _shim_src.milliTimestamp;
+pub const unixTimestamp = _shim_src.unixTimestamp;

@@ -1,32 +1,19 @@
-//! Circuit Relay v2 — reservation, hop/stop bridging (#91).
-//!
-//! Spec: https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md
+//! Compatibility shim for legacy import paths (Zig 0.16).
+const _shim_src = @import("../protocols/relay/root.zig");
 
-pub const wire = @import("wire.zig");
-pub const circuit_addr = @import("circuit_addr.zig");
-pub const reservation = @import("reservation.zig");
-pub const bridge = @import("bridge.zig");
-pub const server = @import("server.zig");
-pub const client = @import("client.zig");
-
-pub const Server = server.Server;
-pub const ServerConfig = server.Config;
-pub const Client = client.Client;
-pub const ClientConfig = client.Config;
-pub const OpenStopFn = server.OpenStopFn;
-pub const OpenStopResult = server.OpenStopResult;
-pub const RelayedAddr = circuit_addr.RelayedAddr;
-pub const ReservationStore = reservation.Store;
-
-pub const hop_protocol_id = wire.hop_protocol_id;
-pub const stop_protocol_id = wire.stop_protocol_id;
-
-test {
-    _ = @import("wire.zig");
-    _ = @import("circuit_addr.zig");
-    _ = @import("reservation.zig");
-    _ = @import("bridge.zig");
-    _ = @import("server.zig");
-    _ = @import("client.zig");
-    _ = @import("scenario.zig");
-}
+pub const Client = _shim_src.Client;
+pub const ClientConfig = _shim_src.ClientConfig;
+pub const OpenStopFn = _shim_src.OpenStopFn;
+pub const OpenStopResult = _shim_src.OpenStopResult;
+pub const RelayedAddr = _shim_src.RelayedAddr;
+pub const ReservationStore = _shim_src.ReservationStore;
+pub const Server = _shim_src.Server;
+pub const ServerConfig = _shim_src.ServerConfig;
+pub const bridge = _shim_src.bridge;
+pub const circuit_addr = _shim_src.circuit_addr;
+pub const client = _shim_src.client;
+pub const hop_protocol_id = _shim_src.hop_protocol_id;
+pub const reservation = _shim_src.reservation;
+pub const server = _shim_src.server;
+pub const stop_protocol_id = _shim_src.stop_protocol_id;
+pub const wire = _shim_src.wire;

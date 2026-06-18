@@ -4,13 +4,13 @@ const std = @import("std");
 const Io = std.Io;
 const log = std.log.scoped(.quic_relay);
 
-const identity = @import("../identity.zig");
-const relay = @import("../relay/root.zig");
+const identity = @import("../primitives/identity.zig");
+const relay = @import("../protocols/relay/root.zig");
 const circuit_transport = @import("circuit_transport.zig");
 const quic_raw_stream_io = @import("quic_raw_stream_io.zig");
 const stream_multistream = @import("stream_multistream.zig");
 const multistream_neg = @import("multistream_negotiate.zig");
-const wall_time = @import("../wall_time.zig");
+const wall_time = @import("../primitives/wall_time.zig");
 
 const zquic = @import("zquic");
 const ZIo = zquic.transport.io;

@@ -34,12 +34,12 @@ const feed_addr = @import("zquic_feed_addr.zig");
 
 const quic = @import("quic.zig");
 const quic_posix_udp = @import("quic_posix_udp.zig");
-const wall_time = @import("../wall_time.zig");
+const wall_time = @import("../primitives/wall_time.zig");
 const quic_v1 = quic.quic_v1;
 const quic_raw_stream_io = @import("quic_raw_stream_io.zig");
 const stream_multistream = @import("stream_multistream.zig");
 const quic_peer_identity = @import("quic_peer_identity.zig");
-const ping = @import("../ping.zig");
+const ping = @import("../protocols/ping/ping.zig");
 
 /// zquic `compat.Address` (not re-exported); layout matches [`feed_addr.Address`].
 const ZquicAddress = blk: {
@@ -714,8 +714,8 @@ test "quic endpoint loopback ping (single-threaded)" {
     if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
 
     const a = std.testing.allocator;
-    const cert = "test/fixtures/quic_loopback/cert.pem";
-    const key = "test/fixtures/quic_loopback/key.pem";
+    const cert = "fixtures/quic_loopback/cert.pem";
+    const key = "fixtures/quic_loopback/key.pem";
     try loopbackPingOnce(a, cert, key);
 }
 
@@ -724,8 +724,8 @@ test "quic endpoint loopback two streams ping (single-threaded)" {
     if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
 
     const a = std.testing.allocator;
-    const cert = "test/fixtures/quic_loopback/cert.pem";
-    const key = "test/fixtures/quic_loopback/key.pem";
+    const cert = "fixtures/quic_loopback/cert.pem";
+    const key = "fixtures/quic_loopback/key.pem";
     try loopbackPingTwoStreams(a, cert, key);
 }
 

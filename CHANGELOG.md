@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+* **layout:** rationalize repository structure (phases 0–2 of `docs/REPO_LAYOUT.md`):
+  merge `interop/` + `interop_quic/` into `harness/{tcp,quic}/`, move
+  `test/fixtures/` to `fixtures/`, reorganize `src/` into `core/`,
+  `primitives/`, `protocols/`, and `internal/` with legacy path shims.
+  Public `@import("zig_libp2p")` flat API unchanged; nested
+  `zig_libp2p.core` / `primitives` / `protocols` aliases added.
+  See `docs/ARCHITECTURE.md`.
+
 ## [0.1.51](https://github.com/ch4r10t33r/zig-libp2p/compare/v0.1.50...v0.1.51) (2026-06-12)
 
 ### Security

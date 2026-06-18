@@ -1,27 +1,15 @@
-//! Backward-compatible re-export of the unsigned varint codec from
-//! [`zig-varint`](https://github.com/ch4r10t33r/zig-varint).
-//!
-//! The actual implementation lives in `zig_varint.unsigned`; this file keeps
-//! the previous in-tree symbol names so existing call sites
-//! (`varint.encodeToScratch`, `varint.decode`, `varint.DecodeError`,
-//! `varint.max_encoding_bytes`) compile unchanged.
+//! Compatibility shim for legacy import paths (Zig 0.16).
+const _shim_src = @import("./primitives/varint.zig");
 
-const unsigned = @import("zig_varint").unsigned;
-
-pub const max_encoding_bytes = unsigned.max_encoding_bytes;
-pub const max_len = unsigned.max_len;
-pub const DecodeError = unsigned.DecodeError;
-
-pub const encodeToScratch = unsigned.encodeToScratch;
-pub const encode = unsigned.encode;
-pub const encodedLen = unsigned.encodedLen;
-pub const append = unsigned.append;
-pub const decode = unsigned.decode;
-pub const decodeRelaxed = unsigned.decodeRelaxed;
-pub const decodeAt = unsigned.decodeAt;
-pub const decodeAtRelaxed = unsigned.decodeAtRelaxed;
-pub const decodeNonNegativeI32 = unsigned.decodeNonNegativeI32;
-
-test {
-    _ = unsigned;
-}
+pub const DecodeError = _shim_src.DecodeError;
+pub const append = _shim_src.append;
+pub const decode = _shim_src.decode;
+pub const decodeAt = _shim_src.decodeAt;
+pub const decodeAtRelaxed = _shim_src.decodeAtRelaxed;
+pub const decodeNonNegativeI32 = _shim_src.decodeNonNegativeI32;
+pub const decodeRelaxed = _shim_src.decodeRelaxed;
+pub const encode = _shim_src.encode;
+pub const encodeToScratch = _shim_src.encodeToScratch;
+pub const encodedLen = _shim_src.encodedLen;
+pub const max_encoding_bytes = _shim_src.max_encoding_bytes;
+pub const max_len = _shim_src.max_len;
