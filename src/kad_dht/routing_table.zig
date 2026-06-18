@@ -121,6 +121,30 @@ pub const RoutingTable = struct {
         return n;
     }
 
+    /// Drop `peer_id` from its k-bucket (#203). Called when the transport
+    /// reports the peer disconnected so dead entries do not pollute lookups.
+    pub fn remove(self: *RoutingTable, peer_id: []const u8) void {
+        const peer_key = keyspace.hashKey(peer_id);
+        const idx = self.bucketIndex(peer_key) orelse return;
+        const bucket = &self.buckets[idx];
+        for (bucket.entries.items, 0..) |*e, i| {
+            if (std.mem.eql(u8, e.id, peer_id)) {
+                e.deinit(self.allocator);
+                _ = bucket.entries.orderedRemove(i);
+                return;
+            }
+        }
+    }
+
+    pub fn contains(self: *const RoutingTable, peer_id: []const u8) bool {
+        const peer_key = keyspace.hashKey(peer_id);
+        const idx = self.bucketIndex(peer_key) orelse return false;
+        for (self.buckets[idx].entries.items) |e| {
+            if (std.mem.eql(u8, e.id, peer_id)) return true;
+        }
+        return false;
+    }
+
     /// Closest `count` peers to `target_key` from the routing table.
     pub fn nearestPeers(
         self: *const RoutingTable,
@@ -191,5 +215,17 @@ test "client mode peers are not stored" {
     defer rt.deinit();
     const addr = [_][]const u8{"/ip4/1.1.1.1/udp/1/quic-v1"};
     try std.testing.expect(!try rt.update("client-peer", &addr, .client, 0));
+    try std.testing.expectEqual(@as(usize, 0), rt.len());
+}
+
+test "remove evicts peer from bucket" {
+    const a = std.testing.allocator;
+    var rt = RoutingTable.init(a, "self-node", .{});
+    defer rt.deinit();
+    const addr = [_][]const u8{"/ip4/127.0.0.1/udp/4001/quic-v1"};
+    try std.testing.expect(try rt.update("peer-a", &addr, .server, 1));
+    try std.testing.expect(rt.contains("peer-a"));
+    rt.remove("peer-a");
+    try std.testing.expect(!rt.contains("peer-a"));
     try std.testing.expectEqual(@as(usize, 0), rt.len());
 }

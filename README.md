@@ -131,7 +131,7 @@ Ethereum consensus, so some libp2p features are intentionally out of scope.
 | Spec | Status | Notes |
 |------|:------:|-------|
 | Bootstrap (static dial) | ✅ | `connect_peers` via `connection_manager` |
-| Kademlia DHT | 🚧 | `kad_dht`; in-memory smoke. Record validators / lifecycle pending ([#198](https://github.com/blockblaz/zig-libp2p/issues/198), [#203](https://github.com/blockblaz/zig-libp2p/issues/203)) |
+| Kademlia DHT | 🚧 | `kad_dht`, `host`; lifecycle ([#203](https://github.com/blockblaz/zig-libp2p/issues/203)) — mode switch, republish, disconnect eviction. Record validators pending ([#198](https://github.com/blockblaz/zig-libp2p/issues/198)) |
 | mDNS (LAN discovery) | ⬜ | [#207](https://github.com/blockblaz/zig-libp2p/issues/207) |
 | Rendezvous | ⬜ | [#209](https://github.com/blockblaz/zig-libp2p/issues/209) |
 
