@@ -16,6 +16,7 @@ pub const ValidateFn = *const fn (
     key: []const u8,
     value: []const u8,
     existing: ?[]const u8,
+    now_ms: i64,
 ) ValidationResult;
 
 const Entry = struct {
@@ -66,13 +67,14 @@ pub const Registry = struct {
         key: []const u8,
         value: []const u8,
         existing: ?[]const u8,
+        now_ms: i64,
     ) ValidationResult {
         var best: ?*const Entry = null;
         for (self.entries.items) |*e| {
             if (!std.mem.startsWith(u8, key, e.prefix)) continue;
             if (best == null or e.prefix.len > best.?.prefix.len) best = e;
         }
-        if (best) |e| return e.validate(e.ctx, key, value, existing);
+        if (best) |e| return e.validate(e.ctx, key, value, existing, now_ms);
         return .accept;
     }
 };
@@ -95,16 +97,16 @@ test "registry longest prefix wins" {
     defer reg.deinit();
 
     const Ctx = struct {
-        fn accept(_: ?*anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) ValidationResult {
+        fn accept(_: ?*anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, _: i64) ValidationResult {
             return .accept;
         }
-        fn reject(_: ?*anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) ValidationResult {
+        fn reject(_: ?*anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, _: i64) ValidationResult {
             return .reject;
         }
     };
 
     try reg.register("/ipns/", Ctx.accept, null);
     try reg.register("/ipns/special/", Ctx.reject, null);
-    try std.testing.expect(reg.validate("/ipns/foo", "v", null) == .accept);
-    try std.testing.expect(reg.validate("/ipns/special/x", "v", null) == .reject);
+    try std.testing.expect(reg.validate("/ipns/foo", "v", null, 0) == .accept);
+    try std.testing.expect(reg.validate("/ipns/special/x", "v", null, 0) == .reject);
 }

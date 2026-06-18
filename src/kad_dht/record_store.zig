@@ -100,7 +100,7 @@ pub const RecordStore = struct {
     pub fn putValue(self: *RecordStore, key: []const u8, value: []const u8, now_ms: i64) std.mem.Allocator.Error!PutResult {
         const existing = self.getValue(key, now_ms);
         if (self.cfg.validators) |reg| {
-            const verdict = reg.validate(key, value, existing);
+            const verdict = reg.validate(key, value, existing, now_ms);
             if (self.cfg.validation_stats) |s| switch (verdict) {
                 .reject => {
                     s.rejected += 1;

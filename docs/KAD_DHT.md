@@ -20,7 +20,7 @@ Import via `zig_libp2p.kad_dht`:
 | `wire` | Length-prefixed protobuf `Message` / `Record` / `Peer` codec |
 | `record_store` | Value + provider records with TTL (default 24 h) |
 | `record_validator` | Prefix-registered `PUT_VALUE` validators (`accept` / `reject` / `ignore`) ([#198](https://github.com/blockblaz/zig-libp2p/issues/198)) |
-| `ipns_validator` | Built-in `/ipns/` reference validator (protobuf parse, sigV1, monotonic sequence) |
+| `ipns_validator` | Built-in `/ipns/` validator (IpnsEntry protobuf, DAG-CBOR `data`, Ed25519 `signatureV2`, monotonic sequence, EOL expiry) |
 | `query` | Iterative `findNode` / `findProviders` (alpha=3 default) |
 | `server` | Inbound RPC handler on `std.Io` streams |
 | `client` | Bootstrap + high-level lookups |
@@ -105,7 +105,7 @@ Live-network acceptance (bootstrap.libp2p.io, cross-impl interop) remains embedd
 - `RecordValidator` registry with longest-prefix matching.
 - `RecordStore.putValue` consults validators before storage; rejects increment `ValidationStats`.
 - Optional `Server.Config.on_validation_reject` hook for peer-score docking.
-- Reference `/ipns/` validator: IPNS protobuf, Ed25519 `signatureV1`, monotonic `sequence`.
+- `/ipns/` validator per the [IPNS record spec](https://specs.ipfs.tech/ipns/ipns-record/): parses the `IpnsEntry` protobuf and DAG-CBOR `data`, verifies Ed25519 `signatureV2` over `"ipns-signature:" ‖ data` against the key inlined in the name, enforces monotonic `Sequence`, and rejects records past their EOL `Validity`. Ed25519 names only.
 
 ```zig
 var reg = zl.kad_dht.RecordValidator.init(allocator);

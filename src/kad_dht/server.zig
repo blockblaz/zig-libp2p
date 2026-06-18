@@ -246,7 +246,7 @@ test "put_value rejects invalid ipns records" {
     });
     defer server.deinit();
 
-    const good = try @import("ipns_validator.zig").buildSignedRecord(a, kp, 1, "/ipfs/bafy");
+    const good = try @import("ipns_validator.zig").buildSignedRecord(a, kp, 1, "/ipfs/bafy", "2099-12-31T23:59:59.000000000Z");
     defer a.free(good);
     const req_good = try wire.encode(a, .{
         .msg_type = .put_value,
