@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const wire = @import("wire.zig");
+const record_validator = @import("record_validator.zig");
 
 pub const Config = struct {
     /// Provider record expiration (issue #93: 24 h).
@@ -9,6 +10,15 @@ pub const Config = struct {
     /// Republish interval hint for embedders (issue #93: 12 h).
     provider_republish_ms: i64 = 12 * 60 * 60 * 1000,
     value_ttl_ms: i64 = 24 * 60 * 60 * 1000,
+    /// Optional prefix validators consulted before `PUT_VALUE` storage (#198).
+    validators: ?*const record_validator.Registry = null,
+    validation_stats: ?*record_validator.Stats = null,
+};
+
+pub const PutResult = enum {
+    stored,
+    rejected,
+    ignored,
 };
 
 const ValueEntry = struct {
@@ -87,13 +97,35 @@ pub const RecordStore = struct {
         }
     }
 
-    pub fn putValue(self: *RecordStore, key: []const u8, value: []const u8, now_ms: i64) std.mem.Allocator.Error!void {
+    pub fn putValue(self: *RecordStore, key: []const u8, value: []const u8, now_ms: i64) std.mem.Allocator.Error!PutResult {
+        const existing = self.getValue(key, now_ms);
+        if (self.cfg.validators) |reg| {
+            const verdict = reg.validate(key, value, existing, now_ms);
+            if (self.cfg.validation_stats) |s| switch (verdict) {
+                .reject => {
+                    s.rejected += 1;
+                    return .rejected;
+                },
+                .ignore => {
+                    s.ignored += 1;
+                    return .ignored;
+                },
+                .accept => {},
+            } else switch (verdict) {
+                .reject => return .rejected,
+                .ignore => return .ignored,
+                .accept => {},
+            }
+        }
+
         const gop = try self.values.getOrPut(key);
         if (gop.found_existing) self.allocator.free(gop.value_ptr.value);
         gop.value_ptr.* = .{
             .value = try self.allocator.dupe(u8, value),
             .expires_ms = now_ms + self.cfg.value_ttl_ms,
         };
+        if (self.cfg.validation_stats) |s| s.accepted += 1;
+        return .stored;
     }
 
     pub fn getValue(self: *RecordStore, key: []const u8, now_ms: i64) ?[]const u8 {

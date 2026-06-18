@@ -19,6 +19,9 @@ pub const Config = struct {
     routing: routing_table.Config = .{},
     records: record_store.Config = .{},
     mode: mode.Mode = .server,
+    /// Called when a `PUT_VALUE` record fails validation (#198).
+    on_validation_reject: ?*const fn (ctx: ?*anyopaque, key: []const u8, value: []const u8) void = null,
+    validation_reject_ctx: ?*anyopaque = null,
 };
 
 fn encodeFromOwned(allocator: std.mem.Allocator, msg: *const wire.MessageOwned) Error![]u8 {
@@ -97,6 +100,12 @@ pub const Server = struct {
         return try out.toOwnedSlice(self.allocator);
     }
 
+    fn encodeDecodeOwned(self: *Server, view: wire.MessageView) Error!wire.MessageOwned {
+        const bytes = try wire.encode(self.allocator, view);
+        defer self.allocator.free(bytes);
+        return try wire.decodeOwned(self.allocator, bytes, self.cfg.limits);
+    }
+
     fn handleMessage(self: *Server, req: wire.MessageOwned, now_ms: i64) Error!wire.MessageOwned {
         self.records.purgeExpired(now_ms);
         switch (req.msg_type) {
@@ -154,21 +163,26 @@ pub const Server = struct {
                     for (p.addrs) |a| try addr_views.append(self.allocator, a);
                     try self.records.addProvider(key, id, addr_views.items, now_ms);
                 }
-                return try wire.decodeOwned(self.allocator, try wire.encode(self.allocator, .{
+                return try self.encodeDecodeOwned(.{
                     .msg_type = .add_provider,
                     .key = key,
-                }), self.cfg.limits);
+                });
             },
             .put_value => {
                 const rec = req.record orelse return error.MissingRequiredField;
                 const key = req.key orelse rec.key orelse return error.MissingRequiredField;
                 const value = rec.value orelse return error.MissingRequiredField;
-                try self.records.putValue(key, value, now_ms);
-                return try wire.decodeOwned(self.allocator, try wire.encode(self.allocator, .{
+                const put_result = try self.records.putValue(key, value, now_ms);
+                if (put_result == .rejected) {
+                    if (self.cfg.on_validation_reject) |cb| {
+                        cb(self.cfg.validation_reject_ctx, key, value);
+                    }
+                }
+                return try self.encodeDecodeOwned(.{
                     .msg_type = .put_value,
                     .key = key,
                     .record = .{ .key = key, .value = value },
-                }), self.cfg.limits);
+                });
             },
             .get_value => {
                 const key = req.key orelse return error.MissingRequiredField;
@@ -188,7 +202,7 @@ pub const Server = struct {
                 return try wire.decodeOwned(self.allocator, wire_bytes, self.cfg.limits);
             },
             .ping => {
-                return try wire.decodeOwned(self.allocator, try wire.encode(self.allocator, .{ .msg_type = .ping }), self.cfg.limits);
+                return try self.encodeDecodeOwned(.{ .msg_type = .ping });
             },
         }
     }
@@ -209,6 +223,56 @@ pub const Server = struct {
         wire.writeLengthPrefixed(w, out) catch return error.IoWriteFailed;
     }
 };
+
+test "put_value rejects invalid ipns records" {
+    const a = std.testing.allocator;
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x44);
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const peer = try @import("../keypair.zig").peerIdFromKeyPair(a, .{ .ed25519 = kp });
+    var b58_buf: [128]u8 = undefined;
+    const b58 = try peer.toBase58(&b58_buf);
+    const key = try std.fmt.allocPrint(a, "/ipns/{s}", .{b58});
+    defer a.free(key);
+
+    var reg = @import("record_validator.zig").Registry.init(a);
+    defer reg.deinit();
+    var alloc_slot = a;
+    try @import("ipns_validator.zig").register(&reg, &alloc_slot);
+
+    var stats: @import("record_validator.zig").Stats = .{};
+    var server = try Server.init(a, "local-node", .{
+        .records = .{ .validators = &reg, .validation_stats = &stats },
+    });
+    defer server.deinit();
+
+    const good = try @import("ipns_validator.zig").buildSignedRecord(a, kp, 1, "/ipfs/bafy", "2099-12-31T23:59:59.000000000Z");
+    defer a.free(good);
+    const req_good = try wire.encode(a, .{
+        .msg_type = .put_value,
+        .key = key,
+        .record = .{ .key = key, .value = good },
+    });
+    defer a.free(req_good);
+    var req1 = try wire.decodeOwned(a, req_good, .standard);
+    defer req1.deinit(a);
+    var resp1 = try server.handleMessage(req1, 0);
+    defer resp1.deinit(a);
+    try std.testing.expect(server.records.getValue(key, 0) != null);
+    try std.testing.expectEqual(@as(u64, 1), stats.accepted);
+
+    const req_bad = try wire.encode(a, .{
+        .msg_type = .put_value,
+        .key = key,
+        .record = .{ .key = key, .value = "not-ipns" },
+    });
+    defer a.free(req_bad);
+    var req2 = try wire.decodeOwned(a, req_bad, .standard);
+    defer req2.deinit(a);
+    var resp2 = try server.handleMessage(req2, 0);
+    defer resp2.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), stats.rejected);
+}
 
 test "server find_node returns closest peers" {
     const a = std.testing.allocator;
