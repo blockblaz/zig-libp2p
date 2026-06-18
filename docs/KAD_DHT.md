@@ -19,6 +19,8 @@ Import via `zig_libp2p.kad_dht`:
 | `routing_table` | CPL-indexed k-buckets (k=20), LRU eviction per bucket |
 | `wire` | Length-prefixed protobuf `Message` / `Record` / `Peer` codec |
 | `record_store` | Value + provider records with TTL (default 24 h) |
+| `record_validator` | Prefix-registered `PUT_VALUE` validators (`accept` / `reject` / `ignore`) ([#198](https://github.com/blockblaz/zig-libp2p/issues/198)) |
+| `ipns_validator` | Built-in `/ipns/` reference validator (protobuf parse, sigV1, monotonic sequence) |
 | `query` | Iterative `findNode` / `findProviders` (alpha=3 default) |
 | `server` | Inbound RPC handler on `std.Io` streams |
 | `client` | Bootstrap + high-level lookups |
@@ -97,3 +99,21 @@ defer client.freeProviders(providers);
 - In-memory integration tests for advertise / lookup / republish / mode promotion.
 
 Live-network acceptance (bootstrap.libp2p.io, cross-impl interop) remains embedder/manual validation.
+
+**#198 (record validators):**
+
+- `RecordValidator` registry with longest-prefix matching.
+- `RecordStore.putValue` consults validators before storage; rejects increment `ValidationStats`.
+- Optional `Server.Config.on_validation_reject` hook for peer-score docking.
+- Reference `/ipns/` validator: IPNS protobuf, Ed25519 `signatureV1`, monotonic `sequence`.
+
+```zig
+var reg = zl.kad_dht.RecordValidator.init(allocator);
+defer reg.deinit();
+try zl.kad_dht.ipns_validator.register(&reg, &allocator);
+
+var stats: zl.kad_dht.ValidationStats = .{};
+var server = try zl.kad_dht.Server.init(allocator, local_id, .{
+    .records = .{ .validators = &reg, .validation_stats = &stats },
+});
+```
