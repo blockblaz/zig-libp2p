@@ -69,9 +69,12 @@ pub fn encodeName(out: *std.ArrayList(u8), allocator: std.mem.Allocator, fqdn: [
     try out.append(allocator, 0);
 }
 
+/// Cap on compression-pointer jumps per name to bound recursion depth on
+/// crafted packets (#207). Real names use at most one pointer.
+const max_name_pointers: usize = 32;
+
 fn readNameAt(allocator: std.mem.Allocator, data: []const u8, offset: usize, scratch: *std.ArrayList(u8), visited: *std.AutoHashMapUnmanaged(usize, void)) Error!struct { name: []const u8, next: usize } {
     var pos = offset;
-    var first = true;
     while (pos < data.len) {
         const len = data[pos];
         if (len == 0) {
@@ -81,16 +84,18 @@ fn readNameAt(allocator: std.mem.Allocator, data: []const u8, offset: usize, scr
         if (len & 0xC0 == 0xC0) {
             if (pos + 1 >= data.len) return error.Truncated;
             const ptr = (@as(usize, len & 0x3F) << 8) | data[pos + 1];
-            if (visited.contains(ptr)) return error.BadPointer;
+            if (visited.contains(ptr) or visited.count() >= max_name_pointers) return error.BadPointer;
             try visited.put(allocator, ptr, {});
             _ = try readNameAt(allocator, data, ptr, scratch, visited);
             return .{ .name = scratch.items, .next = pos + 2 };
         }
         pos += 1;
         if (pos + len > data.len) return error.Truncated;
-        if (!first and scratch.items.len > 0) try scratch.append(allocator, '.');
+        // Separator before every label except the very first written — keyed on
+        // accumulated output, not a per-invocation flag, so a label reached via
+        // a compression pointer is still joined to the prefix with a '.'.
+        if (scratch.items.len > 0) try scratch.append(allocator, '.');
         try scratch.appendSlice(allocator, data[pos .. pos + len]);
-        first = false;
         pos += len;
     }
     return error.Truncated;
@@ -127,6 +132,9 @@ fn parseRecords(
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const name_r = try readName(data, pos, allocator);
+        // Free this iteration's allocations if we error out before the record
+        // is committed to `records` — malformed packets must not leak (#207).
+        errdefer allocator.free(name_r.name);
         pos = name_r.next;
         if (pos + 10 > data.len) return error.Truncated;
         const rtype: Type = @enumFromInt(std.mem.readInt(u16, data[pos..][0..2], .big));
@@ -140,6 +148,7 @@ fn parseRecords(
         pos += 2;
         if (pos + rdlen > data.len) return error.Truncated;
         const rdata = try allocator.dupe(u8, data[pos .. pos + rdlen]);
+        errdefer allocator.free(rdata);
         pos += rdlen;
 
         var txt_strings: []const []const u8 = &.{};
@@ -158,6 +167,10 @@ fn parseRecords(
                 tpos += slen;
             }
             txt_strings = try strings.toOwnedSlice(allocator);
+        }
+        errdefer {
+            for (txt_strings) |s| allocator.free(s);
+            allocator.free(txt_strings);
         }
 
         try records.append(allocator, .{
@@ -190,6 +203,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!Message {
     var qi: usize = 0;
     while (qi < qdcount) : (qi += 1) {
         const name_r = try readName(data, pos, allocator);
+        errdefer allocator.free(name_r.name);
         pos = name_r.next;
         if (pos + 4 > data.len) return error.Truncated;
         const qtype: Type = @enumFromInt(std.mem.readInt(u16, data[pos..][0..2], .big));
@@ -200,6 +214,11 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!Message {
     }
 
     const ans = try parseRecords(allocator, data, pos, ancount);
+    // Free already-parsed answers if a later section fails to parse (#207).
+    errdefer {
+        for (ans.records) |rr| freeRecord(allocator, rr);
+        allocator.free(ans.records);
+    }
     pos = ans.next;
     if (nscount > 0) {
         const ns = try parseRecords(allocator, data, pos, nscount);
@@ -349,4 +368,47 @@ test "encode/decode TXT response with dnsaddr" {
     try std.testing.expect(msg.additionals[0].rtype == .txt);
     try std.testing.expectEqual(@as(usize, 1), msg.additionals[0].txt_strings.len);
     try std.testing.expectEqualStrings(txt, msg.additionals[0].txt_strings[0]);
+}
+
+test "decode does not leak on truncated record" {
+    // Valid response then truncated mid-record. decode must error and free
+    // every partial allocation (testing allocator catches a leak) (#207).
+    const a = std.testing.allocator;
+    const txt_rdata = try encodeTxtRdata(a, "dnsaddr=/ip4/192.168.0.3/udp/4001/quic-v1/p2p/x");
+    defer a.free(txt_rdata);
+    const full = try encode(a, .{
+        .id = 7,
+        .is_response = true,
+        .answers = &.{
+            .{ .name = "_p2p._udp.local", .rtype = .txt, .rclass = .in, .ttl = 120, .rdata = txt_rdata },
+        },
+    });
+    defer a.free(full);
+    // Drop the last 3 bytes so the answer record's rdata runs past the buffer.
+    try std.testing.expectError(error.Truncated, decode(a, full[0 .. full.len - 3]));
+}
+
+test "name reassembly joins labels across a compression pointer" {
+    // Packet: question "a.bc" then a record whose name is "x" + ptr→question
+    // name, i.e. "x.a.bc". A per-invocation first-label flag would drop the dot
+    // and yield "xa.bc" (#207).
+    const a = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    // Header: id=0, flags=0, qd=1, an=1, ns=0, ar=0
+    try buf.appendSlice(a, &.{ 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0 });
+    const qname_off: u8 = @intCast(buf.items.len); // 12
+    // qname "a.bc"
+    try buf.appendSlice(a, &.{ 1, 'a', 2, 'b', 'c', 0 });
+    // qtype=PTR(12), qclass=IN(1)
+    try buf.appendSlice(a, &.{ 0, 12, 0, 1 });
+    // answer name: label "x" then pointer to qname_off
+    try buf.appendSlice(a, &.{ 1, 'x', 0xC0, qname_off });
+    // type=TXT(16), class=IN(1), ttl=0, rdlen=0
+    try buf.appendSlice(a, &.{ 0, 16, 0, 1, 0, 0, 0, 0, 0, 0 });
+
+    var msg = try decode(a, buf.items);
+    defer freeMessage(a, &msg);
+    try std.testing.expectEqualStrings("a.bc", msg.questions[0].qname);
+    try std.testing.expectEqualStrings("x.a.bc", msg.answers[0].name);
 }

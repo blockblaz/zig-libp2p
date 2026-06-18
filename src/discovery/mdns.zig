@@ -71,6 +71,10 @@ const SeenPeer = struct {
     last_announced_ms: i64,
 };
 
+/// Upper bound on distinct discovered peers tracked in `seen`, to cap memory
+/// against spoofed-PeerId floods over unauthenticated mDNS (#207).
+const max_seen_peers: usize = 1024;
+
 pub const Service = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
@@ -307,6 +311,12 @@ pub const Service = struct {
 
         var peer_b58_buf: [128]u8 = undefined;
         const peer_b58 = peer.toBase58(&peer_b58_buf) catch return error.PeerIdFormatFailed;
+
+        // mDNS PeerIds are unauthenticated, so a hostile LAN peer can spam
+        // distinct spoofed IDs. Cap the `seen` table so it cannot grow without
+        // bound; once full, only refresh peers we already track (#207).
+        if (self.seen.count() >= max_seen_peers and self.seen.get(peer_b58) == null) return;
+
         const peer_key = try self.allocator.dupe(u8, peer_b58);
         errdefer self.allocator.free(peer_key);
 
