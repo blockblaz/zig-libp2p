@@ -259,6 +259,7 @@ Spec-compliance umbrella: [#80](https://github.com/blockblaz/zig-libp2p/issues/8
 ```sh
 zig fmt --check .     # formatting
 zig build test        # unit tests + example smoke-runs
+zig build soak-test   # opt-in 60s QUIC gossipsub soak (#235)
 zig build fuzz        # wire-decoder fuzzing via std.testing.fuzz
 ```
 

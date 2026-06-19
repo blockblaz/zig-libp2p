@@ -30,7 +30,16 @@ pub const Deps = struct {
     zquic: *std.Build.Module,
 };
 
-pub fn createDeps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Deps {
+pub const CreateDepsOptions = struct {
+    enable_soak_tests: bool = false,
+};
+
+pub fn createDeps(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    opts: CreateDepsOptions,
+) Deps {
     const multiaddr_dep = b.dependency("multiaddr", .{
         .target = target,
         .optimize = optimize,
@@ -88,6 +97,10 @@ pub fn createDeps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     mod.addImport("zquic_rsa", zquic_rsa_mod);
     mod.addImport("zquic_tls", zquic_tls_mod);
     mod.addImport("zig_varint", zig_varint_mod);
+
+    const test_options = b.addOptions();
+    test_options.addOption(bool, "enable_soak_tests", opts.enable_soak_tests);
+    mod.addOptions("test_options", test_options);
 
     return .{
         .mod = mod,
