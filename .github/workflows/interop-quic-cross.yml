@@ -1,7 +1,7 @@
 # Phase B2 — QUIC interop matrix.
 #
-#   pull_request  → same-impl baseline (must be green) + cross-impl zig↔go ping.
-#   schedule / dispatch → full matrix incl. rust-libp2p.
+#   pull_request  → same-impl baseline + cross-impl zig↔go and zig↔rust ping.
+#   schedule / dispatch → full matrix (all three impls × four testcases).
 name: Interop QUIC (cross-impl)
 
 on:
@@ -11,6 +11,7 @@ on:
       - "harness/quic/run_matrix.sh"
       - "examples/interop_quic_node.zig"
       - "build.zig"
+      - "build/interop.zig"
       - ".github/workflows/interop-quic-cross.yml"
   schedule:
     # Nightly at 04:30 UTC.
@@ -60,7 +61,7 @@ jobs:
         run: bash harness/quic/run_matrix.sh rust-libp2p handshake,ping,gossipsub,reqresp
 
   # Cross-impl: zig ↔ go-libp2p in both directions × {handshake, ping}.
-  cross-impl:
+  cross-impl-go:
     name: cross-impl (zig ↔ go-libp2p)
     runs-on: ubuntu-latest
     steps:
@@ -89,7 +90,35 @@ jobs:
       - name: Matrix — zig ↔ go-libp2p (ping)
         run: bash harness/quic/run_matrix.sh zig,go-libp2p ping
 
-  # Full matrix on cron / manual only (rust cross-impl still evolving).
+  # Cross-impl: zig ↔ rust-libp2p in both directions × {handshake, ping}.
+  cross-impl-rust:
+    name: cross-impl (zig ↔ rust-libp2p)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build zig binaries
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Build rust-libp2p binary
+        working-directory: harness/quic/impls/rust-libp2p
+        run: cargo build --release --locked
+
+      - name: Matrix — zig ↔ rust-libp2p (handshake)
+        run: bash harness/quic/run_matrix.sh zig,rust-libp2p handshake
+
+      - name: Matrix — zig ↔ rust-libp2p (ping)
+        run: DEADLINE_MS=45000 bash harness/quic/run_matrix.sh zig,rust-libp2p ping
+
+  # Full matrix on cron / manual only.
   cross-impl-full:
     name: cross-impl full (incl. rust)
     if: github.event_name != 'pull_request'
@@ -122,5 +151,4 @@ jobs:
         run: cargo build --release --locked
 
       - name: Matrix — zig ↔ go-libp2p ↔ rust-libp2p
-        continue-on-error: true
         run: bash harness/quic/run_matrix.sh zig,go-libp2p,rust-libp2p handshake,ping,gossipsub,reqresp

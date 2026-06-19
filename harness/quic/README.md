@@ -9,18 +9,13 @@ QUIC + libp2p interop harness (separate from [`harness/tcp/`](../tcp/), which ta
 | zig ↔ zig | pass | pass | pass | pass |
 | go ↔ go | pass | pass | pass | pass |
 | rust ↔ rust | pass | pass | pass¹ | pass |
-| zig ↔ go | **pass** | **pass** | **pass** | pass |
-| zig ↔ rust | **pass** | ½² | ½³ | ½² |
-| full 3-corner (cron) | varies | varies | varies | varies |
+| zig ↔ go | pass | pass | pass | pass |
+| zig ↔ rust | pass | pass | pass | pass |
+| full 3-corner (nightly) | pass | pass | pass | pass |
 
 ¹ Was skipped pre-#178; now green after the rust interop server waits for `gossipsub::Event::Subscribed` from the remote peer before publishing instead of sleeping a fixed 1.5 s.
-² zig↔rust **handshake** is green both directions after the rust-libp2p `ecdsa`/`secp256k1` Cargo features landed (commit `e25687b`). The remaining ½ failures:
-- `server=zig client=rust reqresp` — rust client times out on the zig server's reqresp framing.
-- `server=rust client=zig ping` and `server=rust client=zig reqresp` — zig client connects, but the `/ipfs/ping/1.0.0` / reqresp wire after multistream-select doesn't complete against a rust-libp2p server.
 
-³ `server=rust client=zig gossipsub` passes. `server=zig client=rust gossipsub` is skipped via the asymmetric `skip_reason_for_pair` table in `run_matrix.sh`: the zig responder rejects the rust client's inbound substream with `ProtocolNegotiationFailed`. Tracked as [#177](https://github.com/ch4r10t33r/zig-libp2p/issues/177).
-
-The remaining failures are post-handshake protocol gaps (multistream-select dialect, stream framing) — not TLS / cert verification. Umbrella: [#166](https://github.com/ch4r10t33r/zig-libp2p/issues/166).
+All cross-impl pairs in `{handshake, ping, gossipsub, reqresp}` are green on current `main` ([#174](https://github.com/blockblaz/zig-libp2p/issues/174), [#175](https://github.com/blockblaz/zig-libp2p/issues/175), [#177](https://github.com/blockblaz/zig-libp2p/issues/177)). Umbrella tracker [#166](https://github.com/blockblaz/zig-libp2p/issues/166) is closed.
 
 ## Binary
 
@@ -48,7 +43,9 @@ Exit codes: `0` ok, `1` failure, `2` bad config.
 zig build -Doptimize=ReleaseFast
 harness/quic/self_test.sh ping                    # zig ↔ zig
 (cd harness/quic/impls/go-libp2p && go build -o interop-quic-node-go .)
+(cd harness/quic/impls/rust-libp2p && cargo build --release --locked)
 harness/quic/run_matrix.sh zig,go-libp2p handshake,ping
+harness/quic/run_matrix.sh zig,rust-libp2p handshake,ping,gossipsub,reqresp
 zig build interop-matrix                          # shorthand: zig,go-libp2p handshake+ping
 ```
 
@@ -66,6 +63,6 @@ docker build -t go-libp2p:interop-quic -f harness/quic/impls/go-libp2p/Dockerfil
 | Workflow | Trigger | Gate |
 |----------|---------|--------|
 | [`interop-quic-self.yml`](../.github/workflows/interop-quic-self.yml) | every PR | zig ↔ zig handshake + ping |
-| [`interop-quic-cross.yml`](../.github/workflows/interop-quic-cross.yml) | PR / nightly / manual | Same-impl baseline (required); cross-impl **handshake** and **ping** required (zig↔go-libp2p 8/8) |
+| [`interop-quic-cross.yml`](../.github/workflows/interop-quic-cross.yml) | PR / nightly / manual | Same-impl baseline (required); cross-impl **zig↔go** and **zig↔rust** handshake + ping required; full 3-impl matrix on nightly/manual |
 
 Impl sources: [`impls/go-libp2p/`](impls/go-libp2p/), [`impls/rust-libp2p/`](impls/rust-libp2p/).

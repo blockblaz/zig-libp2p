@@ -166,16 +166,17 @@ The live cross-impl interop matrix is in
 
 ## Interoperability
 
-Cross-implementation conformance is part of CI. To run the QUIC matrix locally
-against go-libp2p (add `rust-libp2p` once its binary is built):
+Cross-implementation conformance is part of CI. To run the QUIC matrix locally:
 
 ```sh
 zig build -Doptimize=ReleaseFast
 (cd harness/quic/impls/go-libp2p && go build -o interop-quic-node-go .)
+(cd harness/quic/impls/rust-libp2p && cargo build --release --locked)
 harness/quic/run_matrix.sh zig,go-libp2p handshake,ping,gossipsub,reqresp
+harness/quic/run_matrix.sh zig,rust-libp2p handshake,ping,gossipsub,reqresp
 ```
 
-Or simply `zig build interop-matrix`. Harness details and the full status table
+Or `zig build interop-matrix` for a quick zig↔go handshake+ping smoke. Harness details and the full status table
 live in [`harness/README.md`](harness/README.md).
 
 ## Examples

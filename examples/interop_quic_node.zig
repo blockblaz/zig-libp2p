@@ -568,16 +568,23 @@ fn serveOnePingResponder(
             }
         }
 
-        while (wall_time.milliTimestamp() < deadline_ms) {
+        // Echo the 32-byte payload with FIN — rust-libp2p's ping::Behaviour treats
+        // the round-trip as failed unless the responder half-closes (#174).
+        var pay: [ping.payload_len]u8 = undefined;
+        var have: usize = @min(tail.items.len, ping.payload_len);
+        if (have > 0) @memcpy(pay[0..have], tail.items[0..have]);
+        while (have < ping.payload_len) {
+            // Stay bounded: a peer that half-closes before sending the full
+            // payload would otherwise spin this loop forever.
+            if (wall_time.milliTimestamp() >= deadline_ms) return 1;
             listener.drive(recv_buf, 5) catch {};
-            if (tail.items.len + raw.unreadRecvLen() >= ping.payload_len) break;
-        } else return 1;
-
-        {
+            if (raw.unreadRecvLen() == 0) continue;
             var r = raw.reader();
-            var w = raw.writer();
-            ping.handleInboundPrefixed(tail.items, &r, &w) catch return 1;
+            const need = ping.payload_len - have;
+            Io.Reader.readSliceAll(&r, pay[have..][0..need]) catch return 1;
+            have += need;
         }
+        raw.writeAllFin(&pay);
 
         const flush_until = wall_time.milliTimestamp() + 500;
         while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
