@@ -574,6 +574,9 @@ fn serveOnePingResponder(
         var have: usize = @min(tail.items.len, ping.payload_len);
         if (have > 0) @memcpy(pay[0..have], tail.items[0..have]);
         while (have < ping.payload_len) {
+            // Stay bounded: a peer that half-closes before sending the full
+            // payload would otherwise spin this loop forever.
+            if (wall_time.milliTimestamp() >= deadline_ms) return 1;
             listener.drive(recv_buf, 5) catch {};
             if (raw.unreadRecvLen() == 0) continue;
             var r = raw.reader();
