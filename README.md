@@ -194,6 +194,47 @@ via `zig build`:
 
 See [`examples/README.md`](examples/README.md) for the complete list.
 
+## Repository layout
+
+Organized by libp2p **layer** (`primitives → core → protocols → transport`),
+not by transport. Each folder below has its own `README` describing its modules;
+the public API is the facade in [`src/root.zig`](src/root.zig).
+
+```
+zig-libp2p/
+├── src/                  → library source — see src/README.md
+│   ├── primitives/       wire-agnostic building blocks (identity, varint, multistream, protobuf)
+│   ├── core/             node runtime: Host, Swarm, connection manager, events
+│   ├── protocols/        one folder per libp2p protocol (gossipsub, kad-dht, autonat, relay, …)
+│   ├── transport/        QUIC stack, TCP, WebSocket, yamux/mplex
+│   └── security/         libp2p TLS 1.3 + Noise
+├── examples/             runnable examples — see examples/README.md
+├── harness/              cross-impl interop harnesses (quic/, tcp/) — see harness/README.md
+├── bench/                micro-benchmarks
+├── build/                build helpers (deps, examples, fuzz, soak, interop)
+├── docs/                 design docs (architecture, security, per-protocol)
+├── tests/                integration tests — see tests/interop/README.md
+├── fixtures/             shared test fixtures
+└── vendor/               vendored TLS/RSA, outside src/ — see vendor/README.md
+```
+
+| Folder | README |
+|--------|--------|
+| `src/` overview | [`src/README.md`](src/README.md) |
+| `src/primitives/` | [`src/primitives/README.md`](src/primitives/README.md) |
+| `src/core/` | [`src/core/README.md`](src/core/README.md) |
+| `src/protocols/` | [`src/protocols/README.md`](src/protocols/README.md) |
+| `src/transport/` | [`src/transport/README.md`](src/transport/README.md) |
+| `src/security/` | [`src/security/README.md`](src/security/README.md) |
+| `examples/` | [`examples/README.md`](examples/README.md) |
+| `harness/` | [`harness/README.md`](harness/README.md) |
+| `vendor/` | [`vendor/README.md`](vendor/README.md) |
+
+Full rationale and the migration phases are in
+[`docs/REPO_LAYOUT.md`](docs/REPO_LAYOUT.md); the layer diagram is in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Legacy `src/*.zig` import paths
+remain as compatibility shims through the 1.0 freeze.
+
 ## Documentation
 
 - **Repository layout** — [`docs/REPO_LAYOUT.md`](docs/REPO_LAYOUT.md) · **Architecture** — [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
