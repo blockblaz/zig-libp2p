@@ -911,14 +911,19 @@ test "trim grace blocks re-recommend until expiry" {
     try cm.onConnectionEstablished(1, peer, .inbound, .{});
     try cm.onConnectionEstablished(2, peer, .outbound, .{});
     try std.testing.expectEqual(@as(u64, 1), cm.trimRecommendationCount());
-    _ = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
+    {
+        var ev0 = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
+        defer ev0.deinit(a);
+    }
 
     // Within grace: third conn trims conn 2, not conn 1 again.
     try cm.onConnectionEstablished(3, peer, .outbound, .{});
     try std.testing.expectEqual(@as(u64, 2), cm.trimRecommendationCount());
-    var ev = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
-    defer ev.deinit(a);
-    try std.testing.expectEqual(@as(u64, 2), ev.connection_trim_recommended.conn_id);
+    {
+        var ev = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(@as(u64, 2), ev.connection_trim_recommended.conn_id);
+    }
 
     // After grace expires, conn 1 is eligible again.
     var req = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
@@ -927,9 +932,11 @@ test "trim grace blocks re-recommend until expiry" {
     try cm.tick(wall_time.milliTimestamp());
     try cm.onConnectionEstablished(4, peer, .inbound, .{});
     try std.testing.expectEqual(@as(u64, 3), cm.trimRecommendationCount());
-    ev = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
-    defer ev.deinit(a);
-    try std.testing.expectEqual(@as(u64, 1), ev.connection_trim_recommended.conn_id);
+    {
+        var ev = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(@as(u64, 1), ev.connection_trim_recommended.conn_id);
+    }
 }
 
 test "protected peer is never trim-recommended" {
