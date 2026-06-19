@@ -1381,17 +1381,3 @@ test "nonblock handshake" {
     try testing.expectEqual(0, res.send_pos);
     try testing.expect(h.done());
 }
-
-test "note about sizes" {
-    // values valid only for 64 bit platform, so skip in ci
-    if (true) return error.SkipZigTest;
-
-    try testing.expectEqual(18928, @sizeOf(Handshake));
-    try testing.expectEqual(19072, @sizeOf(NonBlock));
-    try testing.expectEqual(14384, @sizeOf(DhKeyPair));
-    try testing.expectEqual(136, @sizeOf(Options));
-    try testing.expectEqual(2792, @sizeOf(CertKeyPair));
-    try testing.expectEqual(1736, @sizeOf(CertificateParser));
-    try testing.expectEqual(48, @sizeOf(cert.Bundle));
-    try testing.expectEqual(208, @sizeOf(Cipher));
-}
