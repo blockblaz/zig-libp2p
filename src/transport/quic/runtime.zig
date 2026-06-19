@@ -3705,6 +3705,135 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
     try testing.expect(saw_end);
 }
 
+test "QuicRuntime: two instances exchange a large (~300 KB) req/resp response over UDP loopback" {
+    // Faithful to zeam's blocks_by_range: a responder sends a ~300 KB response
+    // chunk (a beam block is ~250 KB). The wire must fragment across many QUIC
+    // packets and drain over cwnd/ACK cycles. Regression for the oversized
+    // pending-stream-entry drop (zquic per-packet split) — before that fix the
+    // requester received 0 chunks and timed out.
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+
+    var bundle_a = try buildTestBundle(a, "a", 0xE5);
+    defer bundle_a.deinit(a);
+    var bundle_b = try buildTestBundle(a, "b", 0xF6);
+    defer bundle_b.deinit(a);
+
+    var host_a = try host_mod.Host.create(.{ .allocator = a, .local_peer = bundle_a.peer, .gossipsub = .{ .local_peer_id = bundle_a.peer } });
+    defer host_a.destroy();
+    try host_a.startBackground();
+    try testing.expect(host_a.waitUntilReady(5_000));
+
+    var rt_a = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_a,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_a.cert_pem, .key_pem = bundle_a.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_a.destroy();
+
+    var host_b = try host_mod.Host.create(.{ .allocator = a, .local_peer = bundle_b.peer, .gossipsub = .{ .local_peer_id = bundle_b.peer } });
+    defer host_b.destroy();
+    try host_b.startBackground();
+    try testing.expect(host_b.waitUntilReady(5_000));
+
+    var rt_b = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_b,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_b.cert_pem, .key_pem = bundle_b.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_b.destroy();
+
+    try rt_a.start();
+    try rt_b.start();
+
+    const a_port = rt_a.boundUdpPortIpv4() orelse return error.NoBoundPort;
+    var a_peer_b58_buf: [128]u8 = undefined;
+    const a_peer_b58 = try bundle_a.peer.toBase58(&a_peer_b58_buf);
+    const a_ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ a_port, a_peer_b58 });
+    defer a.free(a_ma_str);
+    var a_ma = try multiaddr.Multiaddr.fromString(a, a_ma_str);
+    defer a_ma.deinit();
+    try rt_b.registerKnownPeer(&a_ma, bundle_a.peer);
+
+    // The ~300 KB response payload. Filled with an incompressible pattern so
+    // the snappy-framed response wire stays large (a repeating byte would
+    // collapse to < 1 packet and never exercise the fragmentation path).
+    const resp_len: usize = 300 * 1024;
+    const resp = try a.alloc(u8, resp_len);
+    defer a.free(resp);
+    for (resp, 0..) |*b, i| b.* = @truncate((i *% 0x9E3779B1) ^ (i >> 7) ^ (i << 3));
+
+    const ResponderTask = struct {
+        fn run(h: *host_mod.Host, payload: []const u8, done: *std.atomic.Value(bool)) void {
+            const dl = wall_time.milliTimestamp() + 25_000;
+            while (wall_time.milliTimestamp() < dl) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(200) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                defer ev.deinit(h.allocator);
+                switch (ev) {
+                    .rpc_request => |r| {
+                        h.sendResponseChunk(r.channel_id, payload, wall_time.milliTimestamp()) catch {};
+                        h.finishResponseStream(r.channel_id) catch {};
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+    var a_done = std.atomic.Value(bool).init(false);
+    var a_thread = try std.Thread.spawn(.{}, ResponderTask.run, .{ host_a, resp, &a_done });
+    defer {
+        a_done.store(true, .release);
+        a_thread.join();
+    }
+
+    var connected = false;
+    {
+        const dl = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < dl) {
+            if (rt_b.outbound_by_peer.get(bundle_a.peer)) |_| {
+                connected = true;
+                break;
+            }
+            var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+    }
+    try testing.expect(connected);
+
+    _ = try host_b.sendRequest(bundle_a.peer, .blocks_by_range, "REQ", 20_000);
+
+    // Accumulate every response chunk; the full payload must arrive intact.
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(a);
+    var saw_end = false;
+    const deadline_ms = wall_time.milliTimestamp() + 25_000;
+    while (wall_time.milliTimestamp() < deadline_ms and !saw_end) {
+        var ev = host_b.nextEvent(500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        defer ev.deinit(a);
+        switch (ev) {
+            .rpc_response_chunk => |c| try acc.appendSlice(a, c.chunk),
+            .rpc_response_end => saw_end = true,
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_end);
+    try testing.expectEqual(resp_len, acc.items.len);
+    try testing.expectEqualSlices(u8, resp, acc.items);
+}
+
 test "QuicRuntime: simultaneous mutual dial completes both handshakes (no Initial deadlock)" {
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
