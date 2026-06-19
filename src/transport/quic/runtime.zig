@@ -4565,14 +4565,8 @@ test "QuicRuntime: mixed gossipsub pub + req-resp on same hosts" {
     }
 }
 
-test "QuicRuntime: long-running sustained gossipsub (60s)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    if (builtin.os.tag == .wasi) return error.SkipZigTest;
-    // Long-running soak: skipped by default to keep `zig build test` fast.
-    // Flip `enable` to true locally or in a dedicated CI job to run.
-    const enable: bool = false;
-    if (!enable) return error.SkipZigTest;
-
+/// Entry point for `zig build soak-test`; not part of the public API.
+pub fn longRunningSustainedGossipsubSoak() !void {
     const a = testing.allocator;
     const n: usize = 3;
 
@@ -4645,10 +4639,19 @@ test "QuicRuntime: long-running sustained gossipsub (60s)" {
         _ = std.c.nanosleep(&req, &rem);
     }
 
-    for (counters, 0..) |c, i| {
+    // Gossipsub does not run the topic validator on the publisher's own
+    // messages — only receivers (hosts 1..n-1) should see all `sent` payloads.
+    for (counters[1..], 1..) |c, i| {
         if (c.count() + 5 < sent) {
             std.debug.print("soak: host[{d}] got {d}/{d}\n", .{ i, c.count(), sent });
         }
         try testing.expect(c.count() + 5 >= sent);
     }
+}
+
+test "QuicRuntime: long-running sustained gossipsub (60s)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (!@import("test_options").enable_soak_tests) return error.SkipZigTest;
+    try longRunningSustainedGossipsubSoak();
 }

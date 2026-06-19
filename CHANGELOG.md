@@ -4,6 +4,10 @@
 
 ### Changed
 
+* **tests:** re-enable the QUIC TLS remote peer-id loopback test (mint an in-memory
+  libp2p TLS cert instead of the legacy plain-TLS loopback fixture) and move the
+  60s sustained gossipsub soak out of `zig build test` into `zig build soak-test`
+  ([#235](https://github.com/blockblaz/zig-libp2p/issues/235)).
 * **layout:** rationalize repository structure (phases 0–5 of `docs/REPO_LAYOUT.md`):
   merge `interop/` + `interop_quic/` into `harness/{tcp,quic}/`, move
   `test/fixtures/` to `fixtures/`, reorganize `src/` into `core/`,

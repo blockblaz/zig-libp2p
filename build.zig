@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const d = deps_mod.createDeps(b, target, optimize);
+    const d = deps_mod.createDeps(b, target, optimize, .{});
 
     const unit_tests = b.addTest(.{
         .root_module = d.mod,
@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     _ = fuzz_mod.addFuzzStep(b, d.mod);
-    _ = soak_mod.addSoakStep(b, d.mod);
+    _ = soak_mod.addSoakStep(b, target, optimize);
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/bench.zig"),

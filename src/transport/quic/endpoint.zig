@@ -40,6 +40,7 @@ const quic_raw_stream_io = @import("raw_stream_io.zig");
 const stream_multistream = @import("../stream_multistream.zig");
 const quic_peer_identity = @import("peer_identity.zig");
 const ping = @import("../../protocols/ping/ping.zig");
+const libp2p_tls_cert = @import("../../security/libp2p_tls_cert.zig");
 
 /// zquic `compat.Address` (not re-exported); layout matches [`feed_addr.Address`].
 const ZquicAddress = blk: {
@@ -695,6 +696,69 @@ pub fn loopbackPingTwoStreams(
     try quicLoopbackOnePingOnStream(allocator, listener, &outbound, conn, &recv_buf, s1, deadline_ms, true);
 }
 
+const LoopbackTlsBundle = struct {
+    cert_pem: []u8,
+    key_pem: []u8,
+    peer: peer_id_mod.PeerId,
+
+    fn deinit(self: *LoopbackTlsBundle, a: std.mem.Allocator) void {
+        a.free(self.cert_pem);
+        a.free(self.key_pem);
+    }
+};
+
+const LoopbackHostSigner = struct {
+    kp: std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair,
+    fn sign(ctx: ?*anyopaque, message: []const u8, out_sig: []u8, out_sig_len: *usize) anyerror!void {
+        const self: *LoopbackHostSigner = @ptrCast(@alignCast(ctx.?));
+        const sig = try self.kp.sign(message, null);
+        var buf: [std.crypto.sign.ecdsa.EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+        const der = sig.toDer(&buf);
+        if (der.len > out_sig.len) return error.NoSpaceLeft;
+        @memcpy(out_sig[0..der.len], der);
+        out_sig_len.* = der.len;
+    }
+};
+
+fn buildLoopbackLibp2pTlsCertBundle(a: std.mem.Allocator, seed: u8) !LoopbackTlsBundle {
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const host_seed = [_]u8{seed} ** 32;
+    const cert_seed = [_]u8{seed +% 1} ** 32;
+    const now_sec = @divTrunc(wall_time.milliTimestamp(), 1000);
+
+    const host_kp = try EcdsaP256.KeyPair.generateDeterministic(host_seed);
+    var signer = LoopbackHostSigner{ .kp = host_kp };
+    const host_pub_sec1: [65]u8 = host_kp.public_key.toUncompressedSec1();
+
+    var gen = try libp2p_tls_cert.generate(a, .{
+        .host_identity = .{
+            .ecdsa_p256 = .{
+                .public_key_sec1_uncompressed = host_pub_sec1,
+                .sign = LoopbackHostSigner.sign,
+                .sign_ctx = &signer,
+            },
+        },
+        .not_before_sec = now_sec - 3600,
+        .not_after_sec = now_sec + 365 * 24 * 3600,
+        .cert_key_seed = cert_seed,
+    });
+    defer gen.deinit(a);
+
+    const cert_pem = try libp2p_tls_cert.certDerToPem(a, gen.cert_der);
+    errdefer a.free(cert_pem);
+    const key_pem = try libp2p_tls_cert.ecdsaP256SeedToPem(a, gen.cert_key_seed);
+    errdefer a.free(key_pem);
+
+    const host_pub_proto = try libp2p_tls_cert.encodeEcdsaPublicKeyProto(a, host_pub_sec1);
+    defer a.free(host_pub_proto);
+    const reader = try peer_id_mod.PublicKeyReader.init(host_pub_proto);
+    const spki_bytes = reader.getData();
+    var host_pk = peer_id_mod.PublicKey{ .type = .ECDSA, .data = spki_bytes };
+    const peer = try peer_id_mod.PeerId.fromPublicKey(a, &host_pk);
+
+    return .{ .cert_pem = cert_pem, .key_pem = key_pem, .peer = peer };
+}
+
 test "stream_multistream wire lens match negotiate buffers" {
     const a = std.testing.allocator;
     const proto = ping.multistream_protocol_id;
@@ -732,12 +796,48 @@ test "quic endpoint loopback two streams ping (single-threaded)" {
 test "quic tls remote peer id matches listener key" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
-    // TODO(zig-0.16-drift): `std.fs.cwd` was deprecated under `std.Io.Dir.cwd()`
-    // and the replacement `readFileAlloc` requires an `Io` interface. Until we
-    // plumb an `Io.Threaded` through this test, skip it — the bundled QUIC
-    // loopback ping tests above still exercise the handshake end-to-end; this
-    // one was the only path that needed file I/O for the cert/key comparison.
-    return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var bundle = try buildLoopbackLibp2pTlsCertBundle(a, 0x51);
+    defer bundle.deinit(a);
+
+    var ma_listen = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer ma_listen.deinit();
+
+    var listener = try QuicListener.listen(a, ma_listen, .{
+        .cert_pem = bundle.cert_pem,
+        .key_pem = bundle.key_pem,
+    });
+    defer listener.deinit();
+
+    const port = try listener.boundUdpPortIpv4();
+    const dial_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1", .{port});
+    defer a.free(dial_str);
+    var ma_dial = try multiaddr.Multiaddr.fromString(a, dial_str);
+    defer ma_dial.deinit();
+
+    var outbound = try QuicOutbound.dial(a, ma_dial, .{
+        .client_cert_pem = bundle.cert_pem,
+        .client_key_pem = bundle.key_pem,
+    });
+    defer outbound.deinit();
+
+    var recv_buf: [65536]u8 = undefined;
+    const deadline_ms = wall_time.milliTimestamp() + 20_000;
+
+    var accepted = false;
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        try listener.drive(&recv_buf, 50);
+        try outbound.drive(&recv_buf, 50);
+        if (listener.pollAccept() != null) accepted = true;
+        if (accepted and outbound.client.conn.phase == .connected) break;
+    } else return error.Timeout;
+    try outbound.waitConnected(&recv_buf, deadline_ms);
+
+    const want = bundle.peer;
+    const now_sec = @divTrunc(wall_time.milliTimestamp(), 1000);
+    const got = try outbound.verifiedRemotePeerId(a, null, now_sec);
+    try std.testing.expect(got.eql(&want));
 }
 
 // Tests for [`overCapStep`] live in `wire_boundaries.zig` so they're picked up
