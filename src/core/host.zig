@@ -100,6 +100,8 @@ pub const HostConfig = struct {
     req_resp: req_resp_runtime.ReqRespConfig = .{},
     /// Connection-manager trim policy. Defaults to "unlimited" (`null` knobs).
     connection_limits: connection_manager_mod.ConnectionLimits = .{},
+    /// Peers registered at init as trim-exempt (bootnodes, direct peers) ([#210](https://github.com/blockblaz/zig-libp2p/issues/210)).
+    protected_peers: []const identity.PeerId = &.{},
     /// Identify Push auto-trigger batching (#202).
     identify: IdentifyConfig = .{},
     /// AutoNAT vote aggregation + active probing (#206).
@@ -184,6 +186,9 @@ pub const Host = struct {
         cm.* = connection_manager_mod.ConnectionManager.init(allocator, swarm);
         cm.setLimits(cfg.connection_limits);
         cm.setReqResp(rr);
+        for (cfg.protected_peers) |peer| {
+            try cm.protect(peer);
+        }
 
         var autonat_client: ?autonat_mod.Client = null;
         if (cfg.autonat.enable) {
@@ -614,6 +619,16 @@ pub const Host = struct {
 
     pub fn knownPeerStatus(self: *const Host, peer: identity.PeerId) ?connection_manager_mod.KnownPeerDialStatus {
         return self.connection_manager.knownPeerStatus(peer);
+    }
+
+    /// Exempt `peer` from connection trim recommendations ([#210](https://github.com/blockblaz/zig-libp2p/issues/210)).
+    pub fn protectPeer(self: *Host, peer: identity.PeerId) !void {
+        try self.connection_manager.protect(peer);
+    }
+
+    /// Clear trim protection for `peer` ([#210](https://github.com/blockblaz/zig-libp2p/issues/210)).
+    pub fn unprotectPeer(self: *Host, peer: identity.PeerId) void {
+        self.connection_manager.unprotect(peer);
     }
 
     // ── Drain ──────────────────────────────────────────────────────────────
