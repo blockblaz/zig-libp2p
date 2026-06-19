@@ -1132,13 +1132,16 @@ test "event queue drop_oldest evicts head" {
     try swarm.queueEvent(.{ .peer_connected = .{ .peer = p3, .direction = .inbound } });
     try std.testing.expectEqual(@as(u64, 1), swarm.eventsDropped());
 
-    var ev = try swarm.nextEvent(100);
-    defer ev.deinit(a);
-    try std.testing.expect(ev.peer_connected.peer.eql(&p2));
-
-    ev = try swarm.nextEvent(100);
-    defer ev.deinit(a);
-    try std.testing.expect(ev.peer_connected.peer.eql(&p3));
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expect(ev.peer_connected.peer.eql(&p2));
+    }
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expect(ev.peer_connected.peer.eql(&p3));
+    }
 }
 
 test "event queue drop_newest_lazy drops incoming" {
@@ -1160,13 +1163,16 @@ test "event queue drop_newest_lazy drops incoming" {
     try swarm.queueEvent(.{ .peer_connected = .{ .peer = p3, .direction = .inbound } });
     try std.testing.expectEqual(@as(u64, 1), swarm.eventsDropped());
 
-    var ev = try swarm.nextEvent(100);
-    defer ev.deinit(a);
-    try std.testing.expect(ev.peer_connected.peer.eql(&p1));
-
-    ev = try swarm.nextEvent(100);
-    defer ev.deinit(a);
-    try std.testing.expect(ev.peer_connected.peer.eql(&p2));
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expect(ev.peer_connected.peer.eql(&p1));
+    }
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expect(ev.peer_connected.peer.eql(&p2));
+    }
 }
 
 test "hook exceeding deadline increments hookSlowCount" {
