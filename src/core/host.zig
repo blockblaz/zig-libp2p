@@ -80,6 +80,8 @@ pub const SwarmBootConfig = struct {
     /// Optional real-transport interception hook (#TBD). See
     /// [`swarm_mod.CommandDispatchHook`].
     command_dispatch: ?swarm_mod.CommandDispatchHook = null,
+    event_queue_policy: swarm_mod.EventQueuePolicy = .block,
+    hook_deadline_ms: u32 = swarm_mod.default_hook_deadline_ms,
 };
 
 pub const HostConfig = struct {
@@ -164,6 +166,8 @@ pub const Host = struct {
             .command_ring_capacity = cfg.swarm.command_ring_capacity,
             .metrics = cfg.metrics,
             .command_dispatch = cfg.swarm.command_dispatch,
+            .event_queue_policy = cfg.swarm.event_queue_policy,
+            .hook_deadline_ms = cfg.swarm.hook_deadline_ms,
         }) catch return error.SwarmInitFailed;
         errdefer swarm.deinit();
 
