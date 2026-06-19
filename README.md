@@ -47,7 +47,7 @@ needs a libp2p node.
 Add the dependency to your `build.zig.zon` (pin a released tag):
 
 ```sh
-zig fetch --save "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.1.96.tar.gz"
+zig fetch --save "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.1.97.tar.gz"
 ```
 
 Then wire it into `build.zig`:
