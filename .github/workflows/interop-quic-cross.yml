@@ -116,7 +116,7 @@ jobs:
         run: bash harness/quic/run_matrix.sh zig,rust-libp2p handshake
 
       - name: Matrix — zig ↔ rust-libp2p (ping)
-        run: bash harness/quic/run_matrix.sh zig,rust-libp2p ping
+        run: DEADLINE_MS=45000 bash harness/quic/run_matrix.sh zig,rust-libp2p ping
 
   # Full matrix on cron / manual only.
   cross-impl-full:

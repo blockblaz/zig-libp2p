@@ -8,6 +8,8 @@
   refresh `harness/quic/README.md` now that zig↔go and zig↔rust are green on all
   four testcases; require zig↔rust handshake+ping on PR CI; drop
   `continue-on-error` from the nightly full matrix.
+* **interop_quic:** FIN the ping echo on the zig server responder so
+  rust-libp2p clients complete RTT measurement ([#174](https://github.com/blockblaz/zig-libp2p/issues/174)).
 * **tests:** re-enable the QUIC TLS remote peer-id loopback test (mint an in-memory
   libp2p TLS cert instead of the legacy plain-TLS loopback fixture) and move the
   60s sustained gossipsub soak out of `zig build test` into `zig build soak-test`
