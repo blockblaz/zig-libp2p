@@ -55,6 +55,25 @@ pub const RelayRuntimeOptions = config.RelayRuntimeOptions;
 pub const DcutrRuntimeOptions = config.DcutrRuntimeOptions;
 pub const AutonatRuntimeOptions = config.AutonatRuntimeOptions;
 
+/// QUIC dial-handshake budget. A dial that does not reach `phase == .connected`
+/// within this window is abandoned and surfaced via `onDialFailure`.
+const dial_handshake_timeout_ms: i64 = 20_000;
+
+/// An outbound QUIC dial whose handshake is still in flight. The dial is
+/// advanced **non-blocking** every `driveLoop` tick (alongside the listener,
+/// `pollAccept`, and all established outbounds) until it reaches
+/// `phase == .connected` or `deadline_ms` elapses. Previously `handleDial`
+/// spun a dedicated blocking loop for up to 20s, freezing the single drive
+/// thread — and, critically, never calling `pollAccept` — so two peers dialing
+/// each other simultaneously would both wedge in the Initial handshake (neither
+/// accepted the other's inbound), starving every other connection of ACKs and
+/// collapsing the gossip mesh.
+const PendingDial = struct {
+    slot: *conn_table.OutboundConn,
+    expected_peer: ?identity.PeerId,
+    deadline_ms: i64,
+};
+
 pub const QuicRuntime = struct {
     allocator: std.mem.Allocator,
     host: *host_mod.Host,
@@ -65,6 +84,10 @@ pub const QuicRuntime = struct {
     bound_port_v4: ?u16 = null,
 
     outbound_by_peer: conn_table.PeerIdMap,
+    /// Outbound dials whose handshake has not yet completed. Advanced
+    /// non-blocking each `driveLoop` tick; promoted into `outbound_by_peer`
+    /// on `.connected`, or failed on deadline. See [`PendingDial`].
+    pending_dials: std.ArrayList(PendingDial) = .empty,
     /// Verified inbound QUIC connections keyed by remote peer id.
     inbound_by_peer: conn_table.InboundPeerMap,
     /// Inbound streams keyed by an internal monotonic id; supports lookup by
@@ -293,6 +316,13 @@ pub const QuicRuntime = struct {
         self.relayed_conn_by_peer.deinit();
         if (self.relay_addrs_buf) |b| self.allocator.free(b);
         if (self.identify_reply_wire) |w| self.allocator.free(w);
+
+        // Free any dials still in flight at teardown.
+        for (self.pending_dials.items) |pd| {
+            pd.slot.outbound.deinit();
+            self.allocator.destroy(pd.slot);
+        }
+        self.pending_dials.deinit(self.allocator);
 
         // Free outbound conns.
         var it = self.outbound_by_peer.valueIterator();
@@ -774,6 +804,12 @@ pub const QuicRuntime = struct {
             };
             // pollAccept once per loop so the lifecycle callback fires.
             _ = self.listener.pollAccept();
+
+            // Advance in-flight dials non-blocking. Must run alongside (not
+            // instead of) the listener + pollAccept above so two peers dialing
+            // each other both accept the other's inbound and complete the
+            // handshake instead of mutually wedging in Initial.
+            self.advancePendingDials(&recv_buf);
 
             // Drive every active outbound, then surface any remote-initiated streams.
             {
@@ -1793,6 +1829,9 @@ pub const QuicRuntime = struct {
             // every connection_manager redial-on-outbound-death, leaving
             // gossip permanently broken to the affected peer.
             if (self.outbound_by_peer.contains(ep)) return;
+            // A dial to this peer is already advancing in `pending_dials`;
+            // don't open a second QUIC connection for it.
+            if (self.hasPendingDial(ep)) return;
         }
 
         var ma = multiaddr.Multiaddr.fromString(a, addr_str) catch |err| {
@@ -1819,7 +1858,14 @@ pub const QuicRuntime = struct {
             return;
         };
 
-        // Allocate slot, store, drive until connected or timeout.
+        // Allocate the slot and register it as a *pending* dial. The handshake
+        // is then advanced non-blocking by `advancePendingDials` on every
+        // `driveLoop` tick — so this thread keeps draining the listener (incl.
+        // `pollAccept`), every established outbound, gossip, and host ticks
+        // while the handshake completes. The previous design spun a dedicated
+        // blocking loop here for up to 20s, which froze all of the above and
+        // (because it never called `pollAccept`) deadlocked two peers dialing
+        // each other simultaneously.
         const slot = a.create(conn_table.OutboundConn) catch {
             outbound.deinit();
             self.failDial(expected_peer);
@@ -1831,48 +1877,68 @@ pub const QuicRuntime = struct {
         };
         self.next_conn_id += 1;
 
-        // Drive until the QUIC handshake completes (bound deadline).
-        var recv_buf: [65536]u8 = undefined;
-        const deadline_ms = self.opts.now_ms_fn() + 20_000;
-        var connected = false;
-        while (self.opts.now_ms_fn() < deadline_ms) {
-            slot.outbound.drive(&recv_buf, 5) catch {};
-            // Also keep listener drained so its TLS handshake responses move.
-            self.listener.drive(&recv_buf, 0) catch {};
-            if (slot.outbound.client.conn.phase == .connected) {
-                connected = true;
-                break;
-            }
-            if (self.shutdown_requested.load(.acquire)) break;
-        }
-
-        if (!connected) {
-            // No log here previously: the drive loop walked away silently and
-            // upstream (`peer connection failed: result=error_`) had no idea
-            // whether the conn even started or what phase it died at. Emit
-            // one warn with the stalled phase so packet captures / zquic
-            // logs aren't the only signal for cross-impl TLS gaps.
-            var peer_buf: [128]u8 = undefined;
-            const peer_str: []const u8 = if (expected_peer) |p|
-                (p.toBase58(&peer_buf) catch "<peer-id-format-err>")
-            else
-                "<unknown>";
-            log.warn(
-                "quic_runtime: dial drive-loop timed out after 20s; peer={s} stalled_phase={s}",
-                .{ peer_str, @tagName(slot.outbound.client.conn.phase) },
-            );
+        self.pending_dials.append(a, .{
+            .slot = slot,
+            .expected_peer = expected_peer,
+            .deadline_ms = self.opts.now_ms_fn() + dial_handshake_timeout_ms,
+        }) catch {
             slot.outbound.deinit();
             a.destroy(slot);
-            if (expected_peer) |ep| {
-                // Same outbound-only semantics as the pre-dial dedupe above:
-                // an inbound-only state must NOT swallow the dial failure,
-                // otherwise connection_manager keeps `dial_inflight=true`
-                // forever and never retries the outbound we still need.
-                if (self.outbound_by_peer.contains(ep)) return;
-            }
             self.failDial(expected_peer);
             return;
+        };
+    }
+
+    /// True when an outbound dial to `ep` is already in flight (handshake not
+    /// yet complete). Mirrors the `outbound_by_peer.contains` dedupe but for
+    /// the pre-`.connected` window.
+    fn hasPendingDial(self: *QuicRuntime, ep: identity.PeerId) bool {
+        for (self.pending_dials.items) |pd| {
+            if (pd.expected_peer) |p| {
+                if (p.eql(&ep)) return true;
+            }
         }
+        return false;
+    }
+
+    /// Non-blocking driver for in-flight dials. Called once per `driveLoop`
+    /// tick. Advances each pending handshake; promotes connected dials into
+    /// `outbound_by_peer`, and abandons dials that miss their deadline.
+    fn advancePendingDials(self: *QuicRuntime, recv_buf: []u8) void {
+        const now = self.opts.now_ms_fn();
+        const shutting_down = self.shutdown_requested.load(.acquire);
+        var i: usize = 0;
+        while (i < self.pending_dials.items.len) {
+            const pd = self.pending_dials.items[i];
+            pd.slot.outbound.drive(recv_buf, 0) catch {};
+            if (pd.slot.outbound.client.conn.phase == .connected) {
+                _ = self.pending_dials.swapRemove(i);
+                self.promoteDial(pd);
+                continue; // swapRemove moved the tail element into slot `i`.
+            }
+            if (shutting_down) {
+                // Quiet teardown: no warn, no failDial event during shutdown.
+                _ = self.pending_dials.swapRemove(i);
+                pd.slot.outbound.deinit();
+                self.allocator.destroy(pd.slot);
+                continue;
+            }
+            if (now >= pd.deadline_ms) {
+                _ = self.pending_dials.swapRemove(i);
+                self.failPendingDial(pd);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// A pending dial reached `phase == .connected`: verify the remote peer id
+    /// from its TLS leaf, register it in `outbound_by_peer`, fire
+    /// `onConnectionEstablished`, and replay our SUBSCRIBE state onto it.
+    fn promoteDial(self: *QuicRuntime, pd: PendingDial) void {
+        const a = self.allocator;
+        const slot = pd.slot;
+        const expected_peer = pd.expected_peer;
 
         // Verify remote peer id from TLS leaf.
         const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
@@ -1920,6 +1986,32 @@ pub const QuicRuntime = struct {
         // `ensurePersistentGossipStream`). Inbound notification may arrive
         // before our dial completes; defer gossip wire setup until then.
         self.replaySubscribeToPeer(verified);
+    }
+
+    /// A pending dial missed its handshake deadline. Emit one warn with the
+    /// stalled phase (so packet captures / zquic logs aren't the only signal
+    /// for cross-impl TLS gaps), tear it down, and surface the failure.
+    fn failPendingDial(self: *QuicRuntime, pd: PendingDial) void {
+        const a = self.allocator;
+        var peer_buf: [128]u8 = undefined;
+        const peer_str: []const u8 = if (pd.expected_peer) |p|
+            (p.toBase58(&peer_buf) catch "<peer-id-format-err>")
+        else
+            "<unknown>";
+        log.warn(
+            "quic_runtime: dial handshake timed out after {d}ms; peer={s} stalled_phase={s}",
+            .{ dial_handshake_timeout_ms, peer_str, @tagName(pd.slot.outbound.client.conn.phase) },
+        );
+        pd.slot.outbound.deinit();
+        a.destroy(pd.slot);
+        if (pd.expected_peer) |ep| {
+            // Same outbound-only semantics as the pre-dial dedupe: an
+            // inbound-only state must NOT swallow the dial failure, otherwise
+            // connection_manager keeps `dial_inflight=true` forever and never
+            // retries the outbound we still need.
+            if (self.outbound_by_peer.contains(ep)) return;
+        }
+        self.failDial(pd.expected_peer);
     }
 
     fn failDial(self: *QuicRuntime, expected_peer: ?identity.PeerId) void {
@@ -2102,7 +2194,12 @@ pub const QuicRuntime = struct {
     fn relayHookDialPlain(ctx: ?*anyopaque, addr: []const u8, expected: ?identity.PeerId) bool {
         const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
         self.handleDial(addr, expected);
-        if (expected) |ep| return self.outbound_by_peer.contains(ep);
+        // Dials are now non-blocking: a freshly-initiated dial sits in
+        // `pending_dials` until its handshake completes. The relay state
+        // machine's `.hop_handshake` phase already polls `outbound_client`
+        // until the connection appears, so "dial initiated" (pending) is
+        // success here; only a dial that failed to even start is a failure.
+        if (expected) |ep| return self.outbound_by_peer.contains(ep) or self.hasPendingDial(ep);
         return true;
     }
 
@@ -3606,6 +3703,95 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
 
     try testing.expect(saw_chunk);
     try testing.expect(saw_end);
+}
+
+test "QuicRuntime: simultaneous mutual dial completes both handshakes (no Initial deadlock)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+
+    var bundle_a = try buildTestBundle(a, "a", 0xC3);
+    defer bundle_a.deinit(a);
+    var bundle_b = try buildTestBundle(a, "b", 0xD4);
+    defer bundle_b.deinit(a);
+
+    var host_a = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_a.peer,
+        .gossipsub = .{ .local_peer_id = bundle_a.peer },
+    });
+    defer host_a.destroy();
+    try host_a.startBackground();
+    try testing.expect(host_a.waitUntilReady(5_000));
+
+    var rt_a = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_a,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_a.cert_pem, .key_pem = bundle_a.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_a.destroy();
+
+    var host_b = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_b.peer,
+        .gossipsub = .{ .local_peer_id = bundle_b.peer },
+    });
+    defer host_b.destroy();
+    try host_b.startBackground();
+    try testing.expect(host_b.waitUntilReady(5_000));
+
+    var rt_b = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_b,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_b.cert_pem, .key_pem = bundle_b.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_b.destroy();
+
+    try rt_a.start();
+    try rt_b.start();
+
+    const a_port = rt_a.boundUdpPortIpv4() orelse return error.NoBoundPort;
+    const b_port = rt_b.boundUdpPortIpv4() orelse return error.NoBoundPort;
+
+    // Build each side's dial multiaddr for the other.
+    var a_b58: [128]u8 = undefined;
+    var b_b58: [128]u8 = undefined;
+    const a_peer_b58 = try bundle_a.peer.toBase58(&a_b58);
+    const b_peer_b58 = try bundle_b.peer.toBase58(&b_b58);
+
+    const a_ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ a_port, a_peer_b58 });
+    defer a.free(a_ma_str);
+    const b_ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ b_port, b_peer_b58 });
+    defer a.free(b_ma_str);
+
+    var a_ma = try multiaddr.Multiaddr.fromString(a, a_ma_str);
+    defer a_ma.deinit();
+    var b_ma = try multiaddr.Multiaddr.fromString(a, b_ma_str);
+    defer b_ma.deinit();
+
+    // Both sides learn of each other at the same time → both connection
+    // managers dial concurrently. Under the old blocking `handleDial` (which
+    // never called `pollAccept`) both drive threads would wedge in the Initial
+    // handshake and time out. The non-blocking dial must let both complete.
+    try rt_b.registerKnownPeer(&a_ma, bundle_a.peer);
+    try rt_a.registerKnownPeer(&b_ma, bundle_b.peer);
+
+    var a_has_b = false;
+    var b_has_a = false;
+    const deadline_ms = wall_time.milliTimestamp() + 20_000;
+    while (wall_time.milliTimestamp() < deadline_ms and !(a_has_b and b_has_a)) {
+        if (rt_a.outbound_by_peer.get(bundle_b.peer)) |_| a_has_b = true;
+        if (rt_b.outbound_by_peer.get(bundle_a.peer)) |_| b_has_a = true;
+        var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    try testing.expect(a_has_b);
+    try testing.expect(b_has_a);
 }
 
 /// Holds the bytes the gossipsub validator captured on host A. The QUIC drive
