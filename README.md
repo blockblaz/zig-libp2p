@@ -47,7 +47,7 @@ needs a libp2p node.
 Add the dependency to your `build.zig.zon` (pin a released tag):
 
 ```sh
-zig fetch --save "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.1.95.tar.gz"
+zig fetch --save "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.1.96.tar.gz"
 ```
 
 Then wire it into `build.zig`:
@@ -262,8 +262,12 @@ zig build test        # unit tests + example smoke-runs
 zig build fuzz        # wire-decoder fuzzing via std.testing.fuzz
 ```
 
-CI workflows and the release-please automation live in
-[`.github/workflows/`](.github/workflows/).
+CI workflows live in [`.github/workflows/`](.github/workflows/).
+
+Releases are cut **manually**: tag the chosen commit and publish a GitHub
+release (`gh release create vX.Y.Z --target main --notes …`), bumping
+`.version` in [`build.zig.zon`](build.zig.zon) and the install snippet above in
+the same change.
 
 ## Contributing
 
