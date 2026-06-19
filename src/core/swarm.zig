@@ -13,6 +13,7 @@
 //! * Command channel: bounded MPSC, capacity [`command_capacity`], at most [`commands_per_tick`]
 //!   are processed per [`run`] loop iteration (or per [`tick`] call, up to its `budget`).
 //! * Event channel: bounded SPSC (one [`nextEvent`] consumer), same capacity as commands by default.
+//!   [`SwarmConfig.event_queue_policy`] selects blocking (default) or bounded-drop behaviour when full.
 //! * Synchronization uses `std.Io` primitives backed by [`Io.Threaded`] (futex + condvar).
 //!
 //! Real transport, gossip, and req/resp I/O are intentionally stubbed: commands still produce
@@ -28,10 +29,26 @@ const peer_events = @import("peer_events.zig");
 const protocol = @import("../primitives/protocol.zig");
 const identity = @import("../primitives/identity.zig");
 const autonat_mod = @import("../protocols/autonat/root.zig");
+const wall_time = @import("../primitives/wall_time.zig");
 
 pub const command_capacity: usize = 8192;
 pub const commands_per_tick: u32 = 256;
 pub const default_event_capacity: usize = command_capacity;
+/// Soft deadline for [`CommandDispatchHook.dispatch`]: hooks running longer increment
+/// [`Swarm.hookSlowCount`]. Embedders should return well under this; use
+/// [`DeferredCommandQueue`] for work that may block.
+pub const default_hook_deadline_ms: u32 = 5;
+
+/// Behaviour when the event ring is full and a producer calls [`Swarm.queueEvent`] /
+/// [`pushEvent`].
+pub const EventQueuePolicy = enum {
+    /// Block the producer until the consumer drains a slot (current default).
+    block,
+    /// Drop the oldest queued event and enqueue the new one.
+    drop_oldest,
+    /// Drop the incoming event without blocking.
+    drop_newest_lazy,
+};
 
 pub const LogLevel = enum(u8) {
     debug,
@@ -100,6 +117,21 @@ pub const SwarmCommand = union(enum) {
 /// else with them, and call [`destroyCommand`] yourself when you're done."
 /// Returning `.fallthrough` is a no-op assertion that the embedder will let
 /// the default stub run (matching pre-hook behaviour).
+///
+/// ## Contract (do not block the swarm worker)
+///
+/// `dispatch` runs **inline on the swarm thread** for every drained command.
+/// If the hook blocks (syscall, contended lock, slow wire write), the worker
+/// stalls: no further commands, no periodic ticks, no heartbeat. **MUST return
+/// within [`default_hook_deadline_ms`]** (configurable via [`SwarmConfig.hook_deadline_ms`]).
+///
+/// Long-running or I/O-bound work belongs on a transport thread. The canonical
+/// pattern is to copy/enqueue the [`OwnedCommand`] into a [`DeferredCommandQueue`],
+/// return `.handled`, and drain the queue from the transport drive loop (see
+/// `transport/quic/runtime.zig` `HookWork` for the production example).
+///
+/// Hooks that exceed the deadline increment [`Swarm.hookSlowCount`] (observability
+/// only — the call is not interrupted).
 ///
 /// Typical use: a QUIC transport hook intercepts `.dial`, `.send_request`,
 /// `.publish` and the corresponding response-side commands so they reach
@@ -277,6 +309,61 @@ pub fn destroyCommand(a: std.mem.Allocator, c: OwnedCommand) void {
     }
 }
 
+/// Bounded FIFO for [`OwnedCommand`]s drained off the swarm worker thread.
+/// Reference implementation for [`CommandDispatchHook`] embedders — enqueue from
+/// `dispatch`, return `.handled`, and call [`drain`] from a transport thread.
+pub const DeferredCommandQueue = struct {
+    io: Io,
+    mutex: Io.Mutex = .init,
+    items: std.ArrayListUnmanaged(OwnedCommand) = .empty,
+    capacity: usize,
+    dropped: std.atomic.Value(u64) = .init(0),
+
+    pub fn init(io: Io, capacity: usize) DeferredCommandQueue {
+        return .{ .io = io, .capacity = capacity };
+    }
+
+    pub fn deinit(self: *DeferredCommandQueue, gpa: std.mem.Allocator) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.items.items) |cmd| destroyCommand(gpa, cmd);
+        self.items.deinit(gpa);
+    }
+
+    pub fn droppedCount(self: *const DeferredCommandQueue) u64 {
+        return self.dropped.load(.monotonic);
+    }
+
+    /// Takes ownership of `cmd`. When full, drops the oldest queued command.
+    pub fn enqueue(self: *DeferredCommandQueue, gpa: std.mem.Allocator, cmd: OwnedCommand) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.items.items.len >= self.capacity) {
+            const oldest = self.items.orderedRemove(0);
+            destroyCommand(gpa, oldest);
+            _ = self.dropped.fetchAdd(1, .monotonic);
+        }
+        self.items.append(gpa, cmd) catch |err| switch (err) {
+            error.OutOfMemory => {
+                destroyCommand(gpa, cmd);
+                _ = self.dropped.fetchAdd(1, .monotonic);
+            },
+        };
+    }
+
+    pub fn drain(
+        self: *DeferredCommandQueue,
+        handler: *const fn (cmd: OwnedCommand) void,
+    ) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (self.items.items.len > 0) {
+            const cmd = self.items.orderedRemove(0);
+            handler(cmd);
+        }
+    }
+};
+
 fn cloneCommand(a: std.mem.Allocator, cmd: SwarmCommand) SubmitError!OwnedCommand {
     return switch (cmd) {
         .publish => |p| OwnedCommand{
@@ -357,6 +444,11 @@ pub const Swarm = struct {
     /// [`dispatchCommand`]. See [`CommandDispatchHook`].
     command_dispatch: ?CommandDispatchHook = null,
 
+    event_queue_policy: EventQueuePolicy = .block,
+    hook_deadline_ms: u32 = default_hook_deadline_ms,
+    events_dropped: std.atomic.Value(u64) = .init(0),
+    hook_slow_count: std.atomic.Value(u64) = .init(0),
+
     pub const SwarmConfig = struct {
         event_capacity: usize = default_event_capacity,
         /// When `null`, a random [`identity.PeerId`] is generated at init.
@@ -367,6 +459,8 @@ pub const Swarm = struct {
         metrics: ?*metrics.Metrics = null,
         /// Optional real-transport interception hook. See [`CommandDispatchHook`].
         command_dispatch: ?CommandDispatchHook = null,
+        event_queue_policy: EventQueuePolicy = .block,
+        hook_deadline_ms: u32 = default_hook_deadline_ms,
     };
 
     pub fn init(gpa: std.mem.Allocator, event_capacity: usize) InitError!Swarm {
@@ -401,7 +495,17 @@ pub const Swarm = struct {
             .evt_buf = evt_buf,
             .evt_cap = config.event_capacity,
             .command_dispatch = config.command_dispatch,
+            .event_queue_policy = config.event_queue_policy,
+            .hook_deadline_ms = config.hook_deadline_ms,
         };
+    }
+
+    pub fn eventsDropped(self: *const Swarm) u64 {
+        return self.events_dropped.load(.monotonic);
+    }
+
+    pub fn hookSlowCount(self: *const Swarm) u64 {
+        return self.hook_slow_count.load(.monotonic);
     }
 
     pub fn deinit(self: *Swarm) void {
@@ -544,7 +648,13 @@ pub const Swarm = struct {
 
     fn dispatchCommand(self: *Swarm, cmd: OwnedCommand) void {
         if (self.command_dispatch) |hook| {
-            switch (hook.dispatch(hook.ctx, &cmd)) {
+            const started_ms = wall_time.milliTimestamp();
+            const disposition = hook.dispatch(hook.ctx, &cmd);
+            const elapsed_ms = wall_time.milliTimestamp() - started_ms;
+            if (elapsed_ms > self.hook_deadline_ms) {
+                _ = self.hook_slow_count.fetchAdd(1, .monotonic);
+            }
+            switch (disposition) {
                 .handled => return, // embedder took ownership of cmd's heap bytes
                 .fallthrough => {},
             }
@@ -620,15 +730,50 @@ pub const Swarm = struct {
 
     fn pushEvent(self: *Swarm, ev: OwnedEvent) std.mem.Allocator.Error!void {
         const io = self.io;
+        const policy: EventQueuePolicy = if (std.meta.activeTag(ev) == .swarm_closed)
+            .block
+        else
+            self.event_queue_policy;
+
         self.evt_mutex.lockUncancelable(io);
-        while (self.evt_len == self.evt_cap) {
-            self.evt_space.waitUncancelable(io, &self.evt_mutex);
+        switch (policy) {
+            .block => {
+                while (self.evt_len == self.evt_cap) {
+                    self.evt_space.waitUncancelable(io, &self.evt_mutex);
+                }
+                self.pushEventSlot(ev);
+            },
+            .drop_oldest => {
+                if (self.evt_len == self.evt_cap) self.dropOldestEvent();
+                self.pushEventSlot(ev);
+            },
+            .drop_newest_lazy => {
+                if (self.evt_len == self.evt_cap) {
+                    var dropped = ev;
+                    dropped.deinit(self.gpa);
+                    _ = self.events_dropped.fetchAdd(1, .monotonic);
+                    self.evt_mutex.unlock(io);
+                    return;
+                }
+                self.pushEventSlot(ev);
+            },
         }
+        self.evt_notify.set(io);
+        self.evt_mutex.unlock(io);
+    }
+
+    fn pushEventSlot(self: *Swarm, ev: OwnedEvent) void {
         const slot = (self.evt_head + self.evt_len) % self.evt_buf.len;
         self.evt_buf[slot] = ev;
         self.evt_len += 1;
-        self.evt_notify.set(io);
-        self.evt_mutex.unlock(io);
+    }
+
+    fn dropOldestEvent(self: *Swarm) void {
+        var dropped = self.evt_buf[self.evt_head];
+        self.evt_head = (self.evt_head + 1) % self.evt_buf.len;
+        self.evt_len -= 1;
+        dropped.deinit(self.gpa);
+        _ = self.events_dropped.fetchAdd(1, .monotonic);
     }
 
     fn finishShutdown(self: *Swarm) void {
@@ -966,6 +1111,130 @@ test "swarm submit QueueFull increments metrics" {
     var closed = try swarm.nextEvent(1000);
     defer closed.deinit(a);
     try std.testing.expectEqual(.swarm_closed, std.meta.activeTag(closed));
+}
+
+test "event queue drop_oldest evicts head" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    const p1 = try identity.PeerId.random();
+    const p2 = try identity.PeerId.random();
+    const p3 = try identity.PeerId.random();
+    var swarm = try Swarm.initWithConfig(a, .{
+        .event_capacity = 2,
+        .event_queue_policy = .drop_oldest,
+    });
+    defer swarm.deinit();
+
+    try swarm.queueEvent(.{ .peer_connected = .{ .peer = p1, .direction = .inbound } });
+    try swarm.queueEvent(.{ .peer_connected = .{ .peer = p2, .direction = .inbound } });
+    try swarm.queueEvent(.{ .peer_connected = .{ .peer = p3, .direction = .inbound } });
+    try std.testing.expectEqual(@as(u64, 1), swarm.eventsDropped());
+
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expect(ev.peer_connected.peer.eql(&p2));
+    }
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expect(ev.peer_connected.peer.eql(&p3));
+    }
+}
+
+test "event queue drop_newest_lazy drops incoming" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    const p1 = try identity.PeerId.random();
+    const p2 = try identity.PeerId.random();
+    const p3 = try identity.PeerId.random();
+    var swarm = try Swarm.initWithConfig(a, .{
+        .event_capacity = 2,
+        .event_queue_policy = .drop_newest_lazy,
+    });
+    defer swarm.deinit();
+
+    try swarm.queueEvent(.{ .peer_connected = .{ .peer = p1, .direction = .inbound } });
+    try swarm.queueEvent(.{ .peer_connected = .{ .peer = p2, .direction = .inbound } });
+    try swarm.queueEvent(.{ .peer_connected = .{ .peer = p3, .direction = .inbound } });
+    try std.testing.expectEqual(@as(u64, 1), swarm.eventsDropped());
+
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expect(ev.peer_connected.peer.eql(&p1));
+    }
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expect(ev.peer_connected.peer.eql(&p2));
+    }
+}
+
+test "hook exceeding deadline increments hookSlowCount" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn dispatch(_: ?*anyopaque, _: *const OwnedCommand) CommandDispatchHook.Disposition {
+            var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+            return .fallthrough;
+        }
+    };
+
+    var swarm = try Swarm.initWithConfig(a, .{
+        .hook_deadline_ms = 1,
+        .command_dispatch = .{ .dispatch = Hook.dispatch },
+    });
+    defer swarm.deinit();
+
+    try swarm.submit(.{ .publish = .{ .topic = "/t", .payload = "x" } });
+    swarm.tick(commands_per_tick);
+    try std.testing.expectEqual(@as(u64, 1), swarm.hookSlowCount());
+
+    var ev = try swarm.nextEvent(100);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(.gossip_message, std.meta.activeTag(ev));
+}
+
+test "DeferredCommandQueue bounded enqueue and drain" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try Swarm.init(a, 8);
+    defer swarm.deinit();
+    var q = DeferredCommandQueue.init(swarm.io, 2);
+    defer q.deinit(a);
+
+    const mk = struct {
+        fn sub(topic: []const u8) !OwnedCommand {
+            return OwnedCommand{ .subscribe = .{ .topic = try a.dupe(u8, topic) } };
+        }
+    };
+
+    q.enqueue(a, try mk.sub("a"));
+    q.enqueue(a, try mk.sub("b"));
+    q.enqueue(a, try mk.sub("c"));
+    try std.testing.expectEqual(@as(u64, 1), q.droppedCount());
+
+    const Drain = struct {
+        var seen: u32 = 0;
+        fn handle(cmd: OwnedCommand) void {
+            seen += 1;
+            destroyCommand(a, cmd);
+        }
+    };
+    Drain.seen = 0;
+    q.drain(&Drain.handle);
+    try std.testing.expectEqual(@as(u32, 2), Drain.seen);
 }
 
 // ---------------------------------------------------------------------------

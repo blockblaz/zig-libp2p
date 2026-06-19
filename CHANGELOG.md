@@ -4,6 +4,10 @@
 
 ### Changed
 
+* **swarm:** document non-blocking [`CommandDispatchHook`] contract, add
+  [`DeferredCommandQueue`] helper, soft hook deadline observability
+  ([`hookSlowCount`]), and configurable event-queue backpressure
+  (`block` / `drop_oldest` / `drop_newest_lazy` + [`eventsDropped`]) ([#212](https://github.com/blockblaz/zig-libp2p/issues/212)).
 * **connection_manager:** protected peers skip trim recommendations; trim flags
   expire after a configurable grace window (default 30 s); reconnect backoff uses
   ±25% jitter ([#210](https://github.com/blockblaz/zig-libp2p/issues/210)).
