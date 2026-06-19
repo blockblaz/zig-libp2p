@@ -3009,7 +3009,13 @@ pub const QuicRuntime = struct {
             // empty rpc_response_end; without this the request never completes
             // and hangs until the embedder's request timeout (8s in zeam),
             // retrying forever — a request storm against any unavailable root.
-            const fin_recv = req.raw.client.rawAppStreamFinReceived(req.stream_id);
+            //
+            // Use `rawAppStreamFullyReceived` (FIN seen AND all bytes up to the
+            // final size contiguously reassembled), NOT `rawAppStreamFinReceived`:
+            // the trailing 0-byte FIN frame can be processed before the
+            // cwnd-queued payload, so the bare FIN races ahead of the data and
+            // would truncate a large in-flight response to an empty one.
+            const fin_recv = req.raw.client.rawAppStreamFullyReceived(req.stream_id);
             if (req.resp_acc.items.len == 0) {
                 if (fin_recv) {
                     self.host.swarm.queueEvent(.{ .rpc_response_end = .{
