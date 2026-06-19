@@ -14,6 +14,7 @@ const peer_events = @import("peer_events.zig");
 const req_resp_runtime = @import("../protocols/req_resp/runtime.zig");
 const swarm_mod = @import("swarm.zig");
 const circuit_addr = @import("../protocols/relay/circuit_addr.zig");
+const wall_time = @import("../primitives/wall_time.zig");
 
 const log = std.log.scoped(.connection_manager);
 
@@ -40,6 +41,18 @@ pub const PeerIdContext = struct {
         return a.eql(&b);
     }
 };
+
+fn reconnectDelayMs(failure_count: u8, peer: identity.PeerId) i64 {
+    const idx = failure_count - 1;
+    const base = backoff_ms[idx];
+    var prng = std.Random.DefaultPrng.init(PeerIdContext.hash(.{}, peer) ^ failure_count);
+    const jitter_span = @divTrunc(base, 4);
+    const jitter = if (jitter_span == 0)
+        @as(i64, 0)
+    else
+        prng.random().intRangeAtMost(i64, -jitter_span, jitter_span);
+    return base + jitter;
+}
 
 const KnownState = struct {
     dial_str: []const u8,
@@ -74,6 +87,9 @@ pub const ConnectionLimits = struct {
     /// … and stops once we've shaved enough oldest connections to bring total
     /// back to `low_watermark`. Must be ≤ `high_watermark`.
     low_watermark: ?u32 = null,
+    /// How long a trim recommendation blocks re-recommendation for the same
+    /// connection before the grace window expires ([#210](https://github.com/blockblaz/zig-libp2p/issues/210)).
+    trim_grace_ms: i64 = 30_000,
 };
 
 /// Snapshot of dial scheduling state for a known peer (tests and diagnostics, #38).
@@ -98,9 +114,10 @@ pub const ConnectionManager = struct {
     /// Monotonic counter assigned to each [`onConnectionEstablished`]; used to pick
     /// the oldest connection for trim recommendations (#90).
     next_seq: u64 = 0,
-    /// Conns whose trim recommendation has already been sent (#90); we keep them so
-    /// the embedder can still confirm via `onConnectionClosed` without re-recommending.
-    trim_recommended: std.AutoHashMap(ConnectionId, void),
+    /// Peers exempt from trim recommendations (bootnodes, direct peers) ([#210](https://github.com/blockblaz/zig-libp2p/issues/210)).
+    protected_peers: std.HashMap(identity.PeerId, void, PeerIdContext, std.hash_map.default_max_load_percentage),
+    /// Conns with an outstanding trim recommendation and when that flag expires ([#210](https://github.com/blockblaz/zig-libp2p/issues/210)).
+    trim_recommended: std.AutoHashMap(ConnectionId, i64),
     /// Total trim recommendations emitted across both reason codes (#90 observability).
     trim_recommendations_total: u64 = 0,
 
@@ -111,8 +128,58 @@ pub const ConnectionManager = struct {
             .known = .init(allocator),
             .conns = .init(allocator),
             .peer_active = .init(allocator),
+            .protected_peers = .init(allocator),
             .trim_recommended = .init(allocator),
         };
+    }
+
+    /// Mark `peer` exempt from trim recommendations until [`unprotect`].
+    pub fn protect(self: *ConnectionManager, peer: identity.PeerId) !void {
+        try self.protected_peers.put(peer, {});
+    }
+
+    /// Clear trim protection previously set via [`protect`].
+    pub fn unprotect(self: *ConnectionManager, peer: identity.PeerId) void {
+        _ = self.protected_peers.remove(peer);
+    }
+
+    fn isProtected(self: *const ConnectionManager, peer: identity.PeerId) bool {
+        return self.protected_peers.contains(peer);
+    }
+
+    fn trimRecommendedActive(self: *const ConnectionManager, cid: ConnectionId, now_ms: i64) bool {
+        const expires_at = self.trim_recommended.get(cid) orelse return false;
+        return expires_at > now_ms;
+    }
+
+    fn sweepTrimGrace(self: *ConnectionManager, now_ms: i64) void {
+        var expired = std.ArrayList(ConnectionId).empty;
+        defer expired.deinit(self.allocator);
+        var it = self.trim_recommended.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* <= now_ms) {
+                expired.append(self.allocator, e.key_ptr.*) catch {
+                    _ = self.trim_recommended.remove(e.key_ptr.*);
+                };
+            }
+        }
+        for (expired.items) |cid| _ = self.trim_recommended.remove(cid);
+    }
+
+    fn recommendTrim(
+        self: *ConnectionManager,
+        cid: ConnectionId,
+        peer: identity.PeerId,
+        reason: swarm_mod.TrimReason,
+        now_ms: i64,
+    ) !void {
+        try self.trim_recommended.put(cid, now_ms + self.limits.trim_grace_ms);
+        self.trim_recommendations_total += 1;
+        try self.swarm.queueEvent(.{ .connection_trim_recommended = .{
+            .peer = peer,
+            .conn_id = cid,
+            .reason = reason,
+        } });
     }
 
     pub fn setLimits(self: *ConnectionManager, limits: ConnectionLimits) void {
@@ -137,6 +204,7 @@ pub const ConnectionManager = struct {
         self.known.deinit();
         self.conns.deinit();
         self.peer_active.deinit();
+        self.protected_peers.deinit();
         self.trim_recommended.deinit();
     }
 
@@ -242,6 +310,15 @@ pub const ConnectionManager = struct {
     }
 
     pub fn tick(self: *ConnectionManager, now_ms: i64) swarm_mod.SubmitError!void {
+        self.sweepTrimGrace(now_ms);
+
+        if (self.limits.high_watermark) |hi| {
+            const low = self.limits.low_watermark orelse hi;
+            if (self.conns.count() >= hi) {
+                try self.trimOldestDownTo(low, now_ms);
+            }
+        }
+
         var it = self.known.iterator();
         while (it.next()) |e| {
             const peer = e.key_ptr.*;
@@ -277,8 +354,7 @@ pub const ConnectionManager = struct {
                 st.dial_inflight = false;
                 st.failure_count += 1;
                 if (st.failure_count < max_reconnect_failures) {
-                    const idx = st.failure_count - 1;
-                    st.next_dial_deadline_ms = now_ms + backoff_ms[idx];
+                    st.next_dial_deadline_ms = now_ms + reconnectDelayMs(st.failure_count, p);
                 }
             }
         }
@@ -314,9 +390,10 @@ pub const ConnectionManager = struct {
 
         // Per-peer cap: if this connection puts us over `max_per_peer`, recommend
         // closing the oldest connection to that peer (#90).
+        const now_ms = wall_time.milliTimestamp();
         if (self.limits.max_per_peer) |cap| {
             if (gop.value_ptr.* > cap) {
-                try self.recommendOldestForPeer(peer, .over_per_peer_cap);
+                try self.recommendOldestForPeer(peer, .over_per_peer_cap, now_ms);
             }
         }
 
@@ -325,12 +402,13 @@ pub const ConnectionManager = struct {
         if (self.limits.high_watermark) |hi| {
             const low = self.limits.low_watermark orelse hi;
             if (self.conns.count() >= hi) {
-                try self.trimOldestDownTo(low);
+                try self.trimOldestDownTo(low, now_ms);
             }
         }
     }
 
-    fn recommendOldestForPeer(self: *ConnectionManager, peer: identity.PeerId, reason: swarm_mod.TrimReason) !void {
+    fn recommendOldestForPeer(self: *ConnectionManager, peer: identity.PeerId, reason: swarm_mod.TrimReason, now_ms: i64) !void {
+        if (self.isProtected(peer)) return;
         var pick_id: ?ConnectionId = null;
         var pick_seq: u64 = std.math.maxInt(u64);
         var it = self.conns.iterator();
@@ -338,23 +416,17 @@ pub const ConnectionManager = struct {
             const cid = e.key_ptr.*;
             const ent = e.value_ptr.*;
             if (!ent.peer.eql(&peer)) continue;
-            if (self.trim_recommended.contains(cid)) continue;
+            if (self.trimRecommendedActive(cid, now_ms)) continue;
             if (ent.seq < pick_seq) {
                 pick_seq = ent.seq;
                 pick_id = cid;
             }
         }
         const cid = pick_id orelse return;
-        try self.trim_recommended.put(cid, {});
-        self.trim_recommendations_total += 1;
-        try self.swarm.queueEvent(.{ .connection_trim_recommended = .{
-            .peer = peer,
-            .conn_id = cid,
-            .reason = reason,
-        } });
+        try self.recommendTrim(cid, peer, reason, now_ms);
     }
 
-    fn trimOldestDownTo(self: *ConnectionManager, target: u32) !void {
+    fn trimOldestDownTo(self: *ConnectionManager, target: u32, now_ms: i64) !void {
         // We may issue several recommendations per breach; cap the loop by the
         // current live conn count to avoid runaway.
         var safety: usize = self.conns.count();
@@ -363,33 +435,35 @@ pub const ConnectionManager = struct {
                 var n: usize = 0;
                 var it = self.conns.iterator();
                 while (it.next()) |e| {
-                    if (!self.trim_recommended.contains(e.key_ptr.*)) n += 1;
+                    const ent = e.value_ptr.*;
+                    if (self.isProtected(ent.peer)) continue;
+                    if (self.trimRecommendedActive(e.key_ptr.*, now_ms)) continue;
+                    n += 1;
                 }
                 break :blk n;
             };
             if (live_unrecommended <= target) return;
 
-            // Pick globally-oldest non-recommended conn.
+            // Pick globally-oldest non-recommended, non-protected conn.
             var pick_id: ?ConnectionId = null;
             var pick_peer: identity.PeerId = undefined;
             var pick_seq: u64 = std.math.maxInt(u64);
             var it = self.conns.iterator();
             while (it.next()) |e| {
-                if (self.trim_recommended.contains(e.key_ptr.*)) continue;
-                if (e.value_ptr.seq < pick_seq) {
-                    pick_seq = e.value_ptr.seq;
+                const ent = e.value_ptr.*;
+                if (self.isProtected(ent.peer)) continue;
+                if (self.trimRecommendedActive(e.key_ptr.*, now_ms)) continue;
+                if (ent.seq < pick_seq) {
+                    pick_seq = ent.seq;
                     pick_id = e.key_ptr.*;
-                    pick_peer = e.value_ptr.peer;
+                    pick_peer = ent.peer;
                 }
             }
-            const cid = pick_id orelse return;
-            try self.trim_recommended.put(cid, {});
-            self.trim_recommendations_total += 1;
-            try self.swarm.queueEvent(.{ .connection_trim_recommended = .{
-                .peer = pick_peer,
-                .conn_id = cid,
-                .reason = .over_global_watermark,
-            } });
+            const cid = pick_id orelse {
+                log.warn("trimOldestDownTo: all live connections are protected or grace-flagged; cannot trim further", .{});
+                return;
+            };
+            try self.recommendTrim(cid, pick_peer, .over_global_watermark, now_ms);
         }
     }
 
@@ -457,8 +531,7 @@ pub const ConnectionManager = struct {
                     st.dial_inflight = false;
                     st.failure_count += 1;
                     if (st.failure_count < max_reconnect_failures) {
-                        const idx = st.failure_count - 1;
-                        st.next_dial_deadline_ms = now_ms + backoff_ms[idx];
+                        st.next_dial_deadline_ms = now_ms + reconnectDelayMs(st.failure_count, peer);
                     }
                 }
             }
@@ -823,7 +896,43 @@ test "trim recommends oldest conns down to low_watermark when high_watermark cro
     try std.testing.expect(saw_10 and saw_11);
 }
 
-test "trim already-recommended conn is not re-recommended" {
+test "trim grace blocks re-recommend until expiry" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+    cm.setLimits(.{ .max_per_peer = 1, .trim_grace_ms = 5 });
+
+    const peer = try identity.PeerId.random();
+    try cm.onConnectionEstablished(1, peer, .inbound, .{});
+    try cm.onConnectionEstablished(2, peer, .outbound, .{});
+    try std.testing.expectEqual(@as(u64, 1), cm.trimRecommendationCount());
+    _ = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
+
+    // Within grace: third conn trims conn 2, not conn 1 again.
+    try cm.onConnectionEstablished(3, peer, .outbound, .{});
+    try std.testing.expectEqual(@as(u64, 2), cm.trimRecommendationCount());
+    var ev = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), ev.connection_trim_recommended.conn_id);
+
+    // After grace expires, conn 1 is eligible again.
+    var req = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+    var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+    _ = std.c.nanosleep(&req, &rem);
+    try cm.tick(wall_time.milliTimestamp());
+    try cm.onConnectionEstablished(4, peer, .inbound, .{});
+    try std.testing.expectEqual(@as(u64, 3), cm.trimRecommendationCount());
+    ev = try drainEventOfTag(&swarm, .connection_trim_recommended, a);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), ev.connection_trim_recommended.conn_id);
+}
+
+test "protected peer is never trim-recommended" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
 
@@ -834,14 +943,28 @@ test "trim already-recommended conn is not re-recommended" {
     defer cm.deinit();
     cm.setLimits(.{ .max_per_peer = 1 });
 
-    const peer = try identity.PeerId.random();
-    try cm.onConnectionEstablished(1, peer, .inbound, .{});
-    try cm.onConnectionEstablished(2, peer, .outbound, .{});
-    try std.testing.expectEqual(@as(u64, 1), cm.trimRecommendationCount());
+    const protected_peer = try identity.PeerId.random();
+    const other = try identity.PeerId.random();
+    try cm.protect(protected_peer);
 
-    // Third connection: oldest non-recommended is conn 2 (conn 1 was already recommended).
-    try cm.onConnectionEstablished(3, peer, .outbound, .{});
-    try std.testing.expectEqual(@as(u64, 2), cm.trimRecommendationCount());
+    try cm.onConnectionEstablished(1, protected_peer, .inbound, .{});
+    try cm.onConnectionEstablished(2, protected_peer, .outbound, .{});
+    try std.testing.expectEqual(@as(u64, 0), cm.trimRecommendationCount());
+
+    try cm.onConnectionEstablished(3, other, .inbound, .{});
+    try cm.onConnectionEstablished(4, other, .outbound, .{});
+    try std.testing.expectEqual(@as(u64, 1), cm.trimRecommendationCount());
+}
+
+test "reconnect backoff applies ±25% jitter" {
+    const peer = try identity.PeerId.random();
+    for (1..max_reconnect_failures) |fc| {
+        const delay = reconnectDelayMs(@intCast(fc), peer);
+        const base = backoff_ms[fc - 1];
+        const span = @divTrunc(base, 4);
+        try std.testing.expect(delay >= base - span and delay <= base + span);
+    }
+    try std.testing.expectEqual(reconnectDelayMs(1, peer), reconnectDelayMs(1, peer));
 }
 
 test "trim entry is cleaned on close" {

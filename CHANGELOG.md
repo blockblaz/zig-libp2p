@@ -4,6 +4,9 @@
 
 ### Changed
 
+* **connection_manager:** protected peers skip trim recommendations; trim flags
+  expire after a configurable grace window (default 30 s); reconnect backoff uses
+  ±25% jitter ([#210](https://github.com/blockblaz/zig-libp2p/issues/210)).
 * **interop:** close the cross-impl QUIC matrix tracker ([#166](https://github.com/blockblaz/zig-libp2p/issues/166)):
   refresh `harness/quic/README.md` now that zig↔go and zig↔rust are green on all
   four testcases; require zig↔rust handshake+ping on PR CI; drop
