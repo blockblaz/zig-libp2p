@@ -315,6 +315,9 @@ pub const PersistentGossipStream = struct {
     /// instead of 3/3 of validators, blocking FFG supermajority and stalling
     /// finalization).
     outbox_stuck_since_ms: ?i64 = null,
+    /// Rate-limit for the "outbox full, dropping oldest gossip frame" warn so a
+    /// sustained-congestion peer doesn't flood the log.
+    outbox_drop_warn_ms: i64 = 0,
 };
 
 /// Hard cap on queued outbox frames per peer before the persistent gossip
