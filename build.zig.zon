@@ -1,7 +1,7 @@
 .{
     .name = .zig_libp2p,
     // Releases are tagged manually; bump this with each `gh release create`.
-    .version = "0.2.1",
+    .version = "0.2.2",
     .fingerprint = 0x6e2dd2ac84762996,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -26,8 +26,8 @@
             .hash = "zig_varint-0.1.0-JouQHUVXAAAGN-XdMYrVEmYrzJd6zXtI7zk9bPnKYXVK",
         },
         .zquic = .{
-            .url = "https://github.com/ch4r10t33r/zquic/archive/refs/tags/v1.7.42.tar.gz",
-            .hash = "zquic-1.7.0-2zRc1GhzFQDVJr-qawahkyryq4hRVQo9rPDyWzcCEVT6",
+            .url = "https://github.com/ch4r10t33r/zquic/archive/refs/tags/v1.7.43.tar.gz",
+            .hash = "zquic-1.7.0-2zRc1GN7FQCn03u8Gn5U1APdfstcjoaHRkUqcvKT7BJ3",
         },
     },
     .paths = .{
