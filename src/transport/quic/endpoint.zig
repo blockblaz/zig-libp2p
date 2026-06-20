@@ -251,7 +251,7 @@ pub const QuicListener = struct {
         const now_ms = wall_time.milliTimestamp();
         for (0..ZIo.MAX_CONNECTIONS) |i| {
             if (!self.seen_connected[i]) continue;
-            if (self.server.conns[i]) |*c| {
+            if (self.server.conns[i]) |c| {
                 while (true) {
                     const scan = popNextUnreportedPeerBidiStream(c, &self.inbound_stream_reported[i]);
                     self.silently_skipped_inbound_streams_total += scan.over_cap;
@@ -318,7 +318,7 @@ pub const QuicListener = struct {
     pub fn pollAccept(self: *QuicListener) ?AcceptedConn {
         self.syncSeenFlags();
         for (0..ZIo.MAX_CONNECTIONS) |i| {
-            if (self.server.conns[i]) |*c| {
+            if (self.server.conns[i]) |c| {
                 if (c.phase == .connected and !self.seen_connected[i]) {
                     self.seen_connected[i] = true;
                     if (self.lifecycle.on_connection_established) |cb| {
