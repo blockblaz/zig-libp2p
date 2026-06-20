@@ -268,6 +268,15 @@ pub const RawAppBidiServer = struct {
         return ZIo.rawAppStreamFinReceived(self.conn, self.stream_id);
     }
 
+    /// Whether the peer has FIN'd AND every byte up to the final size has been
+    /// contiguously reassembled (stronger than `finReceived`: a bare 0-byte FIN
+    /// frame can be processed ahead of cwnd-queued payload). Used by the req/resp
+    /// engine to decide a response is complete without racing the trailing data.
+    pub fn fullyReceived(self: *const RawAppBidiServer) bool {
+        if (self.client) |c| return c.rawAppStreamFullyReceived(self.stream_id);
+        return ZIo.rawAppStreamFullyReceived(self.conn, self.stream_id);
+    }
+
     /// Release the zquic-side raw_app slot so the per-connection table doesn't fill up.
     pub fn release(self: *RawAppBidiServer, allocator: std.mem.Allocator) bool {
         if (self.client) |c| return c.releaseRawAppStream(self.stream_id);

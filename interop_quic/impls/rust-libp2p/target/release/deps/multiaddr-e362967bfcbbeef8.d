@@ -1,0 +1,11 @@
+/Users/partha/projects/zig/zig-libp2p/interop_quic/impls/rust-libp2p/target/release/deps/multiaddr-e362967bfcbbeef8.d: /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/lib.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/errors.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/onion_addr.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/protocol.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/from_url.rs
+
+/Users/partha/projects/zig/zig-libp2p/interop_quic/impls/rust-libp2p/target/release/deps/libmultiaddr-e362967bfcbbeef8.rlib: /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/lib.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/errors.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/onion_addr.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/protocol.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/from_url.rs
+
+/Users/partha/projects/zig/zig-libp2p/interop_quic/impls/rust-libp2p/target/release/deps/libmultiaddr-e362967bfcbbeef8.rmeta: /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/lib.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/errors.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/onion_addr.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/protocol.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/from_url.rs
+
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/lib.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/errors.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/onion_addr.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/protocol.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/multiaddr-0.18.2/src/from_url.rs:

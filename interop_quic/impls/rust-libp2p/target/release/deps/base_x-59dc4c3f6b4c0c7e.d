@@ -1,0 +1,11 @@
+/Users/partha/projects/zig/zig-libp2p/interop_quic/impls/rust-libp2p/target/release/deps/base_x-59dc4c3f6b4c0c7e.d: /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/lib.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/alphabet.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/bigint.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/decoder.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/encoder.rs
+
+/Users/partha/projects/zig/zig-libp2p/interop_quic/impls/rust-libp2p/target/release/deps/libbase_x-59dc4c3f6b4c0c7e.rlib: /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/lib.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/alphabet.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/bigint.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/decoder.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/encoder.rs
+
+/Users/partha/projects/zig/zig-libp2p/interop_quic/impls/rust-libp2p/target/release/deps/libbase_x-59dc4c3f6b4c0c7e.rmeta: /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/lib.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/alphabet.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/bigint.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/decoder.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/encoder.rs
+
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/lib.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/alphabet.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/bigint.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/decoder.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base-x-0.2.11/src/encoder.rs:

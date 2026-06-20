@@ -1,0 +1,10 @@
+/Users/partha/projects/zig/zig-libp2p/interop_quic/impls/rust-libp2p/target/release/deps/unsigned_varint-94e8efc3f53871e9.d: /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/lib.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/decode.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/encode.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/io.rs
+
+/Users/partha/projects/zig/zig-libp2p/interop_quic/impls/rust-libp2p/target/release/deps/libunsigned_varint-94e8efc3f53871e9.rlib: /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/lib.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/decode.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/encode.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/io.rs
+
+/Users/partha/projects/zig/zig-libp2p/interop_quic/impls/rust-libp2p/target/release/deps/libunsigned_varint-94e8efc3f53871e9.rmeta: /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/lib.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/decode.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/encode.rs /Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/io.rs
+
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/lib.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/decode.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/encode.rs:
+/Users/partha/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unsigned-varint-0.8.0/src/io.rs:

@@ -1,0 +1,265 @@
+# zig-libp2p repository layout rationalization
+
+Proposal for reorganizing the repo into a more meaningful structure. Intended as an incremental plan, not a big-bang rename.
+
+**Status:** draft / discussion  
+**Audience:** maintainers and contributors
+
+---
+
+## Diagnosis (today)
+
+| Area | Problem |
+|------|---------|
+| `src/*.zig` (~21 flat files) | Core (`host`, `swarm`), primitives (`varint`), and internals (`peer_protocols`, `wire_boundaries`) sit side by side |
+| `transport/` | QUIC runtime (~5k lines), relay/DCUtR live glue, muxers, TCP, WS — mixed “stack” and “protocol wiring” |
+| `src/vendor/` | Large vendored TLS tree inside the library package |
+| `interop/` + `interop_quic/` | Two harnesses, different transports; QUIC node binary lives in `examples/` |
+| `test/` vs `tests/` | Fixtures in `test/`; placeholder README in `tests/` |
+| `root.zig` | ~100-line force-import `test {}` block — symptom of unclear module graph |
+| `build.zig` | Manual example table; examples/interop/bench not all in `build.zig.zon` paths |
+
+The **public API** (`@import("zig_libp2p")`) via `root.zig` works well for consumers (e.g. zeam). Reorganization should be **internal**, with stable facade aliases until the [1.0 API freeze](https://github.com/blockblaz/zig-libp2p/issues/172).
+
+---
+
+## Target mental model
+
+Organize by **libp2p layers**, matching how contributors and the README already think:
+
+```
+primitives → core → protocols → transport → harnesses
+```
+
+Not “everything QUIC-related in one folder.”
+
+---
+
+## Proposed `src/` layout
+
+```
+src/
+├── core/                    # Node runtime (embedder-facing)
+│   ├── host.zig
+│   ├── swarm.zig
+│   ├── connection_manager.zig
+│   ├── peer_events.zig
+│   ├── peer_protocols.zig
+│   ├── layer_events.zig
+│   ├── identify_advertisement.zig
+│   └── root.zig               # re-exports for zig_libp2p facade
+│
+├── primitives/                # Wire-agnostic building blocks
+│   ├── identity.zig
+│   ├── keypair.zig
+│   ├── protocol.zig
+│   ├── multistream.zig
+│   ├── varint.zig
+│   ├── addr_list.zig
+│   ├── protobuf/wire.zig
+│   ├── wall_time.zig
+│   ├── errors.zig
+│   └── metrics.zig
+│
+├── protocols/                 # One folder per libp2p protocol (uniform)
+│   ├── ping/
+│   ├── identify/
+│   ├── gossipsub/
+│   ├── req_resp/
+│   ├── autonat/
+│   ├── kad_dht/
+│   ├── relay/
+│   ├── dcutr/
+│   ├── discovery/             # mDNS, rendezvous, (future DNSAddr)
+│   └── root.zig               # optional aggregator
+│
+├── transport/                 # Transports + muxers only
+│   ├── quic/                  # split runtime, endpoint, v1, raw_io, …
+│   ├── tcp/
+│   ├── tcp_tls/
+│   ├── ws/
+│   ├── yamux/
+│   ├── mplex/
+│   ├── circuit/
+│   └── multistream_negotiate.zig
+│
+├── security/
+│   ├── tls/
+│   └── noise/
+│
+├── internal/                  # Not in root.zig public surface
+│   ├── wire_boundaries.zig    # fuzz helpers
+│   └── test_fixtures.zig      # shared PEM bytes, etc.
+│
+├── vendor/                    # See below — ideally shrink or extract
+└── root.zig                   # Thin facade (unchanged paths for consumers)
+```
+
+### Uniform protocol package shape
+
+Every protocol under `protocols/` should follow the pattern already used by `autonat/`:
+
+```
+protocols/foo/
+  root.zig      # public exports
+  wire.zig      # codec + framing
+  client.zig
+  server.zig    # or runtime.zig / coordinator.zig
+  policy.zig    # if needed
+```
+
+**Today:** `gossipsub/` is close but exported field-by-field from `root.zig`; `identify` and `ping` are still flat at `src/`. Moving them into `protocols/` improves consistency.
+
+---
+
+## Proposed repo root (non-`src/`)
+
+```
+zig-libp2p/
+├── src/
+├── examples/
+│   ├── tutorials/             # varint, multistream, membuf demos
+│   ├── nodes/                 # host_quic_node, interop_quic_node
+│   └── tools/                 # gen_libp2p_cert
+├── harness/                   # merge interop + interop_quic
+│   ├── quic/                  # run_matrix.sh, impls/{go,rust,zig}
+│   ├── tcp/                   # unified-testing (today's interop/)
+│   └── README.md              # single entry point
+├── fixtures/                  # merge test/fixtures + shared vectors
+├── docs/
+├── bench/
+├── build/
+│   ├── examples.zig           # split from monolithic build.zig
+│   ├── interop.zig
+│   └── fuzz.zig
+├── build.zig                  # thin orchestrator
+└── tests/                     # real integration tests (not just README)
+```
+
+### Key moves
+
+- **`interop/` + `interop_quic/` → `harness/`** with one README explaining TCP vs QUIC matrices
+- **`examples/interop_quic_node.zig` → `harness/quic/zig_node.zig`** (or `examples/nodes/`)
+- **`test/` → `fixtures/`** — eliminate `test/` vs `tests/` confusion
+- **Remove empty placeholders** (`interop/certs/`, `testcases/`) or add real content
+
+---
+
+## `build.zig` rationalization
+
+| Change | Why |
+|--------|-----|
+| Split `build/` helpers | `build.zig` is becoming a junk drawer |
+| Auto-discover examples (glob or per-subdir `build.zig`) | Stop hand-editing a 15-entry table |
+| Separate steps: `test`, `fuzz`, `soak-test`, `interop-matrix`, `interop-tcp` | Cleanly supports [#235](https://github.com/blockblaz/zig-libp2p/issues/235) (skipped tests) |
+| Add `harness/` + `fixtures/` to `build.zig.zon` `.paths` if needed | Today interop is not in published package paths |
+
+Keep **`zig build test` fast**; long soaks and cross-impl matrices stay opt-in.
+
+---
+
+## `root.zig` / public API
+
+**Do not break** `@import("zig_libp2p").host` (and siblings) until 1.0 freeze.
+
+Strategy:
+
+1. Move files internally
+2. Keep `root.zig` as a **compatibility shim** (e.g. `pub const host = @import("core/host.zig")`)
+3. Optionally add **canonical nested paths** (`zig_libp2p.protocols.gossipsub`) alongside flat aliases
+4. Document deprecation timeline in `CHANGELOG.md`
+
+Shrink the `test {}` force-import block by ensuring every protocol `root.zig` owns its test discovery (`test { _ = @import(...) }`).
+
+---
+
+## Split `transport/quic_runtime.zig`
+
+This file is the main maintainability risk (~5k lines). Proposed split:
+
+```
+transport/quic/
+  runtime.zig           # QuicRuntime struct, tick loop
+  conn_table.zig        # connection slots, lifecycle
+  stream_io.zig         # inbound drain, gossipsub frame pump
+  protocol_handlers.zig # identify, autonat, relay, dcutr stream dispatch
+  gossipsub_live.zig
+  relay_live.zig        # from quic_relay_live.zig
+  dcutr_live.zig        # from quic_dcutr_live.zig
+  config.zig
+```
+
+Embedders still import `zig_libp2p.transport.quic_runtime` via alias.
+
+---
+
+## `vendor/` — isolate, don’t normalize
+
+Vendored `zquic_tls` exists for a real Zig 0.16 compile constraint (duplicate module paths through `zquic`).
+
+Recommended:
+
+- Move to `vendor/zquic_tls/` **at repo root** (not inside `src/`)
+- Wire only via `build.zig`
+- Add a short `vendor/README.md`: why vendored, when it can be removed
+
+Keeps `src/` = library code only.
+
+---
+
+## Docs alignment
+
+Mirror the README spec table in folder structure:
+
+| README section | Location |
+|----------------|----------|
+| Transports | `docs/TRANSPORT.md`, `src/transport/` |
+| Discovery | `docs/DISCOVERY.md`, `src/protocols/discovery/` |
+| NAT traversal | `docs/NAT.md` (or per-protocol docs), autonat/relay/dcutr |
+| App protocols | gossipsub, req_resp, ping, identify |
+
+Add **`docs/ARCHITECTURE.md`**: Host → Swarm → Transport → Protocol handlers (one diagram).
+
+---
+
+## What not to change
+
+- **Single package, single import** — good for zeam and lean clients
+- **Membuf example pattern** — excellent for protocol unit tests
+- **Protocol `wire.zig` + `root.zig` convention** — already working
+- **Worktrees workflow** — team process, not repo layout
+- **Cosmetic renames** — e.g. `req_resp` → `request_response` can wait for 1.0
+
+---
+
+## Phased migration (low risk → high)
+
+| Phase | Scope | Effort |
+|-------|--------|--------|
+| **0** | `harness/` merge, `fixtures/`, delete empty dirs, docs index | ~1 PR |
+| **1** | Move `identify`, `ping` into `protocols/`; add `protocols/discovery/` | ~2 PRs |
+| **2** | Flat `src/` → `core/` + `primitives/` with `root.zig` shims | ~1 PR |
+| **3** | Split `quic_runtime.zig` | ~2–3 PRs |
+| **4** | `build/` split + `soak-test` step ([#235](https://github.com/blockblaz/zig-libp2p/issues/235)) | ~1 PR |
+| **5** | `vendor/` to repo root; nested public API polish before 1.0 | pre-freeze |
+
+Each phase: **no behavior change**; `zig build test` + interop matrix green.
+
+---
+
+## Top three priorities
+
+If scope must stay small:
+
+1. **`harness/`** — unify interop story (biggest contributor confusion today)
+2. **`protocols/` uniformity** — every spec area is a folder with `root.zig` + `wire.zig`
+3. **Split `quic_runtime.zig`** — largest file, hardest to review
+
+---
+
+## Related issues
+
+- [#172](https://github.com/blockblaz/zig-libp2p/issues/172) — API 1.0 freeze (drives compatibility shims)
+- [#235](https://github.com/blockblaz/zig-libp2p/issues/235) — re-enable 2 skipped unit tests / soak target
+- [#57](https://github.com/blockblaz/zig-libp2p/issues/57) — `std.Io` async swarm (tangential to core/ layout)
+- [#44](https://github.com/blockblaz/zig-libp2p/issues/44) — fuzz/stress harness (closed; informs `tests/` + `harness/`)
