@@ -1212,13 +1212,27 @@ pub const QuicRuntime = struct {
             return;
         }
         if (g.outbox.items.len >= conn_table.persistent_gossip_outbox_cap) {
-            log.warn(
-                "quic_runtime: persistent gossip outbox cap ({d}) hit for peer={s}; marking stream broken",
-                .{ conn_table.persistent_gossip_outbox_cap, peer_str },
-            );
-            self.markPersistentGossipBroken(g, "outbox_cap");
-            self.allocator.free(wire);
-            return;
+            // The outbox is full because this peer's per-stream pending queue is
+            // backpressured (transient real-network congestion: cwnd in
+            // recovery). Do NOT tear down the connection here — gossip is
+            // best-effort, and closing a slow-but-alive peer spirals into
+            // redial churn that starves attestation propagation and stalls
+            // finalization (subnet aggregators see e.g. 1/8 sigs). Drop the
+            // OLDEST queued frame (stale gossip) to make room for the new one
+            // and keep the stream + connection alive. A genuinely wedged stream
+            // — one making NO send progress at all — is still torn down by the
+            // `outbox_stuck_since_ms` path in `advancePersistentGossipStreams`,
+            // and a dead transport by the QUIC no-ACK/idle reaper.
+            const oldest = g.outbox.orderedRemove(0);
+            self.allocator.free(oldest);
+            const now_ms = self.opts.now_ms_fn();
+            if (now_ms - g.outbox_drop_warn_ms >= 5_000) {
+                g.outbox_drop_warn_ms = now_ms;
+                log.warn(
+                    "quic_runtime: persistent gossip outbox cap ({d}) hit for peer={s}; dropping oldest frame (congestion backpressure, conn kept)",
+                    .{ conn_table.persistent_gossip_outbox_cap, peer_str },
+                );
+            }
         }
         log.debug("quic_runtime: gossip frame queued peer={s} wire_bytes={d} outbox_depth={d}", .{
             peer_str,
