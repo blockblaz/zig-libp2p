@@ -43,7 +43,10 @@ pub const PeerIdContext = struct {
 };
 
 fn reconnectDelayMs(failure_count: u8, peer: identity.PeerId) i64 {
-    const idx = failure_count - 1;
+    // Clamp to the last backoff bucket: a known peer is retried forever (we never
+    // abandon a configured peer — see `tick`), so `failure_count` can exceed the
+    // table length. Beyond the ramp we hold at the slowest interval (80 s).
+    const idx = @min(@as(usize, failure_count) - 1, backoff_ms.len - 1);
     const base = backoff_ms[idx];
     var prng = std.Random.DefaultPrng.init(PeerIdContext.hash(.{}, peer) ^ failure_count);
     const jitter_span = @divTrunc(base, 4);
@@ -325,7 +328,14 @@ pub const ConnectionManager = struct {
             const st = e.value_ptr;
             if (self.peerActiveCount(peer) > 0) continue;
             if (st.dial_inflight) continue;
-            if (st.failure_count >= max_reconnect_failures) continue;
+            // No abandonment for known (configured) peers. The validator/bootstrap
+            // set is static, so a peer we never reach is a peer we must keep
+            // chasing: on a fleet-wide restart every node dials every other at
+            // once, the QUIC Initial handshakes time out under contention, and a
+            // hard cap (formerly `failure_count >= max_reconnect_failures`) would
+            // permanently drop ~a third of the mesh right as congestion clears —
+            // sinking it below the 2/3 attestation quorum. Backoff still throttles
+            // (capped at the slowest bucket via `reconnectDelayMs`).
             if (st.next_dial_deadline_ms > now_ms) continue;
 
             try self.swarm.submit(.{ .dial = .{ .addr = st.dial_str, .expected_peer = peer } });
@@ -352,10 +362,9 @@ pub const ConnectionManager = struct {
         if (peer) |p| {
             if (self.known.getPtr(p)) |st| {
                 st.dial_inflight = false;
-                st.failure_count += 1;
-                if (st.failure_count < max_reconnect_failures) {
-                    st.next_dial_deadline_ms = now_ms + reconnectDelayMs(st.failure_count, p);
-                }
+                st.failure_count +|= 1;
+                // Always re-arm: known peers are retried forever (capped backoff).
+                st.next_dial_deadline_ms = now_ms + reconnectDelayMs(st.failure_count, p);
             }
         }
     }
@@ -529,10 +538,9 @@ pub const ConnectionManager = struct {
             if (reason != .local_close) {
                 if (self.known.getPtr(peer)) |st| {
                     st.dial_inflight = false;
-                    st.failure_count += 1;
-                    if (st.failure_count < max_reconnect_failures) {
-                        st.next_dial_deadline_ms = now_ms + reconnectDelayMs(st.failure_count, peer);
-                    }
+                    st.failure_count +|= 1;
+                    // Always re-arm: known peers are retried forever (capped backoff).
+                    st.next_dial_deadline_ms = now_ms + reconnectDelayMs(st.failure_count, peer);
                 }
             }
         } else if (direction == .outbound and reason != .local_close) {
@@ -735,6 +743,40 @@ test "tick submits dial after remote close backoff" {
 
     try cm.tick(15_000);
     try std.testing.expect(cm.knownPeerStatus(peer).?.dial_inflight);
+}
+
+test "known peer past former failure cap is still redialed (no permanent abandonment)" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    var ma = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA");
+    defer ma.deinit();
+    try cm.registerKnownPeer(&ma, null);
+    const peer = peerIdFromMultiaddr(&ma).?;
+
+    // Simulate a known peer that blew far past the old hard cap during a
+    // fleet-wide restart storm, with its backoff window now elapsed. Pre-fix
+    // the `failure_count >= max_reconnect_failures` gate skipped it forever.
+    cm.known.getPtr(peer).?.failure_count = max_reconnect_failures + 7;
+    cm.known.getPtr(peer).?.dial_inflight = false;
+    cm.known.getPtr(peer).?.next_dial_deadline_ms = 1_000;
+
+    try cm.tick(2_000);
+    try std.testing.expect(cm.knownPeerStatus(peer).?.dial_inflight);
+
+    // Backoff clamps to the slowest bucket rather than indexing past backoff_ms.
+    const delay = reconnectDelayMs(max_reconnect_failures + 7, peer);
+    const base = backoff_ms[backoff_ms.len - 1];
+    const span = @divTrunc(base, 4);
+    try std.testing.expect(delay >= base - span and delay <= base + span);
 }
 
 test "local close does not set reconnect backoff" {
