@@ -1832,6 +1832,14 @@ pub const QuicRuntime = struct {
         }
 
         if (expected_peer) |ep| {
+            // Never dial ourselves. Each node's own address is in the bootnode
+            // list it is handed, so without this guard a node opens a QUIC
+            // connection to itself — wasting a connection slot + ~4 MB ConnState
+            // and adding a useless self-edge to the gossip mesh (the peer count
+            // then shows N instead of the expected N-1). Drop it silently; we do
+            // NOT `failDial` here — that would make connection_manager retry the
+            // self-dial forever under the no-abandon policy.
+            if (ep.eql(&self.host.swarm.local_peer)) return;
             // Skip only when we already have an *outbound* leg to this peer.
             // An inbound-only connection is NOT sufficient: the persistent
             // /meshsub/1.1.0 stream binds to the outbound leg exclusively
