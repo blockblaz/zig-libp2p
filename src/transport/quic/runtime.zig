@@ -121,6 +121,20 @@ pub const QuicRuntime = struct {
     /// iteration that takes >150ms stops ACKs flowing to all 31 peers; if it
     /// recurs they declare us lost (the "healthy then peer goes silent" deaths).
     last_slow_iter_log_ms: i64 = 0,
+    /// Global drive-loop work budget (#2). Wall-ms of the last interleaved
+    /// inbound pump. The heavy per-entity phases (outbound-conn drive,
+    /// inbound-stream advance, persistent-gossip drain) call `maybePumpInbound`
+    /// as they iterate; it re-drains the listener socket + flushes every
+    /// server-side conn's ACKs whenever `drive_inbound_pump_interval_ms` has
+    /// elapsed. This bounds the gap between ACK flushes to ~that interval no
+    /// matter how many conns/streams a phase walks — so a long phase can't
+    /// starve peers' ACKs into the 60s teardown (the single-thread analogue of
+    /// an async runtime yielding to I/O). Per-call drains are already bounded
+    /// (recv/send/gossip caps); this bounds their *sum* per iteration.
+    last_inbound_pump_ms: i64 = 0,
+    /// Dedicated scratch for `maybePumpInbound` so interleaved pumps never alias
+    /// the drive loop's in-use `recv_buf`.
+    pump_buf: [65536]u8 = undefined,
     /// Inbound channels: req/resp's `channel_id` -> the conn_table.InboundStream that
     /// originated it. So when `.send_response_chunk` etc. arrive we can find
     /// the stream to write back on.
@@ -794,6 +808,24 @@ pub const QuicRuntime = struct {
         self.gossip_work_bytes +|= frame.len;
     }
 
+    /// Global drive-loop work budget (#2): max wall-ms between interleaved
+    /// inbound pumps. 10ms keeps every peer's ACK cadence well inside the QUIC
+    /// idle/PTO budget even while a heavy phase walks all 31 conns.
+    const drive_inbound_pump_interval_ms: i64 = 10;
+
+    /// Re-drain the listener socket + flush server-side conn ACKs if at least
+    /// `drive_inbound_pump_interval_ms` has elapsed since the last pump. Cheap
+    /// when called too soon (a clock read + compare). Called from inside the
+    /// heavy per-entity loops so no single phase starves inbound ACK I/O.
+    fn maybePumpInbound(self: *QuicRuntime) void {
+        const now = self.opts.now_ms_fn();
+        if (now -% self.last_inbound_pump_ms < drive_inbound_pump_interval_ms) return;
+        self.last_inbound_pump_ms = now;
+        _ = self.listener.pumpInbound(&self.pump_buf) catch |err| {
+            log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
+        };
+    }
+
     fn driveLoop(self: *QuicRuntime) !void {
         var recv_buf: [65536]u8 = undefined;
         var work_scratch: std.ArrayList(conn_table.HookWork) = .empty;
@@ -826,6 +858,9 @@ pub const QuicRuntime = struct {
                         log.warn("quic_runtime: outbound.drive: {s}", .{@errorName(err)});
                     };
                     self.dispatchOutboundPeerStreams(v.*);
+                    // Work budget (#2): keep inbound ACKs flowing while we walk
+                    // every outbound conn.
+                    self.maybePumpInbound();
                 }
             }
 
@@ -2568,6 +2603,10 @@ pub const QuicRuntime = struct {
         const a = self.allocator;
         var i: usize = 0;
         while (i < self.inbound_streams.items.len) {
+            // Work budget (#2): flush inbound ACKs while walking many streams.
+            // Before the deref below so the draining/closed guard catches any
+            // conn the pump reaps; pumpInbound never mutates `inbound_streams`.
+            self.maybePumpInbound();
             const ist = self.inbound_streams.items[i];
 
             // 0. Drop streams whose underlying QUIC connection is gone before we
