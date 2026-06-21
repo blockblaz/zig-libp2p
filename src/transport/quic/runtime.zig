@@ -117,6 +117,10 @@ pub const QuicRuntime = struct {
     /// peers see our subscription, (b) re-broadcast on subscribe.
     /// Keys are heap-owned `[]u8` topic strings.
     subscribed_topics: std.StringHashMap(void),
+    /// Rate-limit (wall ms) for the slow-drive-iteration watchdog log. A drive
+    /// iteration that takes >150ms stops ACKs flowing to all 31 peers; if it
+    /// recurs they declare us lost (the "healthy then peer goes silent" deaths).
+    last_slow_iter_log_ms: i64 = 0,
     /// Inbound channels: req/resp's `channel_id` -> the conn_table.InboundStream that
     /// originated it. So when `.send_response_chunk` etc. arrive we can find
     /// the stream to write back on.
@@ -797,6 +801,7 @@ pub const QuicRuntime = struct {
 
         var last_tick_ms = self.opts.now_ms_fn();
         while (!self.shutdown_requested.load(.acquire)) {
+            const iter_t0 = self.opts.now_ms_fn(); // drive-iteration watchdog start
             const poll_to: u32 = 5; // short timeout so we can multiplex
             // Drive listener.
             self.listener.drive(&recv_buf, poll_to) catch |err| {
@@ -821,6 +826,8 @@ pub const QuicRuntime = struct {
                     self.dispatchOutboundPeerStreams(v.*);
                 }
             }
+
+            const iter_t1 = self.opts.now_ms_fn(); // after listener+dials+outbound drive
 
             // Keep the inbound socket drained between the heavy phases so the
             // kernel receive buffer doesn't overflow (dropping peers' ACKs →
@@ -850,6 +857,8 @@ pub const QuicRuntime = struct {
             self.advanceInboundStreams() catch |err| {
                 log.warn("quic_runtime: advanceInboundStreams: {s}", .{@errorName(err)});
             };
+
+            const iter_t2 = self.opts.now_ms_fn(); // after advanceInboundStreams
 
             // Second interleaved inbound drain (see note above) — stream
             // advancement over a full mesh is the other heavy phase.
@@ -905,6 +914,7 @@ pub const QuicRuntime = struct {
 
             // Advance persistent per-peer /meshsub streams (#183).
             self.advancePersistentGossipStreams();
+            const iter_t3 = self.opts.now_ms_fn(); // after outbound reqs/publishes/gossip drain
 
             // Periodic host ticks (~ every 100ms).
             const now_ms = self.opts.now_ms_fn();
@@ -914,6 +924,22 @@ pub const QuicRuntime = struct {
                     log.warn("quic_runtime: host periodic ticks: {s}", .{@errorName(err)});
                 };
                 self.drainGossipsubOutbox();
+            }
+
+            // Drive-iteration watchdog. A long iteration stops ACKs flowing to
+            // all 31 peers; recurring, it produces the "healthy then peer goes
+            // silent → declared lost" deaths. Localize WHICH region stalls.
+            const iter_t4 = self.opts.now_ms_fn();
+            if (iter_t4 - iter_t0 >= 150 and iter_t4 - self.last_slow_iter_log_ms >= 2000) {
+                self.last_slow_iter_log_ms = iter_t4;
+                log.warn("quic_runtime: SLOW drive iter total={d}ms [listener+dials+outbound={d} inbound_streams={d} outreqs+gossip={d} periodic_ticks={d}] conns={d}", .{
+                    iter_t4 - iter_t0,
+                    iter_t1 - iter_t0,
+                    iter_t2 - iter_t1,
+                    iter_t3 - iter_t2,
+                    iter_t4 - iter_t3,
+                    self.outbound_by_peer.count(),
+                });
             }
         }
     }
