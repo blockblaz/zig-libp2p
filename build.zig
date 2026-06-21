@@ -10,7 +10,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const d = deps_mod.createDeps(b, target, optimize, .{});
+    // Shadow simulator build: forwards into the zquic dependency so its
+    // syscall layer routes through libc and Shadow's LD_PRELOAD shim can
+    // intercept. See `### Shadow simulator` in the README.
+    const shadow = b.option(bool, "shadow", "Build for the Shadow simulator (forwards to zquic, links libc on Linux)") orelse false;
+
+    const d = deps_mod.createDeps(b, target, optimize, .{ .shadow = shadow });
 
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
     const unit_tests = b.addTest(.{

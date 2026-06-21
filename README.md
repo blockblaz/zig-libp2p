@@ -47,7 +47,7 @@ needs a libp2p node.
 Add the dependency to your `build.zig.zon` (pin a released tag):
 
 ```sh
-zig fetch --save "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.1.97.tar.gz"
+zig fetch --save "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.2.13.tar.gz"
 ```
 
 Then wire it into `build.zig`:
@@ -59,6 +59,44 @@ const zig_libp2p = b.dependency("zig_libp2p", .{
 });
 exe.root_module.addImport("zig_libp2p", zig_libp2p.module("zig_libp2p"));
 ```
+
+### Shadow simulator
+
+The transitively-pinned [`zquic`](https://github.com/ch4r10t33r/zquic) (v1.7.49+)
+supports the [Shadow network simulator](https://shadow.github.io/) — deterministic,
+bit-exact multi-peer replays — via the `-Dshadow=true` build flag. Because
+zig-libp2p sits entirely on top of zquic for QUIC transport (no direct syscalls
+of its own beyond what zquic re-exports), running a libp2p node under Shadow
+just means building zquic with that flag transitively.
+
+Embedders forward the flag through their own `build.zig`:
+
+```zig
+const shadow = b.option(bool, "shadow", "Build for the Shadow simulator") orelse false;
+
+const zig_libp2p_dep = b.dependency("zig_libp2p", .{
+    .target = target,
+    .optimize = optimize,
+    // Forwarded into the zquic dep — zquic owns the syscall layer. When zquic
+    // is built with -Dshadow=true it links libc and routes time / random / UDP
+    // through libc so Shadow's LD_PRELOAD shim can intercept.
+    .shadow = shadow,
+});
+```
+
+Build with:
+
+```sh
+zig build -Dtarget=x86_64-linux-gnu -Dshadow=true -Doptimize=ReleaseSafe
+file zig-out/bin/your-node   # → dynamically linked, /lib64/ld-linux-x86-64.so.2
+```
+
+The dynamically-linked-against-glibc binary is what Shadow's shim injects into.
+The default no-libc Linux build is unaffected. See
+[zquic/docs/shadow.md](https://github.com/ch4r10t33r/zquic/blob/master/docs/shadow.md)
+for the full list of behavior knobs that flip (libc-routed `clock_gettime` /
+`getrandom`, `sendmmsg`/`recvmmsg` disabled in favor of per-message I/O), a
+minimal `shadow.yaml`, and known limitations.
 
 ### Hello, node
 

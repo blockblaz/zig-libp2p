@@ -32,6 +32,10 @@ pub const Deps = struct {
 
 pub const CreateDepsOptions = struct {
     enable_soak_tests: bool = false,
+    /// Forward `-Dshadow=true` into the transitive `zquic` dependency so its
+    /// syscall layer (compat.zig + batch_io.zig) routes through libc and the
+    /// Shadow simulator's `LD_PRELOAD` shim can intercept. See README.
+    shadow: bool = false,
 };
 
 pub fn createDeps(
@@ -63,6 +67,7 @@ pub fn createDeps(
     const zquic_mod = b.dependency("zquic", .{
         .target = target,
         .optimize = optimize,
+        .shadow = opts.shadow,
     }).module("zquic");
 
     const zquic_rsa_mod = b.createModule(.{
