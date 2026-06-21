@@ -12,8 +12,10 @@ pub fn build(b: *std.Build) void {
 
     const d = deps_mod.createDeps(b, target, optimize, .{});
 
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
     const unit_tests = b.addTest(.{
         .root_module = d.mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
