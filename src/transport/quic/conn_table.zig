@@ -361,6 +361,16 @@ pub const PersistentGossipStream = struct {
 /// healthy mainnet topic without unbounded growth on a wedged peer.
 pub const persistent_gossip_outbox_cap: usize = 1024;
 
+/// Scratch size for coalescing consecutive queued gossip frames into one
+/// MTU-chunked stream write. gossipsub RPC frames are self-delimiting (uvarint
+/// length prefix), so packing many small frames (e.g. forwarded subnet
+/// attestations) into a single contiguous write lets zquic fill 1-RTT packets
+/// (~a dozen 100-300 B frames each) instead of emitting one mostly-empty packet
+/// per frame — the packet-rate reduction that keeps the loss detector's
+/// in-flight table and the single drive loop from saturating once every
+/// per-subnet attestation mesh is live.
+pub const persistent_gossip_coalesce_bytes: usize = 16 * 1024;
+
 /// Interval at which an empty-control gossipsub RPC is pushed onto an
 /// otherwise-idle persistent `/meshsub` stream. The frame is a no-op at the
 /// gossipsub layer (one `ControlMessage` field with all sub-fields absent)

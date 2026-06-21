@@ -1337,6 +1337,9 @@ pub const QuicRuntime = struct {
     /// recovering anything.
     fn advancePersistentGossipStreams(self: *QuicRuntime) void {
         const a = self.allocator;
+        // Reused scratch for coalescing each peer's queued gossip frames into
+        // MTU-dense stream writes (see the drain loop below).
+        var coalesce_buf: [conn_table.persistent_gossip_coalesce_bytes]u8 = undefined;
 
         var it = self.persistent_gossip.valueIterator();
         while (it.next()) |g_ptr| {
@@ -1443,26 +1446,60 @@ pub const QuicRuntime = struct {
                 // handled in other code paths.
                 var any_accepted_this_tick: bool = false;
                 while (g.outbox.items.len > 0) {
-                    const frame_wire = g.outbox.items[0];
+                    // Coalesce consecutive queued frames into one MTU-chunked
+                    // write. gossipsub RPC frames are self-delimiting (uvarint
+                    // length prefix) and the /meshsub stream is a byte stream,
+                    // so concatenating frames is wire-identical to sending them
+                    // one at a time — but it lets zquic fill 1-RTT packets (~a
+                    // dozen small forwarded attestations each) instead of one
+                    // mostly-empty packet per frame. That packet-rate cut is
+                    // what keeps the loss detector's in-flight table and the
+                    // single drive loop from saturating once a subnet mesh is
+                    // live. The offset bookkeeping below removes EXACTLY the
+                    // bytes accepted (whole head frames + a suffix rewrite of
+                    // the straddling frame), so a partial accept never corrupts
+                    // the STREAM layout.
+                    var packed_len: usize = 0;
+                    var packed_frames: usize = 0;
+                    for (g.outbox.items) |fw| {
+                        if (fw.len > coalesce_buf.len) break; // oversize: send alone
+                        if (packed_len + fw.len > coalesce_buf.len) break; // buffer full
+                        @memcpy(coalesce_buf[packed_len..][0..fw.len], fw);
+                        packed_len += fw.len;
+                        packed_frames += 1;
+                    }
+                    // A single head frame larger than the scratch buffer is sent
+                    // on its own, chunked, referencing the frame directly.
+                    const send_slice: []const u8 = if (packed_frames == 0)
+                        g.outbox.items[0]
+                    else
+                        coalesce_buf[0..packed_len];
+
                     var sent: usize = 0;
-                    while (sent < frame_wire.len) {
+                    while (sent < send_slice.len) {
                         const n = @min(
                             quic_raw_stream_io.raw_stream_send_chunk_len,
-                            frame_wire.len - sent,
+                            send_slice.len - sent,
                         );
-                        const accepted = g.raw.sendChunk(frame_wire[sent..][0..n], false);
+                        const accepted = g.raw.sendChunk(send_slice[sent..][0..n], false);
                         if (accepted == 0) break;
                         sent += accepted;
                     }
                     if (sent == 0) break;
                     any_accepted_this_tick = true;
-                    if (sent < frame_wire.len) {
-                        // Partial frame.  Rewrite outbox head to the unsent
-                        // suffix so the next tick resumes exactly where we
-                        // stopped — `send_offset` already advanced for the
-                        // accepted prefix, so re-sending it would corrupt
-                        // the STREAM frame layout.
-                        const suffix = a.dupe(u8, frame_wire[sent..]) catch {
+                    g.last_write_ms = self.opts.now_ms_fn();
+
+                    // Drop fully-sent head frames; rewrite the straddling frame
+                    // (if any) to its unsent suffix.
+                    var consumed: usize = 0;
+                    while (g.outbox.items.len > 0 and consumed + g.outbox.items[0].len <= sent) {
+                        consumed += g.outbox.items[0].len;
+                        const done = g.outbox.orderedRemove(0);
+                        a.free(done);
+                    }
+                    if (sent > consumed and g.outbox.items.len > 0) {
+                        const fw = g.outbox.items[0];
+                        const suffix = a.dupe(u8, fw[sent - consumed ..]) catch {
                             log.warn(
                                 "quic_runtime: persistent gossip partial-frame suffix alloc failed; marking stream broken",
                                 .{},
@@ -1470,14 +1507,12 @@ pub const QuicRuntime = struct {
                             self.markPersistentGossipBroken(g, "partial_suffix_alloc_failed");
                             break;
                         };
-                        a.free(frame_wire);
+                        a.free(fw);
                         g.outbox.items[0] = suffix;
-                        g.last_write_ms = self.opts.now_ms_fn();
-                        break;
                     }
-                    _ = g.outbox.orderedRemove(0);
-                    a.free(frame_wire);
-                    g.last_write_ms = self.opts.now_ms_fn();
+                    // Stop the tick if the pending queue did not take everything
+                    // we offered (transient backpressure).
+                    if (sent < send_slice.len) break;
                 }
                 if (g.broken) continue;
                 if (g.outbox.items.len > 0) {
