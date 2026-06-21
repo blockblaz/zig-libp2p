@@ -109,6 +109,14 @@ jobs:
     - name: Microbenchmarks (compile + smoke run, #19)
       run: zig build bench --summary all
 
+    - name: Sustained gossipsub soak test (#235)
+      # The 60s sustained-gossipsub soak is gated out of `zig build test` (so the
+      # fast suite stays in seconds) behind `enable_soak_tests`. Run it here so it
+      # is actually exercised on every change instead of silently rotting — it
+      # covers exactly the long-lived /meshsub gossip + flow-control paths that
+      # several devnet finalization bugs lived in.
+      run: zig build soak-test --summary all
+
     - name: Build example executables
       run: |
         max_attempts=3
