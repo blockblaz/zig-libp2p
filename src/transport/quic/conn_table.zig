@@ -473,3 +473,11 @@ pub const InboundGossipWork = struct {
 /// live (the point of offloading) even if validation lags.
 pub const inbound_gossip_work_cap_entries: usize = 1024;
 pub const inbound_gossip_work_cap_bytes: usize = 64 * 1024 * 1024;
+
+/// Fairness bound: max gossip frames drained from one inbound stream's
+/// accumulator per drive iteration. Draining a large post-stall `gossip_acc`
+/// backlog (varint-decode + dupe + enqueue per frame) in one call monopolized
+/// the drive thread for seconds (live: inbound_streams=3400ms) — starving every
+/// peer's ACKs. The remainder stays compacted in the accumulator for the next
+/// iteration. Well above the steady-state per-stream frame rate.
+pub const max_inbound_gossip_frames_per_call: usize = 512;

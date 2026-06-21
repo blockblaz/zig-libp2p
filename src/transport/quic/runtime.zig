@@ -2753,8 +2753,10 @@ pub const QuicRuntime = struct {
                     // skipped (consumed, not passed to handleGossipRpc) so one
                     // bad publish does not tear down the whole QUIC stream.
                     var consumed: usize = 0;
+                    var frames: usize = 0;
                     var drop_stream = false;
                     while (consumed < ist.gossip_acc.items.len) {
+                        if (frames >= conn_table.max_inbound_gossip_frames_per_call) break; // fairness bound
                         const tail = ist.gossip_acc.items[consumed..];
                         const dec = varint.decode(tail) catch break; // need more bytes
                         if (dec.value > gossipsub_wire_limits.max_gossip_frame_declared_absolute_bytes) {
@@ -2779,6 +2781,7 @@ pub const QuicRuntime = struct {
                         // takes a copy.
                         self.enqueueInboundGossip(sender_peer, frame_bytes);
                         consumed += frame_total;
+                        frames += 1;
                     }
                     if (drop_stream) {
                         self.removeInboundStreamAt(i);
