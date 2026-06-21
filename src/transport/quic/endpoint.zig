@@ -309,6 +309,33 @@ pub const QuicListener = struct {
         self.dispatchInboundStreamCallbacks();
     }
 
+    /// Non-blocking drain of the inbound UDP socket into zquic — recv +
+    /// `feedPacket` only, NOT the (relatively expensive, O(conns))
+    /// `processPendingWork` / callback sweep. Cheap to call repeatedly within
+    /// one `driveLoop` iteration to keep the kernel receive buffer from
+    /// overflowing under high inbound packet rate. On a busy 31-peer gossip
+    /// mesh the single drive thread spends most of an iteration on outbound
+    /// conns + stream advancement; without interleaved draining the inbound
+    /// buffer (even at SO_RCVBUF=8MB) saturates and the kernel drops datagrams
+    /// — including peers' ACKs — which manifests as "no ACK for 60s" teardowns
+    /// and mesh churn. Recorded ACK ranges are flushed by the next `drive`'s
+    /// `processPendingWork`. Returns the number of datagrams drained.
+    pub fn pumpInbound(self: *QuicListener, recv_buf: []u8) DriveError!usize {
+        var drained: usize = 0;
+        while (true) {
+            var sa: posix.sockaddr.storage = undefined;
+            var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            const n = feed_addr.recvfrom(self.server.sock, recv_buf, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => |e| return e,
+            };
+            const addr: feed_addr.Address = .{ .any = @as(*const posix.sockaddr, @ptrCast(&sa)).* };
+            self.server.feedPacket(recv_buf[0..n], zquicAddr(addr));
+            drained += 1;
+        }
+        return drained;
+    }
+
     pub const AcceptedConn = struct {
         slot: usize,
         conn: *ZIo.ConnState,

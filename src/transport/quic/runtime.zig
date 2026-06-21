@@ -822,6 +822,14 @@ pub const QuicRuntime = struct {
                 }
             }
 
+            // Keep the inbound socket drained between the heavy phases so the
+            // kernel receive buffer doesn't overflow (dropping peers' ACKs →
+            // "no ACK for 60s" teardowns → mesh churn) while we spend the
+            // iteration on outbound conns + stream advancement.
+            _ = self.listener.pumpInbound(&recv_buf) catch |err| {
+                log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
+            };
+
             // Detect outbound connections the remote closed (CONNECTION_CLOSE / idle
             // timeout) and surface to the host so connection_manager can redial.
             // Must run AFTER outbound.drive so zquic has processed any inbound packets
@@ -841,6 +849,12 @@ pub const QuicRuntime = struct {
             // Advance inbound streams (multistream + framing).
             self.advanceInboundStreams() catch |err| {
                 log.warn("quic_runtime: advanceInboundStreams: {s}", .{@errorName(err)});
+            };
+
+            // Second interleaved inbound drain (see note above) — stream
+            // advancement over a full mesh is the other heavy phase.
+            _ = self.listener.pumpInbound(&recv_buf) catch |err| {
+                log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
             };
 
             // Advance outbound request streams.
