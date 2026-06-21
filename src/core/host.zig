@@ -80,7 +80,16 @@ pub const SwarmBootConfig = struct {
     /// Optional real-transport interception hook (#TBD). See
     /// [`swarm_mod.CommandDispatchHook`].
     command_dispatch: ?swarm_mod.CommandDispatchHook = null,
-    event_queue_policy: swarm_mod.EventQueuePolicy = .block,
+    /// MUST default to a non-blocking policy: the QUIC drive thread produces
+    /// these events, and `.block` makes `queueEvent` wait for the application
+    /// consumer (e.g. the consensus/signature-verification thread draining via
+    /// `nextEvent`). When that consumer falls behind under load, a `.block`
+    /// producer freezes the ENTIRE drive loop — it stops sending ACKs to all
+    /// peers, who then declare the node lost after 60s (observed live: deaths
+    /// with acked=MBs, lost=0, healthy cwnd — a pure stall, not congestion).
+    /// `.drop_oldest` keeps the freshest events and never stalls the reactor;
+    /// rust-libp2p likewise never blocks its network task on the app consumer.
+    event_queue_policy: swarm_mod.EventQueuePolicy = .drop_oldest,
     hook_deadline_ms: u32 = swarm_mod.default_hook_deadline_ms,
 };
 
