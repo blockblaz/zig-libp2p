@@ -1620,6 +1620,25 @@ pub const Gossipsub = struct {
                 try self.ensureTopicMesh(gt);
                 const mp = self.mesh.getPtr(gt).?;
                 try mp.peers.put(sender, {});
+            } else {
+                // GRAFT for a topic we do NOT subscribe to (and not in back-off):
+                // reply PRUNE so the sender removes us from its mesh and backs
+                // off (libp2p gossipsub v1.1 §3.3.3). WITHOUT this, a peer using
+                // the empty-`remote_interest` fallback in `candidatesOutsideMesh`
+                // (GRAFT any connected peer) to fill a SPARSE topic mesh — e.g.
+                // the lean per-subnet `attestation_<n>` topic that only 8 of 32
+                // nodes join — never learns we aren't a subscriber. It keeps us
+                // in its mesh, treats the mesh as full at `mesh_n_low`, and never
+                // GRAFTs the real subnet members, so the sparse mesh never
+                // converges: subnet attestations never propagate, aggregators see
+                // 1/8, no 2/3 quorum, no finality. (The dense `block` topic hides
+                // this because every grafted peer happens to be subscribed.)
+                const backoff_s: u64 = @intCast(@divFloor(self.cfg.prune_backoff_default_ms, 1000));
+                const ctl_out = try control.encodePrune(self.allocator, gt, backoff_s);
+                defer self.allocator.free(ctl_out);
+                const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl_out);
+                errdefer self.allocator.free(rpcw);
+                try self.appendOut(rpcw, sender);
             }
         }
         // Decode PRUNE with PX peer-info first; falls back to the legacy view if no PRUNE
@@ -2313,6 +2332,48 @@ test "heartbeat prunes mesh above mesh_n_high down to mesh_n" {
     }
     try std.testing.expectEqual(@as(u32, 2), prune_count);
     try std.testing.expectEqual(@as(?usize, 2), g.meshPeerCountForTopic("t"));
+}
+
+test "GRAFT for an unsubscribed topic replies PRUNE (sparse subnet-mesh convergence)" {
+    // Regression: a node that receives a GRAFT for a topic it does NOT subscribe
+    // to must reply PRUNE (libp2p gossipsub v1.1 §3.3.3). Without it, a peer
+    // filling a SPARSE topic mesh via the empty-remote-interest fallback (GRAFT
+    // any connected peer) never learns we aren't a subscriber, keeps us in its
+    // mesh, and never grafts the real subscribers — the lean per-subnet
+    // `attestation_<n>` mesh never converges and finality stalls at 1/8.
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me });
+    defer g.deinit();
+
+    const p1 = try identity.PeerId.random();
+    g.onPeerConnected(p1);
+
+    // We never subscribed to "attestation_3". Peer p1 GRAFTs us for it.
+    const graft_ctl = try control.encodeGraft(a, "attestation_3");
+    defer a.free(graft_ctl);
+    const graft_full = try rpc.encodeControlOnlyRpc(a, graft_ctl);
+    defer a.free(graft_full);
+    try g.handleInboundRpc(p1, graft_full);
+
+    // We must NOT join a mesh for a topic we don't subscribe to.
+    try std.testing.expectEqual(@as(?usize, null), g.meshPeerCountForTopic("attestation_3"));
+
+    // We MUST reply with a PRUNE for that topic, addressed to p1.
+    var pruned_to_p1 = false;
+    while (g.popOutboxDelivery()) |d| {
+        defer a.free(d.wire);
+        const ctl = (try rpc.decodeControlPayload(a, d.wire)) orelse continue;
+        defer a.free(ctl);
+        if (try control.decodeFirstPrune(a, ctl)) |pv| {
+            var pvv = pv;
+            defer control.deinitPruneView(a, &pvv);
+            if (std.mem.eql(u8, pvv.topic, "attestation_3") and d.to != null and d.to.?.eql(&p1)) {
+                pruned_to_p1 = true;
+            }
+        }
+    }
+    try std.testing.expect(pruned_to_p1);
 }
 
 test "two nodes exchange graft then deliver publish forward" {
