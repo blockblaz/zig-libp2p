@@ -809,12 +809,14 @@ pub const QuicRuntime = struct {
             };
             // pollAccept once per loop so the lifecycle callback fires.
             _ = self.listener.pollAccept();
+            const iter_tL = self.opts.now_ms_fn(); // after listener.drive + pollAccept
 
             // Advance in-flight dials non-blocking. Must run alongside (not
             // instead of) the listener + pollAccept above so two peers dialing
             // each other both accept the other's inbound and complete the
             // handshake instead of mutually wedging in Initial.
             self.advancePendingDials(&recv_buf);
+            const iter_tD = self.opts.now_ms_fn(); // after advancePendingDials
 
             // Drive every active outbound, then surface any remote-initiated streams.
             {
@@ -932,9 +934,11 @@ pub const QuicRuntime = struct {
             const iter_t4 = self.opts.now_ms_fn();
             if (iter_t4 - iter_t0 >= 150 and iter_t4 - self.last_slow_iter_log_ms >= 2000) {
                 self.last_slow_iter_log_ms = iter_t4;
-                log.warn("quic_runtime: SLOW drive iter total={d}ms [listener+dials+outbound={d} inbound_streams={d} outreqs+gossip={d} periodic_ticks={d}] conns={d}", .{
+                log.warn("quic_runtime: SLOW drive iter total={d}ms [listener={d} dials={d} outbound={d} inbound_streams={d} outreqs+gossip={d} periodic_ticks={d}] conns={d}", .{
                     iter_t4 - iter_t0,
-                    iter_t1 - iter_t0,
+                    iter_tL - iter_t0,
+                    iter_tD - iter_tL,
+                    iter_t1 - iter_tD,
                     iter_t2 - iter_t1,
                     iter_t3 - iter_t2,
                     iter_t4 - iter_t3,
