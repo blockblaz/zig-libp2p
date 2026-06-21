@@ -2575,6 +2575,16 @@ pub const QuicRuntime = struct {
                     self.host.onConnectionEstablished(cid, sender, .inbound, .{}) catch |err| {
                         log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
                     };
+                    // Replay our SUBSCRIBEs to this inbound peer too. The outbound
+                    // dial path does this in `promoteDial`, but a peer that dialed
+                    // US (inbound-only) would otherwise never learn which topics we
+                    // are interested in — so it never GRAFTs us into its gossipsub
+                    // mesh and never forwards gossip for those topics. For the sparse
+                    // subnet attestation topics (only the 8 subnet validators
+                    // subscribe), an aggregator whose subnet peers mostly dialed it
+                    // then receives none of their attestations: gossip_sigs sticks at
+                    // 1/8 and the chain can't reach the 2/3 quorum to finalize.
+                    self.replaySubscribeToPeer(sender);
                 }
             }
 
