@@ -26,6 +26,17 @@ const recv_flags_dontwait: u32 = switch (builtin.target.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => 0x80,
     else => 0x40,
 };
+
+/// Fairness bound on a single drive-loop recv drain. The socket recv loops below
+/// previously drained `while (true)` until WouldBlock, so one connection
+/// receiving a burst (a block-sync transfer, or a high-rate gossip mesh) could
+/// monopolize the single drive thread for hundreds of ms — during which NO ACKs
+/// are sent to any other peer, who then declare this node lost (live: outbound
+/// drive phase = ~700ms/iter, all in one busy conn; peers churn). Cap the drain
+/// per call; the kernel buffer (SO_RCVBUF=8MB) holds the remainder until the
+/// next iteration. Well above the steady-state per-conn rate (~550 pkt/s), so it
+/// only bounds bursts, never normal traffic.
+const max_recv_drain_per_call: usize = 1024;
 const Io = std.Io;
 const multiaddr = @import("multiaddr");
 const zquic = @import("zquic");
@@ -294,7 +305,8 @@ pub const QuicListener = struct {
         }};
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN != 0) {
-            while (true) {
+            var recv_n: usize = 0;
+            while (recv_n < max_recv_drain_per_call) : (recv_n += 1) {
                 var sa: posix.sockaddr.storage = undefined;
                 var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
                 const n = feed_addr.recvfrom(self.server.sock, recv_buf, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
@@ -322,7 +334,7 @@ pub const QuicListener = struct {
     /// `processPendingWork`. Returns the number of datagrams drained.
     pub fn pumpInbound(self: *QuicListener, recv_buf: []u8) DriveError!usize {
         var drained: usize = 0;
-        while (true) {
+        while (drained < max_recv_drain_per_call) {
             var sa: posix.sockaddr.storage = undefined;
             var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
             const n = feed_addr.recvfrom(self.server.sock, recv_buf, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
@@ -401,7 +413,8 @@ pub const QuicOutbound = struct {
         }};
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN != 0) {
-            while (true) {
+            var recv_n: usize = 0;
+            while (recv_n < max_recv_drain_per_call) : (recv_n += 1) {
                 var sa: posix.sockaddr.storage = undefined;
                 var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
                 const n = feed_addr.recvfrom(self.client.sock, recv_buf, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
