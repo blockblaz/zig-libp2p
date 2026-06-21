@@ -110,7 +110,10 @@ pub const OutboundRequest = struct {
     request_id: u64,
     proto: protocol_mod.LeanSupportedProtocol,
     stream_id: u64,
-    raw: quic_raw_stream_io.RawAppBidiClient,
+    /// Outbound (client) leg when we dialed the peer; inbound (server-initiated)
+    /// leg when the peer dialed us and we have no outbound conn. libp2p req/resp
+    /// rides whichever single connection exists — see `startOutboundRequest`.
+    raw: PublishBidiStream,
     handshake_sent: bool = false,
     handshake_done: bool = false,
     request_written: bool = false,
@@ -145,6 +148,39 @@ pub const PublishBidiStream = union(enum) {
             .outbound => |*c| c.unreadRecvLen(),
             .inbound => |*s| s.unreadRecvLen(),
         };
+    }
+
+    /// Pending receive buffer for this stream (null until the peer sends data).
+    /// Lets a response reader work over either an outbound (client) leg or an
+    /// inbound (server-initiated) leg — the req/resp-over-inbound fallback,
+    /// symmetric with the gossip-publish fallback this union already serves.
+    pub fn recvBuffer(self: *const PublishBidiStream) ?[]const u8 {
+        return switch (self.*) {
+            .outbound => |*c| c.client.rawAppRecvBuffer(c.stream_id),
+            .inbound => |*s| s.recvBuffer(),
+        };
+    }
+
+    /// FIN seen AND all bytes up to the final size contiguously reassembled.
+    pub fn fullyReceived(self: *const PublishBidiStream) bool {
+        return switch (self.*) {
+            .outbound => |*c| c.client.rawAppStreamFullyReceived(c.stream_id),
+            .inbound => |*s| s.fullyReceived(),
+        };
+    }
+
+    pub fn readCursor(self: *const PublishBidiStream) usize {
+        return switch (self.*) {
+            .outbound => |*c| c.read_cursor,
+            .inbound => |*s| s.read_cursor,
+        };
+    }
+
+    pub fn setReadCursor(self: *PublishBidiStream, v: usize) void {
+        switch (self.*) {
+            .outbound => |*c| c.read_cursor = v,
+            .inbound => |*s| s.read_cursor = v,
+        }
     }
 
     pub fn finStream(self: *PublishBidiStream) void {
