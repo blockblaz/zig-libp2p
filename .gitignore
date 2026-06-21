@@ -9,3 +9,6 @@ zig-out-smoke/
 *.dll
 .DS_Store
 .cursor/
+
+# Local git worktrees (parallel agent work)
+.worktrees/
