@@ -25,6 +25,29 @@ pub const DatagramSlot = struct {
     buf: [max_datagram_bytes]u8 = undefined,
 };
 
+/// Route an inbound datagram to the drive-loop shard that owns its connection.
+///
+/// Short-header (1-RTT) packets — the hot path — carry the DCID we issued as the
+/// connection's `local_cid`, whose byte 0 encodes the shard (see
+/// `ConnectionId.randomTagged`). The DCID immediately follows the 1-byte short
+/// header, so the shard is `bytes[1] & mask`. O(1), no parse.
+///
+/// Long-header packets (Initial/Handshake) may carry a peer-chosen DCID that
+/// isn't shard-tagged yet (the client's very first Initial), so we route them by
+/// a hash of the source address instead — and the accepting shard tags the
+/// `local_cid` it mints with its own index, so every subsequent 1-RTT packet for
+/// that connection routes back here by byte 0. `src_hash` is a precomputed hash
+/// of the datagram's source address.
+///
+/// `shard_mask` is `shard_count - 1` (power of two). With mask 0 (single shard)
+/// this always returns 0 — the demux is a no-op.
+pub fn shardForDatagram(bytes: []const u8, src_hash: u64, shard_mask: u8) u8 {
+    if (shard_mask == 0 or bytes.len < 2) return 0;
+    const long_header = (bytes[0] & 0x80) != 0;
+    if (long_header) return @intCast(src_hash & shard_mask);
+    return bytes[1] & shard_mask;
+}
+
 pub const InboundRing = struct {
     slots: []DatagramSlot,
     mask: usize, // capacity - 1; capacity is a power of two
@@ -132,4 +155,35 @@ test "InboundRing: oversize datagram dropped" {
     const big = [_]u8{0} ** (max_datagram_bytes + 1);
     try testing.expect(!ring.push(&big, addr));
     try testing.expectEqual(@as(u64, 1), ring.dropCount());
+}
+
+test "shardForDatagram: single shard (mask 0) is always 0" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(u8, 0), shardForDatagram(&[_]u8{ 0x40, 0x07 }, 12345, 0));
+    try testing.expectEqual(@as(u8, 0), shardForDatagram(&[_]u8{ 0xC0, 0x03 }, 9, 0));
+}
+
+test "shardForDatagram: short header routes by tagged DCID byte 0" {
+    const testing = std.testing;
+    const mask: u8 = 0b11; // 4 shards
+    // Short header: bit 0x80 clear. byte[1] is the first DCID byte (shard tag).
+    // 0x40 = short header form; DCID byte 0 low bits select the shard.
+    try testing.expectEqual(@as(u8, 0), shardForDatagram(&[_]u8{ 0x40, 0b1000 }, 0, mask));
+    try testing.expectEqual(@as(u8, 1), shardForDatagram(&[_]u8{ 0x40, 0b1001 }, 0, mask));
+    try testing.expectEqual(@as(u8, 2), shardForDatagram(&[_]u8{ 0x40, 0b0110 }, 0, mask));
+    try testing.expectEqual(@as(u8, 3), shardForDatagram(&[_]u8{ 0x40, 0b1111 }, 0, mask));
+}
+
+test "shardForDatagram: long header routes by source hash" {
+    const testing = std.testing;
+    const mask: u8 = 0b11;
+    // Long header: bit 0x80 set. DCID may be peer-chosen → route by src hash.
+    try testing.expectEqual(@as(u8, 1), shardForDatagram(&[_]u8{ 0xC0, 0xFF }, 5, mask)); // 5 & 3 = 1
+    try testing.expectEqual(@as(u8, 2), shardForDatagram(&[_]u8{ 0xC0, 0x00 }, 6, mask)); // 6 & 3 = 2
+}
+
+test "shardForDatagram: runt datagram routes to shard 0" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(u8, 0), shardForDatagram(&[_]u8{0x40}, 7, 0b11));
+    try testing.expectEqual(@as(u8, 0), shardForDatagram(&[_]u8{}, 7, 0b11));
 }
