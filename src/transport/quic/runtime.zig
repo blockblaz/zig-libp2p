@@ -589,6 +589,55 @@ pub const QuicRuntime = struct {
         self.inbound_conn_ids[slot] = 0;
     }
 
+    /// Register an established inbound connection with the host exactly once per
+    /// listener slot: record the peer, fire `onConnectionEstablished(.inbound)`,
+    /// and replay our SUBSCRIBEs so an inbound-only peer learns our topics and
+    /// GRAFTs us into its mesh. Shared by the handshake-time poll
+    /// (`pollInboundRegistrations`) and the first-inbound-stream fallback.
+    fn notifyInboundEstablished(self: *QuicRuntime, slot: usize, sender: identity.PeerId, conn: *ZIo.ConnState) void {
+        if (slot == inbound_slot_none or self.inbound_conn_notified[slot]) return;
+        self.inbound_conn_notified[slot] = true;
+        self.inbound_conn_peer[slot] = sender;
+        self.inbound_by_peer.put(sender, .{ .slot = slot, .conn = conn }) catch {};
+        if (self.inbound_conn_ids[slot] == 0) {
+            self.inbound_conn_ids[slot] = self.next_conn_id;
+            self.next_conn_id += 1;
+        }
+        const cid = self.inbound_conn_ids[slot];
+        self.host.onConnectionEstablished(cid, sender, .inbound, .{}) catch |err| {
+            log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
+        };
+        self.replaySubscribeToPeer(sender);
+    }
+
+    /// Register inbound connections as soon as the QUIC handshake completes —
+    /// the peer id is recoverable from the client's leaf cert at that point — so
+    /// mesh membership no longer waits for the peer's first stream to be
+    /// negotiated and processed. Without this, an inbound-ONLY peer (one we
+    /// cannot dial back: inbound-unreachable behind NAT/firewall, common in a
+    /// multi-cloud devnet) stays absent from `connected_peers` + the gossip mesh
+    /// until its stream happens to be processed, while the connection manager
+    /// keeps futilely re-dialing it (the dial-timeout storm) — burning drive-loop
+    /// time that further delays that very stream. Polling here closes those mesh
+    /// holes and stops the doomed redials. Cheap: a slot scan that only does cert
+    /// extraction for connected-but-unregistered inbound slots.
+    fn pollInboundRegistrations(self: *QuicRuntime) void {
+        var slot: usize = 0;
+        while (slot < ZIo.MAX_CONNECTIONS) : (slot += 1) {
+            if (self.inbound_conn_notified[slot]) continue;
+            const conn = self.listener.server.conns[slot] orelse continue;
+            if (conn.phase != .connected or conn.draining) continue;
+            const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
+            const sender = quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn(
+                conn,
+                self.allocator,
+                null,
+                now_sec,
+            ) catch continue; // cert not ready yet / not a libp2p peer — retry next tick
+            self.notifyInboundEstablished(slot, sender, conn);
+        }
+    }
+
     /// Detect outbound QUIC connections that the remote peer has closed
     /// (`CONNECTION_CLOSE` frame received, or transport idle-timeout fired locally)
     /// and surface them via `host.onConnectionClosed`. Without this poll, zeam keeps
@@ -841,6 +890,10 @@ pub const QuicRuntime = struct {
             };
             // pollAccept once per loop so the lifecycle callback fires.
             _ = self.listener.pollAccept();
+            // Register inbound conns at handshake completion (mesh membership
+            // without waiting for the peer's first stream — closes mesh holes for
+            // inbound-only peers and stops the doomed redial storm).
+            self.pollInboundRegistrations();
             const iter_tL = self.opts.now_ms_fn(); // after listener.drive + pollAccept
 
             // Advance in-flight dials non-blocking. Must run alongside (not
@@ -2717,26 +2770,12 @@ pub const QuicRuntime = struct {
                 ist.protocol_index = config.normalizeProtocolIndex(ix);
                 ist.sender_peer = sender;
 
-                // Lazily notify host of new inbound connection (once per listener slot).
-                // Streams on outbound connections have slot == inbound_slot_none so we skip this.
+                // Notify host of new inbound connection (once per listener slot).
+                // Normally `pollInboundRegistrations` already did this at handshake
+                // time; this is the fallback from the first negotiated stream.
+                // Streams on outbound connections have slot == inbound_slot_none.
                 if (ist.slot != inbound_slot_none and !self.inbound_conn_notified[ist.slot]) {
-                    self.inbound_conn_notified[ist.slot] = true;
-                    self.inbound_conn_peer[ist.slot] = sender;
-                    self.inbound_by_peer.put(sender, .{ .slot = ist.slot, .conn = ist.conn }) catch {};
-                    const cid = self.inbound_conn_ids[ist.slot];
-                    self.host.onConnectionEstablished(cid, sender, .inbound, .{}) catch |err| {
-                        log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
-                    };
-                    // Replay our SUBSCRIBEs to this inbound peer too. The outbound
-                    // dial path does this in `promoteDial`, but a peer that dialed
-                    // US (inbound-only) would otherwise never learn which topics we
-                    // are interested in — so it never GRAFTs us into its gossipsub
-                    // mesh and never forwards gossip for those topics. For the sparse
-                    // subnet attestation topics (only the 8 subnet validators
-                    // subscribe), an aggregator whose subnet peers mostly dialed it
-                    // then receives none of their attestations: gossip_sigs sticks at
-                    // 1/8 and the chain can't reach the 2/3 quorum to finalize.
-                    self.replaySubscribeToPeer(sender);
+                    self.notifyInboundEstablished(ist.slot, sender, ist.conn);
                 }
             }
 
