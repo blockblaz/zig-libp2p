@@ -873,6 +873,11 @@ pub const QuicRuntime = struct {
         _ = self.listener.pumpInbound(&self.pump_buf) catch |err| {
             log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
         };
+        // pumpInbound only RECEIVES; flush the ACKs those packets queued so peers
+        // keep getting ACKed through this long phase and don't hit the 60s no-ACK
+        // teardown (which also stalls their gossip outbox into dropping
+        // attestation frames). Non-reaping, so safe to interleave mid-phase.
+        self.listener.server.flushAppAcks();
     }
 
     fn driveLoop(self: *QuicRuntime) !void {
