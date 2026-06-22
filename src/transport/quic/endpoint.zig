@@ -38,6 +38,7 @@ const recv_flags_dontwait: u32 = switch (builtin.target.os.tag) {
 /// only bounds bursts, never normal traffic.
 const max_recv_drain_per_call: usize = 1024;
 const Io = std.Io;
+const shard_ring = @import("shard_ring.zig");
 const multiaddr = @import("multiaddr");
 const zquic = @import("zquic");
 const ZIo = zquic.transport.io;
@@ -319,6 +320,61 @@ pub const QuicListener = struct {
         }
         self.server.processPendingWork();
         self.dispatchInboundStreamCallbacks();
+    }
+
+    // ── Sharded recv path (multi-shard drive loop) ─────────────────────────
+    // The demux thread reads the shared listen socket and queues datagrams into
+    // an InboundRing; the drive thread consumes them. The demux thread touches
+    // only the socket + ring (never Server/ConnState), so all QUIC state stays
+    // single-threaded on the drive thread. These are the ring-fed analogues of
+    // `drive`/`pumpInbound`.
+
+    /// Demux-thread side: poll the shared listen socket and copy any waiting
+    /// datagrams into `ring` (drop-newest on overflow). `scratch` is a
+    /// caller-owned datagram staging buffer (>= shard_ring.max_datagram_bytes).
+    pub fn pollAndDrainToRing(self: *QuicListener, ring: *shard_ring.InboundRing, scratch: []u8, poll_timeout_ms: u32) DriveError!void {
+        var fds = [1]posix.pollfd{.{ .fd = self.server.sock, .events = posix.POLL.IN, .revents = 0 }};
+        _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
+        if (fds[0].revents & posix.POLL.IN == 0) return;
+        var recv_n: usize = 0;
+        while (recv_n < max_recv_drain_per_call) : (recv_n += 1) {
+            var sa: posix.sockaddr.storage = undefined;
+            var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            const n = feed_addr.recvfrom(self.server.sock, scratch, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => |e| return e,
+            };
+            const addr: feed_addr.Address = .{ .any = @as(*const posix.sockaddr, @ptrCast(&sa)).* };
+            _ = ring.push(scratch[0..n], addr);
+        }
+    }
+
+    /// Drive-thread side: consume up to `max` queued datagrams, feed each to the
+    /// Server, then run pending work + surface inbound streams. Ring-fed
+    /// analogue of `drive`.
+    pub fn driveFromRing(self: *QuicListener, ring: *shard_ring.InboundRing, max: usize) void {
+        self.syncSeenFlags();
+        var n: usize = 0;
+        while (n < max) : (n += 1) {
+            const slot = ring.peek() orelse break;
+            self.server.feedPacket(slot.buf[0..slot.len], zquicAddr(slot.addr));
+            ring.pop();
+        }
+        self.server.processPendingWork();
+        self.dispatchInboundStreamCallbacks();
+    }
+
+    /// Drive-thread side: feed up to `max` queued datagrams to the Server with no
+    /// pending-work pass — ring-fed analogue of `pumpInbound`, for the
+    /// interleaved inbound drains inside long phases. Returns the count drained.
+    pub fn pumpFromRing(self: *QuicListener, ring: *shard_ring.InboundRing, max: usize) usize {
+        var n: usize = 0;
+        while (n < max) : (n += 1) {
+            const slot = ring.peek() orelse break;
+            self.server.feedPacket(slot.buf[0..slot.len], zquicAddr(slot.addr));
+            ring.pop();
+        }
+        return n;
     }
 
     /// Non-blocking drain of the inbound UDP socket into zquic — recv +

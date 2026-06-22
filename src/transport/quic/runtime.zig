@@ -48,6 +48,7 @@ const peer_id_pkg = @import("peer_id");
 
 const config = @import("config.zig");
 const conn_table = @import("conn_table.zig");
+const shard_ring = @import("shard_ring.zig");
 
 pub const TlsPemSource = config.TlsPemSource;
 pub const QuicRuntimeOptions = config.QuicRuntimeOptions;
@@ -165,6 +166,13 @@ pub const QuicRuntime = struct {
     /// Drive thread control.
     drive_thread: ?std.Thread = null,
     shutdown_requested: std.atomic.Value(bool) = .init(false),
+    /// Listener/demux thread (multi-shard drive loop): reads the shared listen
+    /// socket and queues datagrams into `inbound_ring`; the drive thread consumes
+    /// them. Keeps recvfrom off the drive thread. `inbound_ring` is null until
+    /// `start` allocates it. With a single shard today this is one ring + one
+    /// demux thread feeding the one drive loop (behavior-preserving).
+    demux_thread: ?std.Thread = null,
+    inbound_ring: ?shard_ring.InboundRing = null,
     started: bool = false,
 
     /// Inbound gossip processing is offloaded from the drive thread to this
@@ -428,6 +436,21 @@ pub const QuicRuntime = struct {
         if (self.started) return;
         self.started = true;
         self.shutdown_requested.store(false, .release);
+        // Listener/demux thread: own the listen socket's recv, queue datagrams
+        // into the ring for the drive thread. If either the ring alloc or the
+        // thread spawn fails, leave inbound_ring null and the drive loop falls
+        // back to reading the socket inline (the pre-sharding path).
+        if (shard_ring.InboundRing.init(self.allocator, inbound_ring_capacity)) |r| {
+            self.inbound_ring = r;
+            self.demux_thread = std.Thread.spawn(.{}, demuxTrampoline, .{self}) catch |err| blk: {
+                log.warn("quic_runtime: demux thread spawn failed ({s}); drive loop will read the socket inline", .{@errorName(err)});
+                if (self.inbound_ring) |*ring| ring.deinit(self.allocator);
+                self.inbound_ring = null;
+                break :blk null;
+            };
+        } else |err| {
+            log.warn("quic_runtime: inbound ring alloc failed ({s}); drive loop will read the socket inline", .{@errorName(err)});
+        }
         self.drive_thread = try std.Thread.spawn(.{}, driveTrampoline, .{self});
         self.gossip_worker_thread = std.Thread.spawn(.{}, gossipWorkerTrampoline, .{self}) catch |err| blk: {
             // Worker is an optimization; if it can't spawn, fall back to inline
@@ -454,6 +477,14 @@ pub const QuicRuntime = struct {
         if (self.drive_thread) |t| {
             t.join();
             self.drive_thread = null;
+        }
+        if (self.demux_thread) |t| {
+            t.join();
+            self.demux_thread = null;
+        }
+        if (self.inbound_ring) |*r| {
+            r.deinit(self.allocator);
+            self.inbound_ring = null;
         }
         if (self.gossip_worker_thread) |t| {
             t.join();
@@ -770,6 +801,29 @@ pub const QuicRuntime = struct {
         };
     }
 
+    /// Capacity (slots) of the inbound datagram ring. Power of two; 4096 × 2 KiB
+    /// ≈ 8 MiB, matching the listen socket's SO_RCVBUF so a burst the kernel
+    /// accepted can be staged for the drive thread without ring drops.
+    const inbound_ring_capacity: usize = 4096;
+
+    fn demuxTrampoline(self: *QuicRuntime) void {
+        self.demuxLoop();
+    }
+
+    /// Listener/demux thread: read the shared listen socket and queue datagrams
+    /// into `inbound_ring` for the drive thread. Touches ONLY the socket + ring
+    /// (never Server/ConnState), so all QUIC state stays single-threaded on the
+    /// drive thread. Polls with a 100ms timeout so it observes shutdown promptly.
+    fn demuxLoop(self: *QuicRuntime) void {
+        const ring = if (self.inbound_ring) |*r| r else return;
+        var scratch: [shard_ring.max_datagram_bytes]u8 = undefined;
+        while (!self.shutdown_requested.load(.acquire)) {
+            self.listener.pollAndDrainToRing(ring, &scratch, 100) catch |err| {
+                log.warn("quic_runtime: demux pollAndDrainToRing: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
     fn gossipWorkerTrampoline(self: *QuicRuntime) void {
         self.gossipWorkerLoop();
     }
@@ -862,6 +916,10 @@ pub const QuicRuntime = struct {
     /// idle/PTO budget even while a heavy phase walks all 31 conns.
     const drive_inbound_pump_interval_ms: i64 = 10;
 
+    /// Max datagrams a single ring drain (driveFromRing/pumpFromRing) consumes,
+    /// matching the inline path's per-call recv bound.
+    const inbound_drain_per_call: usize = 1024;
+
     /// Re-drain the listener socket + flush server-side conn ACKs if at least
     /// `drive_inbound_pump_interval_ms` has elapsed since the last pump. Cheap
     /// when called too soon (a clock read + compare). Called from inside the
@@ -870,9 +928,13 @@ pub const QuicRuntime = struct {
         const now = self.opts.now_ms_fn();
         if (now -% self.last_inbound_pump_ms < drive_inbound_pump_interval_ms) return;
         self.last_inbound_pump_ms = now;
-        _ = self.listener.pumpInbound(&self.pump_buf) catch |err| {
-            log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
-        };
+        if (self.inbound_ring) |*ring| {
+            _ = self.listener.pumpFromRing(ring, inbound_drain_per_call);
+        } else {
+            _ = self.listener.pumpInbound(&self.pump_buf) catch |err| {
+                log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
+            };
+        }
         // pumpInbound only RECEIVES; flush the ACKs those packets queued so peers
         // keep getting ACKed through this long phase and don't hit the 60s no-ACK
         // teardown (which also stalls their gossip outbox into dropping
@@ -889,10 +951,26 @@ pub const QuicRuntime = struct {
         while (!self.shutdown_requested.load(.acquire)) {
             const iter_t0 = self.opts.now_ms_fn(); // drive-iteration watchdog start
             const poll_to: u32 = 5; // short timeout so we can multiplex
-            // Drive listener.
-            self.listener.drive(&recv_buf, poll_to) catch |err| {
-                log.warn("quic_runtime: listener.drive: {s}", .{@errorName(err)});
-            };
+            // Drive listener: consume datagrams the demux thread queued, or read
+            // the socket inline if the demux thread isn't running (fallback).
+            if (self.inbound_ring) |*ring| {
+                // Brief passive wait when the ring is empty so we don't hot-spin
+                // now that the demux thread (not a blocking poll here) owns the
+                // socket. The demux fills the ring concurrently; we wake within
+                // this bound. Under load the ring is non-empty → no sleep. (Zig
+                // 0.16 dropped std.Thread.sleep; use libc nanosleep like the
+                // gossip worker's idle path.)
+                if (ring.peek() == null) {
+                    var req = std.c.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_us };
+                    var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+                    _ = std.c.nanosleep(&req, &rem);
+                }
+                self.listener.driveFromRing(ring, inbound_drain_per_call);
+            } else {
+                self.listener.drive(&recv_buf, poll_to) catch |err| {
+                    log.warn("quic_runtime: listener.drive: {s}", .{@errorName(err)});
+                };
+            }
             // pollAccept once per loop so the lifecycle callback fires.
             _ = self.listener.pollAccept();
             // Register inbound conns at handshake completion (mesh membership
@@ -928,9 +1006,13 @@ pub const QuicRuntime = struct {
             // kernel receive buffer doesn't overflow (dropping peers' ACKs →
             // "no ACK for 60s" teardowns → mesh churn) while we spend the
             // iteration on outbound conns + stream advancement.
-            _ = self.listener.pumpInbound(&recv_buf) catch |err| {
-                log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
-            };
+            if (self.inbound_ring) |*ring| {
+                _ = self.listener.pumpFromRing(ring, inbound_drain_per_call);
+            } else {
+                _ = self.listener.pumpInbound(&recv_buf) catch |err| {
+                    log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
+                };
+            }
 
             // Detect outbound connections the remote closed (CONNECTION_CLOSE / idle
             // timeout) and surface to the host so connection_manager can redial.
@@ -957,9 +1039,13 @@ pub const QuicRuntime = struct {
 
             // Second interleaved inbound drain (see note above) — stream
             // advancement over a full mesh is the other heavy phase.
-            _ = self.listener.pumpInbound(&recv_buf) catch |err| {
-                log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
-            };
+            if (self.inbound_ring) |*ring| {
+                _ = self.listener.pumpFromRing(ring, inbound_drain_per_call);
+            } else {
+                _ = self.listener.pumpInbound(&recv_buf) catch |err| {
+                    log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
+                };
+            }
 
             // Advance outbound request streams.
             self.advanceOutboundRequests() catch |err| {
@@ -1835,8 +1921,14 @@ pub const QuicRuntime = struct {
         const deadline_ms = self.opts.now_ms_fn() + autonat_dial_back_deadline_ms;
         while (self.opts.now_ms_fn() < deadline_ms) {
             outbound.drive(&recv_buf, 5) catch {};
-            // Keep the listener drained so its TLS handshake responses move.
-            self.listener.drive(&recv_buf, 0) catch {};
+            // Keep the listener drained so its TLS handshake responses move. Use
+            // the demux ring when present — reading the socket inline here would
+            // race the demux thread for datagrams.
+            if (self.inbound_ring) |*ring| {
+                self.listener.driveFromRing(ring, inbound_drain_per_call);
+            } else {
+                self.listener.drive(&recv_buf, 0) catch {};
+            }
             if (outbound.client.conn.phase == .connected) return true;
             if (self.shutdown_requested.load(.acquire)) return false;
         }
