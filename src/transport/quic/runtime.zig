@@ -2284,6 +2284,70 @@ pub const QuicRuntime = struct {
         self.destroyPersistentGossipStream(sh, peer);
     }
 
+    /// Recover a wedged persistent `/meshsub` stream WITHOUT tearing down the
+    /// connection: FIN the stalled stream, open a fresh one on the SAME QUIC
+    /// connection (fresh per-stream flow-control window), and reset the stream
+    /// to its pre-handshake state so the next ticks re-run multistream-select
+    /// and drain fresh gossip. The map entry (and `*g`) is reused in place — no
+    /// `fetchRemove`/`destroy` — so this is safe to call WHILE iterating
+    /// `sh.persistent_gossip`. The stale outbox backlog is dropped (a wedge
+    /// means it's stale anyway), which also clears the atomic-frame partial
+    /// locks so the fresh stream starts on a clean frame boundary. On open
+    /// failure the stream is marked broken (the next enqueue re-creates it).
+    fn reopenPersistentGossipStream(self: *QuicRuntime, sh: *Shard, g: *conn_table.PersistentGossipStream) void {
+        const a = self.allocator;
+        const peer = g.peer;
+        var peer_buf: [128]u8 = undefined;
+
+        // FIN the stalled stream so the peer retires it (best-effort; a wedged
+        // stream may not flush the FIN, but zquic retires it on conn close/idle).
+        if (g.handshake_sent and !g.broken) g.raw.finStream();
+
+        // Open a fresh stream on the same connection (prefer the outbound leg).
+        var new_sid: u64 = undefined;
+        const new_raw: conn_table.PublishBidiStream = blk: {
+            if (sh.outbound_by_peer.get(peer)) |slot| {
+                new_sid = slot.outbound.nextLocalBidiStream() catch |err| {
+                    log.warn("quic_runtime: gossip stream reopen (outbound) failed peer={s}: {s}; marking broken", .{ peerBase58(peer, &peer_buf), @errorName(err) });
+                    self.markPersistentGossipBroken(sh, g, "reopen_open_failed");
+                    return;
+                };
+                break :blk .{ .outbound = .{ .client = slot.outbound.client, .stream_id = new_sid } };
+            }
+            if (sh.inbound_by_peer.get(peer)) |ic| {
+                new_sid = sh.listener.server.openRawAppStream(ic.conn) catch |err| {
+                    log.warn("quic_runtime: gossip stream reopen (inbound) failed peer={s}: {s}; marking broken", .{ peerBase58(peer, &peer_buf), @errorName(err) });
+                    self.markPersistentGossipBroken(sh, g, "reopen_open_failed");
+                    return;
+                };
+                break :blk .{ .inbound = .{ .server = sh.listener.server, .conn = ic.conn, .stream_id = new_sid } };
+            }
+            // No live leg at all: this really is a dead conn — let the broken
+            // path + conn reaper handle it.
+            self.markPersistentGossipBroken(sh, g, "reopen_no_conn");
+            return;
+        };
+
+        // Drop the stale backlog (frees frames in both lanes; clears the
+        // partial locks because we reset the flags below).
+        for (g.outbox.items) |w| a.free(w);
+        g.outbox.clearRetainingCapacity();
+        for (g.outbox_bulk.items) |w| a.free(w);
+        g.outbox_bulk.clearRetainingCapacity();
+
+        // Reset the stream to pre-handshake state on the fresh wire stream.
+        g.raw = new_raw;
+        g.stream_id = new_sid;
+        g.handshake_sent = false;
+        g.handshake_done = false;
+        g.ms_header_done = false;
+        g.offer_idx = 0;
+        g.outbox_partial = false;
+        g.outbox_bulk_partial = false;
+        g.outbox_stuck_since_ms = null;
+        g.last_write_ms = self.opts.now_ms_fn();
+    }
+
     fn replaySubscribeToPeer(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) void {
         const a = self.allocator;
         // Snapshot the topic keys under the lock (shard 0 may `put`/resize the
@@ -2620,11 +2684,31 @@ pub const QuicRuntime = struct {
                     if (g.outbox_stuck_since_ms) |since| {
                         const stuck_ms = now_ms - since;
                         if (stuck_ms >= conn_table.persistent_gossip_outbox_stuck_timeout_ms) {
+                            // A wedged gossip stream is NOT a dead connection —
+                            // it means the peer stopped reading our /meshsub
+                            // stream (its inbound gossip worker fell behind), so
+                            // its per-stream flow-control window stopped
+                            // extending and our send stalled. Previously we tore
+                            // down the whole QUIC connection ("trigger redial"),
+                            // which dropped the peer below the full mesh and —
+                            // because an inbound-only peer is not re-dialed by us
+                            // — frequently never reconnected (observed:
+                            // conn_established=0 after wedges, peers stuck at
+                            // 30/31). Instead, REOPEN the gossip stream IN PLACE
+                            // on the SAME connection: FIN the stalled stream,
+                            // open a fresh one (fresh flow-control window), drop
+                            // the stale backlog. The connection — and every
+                            // other stream on it (req/resp, the peer's gossip to
+                            // us) — stays up, so the peer count holds at 31 and
+                            // gossip resumes the moment the peer drains.
                             log.warn(
-                                "quic_runtime: persistent gossip outbox stuck peer={s} for {d}ms (>= {d}ms); declaring wedge to trigger redial",
+                                "quic_runtime: persistent gossip outbox stuck peer={s} for {d}ms (>= {d}ms); reopening stream in place (conn kept)",
                                 .{ peerBase58(g.peer, &peer_buf), stuck_ms, conn_table.persistent_gossip_outbox_stuck_timeout_ms },
                             );
-                            self.markPersistentGossipBroken(sh, g, "outbox_stuck_timeout");
+                            self.reopenPersistentGossipStream(sh, g);
+                            // Re-advertise our topic subscriptions on the fresh
+                            // stream so the peer keeps us in its mesh.
+                            self.replaySubscribeToPeer(sh, g.peer);
                             continue;
                         }
                     }
