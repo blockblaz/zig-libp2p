@@ -115,6 +115,17 @@ const GossipDelivery = struct {
     wire: []u8,
 };
 
+/// An inbound Identify record (peer protocols / observed addr) produced by any
+/// shard's `advanceInboundStreams` and funneled to the single coordinator
+/// (drained on shard 0) so `host.recordPeerProtocols`/`recordObservedAddr` —
+/// which mutate global, non-thread-safe host state — are only ever called from
+/// one thread (Phase 4). Same pattern as `ConnLifecycleEvent`. `wire` is a
+/// heap-owned copy of the identify reply bytes, freed by the consumer.
+const IdentifyRecord = struct {
+    peer: identity.PeerId,
+    wire: []u8,
+};
+
 /// Per-shard transport state for the multi-shard drive loop (quinn model).
 ///
 /// Phase 2b incrementally migrates QuicRuntime's per-connection state into this
@@ -168,6 +179,15 @@ pub const Shard = struct {
     /// threads. Entries' `wire` is heap-owned and freed by the consumer.
     gossip_inbox: std.ArrayList(GossipDelivery) = .empty,
     gossip_inbox_lock: conn_table.SpinLock = .{},
+    /// Per-shard hook work sub-queue (Phase 4). The swarm thread enqueues each
+    /// hook item (dial / send_request / send_response_chunk / publish / …) onto
+    /// the OWNING shard's sub-queue (routed by `ownerShardForPeer` / hash); this
+    /// shard's drive thread drains it via `drainHookWork`. Guarded by
+    /// `QuicRuntime.hook_mutex` (one mutex covers all shards' sub-queues — the
+    /// producer is a single swarm thread, so contention is between that producer
+    /// and the N drive-thread consumers). At `shard_mask == 0` only shard 0's
+    /// sub-queue is ever used (pre-sharding single-queue path).
+    hook_queue: std.ArrayList(conn_table.HookWork) = .empty,
     /// Back-pointer to the owning runtime, so a zquic callback that recovers a
     /// `*Shard` from its ctx can reach the global state (host, gossipsub,
     /// counters). Set in `create`.
@@ -276,6 +296,10 @@ pub const Shard = struct {
         for (self.gossip_inbox.items) |d| a.free(d.wire);
         self.gossip_inbox.deinit(a);
 
+        // Free any hook work routed to this shard but not yet drained.
+        for (self.hook_queue.items) |w| conn_table.freeHookWork(a, w);
+        self.hook_queue.deinit(a);
+
         self.listener.lifecycle = .{};
         self.listener.deinit();
     }
@@ -334,13 +358,58 @@ pub const QuicRuntime = struct {
     conn_lifecycle_queue: std.ArrayList(ConnLifecycleEvent) = .empty,
     conn_lifecycle_lock: conn_table.SpinLock = .{},
 
+    /// Identify-record coordinator queue (Phase 4). `advanceInboundStreams` runs
+    /// on EVERY shard's drive thread, but `recordInboundIdentifyProtocols` ->
+    /// `host.recordPeerProtocols`/`recordObservedAddr` mutate global, non-
+    /// thread-safe host state. Each shard enqueues the `(peer, wire-copy)` here;
+    /// shard 0 drains it via [`drainIdentifyRecords`] — the ONLY thread that
+    /// calls the host record methods. Same single-coordinator pattern as
+    /// `conn_lifecycle_queue`. Guarded by a SpinLock; the small drain delay is
+    /// benign (protocol/addr records are advisory). At `shard_mask == 0` the
+    /// single drive thread IS shard 0, so the record is applied next tick.
+    identify_record_queue: std.ArrayList(IdentifyRecord) = .empty,
+    identify_record_lock: conn_table.SpinLock = .{},
+
+    /// AUTHORITATIVE peer → owning-shard-index map (Phase 4). The OWNING shard is
+    /// the one that actually holds a live connection (outbound or inbound) to the
+    /// peer; directed work (req/resp, directed gossip, hook work) is routed here,
+    /// NOT by bare `hash(peer)&mask`. Necessary because an inbound-only leg is
+    /// owned by whatever shard the demux CID-routed its Initial to (by src-addr
+    /// hash), which can differ from `shardIndexForPeer(peer)` (peer hash) — so
+    /// routing directed work by hash would send it to a shard that holds no
+    /// connection and it would be dropped. Every shard sets ownership on connect
+    /// (`notifyInboundEstablished`/`promoteDial`/relay+dcutr established paths)
+    /// and clears it on close. Guarded by a SpinLock; producers/consumers are
+    /// different drive threads. At `shard_mask == 0` (single shard) this is never
+    /// touched — every router short-circuits to shard 0, the pre-sharding path.
+    owner_by_peer: conn_table.PeerShardMap,
+    owner_lock: conn_table.SpinLock = .{},
+
+    /// Inbound req/resp `request_id` (== `InboundStream.request_id_for_channel`)
+    /// -> the shard whose `channel_to_inbound` holds that stream (Phase 4). The
+    /// response side (`send_response_chunk` / `send_end_of_stream` /
+    /// `send_error_response`) MUST run on the shard that accepted the inbound
+    /// request stream — which is NOT necessarily `ownerShardForPeer(peer)`: when
+    /// a peer has both legs on different shards, the requester may have sent the
+    /// request over its inbound leg, so the request stream lands on the
+    /// responder's OTHER shard. Routing the response by `peer` then misses
+    /// (`channel_to_inbound` empty on the owner shard). This map records the
+    /// actual shard at channel-registration time so the response is routed there.
+    /// Populated/cleared from each shard's drive thread; SpinLock-guarded. Unused
+    /// at `shard_mask == 0` (single shard).
+    inbound_stream_shard: std.AutoHashMap(u64, u8),
+    inbound_stream_shard_lock: conn_table.SpinLock = .{},
+
     /// Cross-thread hook → drive-thread work queue. Hook runs on swarm
-    /// thread; drive thread drains via [`drainHookWork`]. Synchronization
-    /// uses [`std.Io.Mutex`] backed by the host swarm's `Io` instance so
-    /// both producer (swarm thread) and consumer (drive thread) speak the
-    /// same primitive.
+    /// thread; drive thread drains via [`drainHookWork`]. Each entry is routed at
+    /// enqueue time to the OWNING shard's sub-queue (`Shard.hook_queue`) via
+    /// [`ownerShardForPeer`] (peer-targeted work) or `shardIndexForPeer` (dials,
+    /// no live conn yet); each shard drains its own sub-queue in its drive loop.
+    /// Synchronization uses [`std.Io.Mutex`] backed by the host swarm's `Io`
+    /// instance so producer (swarm thread) and consumers (drive threads) speak
+    /// the same primitive. At `shard_mask == 0` every item routes to shard 0 —
+    /// the pre-sharding single-queue behaviour.
     hook_mutex: std.Io.Mutex = .init,
-    hook_queue: std.ArrayList(conn_table.HookWork) = .empty,
 
     relay_live: quic_relay_live.LiveRelay,
     dcutr_live: quic_dcutr_live.LiveDcutr,
@@ -506,6 +575,8 @@ pub const QuicRuntime = struct {
                 .local_obs_addrs = opts.dcutr.local_obs_addrs,
             }, dcutr_hooks),
             .subscribed_topics = std.StringHashMap(void).init(a),
+            .owner_by_peer = conn_table.PeerShardMap.init(a),
+            .inbound_stream_shard = std.AutoHashMap(u64, u8).init(a),
         };
 
         self.bound_port_v4 = bound;
@@ -587,13 +658,20 @@ pub const QuicRuntime = struct {
     pub fn destroy(self: *QuicRuntime) void {
         self.stop();
 
-        // Drain hook queue (drive thread already joined, but be defensive).
-        for (self.hook_queue.items) |w| conn_table.freeHookWork(self.allocator, w);
-        self.hook_queue.deinit(self.allocator);
+        // Per-shard hook sub-queues are drained + freed in `Shard.deinit`.
 
         // Connection-lifecycle coordinator queue: entries carry no owned memory,
         // just release the backing storage (threads joined).
         self.conn_lifecycle_queue.deinit(self.allocator);
+
+        // Peer→shard ownership table: u8 values, no owned memory.
+        self.owner_by_peer.deinit();
+        // Inbound-stream response-route map: u8 values, no owned memory.
+        self.inbound_stream_shard.deinit();
+
+        // Identify-record coordinator queue: free any undrained wire copies.
+        for (self.identify_record_queue.items) |r| self.allocator.free(r.wire);
+        self.identify_record_queue.deinit(self.allocator);
 
         // Inbound gossip work queue: `stop()` already joined the worker and
         // freed the frames; just release the backing storage.
@@ -814,23 +892,72 @@ pub const QuicRuntime = struct {
         _ = a;
     }
 
+    /// Shard whose drive thread must process hook item `w` (Phase 4):
+    ///   - peer-directed work (send_request / send_response_chunk /
+    ///     send_end_of_stream / send_error_response): the AUTHORITATIVE owner of
+    ///     that peer's live connection (`ownerShardForPeer`), so the request /
+    ///     response stream is opened on the shard that actually holds the leg —
+    ///     NOT bare `hash(peer)&mask`, which for an inbound-only peer points at a
+    ///     shard with no connection (req/resp would fail). No owner yet → hash
+    ///     fallback (a transient race window; the work fails-soft and zeam
+    ///     retries);
+    ///   - `dial`: no live conn yet, so route to where the outbound leg WILL land
+    ///     (`shardIndexForPeer`); no expected_peer → shard 0;
+    ///   - `publish` / `subscribe`: shard 0 (the single gossipsub owner). Shard 0
+    ///     fans the frame out to every shard's peers (`broadcastGossipFrame`).
+    /// At `shard_mask == 0` every branch returns 0 (single-queue path).
+    fn hookWorkShard(self: *QuicRuntime, w: conn_table.HookWork) u8 {
+        if (self.shard_mask == 0) return 0;
+        return switch (w) {
+            // Circuit (relay) dials touch the single-instance `relay_live`, which
+            // only shard 0 advances — keep them on shard 0 (relay is disabled in
+            // zeam, but this preserves the pre-sharding single-owner invariant).
+            // Direct dials route to the shard that will own the outbound leg.
+            .dial => |d| if (quic_relay_live.LiveRelay.isCircuitDialAddr(d.addr))
+                0
+            else if (d.expected_peer) |ep|
+                self.shardIndexForPeer(ep)
+            else
+                0,
+            // A REQUEST opens a new outbound/inbound stream to the peer → route to
+            // the shard that owns a leg to the peer.
+            .send_request => |r| self.ownerShardForPeer(r.peer) orelse self.shardIndexForPeer(r.peer),
+            // A RESPONSE rides the existing inbound request stream → route to the
+            // shard that ACCEPTED that stream (recorded at channel registration),
+            // which may differ from the peer's owner shard when legs straddle two
+            // shards. Fall back to owner/hash only if the route is unknown (the
+            // stream was reaped or a registration race).
+            .send_response_chunk => |r| self.inboundStreamShard(r.request_id) orelse
+                (self.ownerShardForPeer(r.peer) orelse self.shardIndexForPeer(r.peer)),
+            .send_end_of_stream => |e| self.inboundStreamShard(e.request_id) orelse
+                (self.ownerShardForPeer(e.peer) orelse self.shardIndexForPeer(e.peer)),
+            .send_error_response => |e| self.inboundStreamShard(e.request_id) orelse
+                (self.ownerShardForPeer(e.peer) orelse self.shardIndexForPeer(e.peer)),
+            .publish, .subscribe => 0,
+        };
+    }
+
     fn enqueueHookWork(self: *QuicRuntime, w: conn_table.HookWork) void {
         const io = self.host.swarm.io;
+        const target = self.hookWorkShard(w);
         self.hook_mutex.lockUncancelable(io);
         defer self.hook_mutex.unlock(io);
-        self.hook_queue.append(self.allocator, w) catch |err| {
+        self.shards[target].hook_queue.append(self.allocator, w) catch |err| {
             log.err("quic_runtime: hook queue append failed: {s}", .{@errorName(err)});
             conn_table.freeHookWork(self.allocator, w);
         };
     }
 
-    fn drainHookWork(self: *QuicRuntime, into: *std.ArrayList(conn_table.HookWork)) void {
+    /// Drain `sh`'s hook sub-queue into `into`. Each shard's drive loop calls
+    /// this for its OWN shard (Phase 4), so directed work runs on the shard that
+    /// owns the destination peer's connection. One mutex guards all sub-queues.
+    fn drainHookWork(self: *QuicRuntime, sh: *Shard, into: *std.ArrayList(conn_table.HookWork)) void {
         const io = self.host.swarm.io;
         self.hook_mutex.lockUncancelable(io);
         defer self.hook_mutex.unlock(io);
-        if (self.hook_queue.items.len == 0) return;
-        into.appendSlice(self.allocator, self.hook_queue.items) catch return;
-        self.hook_queue.clearRetainingCapacity();
+        if (sh.hook_queue.items.len == 0) return;
+        into.appendSlice(self.allocator, sh.hook_queue.items) catch return;
+        sh.hook_queue.clearRetainingCapacity();
     }
 
     // ── Connection-lifecycle coordinator (step 9) ──────────────────────────
@@ -928,6 +1055,52 @@ pub const QuicRuntime = struct {
         };
     }
 
+    // ── Identify-record coordinator (Phase 4) ──────────────────────────────
+    //
+    // `advanceInboundStreams` runs on EVERY shard, but the identify *record*
+    // path mutates global, non-thread-safe host state (`peer_protocols`,
+    // `observed_addrs`). Each shard copies the identify reply wire and enqueues
+    // it here; shard 0 drains and applies the records — the only thread that
+    // calls `host.recordPeerProtocols` / `recordObservedAddr`. Same single-
+    // coordinator pattern as `conn_lifecycle`. Chosen over a host-side lock
+    // because the records are advisory and a one-tick delay is harmless, and it
+    // keeps host APIs lock-free for the single-threaded N=1 path.
+
+    /// Enqueue an inbound Identify reply for the coordinator (shard 0) to apply.
+    /// Copies `wire_bytes` (the source accumulator is reused by the drive loop).
+    /// At `shard_mask == 0` the single drive thread is shard 0, so this is just a
+    /// one-tick deferral of the same record that used to run inline.
+    fn enqueueIdentifyRecord(self: *QuicRuntime, peer: identity.PeerId, wire_bytes: []const u8) void {
+        const copy = self.allocator.dupe(u8, wire_bytes) catch |err| {
+            log.warn("quic_runtime: identify record dup failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.identify_record_lock.lock();
+        defer self.identify_record_lock.unlock();
+        self.identify_record_queue.append(self.allocator, .{ .peer = peer, .wire = copy }) catch |err| {
+            log.warn("quic_runtime: identify record queue append failed: {s}", .{@errorName(err)});
+            self.allocator.free(copy);
+        };
+    }
+
+    /// Drain queued inbound Identify records on the single coordinator thread
+    /// (shard 0). The only place `recordInboundIdentifyProtocols` is invoked.
+    fn drainIdentifyRecords(self: *QuicRuntime) void {
+        var batch: std.ArrayList(IdentifyRecord) = .empty;
+        defer batch.deinit(self.allocator);
+        {
+            self.identify_record_lock.lock();
+            defer self.identify_record_lock.unlock();
+            if (self.identify_record_queue.items.len == 0) return;
+            batch.appendSlice(self.allocator, self.identify_record_queue.items) catch return;
+            self.identify_record_queue.clearRetainingCapacity();
+        }
+        for (batch.items) |r| {
+            self.recordInboundIdentifyProtocols(r.peer, r.wire);
+            self.allocator.free(r.wire);
+        }
+    }
+
     // ── QuicListener lifecycle ─────────────────────────────────────────────
 
     fn onLifecycleConnected(ctx: ?*anyopaque, slot: usize, _: *ZIo.ConnState) void {
@@ -950,6 +1123,7 @@ pub const QuicRuntime = struct {
             const now_ms = self.opts.now_ms_fn();
             self.notifyConnClosed(now_ms, cid, peer, .remote_close);
             _ = sh.inbound_by_peer.remove(peer);
+            self.clearOwner(peer, sh.index);
             self.destroyPersistentGossipStream(sh, peer);
         }
         sh.inbound_conn_notified[slot] = false;
@@ -971,6 +1145,7 @@ pub const QuicRuntime = struct {
             sh.inbound_conn_ids[slot] = self.nextConnId();
         }
         const cid = sh.inbound_conn_ids[slot];
+        self.setOwner(sender, sh.index, true);
         self.notifyConnEstablished(cid, sender, .inbound, .{});
         self.replaySubscribeToPeer(sh, sender);
     }
@@ -1047,6 +1222,7 @@ pub const QuicRuntime = struct {
                 .{cid},
             );
             self.notifyConnClosed(now_ms, cid, peer, .remote_close);
+            self.clearOwner(peer, sh.index);
             self.destroyPersistentGossipStream(sh, peer);
             if (sh.outbound_by_peer.fetchRemove(peer)) |kv| {
                 kv.value.outbound.deinit();
@@ -1373,22 +1549,29 @@ pub const QuicRuntime = struct {
             // routing of directed hook work / gossip deliveries to non-zero
             // shards is the Phase-3 cross-shard outbox follow-up.
             if (sh.index == 0) {
-                // Coordinator funnel: drain connection-lifecycle notifications
-                // from ALL shards and apply them to `connection_manager` on this
-                // one thread (step 9). Done before hook work + periodic ticks so
-                // a just-established conn is known to the conn-manager / dial
-                // scheduler this iteration.
+                // Coordinator funnel (single-thread, shard 0 only): apply the
+                // connection-lifecycle notifications from ALL shards to
+                // `connection_manager` (step 9) and the inbound Identify records
+                // to the global host state (Phase 4) — both are non-thread-safe
+                // and must be touched by exactly one thread. Done before hook
+                // work so a just-established conn is known to the conn-manager /
+                // dial scheduler this iteration.
                 self.drainConnLifecycle();
-
-                self.drainHookWork(&work_scratch);
-                for (work_scratch.items) |w| {
-                    self.handleHookWork(sh, w) catch |err| {
-                        log.warn("quic_runtime: hook handler error: {s}", .{@errorName(err)});
-                        conn_table.freeHookWork(self.allocator, w);
-                    };
-                }
-                work_scratch.clearRetainingCapacity();
+                self.drainIdentifyRecords();
             }
+
+            // Drain THIS shard's hook sub-queue (Phase 4): directed work
+            // (req/resp, dials) was routed at enqueue time to the shard that owns
+            // the destination peer's connection, so every shard processes its own
+            // items. At N=1 only shard 0 ever has hook work (single-queue path).
+            self.drainHookWork(sh, &work_scratch);
+            for (work_scratch.items) |w| {
+                self.handleHookWork(sh, w) catch |err| {
+                    log.warn("quic_runtime: hook handler error: {s}", .{@errorName(err)});
+                    conn_table.freeHookWork(self.allocator, w);
+                };
+            }
+            work_scratch.clearRetainingCapacity();
 
             // Cross-shard gossip (Phase 3): deliver any directed/broadcast gossip
             // frames the owner (shard 0) routed to THIS shard. Every shard drains
@@ -1591,30 +1774,22 @@ pub const QuicRuntime = struct {
         defer peers.deinit(a);
         self.collectConnectedPeers(sh, &peers) catch return;
 
-        if (peers.items.len == 0) {
-            log.debug("quic_runtime: gossipsub publish topic={s} inner_bytes={d} wire_bytes={d}: no connected peers", .{
-                topic,
-                inner.len,
-                wire_buf.items.len,
-            });
-            return;
-        }
-
-        log.info("quic_runtime: gossipsub publish topic={s} inner_bytes={d} wire_bytes={d} peer_count={d}", .{
+        log.info("quic_runtime: gossipsub publish topic={s} inner_bytes={d} wire_bytes={d} shard0_peers={d}", .{
             topic,
             inner.len,
             wire_buf.items.len,
             peers.items.len,
         });
 
-        for (peers.items) |peer| {
-            const wire_dup = a.dupe(u8, wire_buf.items) catch continue;
-            // Publishes ride the single per-peer persistent `/meshsub` stream
-            // alongside SUBSCRIBE / GRAFT / PRUNE. See [`conn_table.PersistentGossipStream`]
-            // for why opening a per-message stream here would trip rust-libp2p's
-            // `MaxInboundSubstreams` cap and kill all gossip on the connection.
-            self.enqueueGossipFrame(sh, peer, wire_dup);
-        }
+        // Fan out to every connected peer across ALL shards. Each peer's frame
+        // rides the single per-peer persistent `/meshsub` stream alongside
+        // SUBSCRIBE / GRAFT / PRUNE (see [`conn_table.PersistentGossipStream`]:
+        // a per-message stream would trip rust-libp2p's `MaxInboundSubstreams`
+        // cap and kill all gossip on the connection). `broadcastGossipFrame`
+        // delivers shard 0's peers inline and routes a copy to each other shard
+        // so no shard touches another's connection state. At N=1 this reduces to
+        // the shard-0 inline fan.
+        self.broadcastGossipFrame(sh, wire_buf.items);
     }
 
     /// Handle the swarm `.subscribe(topic)` command (#183). Track the topic
@@ -1635,13 +1810,12 @@ pub const QuicRuntime = struct {
             }
         }
 
-        var peers: std.ArrayList(identity.PeerId) = .empty;
-        defer peers.deinit(a);
-        self.collectConnectedPeers(sh, &peers) catch return;
-        for (peers.items) |peer| {
-            const w = self.buildSubscribeWire(topic) orelse continue;
-            self.enqueueGossipFrame(sh, peer, w);
-        }
+        // Fan the SUBSCRIBE out to every connected peer across ALL shards (each
+        // shard's drive thread delivers to its own peers; no cross-shard conn
+        // access). At N=1 this is the shard-0 inline fan.
+        const w = self.buildSubscribeWire(topic) orelse return;
+        defer a.free(w);
+        self.broadcastGossipFrame(sh, w);
     }
 
     fn collectConnectedPeers(self: *QuicRuntime, sh: *Shard, out: *std.ArrayList(identity.PeerId)) !void {
@@ -1703,8 +1877,16 @@ pub const QuicRuntime = struct {
             defer a.free(d.wire);
             if (d.to) |peer| {
                 // Directed: length-prefix once, then deliver on the owning shard.
+                // Route by the AUTHORITATIVE owner table (the shard that actually
+                // holds a live leg), NOT bare hash — an inbound-only peer (#214)
+                // is owned by the demux-CID-routed shard, which may differ from
+                // `shardIndexForPeer(peer)`; hashing would drop the frame on a
+                // shard that holds no connection. No owner → no live conn → drop.
                 const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
-                const owner = self.shardIndexForPeer(peer);
+                const owner = self.ownerShardForPeer(peer) orelse {
+                    a.free(framed);
+                    continue;
+                };
                 if (owner == sh.index) {
                     // We own this peer: deliver inline (drop if no live conn).
                     if (!self.shardOwnsConnectionTo(sh, peer)) {
@@ -1722,14 +1904,26 @@ pub const QuicRuntime = struct {
                 // to every other shard's inbox (peer==null = broadcast entry).
                 const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
                 defer a.free(framed);
-                self.broadcastToOwnPeers(sh, framed);
-                var i: u8 = 0;
-                while (i < self.shard_count) : (i += 1) {
-                    if (i == sh.index) continue;
-                    const dup = a.dupe(u8, framed) catch continue;
-                    self.routeGossipDelivery(i, null, dup);
-                }
+                self.broadcastGossipFrame(sh, framed);
             }
+        }
+    }
+
+    /// Broadcast a framed gossip wire (SUBSCRIBE / UNSUBSCRIBE / direct publish)
+    /// to every connected peer across ALL shards, without any shard touching
+    /// another shard's connection state. `sh` (always shard 0 — the only hook /
+    /// gossip-owner drainer) fans out to its own peers inline; every other shard
+    /// gets a `peer == null` broadcast entry on its `gossip_inbox` that its own
+    /// drive thread fans out via [`drainGossipInbox`]. `framed` is borrowed
+    /// (caller frees). At `shard_mask == 0` this is just the shard-0 inline fan.
+    fn broadcastGossipFrame(self: *QuicRuntime, sh: *Shard, framed: []const u8) void {
+        const a = self.allocator;
+        self.broadcastToOwnPeers(sh, framed);
+        var i: u8 = 0;
+        while (i < self.shard_count) : (i += 1) {
+            if (i == sh.index) continue;
+            const dup = a.dupe(u8, framed) catch continue;
+            self.routeGossipDelivery(i, null, dup);
         }
     }
 
@@ -2569,19 +2763,88 @@ pub const QuicRuntime = struct {
         return @intCast(h & self.shard_mask);
     }
 
+    /// Register `shard_idx` as the owner of `peer`'s live connection (Phase 4).
+    /// Called from the owning shard's drive thread when it establishes a leg.
+    ///
+    /// `force` is set by the INBOUND-leg path and ALWAYS wins; the OUTBOUND-leg
+    /// path passes `force = false` and only claims ownership when the peer is not
+    /// already owned. Rationale: inbound request streams are accepted on the
+    /// listener of the inbound-leg shard and pinned there (`channel_to_inbound`),
+    /// so `send_response_chunk` / `send_end_of_stream` for that peer MUST be
+    /// routed to the inbound-leg shard. Directed gossip and `send_request` work
+    /// on either leg (both maps are consulted on the owner shard, outbound
+    /// preferred within that shard), so pinning the owner to the inbound leg when
+    /// one exists is safe for them and necessary for response routing. In the
+    /// common case a peer has exactly one leg (peers reject duplicate conns), so
+    /// the two paths don't contend. No-op at `shard_mask == 0` — every router
+    /// short-circuits to shard 0 without consulting the table.
+    fn setOwner(self: *QuicRuntime, peer: identity.PeerId, shard_idx: u8, force: bool) void {
+        if (self.shard_mask == 0) return;
+        self.owner_lock.lock();
+        defer self.owner_lock.unlock();
+        if (!force and self.owner_by_peer.contains(peer)) return;
+        self.owner_by_peer.put(peer, shard_idx) catch |err| {
+            log.warn("quic_runtime: owner_by_peer put failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Clear `peer`'s ownership IFF the current owner is `shard_idx` — so a stale
+    /// close on one leg can't evict a still-live owner the other leg just set.
+    /// No-op at `shard_mask == 0`.
+    fn clearOwner(self: *QuicRuntime, peer: identity.PeerId, shard_idx: u8) void {
+        if (self.shard_mask == 0) return;
+        self.owner_lock.lock();
+        defer self.owner_lock.unlock();
+        if (self.owner_by_peer.get(peer)) |cur| {
+            if (cur == shard_idx) _ = self.owner_by_peer.remove(peer);
+        }
+    }
+
+    /// Authoritative router for directed work: the shard that actually holds a
+    /// live connection to `peer`, or `null` when none exists (a fresh peer with
+    /// no established leg — the caller falls back to `shardIndexForPeer` for the
+    /// dial placement). At `shard_mask == 0` always shard 0.
+    fn ownerShardForPeer(self: *QuicRuntime, peer: identity.PeerId) ?u8 {
+        if (self.shard_mask == 0) return 0;
+        self.owner_lock.lock();
+        defer self.owner_lock.unlock();
+        return self.owner_by_peer.get(peer);
+    }
+
+    /// Record the shard that accepted inbound request stream `request_id`, so its
+    /// response is routed back to that shard (Phase 4). No-op at single shard.
+    fn setInboundStreamShard(self: *QuicRuntime, request_id: u64, shard_idx: u8) void {
+        if (self.shard_mask == 0) return;
+        self.inbound_stream_shard_lock.lock();
+        defer self.inbound_stream_shard_lock.unlock();
+        self.inbound_stream_shard.put(request_id, shard_idx) catch |err| {
+            log.warn("quic_runtime: inbound_stream_shard put failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn clearInboundStreamShard(self: *QuicRuntime, request_id: u64) void {
+        if (self.shard_mask == 0) return;
+        self.inbound_stream_shard_lock.lock();
+        defer self.inbound_stream_shard_lock.unlock();
+        _ = self.inbound_stream_shard.remove(request_id);
+    }
+
+    /// The shard holding the inbound request stream for `request_id`, or null if
+    /// unknown (race / already reaped). At `shard_mask == 0` always shard 0.
+    fn inboundStreamShard(self: *QuicRuntime, request_id: u64) ?u8 {
+        if (self.shard_mask == 0) return 0;
+        self.inbound_stream_shard_lock.lock();
+        defer self.inbound_stream_shard_lock.unlock();
+        return self.inbound_stream_shard.get(request_id);
+    }
+
     fn handleDial(self: *QuicRuntime, sh: *Shard, addr_str: []const u8, expected_peer: ?identity.PeerId) void {
         const a = self.allocator;
-        // Dial routing (quinn model): the outbound leg to `expected_peer` is
-        // owned by `shardIndexForPeer(peer)`. Under the current single-writer
-        // model the hook queue is drained only by shard 0, so `sh` is shard 0
-        // and (at shard_count == 1) the target is shard 0 too — no cross-shard
-        // write. When Phase 3 moves hook-work routing to enqueue time, the
-        // owning shard's drive thread will run this and `dial_shard` will equal
-        // `sh`; the selector below documents that mapping. We never write
-        // another shard's `pending_dials` from here (that would race its drive
-        // thread).
-        const dial_shard = if (expected_peer) |ep| self.shardIndexForPeer(ep) else sh.index;
-        _ = dial_shard;
+        // Dial routing (quinn model): the hook work was already routed at enqueue
+        // time (`hookWorkShard`) to `shards[shardIndexForPeer(expected_peer)]`, so
+        // `sh` IS the shard that will own this outbound leg. The dial is appended
+        // to `sh.pending_dials` and promoted into `sh.outbound_by_peer` on `sh`'s
+        // own drive thread — no cross-shard write.
 
         if (quic_relay_live.LiveRelay.isCircuitDialAddr(addr_str)) {
             self.relay_live.enqueueCircuitDial(addr_str, expected_peer) catch |err| {
@@ -2746,6 +3009,7 @@ pub const QuicRuntime = struct {
         };
 
         slot.notified = true;
+        self.setOwner(verified, sh.index, false);
         self.notifyConnEstablished(slot.conn_id, verified, .outbound, .{});
 
         // Tear down any stale gossip publish stream that was bound to a
@@ -2873,7 +3137,6 @@ pub const QuicRuntime = struct {
     }
 
     fn handleSendResponseChunk(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, request_id: u64, chunk: []const u8) void {
-        _ = peer;
         // Look up channel via request_id (`stream_request_id` == request_id
         // for inbound channels). Iterate channel_to_inbound to find a match.
         var found: ?*conn_table.InboundStream = null;
@@ -2884,6 +3147,7 @@ pub const QuicRuntime = struct {
                 break;
             }
         }
+        _ = peer;
         const ist = found orelse {
             log.warn("quic_runtime: send_response_chunk for unknown request_id {d}", .{request_id});
             return;
@@ -2951,6 +3215,7 @@ pub const QuicRuntime = struct {
         // silently dropped by zquic.  See ch4r10t33r/zquic#149.
         _ = ist.raw.release(self.allocator);
         if (ist.channel_id) |cid| _ = sh.channel_to_inbound.remove(cid);
+        if (ist.request_id_for_channel != 0) self.clearInboundStreamShard(ist.request_id_for_channel);
         ist.req_acc.deinit(self.allocator);
         ist.gossip_acc.deinit(self.allocator);
         ist.relay_acc.deinit(self.allocator);
@@ -3022,7 +3287,9 @@ pub const QuicRuntime = struct {
     }
 
     fn relayHookRelayedConnected(ctx: ?*anyopaque, target: identity.PeerId, conn_id: connection_manager_mod.ConnectionId) void {
-        const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const self = sh.rt;
+        self.setOwner(target, sh.index, false);
         self.notifyConnEstablished(conn_id, target, .outbound, .{ .via_relay = true });
         self.tryScheduleDcutrFromVirtual(target, conn_id);
     }
@@ -3038,6 +3305,7 @@ pub const QuicRuntime = struct {
         sh.relayed_conn_by_peer.put(remote_peer, conn_id) catch {
             log.warn("quic_runtime: relayed_conn_by_peer put failed", .{});
         };
+        self.setOwner(remote_peer, sh.index, true);
         self.notifyConnEstablished(conn_id, remote_peer, .inbound, .{ .via_relay = true });
         self.tryScheduleDcutrInitiator(remote_peer, conn_id, stop_client);
     }
@@ -3137,6 +3405,7 @@ pub const QuicRuntime = struct {
         const sh: *Shard = @ptrCast(@alignCast(ctx.?));
         const self = sh.rt;
         _ = sh.relayed_conn_by_peer.remove(peer);
+        self.setOwner(peer, sh.index, true);
         self.notifyConnEstablished(direct_conn_id, peer, .outbound, .{});
         self.host.swarm.queueEvent(.{ .dcutr_succeeded = .{
             .peer = peer,
@@ -3238,23 +3507,21 @@ pub const QuicRuntime = struct {
         return self.identify_reply_wire.?;
     }
 
-    // FIXME(phase-4, N>1 race): this runs on EVERY shard's drive thread, but the
-    // relay/dcutr/autonat/identify branches below mutate single-instance GLOBAL
-    // state that is NOT thread-safe and is NOT funneled through the shard-0
-    // coordinator (unlike connection_manager, step 9):
-    //   - `self.relay_live.handleHopFrame/handleStopFrame`
-    //   - `self.dcutr_live.startResponderInbound`
-    //   - `self.autonat_server.handleV1Stream`
-    //   - `self.recordInboundIdentifyProtocols` -> `host.recordPeerProtocols`
-    //     / `host.recordObservedAddr`
-    // If a relay/dcutr/autonat/identify inbound stream lands on a shard != 0
-    // while shard 0 is touching the same object, that races. SAFE TODAY because:
-    // (a) the zeam consensus devnet runs with relay/dcutr/autonat disabled, and
-    // (b) identify reply is now a read-only prebuilt cache. The identify
-    // *record* path (peer protocols / observed addr) is the live residual hazard
-    // and must be funneled through the coordinator (or made per-shard) in the
-    // Phase-4 cut before enabling those protocols under N>1. Tracked in the
-    // session report's residual-risk list.
+    // N>1 thread-safety note: this runs on EVERY shard's drive thread.
+    //   - identify *reply*: read-only prebuilt cache (`ensureIdentifyReplyWire`).
+    //   - identify *record* (peer protocols / observed addr): FUNNELED through the
+    //     shard-0 coordinator (`enqueueIdentifyRecord` -> `drainIdentifyRecords`),
+    //     so `host.recordPeerProtocols`/`recordObservedAddr` are only ever called
+    //     from shard 0 (Phase 4).
+    //   - RESIDUAL (relay/dcutr/autonat) — still NOT funneled and therefore unsafe
+    //     under N>1 if their inbound streams can land on a shard != 0 concurrently
+    //     with shard 0 touching the same single-instance object:
+    //       `self.relay_live.handleHopFrame/handleStopFrame`
+    //       `self.dcutr_live.startResponderInbound`
+    //       `self.autonat_server.handleV1Stream`
+    //     SAFE TODAY because the zeam consensus devnet runs relay/dcutr/autonat
+    //     DISABLED. These must be funneled (or made per-shard) before enabling
+    //     those protocols under N>1. Tracked in the session report's residual list.
     fn advanceInboundStreams(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
         var i: usize = 0;
@@ -3592,7 +3859,11 @@ pub const QuicRuntime = struct {
                         }
                     }
                     if (ist.req_acc.items.len > 0) {
-                        self.recordInboundIdentifyProtocols(sender_peer, ist.req_acc.items);
+                        // Funnel the record through the shard-0 coordinator: this
+                        // runs on every shard, but `recordPeerProtocols` /
+                        // `recordObservedAddr` mutate non-thread-safe host state
+                        // (Phase 4). The identify *reply* below is read-only.
+                        self.enqueueIdentifyRecord(sender_peer, ist.req_acc.items);
                     }
                     const wire = self.ensureIdentifyReplyWire() catch |err| {
                         log.warn("quic_runtime: identify reply build failed: {s}", .{@errorName(err)});
@@ -3634,7 +3905,9 @@ pub const QuicRuntime = struct {
                         }
                     }
                     if (ist.req_acc.items.len > 0) {
-                        self.recordInboundIdentifyProtocols(sender_peer, ist.req_acc.items);
+                        // Funnel through the shard-0 coordinator (Phase 4); see
+                        // the proto_identify branch above.
+                        self.enqueueIdentifyRecord(sender_peer, ist.req_acc.items);
                     }
                     ist.req_acc.clearRetainingCapacity();
                     ist.raw.writeAllFin(&.{});
@@ -3738,6 +4011,10 @@ pub const QuicRuntime = struct {
                     ist.channel_id = channel_id;
                     ist.request_id_for_channel = stream_rid;
                     sh.channel_to_inbound.put(channel_id, ist) catch {};
+                    // Record which shard accepted this inbound request stream so
+                    // its response is routed back here (Phase 4) even when the
+                    // peer's legs straddle two shards.
+                    self.setInboundStreamShard(stream_rid, sh.index);
 
                     // Hand the request payload to the embedder via swarm.
                     const payload_dup = a.dupe(u8, req_ssz) catch {

@@ -25,6 +25,8 @@ pub const PeerIdMap = std.HashMap(identity.PeerId, *OutboundConn, PeerIdContext,
 pub const InboundPeerMap = std.HashMap(identity.PeerId, InboundConnRef, PeerIdContext, std.hash_map.default_max_load_percentage);
 pub const PersistentGossipMap = std.HashMap(identity.PeerId, *PersistentGossipStream, PeerIdContext, std.hash_map.default_max_load_percentage);
 pub const RelayedConnIdMap = std.HashMap(identity.PeerId, connection_manager_mod.ConnectionId, PeerIdContext, std.hash_map.default_max_load_percentage);
+/// peer id -> owning drive-shard index (Phase 4 authoritative work router).
+pub const PeerShardMap = std.HashMap(identity.PeerId, u8, PeerIdContext, std.hash_map.default_max_load_percentage);
 
 pub const InboundConnRef = struct {
     slot: usize,
