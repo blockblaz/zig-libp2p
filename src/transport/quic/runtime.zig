@@ -91,6 +91,10 @@ pub const Shard = struct {
     /// Datagrams the demux thread queued for this shard's drive thread. Null
     /// until `start` allocates it (else the drive loop reads the socket inline).
     inbound_ring: ?shard_ring.InboundRing = null,
+    /// This shard's QUIC listener (wraps a `Server` bound to the shared listen
+    /// fd; for N>1 each shard gets its own `Server` via `initFromSocket` +
+    /// `setShard`). Owns this shard's inbound connections.
+    listener: *quic_endpoint.QuicListener,
     /// Outbound connections this shard owns, keyed by remote peer id.
     outbound_by_peer: conn_table.PeerIdMap,
     /// Inbound connections this shard owns, keyed by remote peer id.
@@ -117,8 +121,9 @@ pub const Shard = struct {
     /// Inbound relay-bridge conn ids for this shard's relayed peers (#205).
     relayed_conn_by_peer: conn_table.RelayedConnIdMap,
 
-    pub fn init(a: std.mem.Allocator) Shard {
+    pub fn init(a: std.mem.Allocator, listener: *quic_endpoint.QuicListener) Shard {
         return .{
+            .listener = listener,
             .outbound_by_peer = conn_table.PeerIdMap.init(a),
             .inbound_by_peer = conn_table.InboundPeerMap.init(a),
             .persistent_gossip = conn_table.PersistentGossipMap.init(a),
@@ -138,7 +143,6 @@ pub const QuicRuntime = struct {
     opts: config.QuicRuntimeOptions,
     tls_pem_resolved: config.ResolvedTlsPem,
 
-    listener: *quic_endpoint.QuicListener,
     bound_port_v4: ?u16 = null,
 
     /// Monotonic id counters for the per-shard outbound stream maps (global so
@@ -276,8 +280,7 @@ pub const QuicRuntime = struct {
             .host = opts.host,
             .opts = opts,
             .tls_pem_resolved = tls_pem_resolved,
-            .listener = listener,
-            .shard = Shard.init(a),
+            .shard = Shard.init(a, listener),
             .autonat_server = autonat_mod.Server.init(a, .{}, autonatDialBack),
             .relay_live = quic_relay_live.LiveRelay.init(a, opts.host.swarm.local_peer, .{
                 .enable_server = opts.relay.enable_server,
@@ -437,9 +440,9 @@ pub const QuicRuntime = struct {
 
         // Unlink the hook so swarm doesn't keep calling into freed memory.
         self.host.swarm.command_dispatch = null;
-        self.listener.lifecycle = .{};
+        self.shard.listener.lifecycle = .{};
 
-        self.listener.deinit();
+        self.shard.listener.deinit();
         // `tls_pem_resolved` borrows the embedder's config.TlsPemSource slices —
         // nothing to free.
         self.allocator.destroy(self);
@@ -673,7 +676,7 @@ pub const QuicRuntime = struct {
         var slot: usize = 0;
         while (slot < ZIo.MAX_CONNECTIONS) : (slot += 1) {
             if (self.shard.inbound_conn_notified[slot]) continue;
-            const conn = self.listener.server.conns[slot] orelse continue;
+            const conn = self.shard.listener.server.conns[slot] orelse continue;
             if (conn.phase != .connected or conn.draining) continue;
             const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
             const sender = quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn(
@@ -760,7 +763,7 @@ pub const QuicRuntime = struct {
             .conn = conn,
             .stream_id = stream_id,
             .raw = .{
-                .server = self.listener.server,
+                .server = self.shard.listener.server,
                 .conn = conn,
                 .stream_id = stream_id,
             },
@@ -796,7 +799,7 @@ pub const QuicRuntime = struct {
                 .conn = &client.conn,
                 .stream_id = sid,
                 .raw = .{
-                    .server = self.listener.server, // placeholder; writes go through .client
+                    .server = self.shard.listener.server, // placeholder; writes go through .client
                     .conn = &client.conn,
                     .stream_id = sid,
                     .client = client,
@@ -835,7 +838,7 @@ pub const QuicRuntime = struct {
         const ring = if (self.shard.inbound_ring) |*r| r else return;
         var scratch: [shard_ring.max_datagram_bytes]u8 = undefined;
         while (!self.shutdown_requested.load(.acquire)) {
-            self.listener.pollAndDrainToRing(ring, &scratch, 100) catch |err| {
+            self.shard.listener.pollAndDrainToRing(ring, &scratch, 100) catch |err| {
                 log.warn("quic_runtime: demux pollAndDrainToRing: {s}", .{@errorName(err)});
             };
         }
@@ -946,9 +949,9 @@ pub const QuicRuntime = struct {
         if (now -% self.last_inbound_pump_ms < drive_inbound_pump_interval_ms) return;
         self.last_inbound_pump_ms = now;
         if (self.shard.inbound_ring) |*ring| {
-            _ = self.listener.pumpFromRing(ring, inbound_drain_per_call);
+            _ = self.shard.listener.pumpFromRing(ring, inbound_drain_per_call);
         } else {
-            _ = self.listener.pumpInbound(&self.pump_buf) catch |err| {
+            _ = self.shard.listener.pumpInbound(&self.pump_buf) catch |err| {
                 log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
             };
         }
@@ -956,7 +959,7 @@ pub const QuicRuntime = struct {
         // keep getting ACKed through this long phase and don't hit the 60s no-ACK
         // teardown (which also stalls their gossip outbox into dropping
         // attestation frames). Non-reaping, so safe to interleave mid-phase.
-        self.listener.server.flushAppAcks();
+        self.shard.listener.server.flushAppAcks();
     }
 
     fn driveLoop(self: *QuicRuntime) !void {
@@ -982,14 +985,14 @@ pub const QuicRuntime = struct {
                     var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
                     _ = std.c.nanosleep(&req, &rem);
                 }
-                self.listener.driveFromRing(ring, inbound_drain_per_call);
+                self.shard.listener.driveFromRing(ring, inbound_drain_per_call);
             } else {
-                self.listener.drive(&recv_buf, poll_to) catch |err| {
+                self.shard.listener.drive(&recv_buf, poll_to) catch |err| {
                     log.warn("quic_runtime: listener.drive: {s}", .{@errorName(err)});
                 };
             }
             // pollAccept once per loop so the lifecycle callback fires.
-            _ = self.listener.pollAccept();
+            _ = self.shard.listener.pollAccept();
             // Register inbound conns at handshake completion (mesh membership
             // without waiting for the peer's first stream — closes mesh holes for
             // inbound-only peers and stops the doomed redial storm).
@@ -1024,9 +1027,9 @@ pub const QuicRuntime = struct {
             // "no ACK for 60s" teardowns → mesh churn) while we spend the
             // iteration on outbound conns + stream advancement.
             if (self.shard.inbound_ring) |*ring| {
-                _ = self.listener.pumpFromRing(ring, inbound_drain_per_call);
+                _ = self.shard.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
-                _ = self.listener.pumpInbound(&recv_buf) catch |err| {
+                _ = self.shard.listener.pumpInbound(&recv_buf) catch |err| {
                     log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
                 };
             }
@@ -1057,9 +1060,9 @@ pub const QuicRuntime = struct {
             // Second interleaved inbound drain (see note above) — stream
             // advancement over a full mesh is the other heavy phase.
             if (self.shard.inbound_ring) |*ring| {
-                _ = self.listener.pumpFromRing(ring, inbound_drain_per_call);
+                _ = self.shard.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
-                _ = self.listener.pumpInbound(&recv_buf) catch |err| {
+                _ = self.shard.listener.pumpInbound(&recv_buf) catch |err| {
                     log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
                 };
             }
@@ -1395,7 +1398,7 @@ pub const QuicRuntime = struct {
             // `openRawAppStream` registers the receive slot so the peer's
             // multistream-select reply reassembles into it and the connection
             // participates in the reap-pin UAF guard while the stream is live.
-            const sid = self.listener.server.openRawAppStream(ic.conn) catch |err| {
+            const sid = self.shard.listener.server.openRawAppStream(ic.conn) catch |err| {
                 log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=inbound err={s}", .{
                     peerBase58(peer, &peer_buf),
                     @errorName(err),
@@ -1404,7 +1407,7 @@ pub const QuicRuntime = struct {
             };
             stream_id = sid;
             raw = .{ .inbound = .{
-                .server = self.listener.server,
+                .server = self.shard.listener.server,
                 .conn = ic.conn,
                 .stream_id = sid,
             } };
@@ -1523,7 +1526,7 @@ pub const QuicRuntime = struct {
         if (self.shard.inbound_by_peer.get(peer)) |ic| {
             if (ic.conn.phase != .closed) {
                 log.warn("quic_runtime: closing inbound QUIC connection for gossip recovery peer={s}", .{peer_str});
-                self.listener.server.closeConnection(ic.conn, 0, "gossip stream wedge");
+                self.shard.listener.server.closeConnection(ic.conn, 0, "gossip stream wedge");
             }
         }
     }
@@ -1874,7 +1877,7 @@ pub const QuicRuntime = struct {
             .peer = peer,
             .stream_id = sid,
             .raw = .{ .inbound = .{
-                .server = self.listener.server,
+                .server = self.shard.listener.server,
                 .conn = ic.conn,
                 .stream_id = sid,
             } },
@@ -1942,9 +1945,9 @@ pub const QuicRuntime = struct {
             // the demux ring when present — reading the socket inline here would
             // race the demux thread for datagrams.
             if (self.shard.inbound_ring) |*ring| {
-                self.listener.driveFromRing(ring, inbound_drain_per_call);
+                self.shard.listener.driveFromRing(ring, inbound_drain_per_call);
             } else {
-                self.listener.drive(&recv_buf, 0) catch {};
+                self.shard.listener.drive(&recv_buf, 0) catch {};
             }
             if (outbound.client.conn.phase == .connected) return true;
             if (self.shutdown_requested.load(.acquire)) return false;
@@ -2069,11 +2072,11 @@ pub const QuicRuntime = struct {
             };
         }
         if (self.shard.inbound_by_peer.get(peer)) |ic| {
-            const sid = try self.listener.server.openRawAppStream(ic.conn);
+            const sid = try self.shard.listener.server.openRawAppStream(ic.conn);
             return .{
                 .stream_id = sid,
                 .raw = .{ .inbound = .{
-                    .server = self.listener.server,
+                    .server = self.shard.listener.server,
                     .conn = ic.conn,
                     .stream_id = sid,
                 } },
@@ -2350,11 +2353,11 @@ pub const QuicRuntime = struct {
                 break :blk .{ .outbound = .{ .client = slot.outbound.client, .stream_id = sid } };
             }
             if (self.shard.inbound_by_peer.get(peer)) |ic| {
-                sid = self.listener.server.openRawAppStream(ic.conn) catch |err| {
+                sid = self.shard.listener.server.openRawAppStream(ic.conn) catch |err| {
                     self.failOutboundRequestStart(peer, request_id, payload, error.IoError, "openRawAppStream", err);
                     return;
                 };
-                break :blk .{ .inbound = .{ .server = self.listener.server, .conn = ic.conn, .stream_id = sid } };
+                break :blk .{ .inbound = .{ .server = self.shard.listener.server, .conn = ic.conn, .stream_id = sid } };
             }
             // Genuinely no connection to this peer in either direction.
             self.failOutboundRequestStart(peer, request_id, payload, error.Disconnected, "no conn to peer", null);
