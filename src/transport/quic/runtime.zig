@@ -75,6 +75,24 @@ const PendingDial = struct {
     deadline_ms: i64,
 };
 
+/// Per-shard transport state for the multi-shard drive loop (quinn model).
+///
+/// Phase 2b incrementally migrates QuicRuntime's per-connection state into this
+/// struct so N drive threads can each own a disjoint slice of connections
+/// (share-nothing). QuicRuntime will hold `shards: [N]Shard`; the demux routes
+/// each inbound datagram to its shard's ring via `shard_ring.shardForDatagram`.
+/// Migrated so far: the inbound datagram ring (Phase 1). Still on QuicRuntime,
+/// to migrate next: the connection maps (outbound_by_peer, inbound_by_peer,
+/// persistent_gossip), inbound_streams, the outbound_* request/publish maps,
+/// channel_to_inbound, inbound_conn_*, pending_dials, and the listener/Server.
+/// Global state stays on QuicRuntime (host, gossipsub actor, connection_manager,
+/// hook_queue, gossip_work). Single shard today → behavior unchanged.
+pub const Shard = struct {
+    /// Datagrams the demux thread queued for this shard's drive thread. Null
+    /// until `start` allocates it (else the drive loop reads the socket inline).
+    inbound_ring: ?shard_ring.InboundRing = null,
+};
+
 pub const QuicRuntime = struct {
     allocator: std.mem.Allocator,
     host: *host_mod.Host,
@@ -172,7 +190,9 @@ pub const QuicRuntime = struct {
     /// `start` allocates it. With a single shard today this is one ring + one
     /// demux thread feeding the one drive loop (behavior-preserving).
     demux_thread: ?std.Thread = null,
-    inbound_ring: ?shard_ring.InboundRing = null,
+    /// Per-shard transport state (Phase 2b migration in progress). Single shard
+    /// today; becomes `shards: [N]Shard` when N drive threads land.
+    shard: Shard = .{},
     started: bool = false,
 
     /// Inbound gossip processing is offloaded from the drive thread to this
@@ -441,11 +461,11 @@ pub const QuicRuntime = struct {
         // thread spawn fails, leave inbound_ring null and the drive loop falls
         // back to reading the socket inline (the pre-sharding path).
         if (shard_ring.InboundRing.init(self.allocator, inbound_ring_capacity)) |r| {
-            self.inbound_ring = r;
+            self.shard.inbound_ring = r;
             self.demux_thread = std.Thread.spawn(.{}, demuxTrampoline, .{self}) catch |err| blk: {
                 log.warn("quic_runtime: demux thread spawn failed ({s}); drive loop will read the socket inline", .{@errorName(err)});
-                if (self.inbound_ring) |*ring| ring.deinit(self.allocator);
-                self.inbound_ring = null;
+                if (self.shard.inbound_ring) |*ring| ring.deinit(self.allocator);
+                self.shard.inbound_ring = null;
                 break :blk null;
             };
         } else |err| {
@@ -482,9 +502,9 @@ pub const QuicRuntime = struct {
             t.join();
             self.demux_thread = null;
         }
-        if (self.inbound_ring) |*r| {
+        if (self.shard.inbound_ring) |*r| {
             r.deinit(self.allocator);
-            self.inbound_ring = null;
+            self.shard.inbound_ring = null;
         }
         if (self.gossip_worker_thread) |t| {
             t.join();
@@ -815,7 +835,7 @@ pub const QuicRuntime = struct {
     /// (never Server/ConnState), so all QUIC state stays single-threaded on the
     /// drive thread. Polls with a 100ms timeout so it observes shutdown promptly.
     fn demuxLoop(self: *QuicRuntime) void {
-        const ring = if (self.inbound_ring) |*r| r else return;
+        const ring = if (self.shard.inbound_ring) |*r| r else return;
         var scratch: [shard_ring.max_datagram_bytes]u8 = undefined;
         while (!self.shutdown_requested.load(.acquire)) {
             self.listener.pollAndDrainToRing(ring, &scratch, 100) catch |err| {
@@ -928,7 +948,7 @@ pub const QuicRuntime = struct {
         const now = self.opts.now_ms_fn();
         if (now -% self.last_inbound_pump_ms < drive_inbound_pump_interval_ms) return;
         self.last_inbound_pump_ms = now;
-        if (self.inbound_ring) |*ring| {
+        if (self.shard.inbound_ring) |*ring| {
             _ = self.listener.pumpFromRing(ring, inbound_drain_per_call);
         } else {
             _ = self.listener.pumpInbound(&self.pump_buf) catch |err| {
@@ -953,7 +973,7 @@ pub const QuicRuntime = struct {
             const poll_to: u32 = 5; // short timeout so we can multiplex
             // Drive listener: consume datagrams the demux thread queued, or read
             // the socket inline if the demux thread isn't running (fallback).
-            if (self.inbound_ring) |*ring| {
+            if (self.shard.inbound_ring) |*ring| {
                 // Brief passive wait when the ring is empty so we don't hot-spin
                 // now that the demux thread (not a blocking poll here) owns the
                 // socket. The demux fills the ring concurrently; we wake within
@@ -1006,7 +1026,7 @@ pub const QuicRuntime = struct {
             // kernel receive buffer doesn't overflow (dropping peers' ACKs →
             // "no ACK for 60s" teardowns → mesh churn) while we spend the
             // iteration on outbound conns + stream advancement.
-            if (self.inbound_ring) |*ring| {
+            if (self.shard.inbound_ring) |*ring| {
                 _ = self.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
                 _ = self.listener.pumpInbound(&recv_buf) catch |err| {
@@ -1039,7 +1059,7 @@ pub const QuicRuntime = struct {
 
             // Second interleaved inbound drain (see note above) — stream
             // advancement over a full mesh is the other heavy phase.
-            if (self.inbound_ring) |*ring| {
+            if (self.shard.inbound_ring) |*ring| {
                 _ = self.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
                 _ = self.listener.pumpInbound(&recv_buf) catch |err| {
@@ -1924,7 +1944,7 @@ pub const QuicRuntime = struct {
             // Keep the listener drained so its TLS handshake responses move. Use
             // the demux ring when present — reading the socket inline here would
             // race the demux thread for datagrams.
-            if (self.inbound_ring) |*ring| {
+            if (self.shard.inbound_ring) |*ring| {
                 self.listener.driveFromRing(ring, inbound_drain_per_call);
             } else {
                 self.listener.drive(&recv_buf, 0) catch {};
