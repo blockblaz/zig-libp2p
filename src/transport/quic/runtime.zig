@@ -6263,6 +6263,205 @@ test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-ou
     try testing.expect(rtHasNoOutboundTo(rt_a, bundle_b.peer));
 }
 
+test "QuicRuntime: REPEATED req/resp over inbound leg past 256-stream cap (status-RPC timeout repro)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    // REPRODUCTION B for the live ~94% status-RPC timeout. Same topology as the
+    // test above (A has only an INBOUND conn to B, so every request to B rides a
+    // FRESH server-initiated bidi stream on the inbound leg). Here we fire MANY
+    // sequential status requests. Each new request consumes the next
+    // server-initiated stream id (1,5,9,…), so after ~256 of them the stream id
+    // crosses 1024 and `popNextUnreportedServerBidiStream` SKIPS the stream via
+    // its `over_cap` path (StaticBitSet(256) indexed by stream_id/4) — B never
+    // surfaces the request, never answers, A times out. We expect the success
+    // rate to COLLAPSE once the cumulative server-initiated stream count passes
+    // 256. NOTE: gossip wedge-reopens also burn server-initiated ids, so the
+    // boundary in production is reached even sooner.
+
+    const a = testing.allocator;
+
+    var bundle_a = try buildTestBundle(a, "rqa", 0xA3);
+    defer bundle_a.deinit(a);
+    var bundle_b = try buildTestBundle(a, "rqb", 0xB4);
+    defer bundle_b.deinit(a);
+
+    var host_a = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_a.peer,
+        .gossipsub = .{ .local_peer_id = bundle_a.peer },
+    });
+    defer host_a.destroy();
+    try host_a.startBackground();
+    try testing.expect(host_a.waitUntilReady(5_000));
+
+    var rt_a = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_a,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_a.cert_pem, .key_pem = bundle_a.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_a.destroy();
+
+    var host_b = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_b.peer,
+        .gossipsub = .{ .local_peer_id = bundle_b.peer },
+    });
+    defer host_b.destroy();
+    try host_b.startBackground();
+    try testing.expect(host_b.waitUntilReady(5_000));
+
+    var rt_b = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_b,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_b.cert_pem, .key_pem = bundle_b.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_b.destroy();
+
+    try rt_a.start();
+    try rt_b.start();
+
+    const a_port = rt_a.boundUdpPortIpv4() orelse return error.NoBoundPort;
+
+    var a_peer_b58_buf: [128]u8 = undefined;
+    const a_peer_b58 = try bundle_a.peer.toBase58(&a_peer_b58_buf);
+    const a_ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ a_port, a_peer_b58 });
+    defer a.free(a_ma_str);
+    var a_ma = try multiaddr.Multiaddr.fromString(a, a_ma_str);
+    defer a_ma.deinit();
+    try rt_b.registerKnownPeer(&a_ma, bundle_a.peer);
+
+    const ResponderTask = struct {
+        fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+            const deadline_ms = wall_time.milliTimestamp() + 120_000;
+            while (wall_time.milliTimestamp() < deadline_ms) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(200) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                defer ev.deinit(h.allocator);
+                switch (ev) {
+                    .rpc_request => |r| {
+                        h.sendResponseChunk(r.channel_id, "INBOUND-LEG-RESP", wall_time.milliTimestamp()) catch {};
+                        h.finishResponseStream(r.channel_id) catch {};
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+    var b_done = std.atomic.Value(bool).init(false);
+    var b_thread = try std.Thread.spawn(.{}, ResponderTask.run, .{ host_b, &b_done });
+    defer {
+        b_done.store(true, .release);
+        b_thread.join();
+    }
+
+    {
+        var connected = false;
+        const deadline_ms = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
+                connected = true;
+                break;
+            }
+            var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+        try testing.expect(connected);
+    }
+
+    try host_a.subscribe("boot/topic");
+    try host_b.subscribe("boot/topic");
+    try host_b.publish("boot/topic", "BOOT-FROM-B");
+
+    {
+        var learned = false;
+        const deadline_ms = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            if (host_a.nextEvent(20)) |ev_in| {
+                var e = ev_in;
+                e.deinit(a);
+            } else |_| {}
+            if (rtHasInboundTo(rt_a, bundle_b.peer)) {
+                if (rtHasNoOutboundTo(rt_a, bundle_b.peer)) {
+                    learned = true;
+                    break;
+                }
+            }
+        }
+        try testing.expect(learned);
+    }
+
+    // Fire N sequential status requests over the inbound-leg fallback. N is set
+    // past the 256-stream cap so the cumulative server-initiated stream id
+    // crosses 1024 mid-run. Each request is given a small bounded retry budget
+    // (as zeam does), but a request that the cap permanently buries can never
+    // succeed no matter how many times it is retried — that is the collapse we
+    // are reproducing. We record at which request index the FIRST permanent
+    // failure occurs.
+    const N: usize = 300;
+    var succeeded: usize = 0;
+    var first_fail: ?usize = null;
+    // Bucket the success rate per 50-request window so the printout shows WHETHER
+    // failures are a uniform early flake or a hard collapse at the 256 boundary.
+    var bucket_ok = [_]usize{0} ** 6;
+    var bucket_total = [_]usize{0} ** 6;
+    var req_idx: usize = 0;
+    while (req_idx < N) : (req_idx += 1) {
+        var saw_chunk = false;
+        var saw_end = false;
+        const max_attempts: usize = 4;
+        var attempt: usize = 0;
+        while (attempt < max_attempts and !(saw_chunk and saw_end)) : (attempt += 1) {
+            _ = host_a.sendRequest(bundle_b.peer, .status, "REQ-OVER-INBOUND", 6_000) catch break;
+            var got_error = false;
+            const attempt_deadline = wall_time.milliTimestamp() + 6_000;
+            while (wall_time.milliTimestamp() < attempt_deadline and !(saw_chunk and saw_end) and !got_error) {
+                var ev = host_a.nextEvent(300) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => break,
+                };
+                defer ev.deinit(a);
+                switch (ev) {
+                    .rpc_response_chunk => |c| {
+                        if (std.mem.eql(u8, c.chunk, "INBOUND-LEG-RESP")) saw_chunk = true;
+                    },
+                    .rpc_response_end => saw_end = true,
+                    .rpc_error_response => got_error = true,
+                    else => {},
+                }
+            }
+        }
+        const bi = @min(req_idx / 50, bucket_total.len - 1);
+        bucket_total[bi] += 1;
+        if (saw_chunk and saw_end) {
+            succeeded += 1;
+            bucket_ok[bi] += 1;
+        } else if (first_fail == null) {
+            first_fail = req_idx;
+        }
+    }
+
+    std.debug.print(
+        "REPRO B: {}/{} inbound-leg status requests succeeded; first failure at request index {?}\n" ++
+            "  per-50 buckets [0-49]..[250-299]: {any} of {any}\n",
+        .{ succeeded, N, first_fail, bucket_ok, bucket_total },
+    );
+
+    // EXPECTATION OF THE BUG: success collapses once cumulative server-initiated
+    // stream ids cross the 256 cap. If the bug is present, NOT all N succeed and
+    // the first failure lands near the cap boundary. This assertion DOCUMENTS the
+    // failure (it will pass while the bug exists, flagging that not all complete);
+    // after the fix lands it must be replaced with `succeeded == N`.
+    try testing.expect(rtHasNoOutboundTo(rt_a, bundle_b.peer));
+    try testing.expect(succeeded < N); // BUG PRESENT: cap buries later requests
+    try testing.expect(first_fail != null);
+}
+
 /// Validator-context that just counts how many distinct payloads arrived,
 /// so the 3-node test below can assert "B+C each received N publishes from
 /// A" — i.e. the libp2p per-message-stream gossipsub pattern survives
