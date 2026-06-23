@@ -175,6 +175,16 @@ pub const Shard = struct {
     /// This shard's index (0-based). Used to tag minted CIDs and route work.
     /// Single shard today → 0.
     index: u8 = 0,
+    /// Per-shard drive-loop timers (were global on QuicRuntime; with N drive
+    /// threads each shard must own its own or the threads race the field).
+    /// Wall-ms of this shard's last interleaved inbound pump (`maybePumpInbound`).
+    last_inbound_pump_ms: i64 = 0,
+    /// Wall-ms of this shard's last slow-iteration watchdog log (rate-limit).
+    last_slow_iter_log_ms: i64 = 0,
+    /// Per-shard scratch for the no-ring (N=1) `maybePumpInbound` fallback so
+    /// interleaved pumps never alias the drive loop's in-use `recv_buf`. Only
+    /// touched by this shard's own drive thread.
+    pump_buf: [65536]u8 = undefined,
 
     pub fn init(a: std.mem.Allocator, listener: *quic_endpoint.QuicListener) Shard {
         return .{
@@ -280,35 +290,36 @@ pub const QuicRuntime = struct {
     bound_port_v4: ?u16 = null,
 
     /// Monotonic id counters for the per-shard outbound stream maps (global so
-    /// ids stay unique across shards). The maps themselves live on `Shard`.
-    next_publish_id: u64 = 1,
-    next_identify_push_id: u64 = 1,
-    next_autonat_probe_id: u64 = 1,
+    /// ids stay unique across shards). Minted from each shard's drive thread, so
+    /// they are atomic (a non-atomic `+= 1` from N threads tears the counter,
+    /// same hazard `next_conn_id` already guards against). The maps themselves
+    /// live on `Shard`.
+    next_publish_id: std.atomic.Value(u64) = .init(1),
+    next_identify_push_id: std.atomic.Value(u64) = .init(1),
+    next_autonat_probe_id: std.atomic.Value(u64) = .init(1),
     autonat_server: autonat_mod.Server,
 
     /// Topics we have subscribed to locally — used to (a) queue SUBSCRIBE
     /// frames into freshly-opened persistent streams so newly-connected
     /// peers see our subscription, (b) re-broadcast on subscribe.
-    /// Keys are heap-owned `[]u8` topic strings.
+    /// Keys are heap-owned `[]u8` topic strings. Written only on shard 0
+    /// (`onSubscribeCommand`, hook work) but READ from every shard's drive
+    /// thread (`replaySubscribeToPeer`, on inbound-established / dial-promote),
+    /// so the map is guarded by a SpinLock — a read concurrent with a `put`
+    /// resize is otherwise UB. Readers snapshot the keys under the lock and
+    /// release it before doing any wire-building / enqueue work.
     subscribed_topics: std.StringHashMap(void),
+    subscribed_topics_lock: conn_table.SpinLock = .{},
     /// Rate-limit (wall ms) for the slow-drive-iteration watchdog log. A drive
     /// iteration that takes >150ms stops ACKs flowing to all 31 peers; if it
     /// recurs they declare us lost (the "healthy then peer goes silent" deaths).
-    last_slow_iter_log_ms: i64 = 0,
-    /// Global drive-loop work budget (#2). Wall-ms of the last interleaved
-    /// inbound pump. The heavy per-entity phases (outbound-conn drive,
-    /// inbound-stream advance, persistent-gossip drain) call `maybePumpInbound`
-    /// as they iterate; it re-drains the listener socket + flushes every
-    /// server-side conn's ACKs whenever `drive_inbound_pump_interval_ms` has
-    /// elapsed. This bounds the gap between ACK flushes to ~that interval no
-    /// matter how many conns/streams a phase walks — so a long phase can't
-    /// starve peers' ACKs into the 60s teardown (the single-thread analogue of
-    /// an async runtime yielding to I/O). Per-call drains are already bounded
-    /// (recv/send/gossip caps); this bounds their *sum* per iteration.
-    last_inbound_pump_ms: i64 = 0,
-    /// Dedicated scratch for `maybePumpInbound` so interleaved pumps never alias
-    /// the drive loop's in-use `recv_buf`.
-    pump_buf: [65536]u8 = undefined,
+    /// Global drive-loop work budget (#2): the heavy per-entity phases call
+    /// `maybePumpInbound` as they iterate; it re-drains the listener socket +
+    /// flushes every server-side conn's ACKs whenever
+    /// `drive_inbound_pump_interval_ms` has elapsed, bounding the gap between ACK
+    /// flushes so a long phase can't starve peers' ACKs into the 60s teardown.
+    /// The per-shard cadence/log timers + scratch buffer live on `Shard` (each
+    /// drive thread owns its own; the global fields here used to race them).
     /// Monotonic connection-id source. Minted from every shard's drive thread
     /// (inbound lifecycle, outbound dial failure), so it must be atomic to avoid
     /// a torn counter under N>1. Use [`nextConnId`].
@@ -527,6 +538,17 @@ pub const QuicRuntime = struct {
         }
         self.seedHostIdentifyAdvertisement() catch |err| {
             log.warn("quic_runtime: seed host identify advertisement failed: {s}", .{@errorName(err)});
+        };
+
+        // Build the cached Identify reply wire eagerly (single-threaded here,
+        // before any drive thread runs). `advanceInboundStreams` runs on every
+        // shard's drive thread and reads this cache; a lazy first-touch build
+        // from N threads would be a read-then-write data race (double alloc /
+        // torn pointer). Building it now makes it read-only at runtime. If the
+        // build fails we leave it null and `ensureIdentifyReplyWire` retries
+        // (best-effort; the devnet path always succeeds here).
+        _ = self.ensureIdentifyReplyWire() catch |err| {
+            log.warn("quic_runtime: identify reply wire prebuild failed: {s}", .{@errorName(err)});
         };
 
         // Install the swarm CommandDispatchHook by patching it onto the
@@ -1249,12 +1271,12 @@ pub const QuicRuntime = struct {
     /// heavy per-entity loops so no single phase starves inbound ACK I/O.
     fn maybePumpInbound(self: *QuicRuntime, sh: *Shard) void {
         const now = self.opts.now_ms_fn();
-        if (now -% self.last_inbound_pump_ms < drive_inbound_pump_interval_ms) return;
-        self.last_inbound_pump_ms = now;
+        if (now -% sh.last_inbound_pump_ms < drive_inbound_pump_interval_ms) return;
+        sh.last_inbound_pump_ms = now;
         if (sh.inbound_ring) |*ring| {
             _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
         } else {
-            _ = sh.listener.pumpInbound(&self.pump_buf) catch |err| {
+            _ = sh.listener.pumpInbound(&sh.pump_buf) catch |err| {
                 log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
             };
         }
@@ -1459,8 +1481,8 @@ pub const QuicRuntime = struct {
             // all 31 peers; recurring, it produces the "healthy then peer goes
             // silent → declared lost" deaths. Localize WHICH region stalls.
             const iter_t4 = self.opts.now_ms_fn();
-            if (iter_t4 - iter_t0 >= 150 and iter_t4 - self.last_slow_iter_log_ms >= 2000) {
-                self.last_slow_iter_log_ms = iter_t4;
+            if (iter_t4 - iter_t0 >= 150 and iter_t4 - sh.last_slow_iter_log_ms >= 2000) {
+                sh.last_slow_iter_log_ms = iter_t4;
                 log.warn("quic_runtime: SLOW drive iter total={d}ms [listener={d} dials={d} outbound={d} inbound_streams={d} outreqs+gossip={d} periodic_ticks={d}] conns={d}", .{
                     iter_t4 - iter_t0,
                     iter_tL - iter_t0,
@@ -1601,12 +1623,16 @@ pub const QuicRuntime = struct {
     /// `/meshsub/1.1.0` stream.
     fn onSubscribeCommand(self: *QuicRuntime, sh: *Shard, topic: []const u8) void {
         const a = self.allocator;
-        if (!self.subscribed_topics.contains(topic)) {
-            const owned = a.dupe(u8, topic) catch return;
-            self.subscribed_topics.put(owned, {}) catch {
-                a.free(owned);
-                return;
-            };
+        {
+            self.subscribed_topics_lock.lock();
+            defer self.subscribed_topics_lock.unlock();
+            if (!self.subscribed_topics.contains(topic)) {
+                const owned = a.dupe(u8, topic) catch return;
+                self.subscribed_topics.put(owned, {}) catch {
+                    a.free(owned);
+                    return;
+                };
+            }
         }
 
         var peers: std.ArrayList(identity.PeerId) = .empty;
@@ -1955,10 +1981,30 @@ pub const QuicRuntime = struct {
     }
 
     fn replaySubscribeToPeer(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) void {
-        if (self.subscribed_topics.count() == 0) return;
-        var t_it = self.subscribed_topics.keyIterator();
-        while (t_it.next()) |topic_key| {
-            const w = self.buildSubscribeWire(topic_key.*) orelse continue;
+        const a = self.allocator;
+        // Snapshot the topic keys under the lock (shard 0 may `put`/resize the
+        // map concurrently), then release before building/enqueuing wires so we
+        // never hold the SpinLock across heavy work or a re-entrant lock.
+        var topics: std.ArrayList([]u8) = .empty;
+        defer {
+            for (topics.items) |t| a.free(t);
+            topics.deinit(a);
+        }
+        {
+            self.subscribed_topics_lock.lock();
+            defer self.subscribed_topics_lock.unlock();
+            if (self.subscribed_topics.count() == 0) return;
+            var t_it = self.subscribed_topics.keyIterator();
+            while (t_it.next()) |topic_key| {
+                const dup = a.dupe(u8, topic_key.*) catch return;
+                topics.append(a, dup) catch {
+                    a.free(dup);
+                    return;
+                };
+            }
+        }
+        for (topics.items) |topic| {
+            const w = self.buildSubscribeWire(topic) orelse continue;
             self.enqueueGossipFrame(sh, peer, w);
         }
     }
@@ -2258,8 +2304,7 @@ pub const QuicRuntime = struct {
     fn startOutboundPublish(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, wire: []u8) !void {
         const slot = sh.outbound_by_peer.get(peer) orelse return error.NotConnected;
         const sid = try slot.outbound.nextLocalBidiStream();
-        const pub_id = self.next_publish_id;
-        self.next_publish_id += 1;
+        const pub_id = self.next_publish_id.fetchAdd(1, .monotonic);
 
         const op = try self.allocator.create(conn_table.OutboundPublish);
         op.* = .{
@@ -2277,8 +2322,7 @@ pub const QuicRuntime = struct {
     fn startInboundPublish(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, wire: []u8) !void {
         const ic = sh.inbound_by_peer.get(peer) orelse return error.NotConnected;
         const sid = try ZIo.rawAllocateNextLocalBidiStream(ic.conn);
-        const pub_id = self.next_publish_id;
-        self.next_publish_id += 1;
+        const pub_id = self.next_publish_id.fetchAdd(1, .monotonic);
 
         const op = try self.allocator.create(conn_table.OutboundPublish);
         op.* = .{
@@ -2398,9 +2442,8 @@ pub const QuicRuntime = struct {
             .probe_wire = probe_wire,
         };
 
-        const probe_id = self.next_autonat_probe_id;
+        const probe_id = self.next_autonat_probe_id.fetchAdd(1, .monotonic);
         try sh.outbound_autonat_probes.put(probe_id, op);
-        self.next_autonat_probe_id += 1;
     }
 
     fn recordInboundIdentifyProtocols(self: *QuicRuntime, peer: identity.PeerId, wire_bytes: []const u8) void {
@@ -2503,8 +2546,7 @@ pub const QuicRuntime = struct {
             else => return err,
         };
         const wire = try self.buildIdentifyPushWire();
-        const push_id = self.next_identify_push_id;
-        self.next_identify_push_id += 1;
+        const push_id = self.next_identify_push_id.fetchAdd(1, .monotonic);
 
         const op = try self.allocator.create(conn_table.OutboundIdentifyPush);
         op.* = .{
@@ -3196,6 +3238,23 @@ pub const QuicRuntime = struct {
         return self.identify_reply_wire.?;
     }
 
+    // FIXME(phase-4, N>1 race): this runs on EVERY shard's drive thread, but the
+    // relay/dcutr/autonat/identify branches below mutate single-instance GLOBAL
+    // state that is NOT thread-safe and is NOT funneled through the shard-0
+    // coordinator (unlike connection_manager, step 9):
+    //   - `self.relay_live.handleHopFrame/handleStopFrame`
+    //   - `self.dcutr_live.startResponderInbound`
+    //   - `self.autonat_server.handleV1Stream`
+    //   - `self.recordInboundIdentifyProtocols` -> `host.recordPeerProtocols`
+    //     / `host.recordObservedAddr`
+    // If a relay/dcutr/autonat/identify inbound stream lands on a shard != 0
+    // while shard 0 is touching the same object, that races. SAFE TODAY because:
+    // (a) the zeam consensus devnet runs with relay/dcutr/autonat disabled, and
+    // (b) identify reply is now a read-only prebuilt cache. The identify
+    // *record* path (peer protocols / observed addr) is the live residual hazard
+    // and must be funneled through the coordinator (or made per-shard) in the
+    // Phase-4 cut before enabling those protocols under N>1. Tracked in the
+    // session report's residual-risk list.
     fn advanceInboundStreams(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
         var i: usize = 0;
@@ -5755,6 +5814,10 @@ const ClusterCfg = struct {
     /// Per-host validator contexts.  Slice length must equal `n`.  Each entry
     /// is passed verbatim to that host's gossipsub config.
     validator_ctxs: ?[]const ?*anyopaque = null,
+    /// Number of drive-loop shards each host runs (quinn model). 1 (default) is
+    /// the single-thread pre-sharding path; >1 exercises the N drive threads +
+    /// CID demux routing. Snapped to a power of two in `[1,8]` by the runtime.
+    drive_shards: u8 = 1,
 };
 
 const ClusterHost = struct {
@@ -5796,6 +5859,7 @@ fn buildCluster(a: std.mem.Allocator, cfg: ClusterCfg) ![]ClusterHost {
             .host = out[i].host,
             .tls_pem = .{ .pem_bytes = .{ .cert_pem = out[i].bundle.cert_pem, .key_pem = out[i].bundle.key_pem } },
             .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+            .drive_shards = cfg.drive_shards,
         });
         try out[i].rt.start();
         built += 1;
@@ -5838,6 +5902,41 @@ fn waitMeshConverged(cluster: []ClusterHost, deadline_ms: i64) bool {
             for (cluster) |*hj| {
                 if (hi.bundle.peer.eql(&hj.bundle.peer)) continue;
                 if (hi.rt.shards[0].outbound_by_peer.get(hj.bundle.peer) == null) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (!all_ok) break;
+        }
+        if (all_ok) return true;
+        var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+    return false;
+}
+
+/// Whether `rt` owns a live outbound leg to `peer` on ANY of its shards. At
+/// `drive_shards > 1` the outbound leg lives on `shards[hash(peer)&mask]`, not
+/// necessarily shard 0, so a shard-0-only check (as `waitMeshConverged` uses)
+/// would spuriously fail. Reads are racy w.r.t. the owning drive thread's
+/// map mutation but only used as a settled-state probe in tests.
+fn rtHasOutboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
+    for (rt.shards) |*sh| {
+        if (sh.outbound_by_peer.get(peer) != null) return true;
+    }
+    return false;
+}
+
+/// Sharded-aware analogue of `waitMeshConverged`: every host has an outbound
+/// leg to every other host, regardless of which shard owns it.
+fn waitMeshConvergedSharded(cluster: []ClusterHost, deadline_ms: i64) bool {
+    while (wall_time.milliTimestamp() < deadline_ms) {
+        var all_ok = true;
+        for (cluster) |*hi| {
+            for (cluster) |*hj| {
+                if (hi.bundle.peer.eql(&hj.bundle.peer)) continue;
+                if (!rtHasOutboundTo(hi.rt, hj.bundle.peer)) {
                     all_ok = false;
                     break;
                 }
@@ -5953,6 +6052,131 @@ test "QuicRuntime: 5-node gossipsub mesh under sustained publishes" {
             std.debug.print("5-node mesh: host[{d}] got {d}/{d}\n", .{ i, c.count(), exp });
         }
         try testing.expect(c.count() >= exp);
+    }
+}
+
+// N=2 SHARDING VERIFICATION GATE (Phase 2b).
+//
+// Brings up a 3-node cluster where EVERY host runs `drive_shards = 2` (two
+// drive threads + the demux thread per host) and asserts the full sharded path
+// works end to end:
+//   1. `drive_shards` snaps to 2 (power-of-two clamp) and `shard_mask == 1`.
+//   2. The all-to-all mesh converges — handshakes only complete if the demux
+//      CID-routes each inbound 1-RTT datagram to the shard that minted (and so
+//      owns) that connection's `local_cid`. A misrouted datagram would land on
+//      the wrong Server, AEAD-fail, and the handshake would never finish, so
+//      convergence at N=2 is the live proof that CID demux routes correctly.
+//   3. Inbound connections actually land on >1 distinct shard (otherwise the
+//      test would pass trivially with everything funneled to shard 0 and prove
+//      nothing about cross-shard routing).
+//   4. Gossip round-trips to both listener hosts — exercising Phase 3
+//      cross-shard directed/broadcast delivery (the gossipsub owner drains on
+//      shard 0 and routes each frame to the shard owning the destination peer).
+//
+// This is the first multi-shard in-process integration test; the devnet is the
+// scale validation.
+test "QuicRuntime: N=2 sharded cluster — CID demux routing + cross-shard gossip" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const n: usize = 3;
+
+    var counters: [n]*GossipCounter = undefined;
+    for (0..n) |i| {
+        counters[i] = try a.create(GossipCounter);
+        counters[i].* = .{};
+    }
+    defer for (counters) |c| a.destroy(c);
+    var ctx: [n]?*anyopaque = undefined;
+    for (0..n) |i| ctx[i] = @as(*anyopaque, @ptrCast(counters[i]));
+
+    const cluster = try buildCluster(a, .{
+        .n = n,
+        .topic_validator = gossipCountValidator,
+        .validator_ctxs = ctx[0..],
+        .drive_shards = 2,
+    });
+    defer destroyCluster(a, cluster);
+
+    // (1) Every host snapped to exactly 2 shards, mask 1.
+    for (cluster) |*ch| {
+        try testing.expectEqual(@as(u8, 2), ch.rt.shard_count);
+        try testing.expectEqual(@as(u8, 1), ch.rt.shard_mask);
+        try testing.expectEqual(@as(usize, 2), ch.rt.shards.len);
+    }
+
+    var drain_done = std.atomic.Value(bool).init(false);
+    var threads = std.ArrayList(std.Thread).empty;
+    defer threads.deinit(a);
+    defer {
+        drain_done.store(true, .release);
+        for (threads.items) |th| th.join();
+    }
+    for (cluster) |*ch| {
+        const th = try std.Thread.spawn(.{}, ClusterDrainer.run, .{ ch.host, &drain_done });
+        try threads.append(a, th);
+    }
+
+    // (2) Mesh converges → CID demux routed every inbound 1-RTT datagram to the
+    //     shard owning that conn (else the AEAD-failing handshakes never finish).
+    try testing.expect(waitMeshConvergedSharded(cluster, wall_time.milliTimestamp() + 30_000));
+
+    // (3) Connections genuinely fan across BOTH shards somewhere in the cluster,
+    //     so the test isn't passing trivially with everything on shard 0.
+    //     Inbound ownership follows the demux (source-addr hash for the Initial,
+    //     CID byte thereafter); outbound follows `shardIndexForPeer` (peer hash).
+    //     Across 3 hosts × (n-1) legs each, both shard indices should appear.
+    //     This is a hard assert: if it ever fails, either the demux collapsed
+    //     routing to one shard (a real bug) or — far less likely — every peer/
+    //     addr hash shares a parity, which the convergence in (2) already shows
+    //     is being routed correctly. Count both directions so a port-hash skew
+    //     in inbound is covered by the deterministic outbound placement.
+    var shard_seen = [_]bool{ false, false };
+    for (cluster) |*ch| {
+        for (ch.rt.shards, 0..) |*sh, si| {
+            if (sh.inbound_by_peer.count() > 0 or sh.outbound_by_peer.count() > 0) {
+                shard_seen[si] = true;
+            }
+        }
+    }
+    if (!(shard_seen[0] and shard_seen[1])) {
+        std.debug.print("N=2 shard mesh: connections did not fan across both shards (shard0={}, shard1={})\n", .{ shard_seen[0], shard_seen[1] });
+    }
+    try testing.expect(shard_seen[0] and shard_seen[1]);
+
+    for (cluster) |*ch| try ch.host.subscribe("shard2/topic");
+
+    // (4) Publish from host 0; both listeners (1,2) must receive — gossip frames
+    //     are routed by the owner (shard 0) to whichever shard owns each peer.
+    const pubs: usize = 15;
+    for (0..pubs) |i| {
+        var buf: [32]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&buf, "s2-{d}", .{i});
+        try cluster[0].host.publish("shard2/topic", payload);
+        var req = std.c.timespec{ .sec = 0, .nsec = 30 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    const dl = wall_time.milliTimestamp() + 30_000;
+    while (wall_time.milliTimestamp() < dl) {
+        var ok = true;
+        for (counters[1..]) |c| if (c.count() < pubs) {
+            ok = false;
+            break;
+        };
+        if (ok) break;
+        var req = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    for (counters[1..], 1..) |c, i| {
+        if (c.count() < pubs) {
+            std.debug.print("N=2 shard mesh: host[{d}] got {d}/{d}\n", .{ i, c.count(), pubs });
+        }
+        try testing.expect(c.count() >= pubs);
     }
 }
 
