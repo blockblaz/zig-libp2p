@@ -43,6 +43,21 @@ pub const Error = error{
     UnknownInboundChannel,
 };
 
+/// Minimal atomic spin lock (Zig 0.16 std has no Thread.Mutex). Mirrors
+/// `transport/quic/conn_table.SpinLock`; defined locally to avoid a
+/// protocols→transport layering dependency.
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+    fn lock(self: *SpinLock) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+    fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
 pub const ReqResp = struct {
     allocator: std.mem.Allocator,
     swarm: *swarm_mod.Swarm,
@@ -51,6 +66,17 @@ pub const ReqResp = struct {
     next_channel_id: u64 = 1,
     pending_out: std.AutoHashMap(u64, PendingOutbound),
     inbound: std.AutoHashMap(u64, InboundChannel),
+    /// Guards `next_request_id`, `next_channel_id`, `pending_out`, and `inbound`.
+    /// With QUIC connection sharding (`drive_shards > 1`) `registerInboundChannel`
+    /// is called concurrently from N drive threads (each shard's
+    /// `advanceInboundStreams`), `tick` runs on the shard-0 drive thread, and the
+    /// response side (`sendRequest`/`sendResponseChunk`/`finishResponseStream`/
+    /// `sendErrorResponse`/`completeOutbound`) runs on the embedder/swarm thread —
+    /// so the two HashMaps and the monotonic counters are touched by multiple
+    /// threads and must be serialized. At `drive_shards == 1` there is a single
+    /// drive thread, so contention is only ever between it and the embedder thread
+    /// (uncontended fast path).
+    state_lock: SpinLock = .{},
 
     pub fn init(allocator: std.mem.Allocator, s: *swarm_mod.Swarm, cfg: ReqRespConfig) ReqResp {
         return .{
@@ -94,11 +120,20 @@ pub const ReqResp = struct {
         payload: []const u8,
         now_ms: i64,
     ) swarm_mod.SubmitError!u64 {
-        const id = self.next_request_id;
-        self.next_request_id += 1;
         const deadline_ms = now_ms + self.cfg.request_timeout_ms;
-        try self.pending_out.put(id, .{ .peer = peer, .deadline_ms = deadline_ms });
-        errdefer _ = self.pending_out.remove(id);
+        const id = blk: {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
+            const new_id = self.next_request_id;
+            self.next_request_id += 1;
+            try self.pending_out.put(new_id, .{ .peer = peer, .deadline_ms = deadline_ms });
+            break :blk new_id;
+        };
+        errdefer {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
+            _ = self.pending_out.remove(id);
+        }
         try self.swarm.submit(.{ .send_request = .{
             .peer = peer,
             .protocol = proto,
@@ -110,12 +145,16 @@ pub const ReqResp = struct {
     }
 
     pub fn cancelRequest(self: *ReqResp, request_id: u64) void {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
         _ = self.pending_out.remove(request_id);
     }
 
     /// Clears the outbound pending slot after a terminal response (`rpc_response_end` or
     /// `rpc_error_response`) for this `request_id`.
     pub fn completeOutbound(self: *ReqResp, request_id: u64) void {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
         _ = self.pending_out.remove(request_id);
     }
 
@@ -128,6 +167,8 @@ pub const ReqResp = struct {
         request_id: u64,
         now_ms: i64,
     ) std.mem.Allocator.Error!u64 {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
         const ch = self.next_channel_id;
         self.next_channel_id += 1;
         try self.inbound.put(ch, .{
@@ -145,17 +186,26 @@ pub const ReqResp = struct {
         payload: []const u8,
         now_ms: i64,
     ) (Error || swarm_mod.SubmitError)!void {
-        const ent = self.inbound.getPtr(channel_id) orelse return error.UnknownInboundChannel;
-        ent.last_activity_ms = now_ms;
+        const snap = blk: {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
+            const ent = self.inbound.getPtr(channel_id) orelse return error.UnknownInboundChannel;
+            ent.last_activity_ms = now_ms;
+            break :blk .{ .peer = ent.peer, .request_id = ent.stream_request_id };
+        };
         try self.swarm.submit(.{ .send_response_chunk = .{
-            .peer = ent.peer,
-            .request_id = ent.stream_request_id,
+            .peer = snap.peer,
+            .request_id = snap.request_id,
             .chunk = payload,
         } });
     }
 
     pub fn finishResponseStream(self: *ReqResp, channel_id: u64) (Error || swarm_mod.SubmitError)!void {
-        const ent = self.inbound.fetchRemove(channel_id) orelse return error.UnknownInboundChannel;
+        const ent = blk: {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
+            break :blk self.inbound.fetchRemove(channel_id) orelse return error.UnknownInboundChannel;
+        };
         try self.swarm.submit(.{ .send_end_of_stream = .{
             .peer = ent.value.peer,
             .request_id = ent.value.stream_request_id,
@@ -164,7 +214,11 @@ pub const ReqResp = struct {
 
     /// UTF-8 diagnostic is stored via [`errors.setLastErrorMessage`] for this thread (`RawError` + #45).
     pub fn sendErrorResponse(self: *ReqResp, channel_id: u64, message: []const u8) (Error || swarm_mod.SubmitError)!void {
-        const ent = self.inbound.fetchRemove(channel_id) orelse return error.UnknownInboundChannel;
+        const ent = blk: {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
+            break :blk self.inbound.fetchRemove(channel_id) orelse return error.UnknownInboundChannel;
+        };
         errors.setLastErrorMessage(message);
         try self.swarm.submit(.{ .send_error_response = .{
             .peer = ent.value.peer,
@@ -179,6 +233,8 @@ pub const ReqResp = struct {
         var expired_out: std.ArrayList(u64) = .empty;
         defer expired_out.deinit(self.allocator);
         {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
             var it = self.pending_out.iterator();
             while (it.next()) |e| {
                 if (e.value_ptr.deadline_ms <= now_ms) {
@@ -187,7 +243,11 @@ pub const ReqResp = struct {
             }
         }
         for (expired_out.items) |rid| {
-            const p = self.pending_out.fetchRemove(rid) orelse continue;
+            const p = blk: {
+                self.state_lock.lock();
+                defer self.state_lock.unlock();
+                break :blk self.pending_out.fetchRemove(rid) orelse continue;
+            };
             try self.swarm.queueEvent(.{ .rpc_error_response = .{
                 .peer = p.value.peer,
                 .request_id = rid,
@@ -199,6 +259,8 @@ pub const ReqResp = struct {
         defer idle_ch.deinit(self.allocator);
         const idle_ms = self.cfg.response_idle_timeout_ms;
         {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
             var it = self.inbound.iterator();
             while (it.next()) |e| {
                 const elapsed = now_ms - e.value_ptr.last_activity_ms;
@@ -208,7 +270,11 @@ pub const ReqResp = struct {
             }
         }
         for (idle_ch.items) |cid| {
-            const ent = self.inbound.fetchRemove(cid) orelse continue;
+            const ent = blk: {
+                self.state_lock.lock();
+                defer self.state_lock.unlock();
+                break :blk self.inbound.fetchRemove(cid) orelse continue;
+            };
             try self.swarm.queueEvent(.{ .rpc_error_response = .{
                 .peer = ent.value.peer,
                 .request_id = ent.value.stream_request_id,
@@ -223,6 +289,8 @@ pub const ReqResp = struct {
         var drop_out: std.ArrayList(u64) = .empty;
         defer drop_out.deinit(self.allocator);
         {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
             var it = self.pending_out.iterator();
             while (it.next()) |e| {
                 if (e.value_ptr.peer.eql(&peer)) {
@@ -231,7 +299,11 @@ pub const ReqResp = struct {
             }
         }
         for (drop_out.items) |rid| {
-            _ = self.pending_out.remove(rid);
+            {
+                self.state_lock.lock();
+                defer self.state_lock.unlock();
+                _ = self.pending_out.remove(rid);
+            }
             try self.swarm.queueEvent(.{ .rpc_error_response = .{
                 .peer = peer,
                 .request_id = rid,
@@ -246,6 +318,8 @@ pub const ReqResp = struct {
         var drop_in: std.ArrayList(InboundDrop) = .empty;
         defer drop_in.deinit(self.allocator);
         {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
             var it = self.inbound.iterator();
             while (it.next()) |e| {
                 if (e.value_ptr.peer.eql(&peer)) {
@@ -257,7 +331,11 @@ pub const ReqResp = struct {
             }
         }
         for (drop_in.items) |d| {
-            _ = self.inbound.remove(d.channel_id);
+            {
+                self.state_lock.lock();
+                defer self.state_lock.unlock();
+                _ = self.inbound.remove(d.channel_id);
+            }
             try self.swarm.queueEvent(.{ .rpc_error_response = .{
                 .peer = peer,
                 .request_id = d.stream_request_id,
