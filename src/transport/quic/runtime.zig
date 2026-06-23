@@ -75,6 +75,46 @@ const PendingDial = struct {
     deadline_ms: i64,
 };
 
+/// A connection-lifecycle notification produced by any shard's drive thread and
+/// funneled through the single coordinator (drained by shard 0) so that
+/// `connection_manager` — which is NOT thread-safe — is only ever mutated by one
+/// thread. The gossipsub side of `host.onConnection*` is already cross-thread
+/// (its own command queue), so routing the whole call through here is safe; it
+/// just delays the connection_manager + swarm-event side to shard 0's next tick.
+const ConnLifecycleEvent = union(enum) {
+    established: struct {
+        conn_id: connection_manager_mod.ConnectionId,
+        peer: identity.PeerId,
+        direction: peer_events.Direction,
+        opts: connection_manager_mod.ConnectionEstablishedOptions,
+    },
+    closed: struct {
+        now_ms: i64,
+        conn_id: connection_manager_mod.ConnectionId,
+        peer: identity.PeerId,
+        reason: peer_events.DisconnectReason,
+    },
+    dial_failure: struct {
+        now_ms: i64,
+        conn_id: connection_manager_mod.ConnectionId,
+        peer: ?identity.PeerId,
+        direction: peer_events.Direction,
+        result: peer_events.ConnectionFailureResult,
+    },
+};
+
+/// A directed gossip frame routed from the gossipsub owner (drained on shard 0)
+/// to the shard that OWNS the destination peer's connection (Phase 3). The
+/// owning shard's drive thread drains its `gossip_inbox` and delivers each entry
+/// over its own per-peer persistent `/meshsub` stream — no shard ever touches
+/// another shard's connection state. `peer == null` is a broadcast entry: the
+/// owning shard fans `wire` out to every peer IT owns (SUBSCRIBE/UNSUBSCRIBE).
+/// `wire` is heap-owned (already length-prefixed) and freed by the consumer.
+const GossipDelivery = struct {
+    peer: ?identity.PeerId,
+    wire: []u8,
+};
+
 /// Per-shard transport state for the multi-shard drive loop (quinn model).
 ///
 /// Phase 2b incrementally migrates QuicRuntime's per-connection state into this
@@ -120,6 +160,14 @@ pub const Shard = struct {
     outbound_autonat_probes: std.AutoHashMap(u64, *conn_table.OutboundAutonatProbe),
     /// Inbound relay-bridge conn ids for this shard's relayed peers (#205).
     relayed_conn_by_peer: conn_table.RelayedConnIdMap,
+    /// Cross-shard gossip delivery queue (Phase 3). The gossipsub owner is
+    /// drained on shard 0; a directed/broadcast delivery whose destination peer
+    /// lives on THIS shard is routed here by shard 0 and drained by this shard's
+    /// own drive thread (via `drainGossipInbox`). Guarded by `gossip_inbox_lock`
+    /// because the producer (shard 0) and consumer (this shard) are different
+    /// threads. Entries' `wire` is heap-owned and freed by the consumer.
+    gossip_inbox: std.ArrayList(GossipDelivery) = .empty,
+    gossip_inbox_lock: conn_table.SpinLock = .{},
     /// Back-pointer to the owning runtime, so a zquic callback that recovers a
     /// `*Shard` from its ctx can reach the global state (host, gossipsub,
     /// counters). Set in `create`.
@@ -213,6 +261,11 @@ pub const Shard = struct {
 
         self.channel_to_inbound.deinit();
 
+        // Free any cross-shard gossip deliveries that were routed to this shard
+        // but not yet drained at shutdown. Threads are already joined.
+        for (self.gossip_inbox.items) |d| a.free(d.wire);
+        self.gossip_inbox.deinit(a);
+
         self.listener.lifecycle = .{};
         self.listener.deinit();
     }
@@ -256,7 +309,19 @@ pub const QuicRuntime = struct {
     /// Dedicated scratch for `maybePumpInbound` so interleaved pumps never alias
     /// the drive loop's in-use `recv_buf`.
     pump_buf: [65536]u8 = undefined,
-    next_conn_id: connection_manager_mod.ConnectionId = 1,
+    /// Monotonic connection-id source. Minted from every shard's drive thread
+    /// (inbound lifecycle, outbound dial failure), so it must be atomic to avoid
+    /// a torn counter under N>1. Use [`nextConnId`].
+    next_conn_id: std.atomic.Value(connection_manager_mod.ConnectionId) = .init(1),
+
+    /// Connection-lifecycle coordinator (step 9). Every shard's drive thread
+    /// enqueues `onConnectionEstablished`/`Closed`/`onDialFailure` notifications
+    /// here instead of calling `host.onConnection*` directly; shard 0's drive
+    /// loop drains them via [`drainConnLifecycle`] so `connection_manager` is
+    /// only ever touched by one thread. Guarded by a SpinLock (Zig 0.16 std has
+    /// no Mutex; producers/consumers are different drive threads).
+    conn_lifecycle_queue: std.ArrayList(ConnLifecycleEvent) = .empty,
+    conn_lifecycle_lock: conn_table.SpinLock = .{},
 
     /// Cross-thread hook → drive-thread work queue. Hook runs on swarm
     /// thread; drive thread drains via [`drainHookWork`]. Synchronization
@@ -504,6 +569,10 @@ pub const QuicRuntime = struct {
         for (self.hook_queue.items) |w| conn_table.freeHookWork(self.allocator, w);
         self.hook_queue.deinit(self.allocator);
 
+        // Connection-lifecycle coordinator queue: entries carry no owned memory,
+        // just release the backing storage (threads joined).
+        self.conn_lifecycle_queue.deinit(self.allocator);
+
         // Inbound gossip work queue: `stop()` already joined the worker and
         // freed the frames; just release the backing storage.
         self.gossip_work.deinit(self.allocator);
@@ -742,6 +811,101 @@ pub const QuicRuntime = struct {
         self.hook_queue.clearRetainingCapacity();
     }
 
+    // ── Connection-lifecycle coordinator (step 9) ──────────────────────────
+    //
+    // `connection_manager` is not thread-safe, but N drive threads observe
+    // connection establish/close/dial-failure. Each enqueues here; shard 0
+    // drains and is the ONLY thread that calls `host.onConnection*`, so
+    // `connection_manager` (and the inner `peer_protocols`/`kad` mutations) are
+    // single-threaded. The gossipsub side of `host.onConnection*` is already
+    // cross-thread (its own command queue), so the small drain delay is benign.
+
+    fn nextConnId(self: *QuicRuntime) connection_manager_mod.ConnectionId {
+        return self.next_conn_id.fetchAdd(1, .monotonic);
+    }
+
+    fn enqueueConnLifecycle(self: *QuicRuntime, ev: ConnLifecycleEvent) void {
+        self.conn_lifecycle_lock.lock();
+        defer self.conn_lifecycle_lock.unlock();
+        self.conn_lifecycle_queue.append(self.allocator, ev) catch |err| {
+            log.err("quic_runtime: conn lifecycle queue append failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn notifyConnEstablished(
+        self: *QuicRuntime,
+        conn_id: connection_manager_mod.ConnectionId,
+        peer: identity.PeerId,
+        direction: peer_events.Direction,
+        opts: connection_manager_mod.ConnectionEstablishedOptions,
+    ) void {
+        self.enqueueConnLifecycle(.{ .established = .{
+            .conn_id = conn_id,
+            .peer = peer,
+            .direction = direction,
+            .opts = opts,
+        } });
+    }
+
+    fn notifyConnClosed(
+        self: *QuicRuntime,
+        now_ms: i64,
+        conn_id: connection_manager_mod.ConnectionId,
+        peer: identity.PeerId,
+        reason: peer_events.DisconnectReason,
+    ) void {
+        self.enqueueConnLifecycle(.{ .closed = .{
+            .now_ms = now_ms,
+            .conn_id = conn_id,
+            .peer = peer,
+            .reason = reason,
+        } });
+    }
+
+    fn notifyDialFailure(
+        self: *QuicRuntime,
+        now_ms: i64,
+        conn_id: connection_manager_mod.ConnectionId,
+        peer: ?identity.PeerId,
+        direction: peer_events.Direction,
+        result: peer_events.ConnectionFailureResult,
+    ) void {
+        self.enqueueConnLifecycle(.{ .dial_failure = .{
+            .now_ms = now_ms,
+            .conn_id = conn_id,
+            .peer = peer,
+            .direction = direction,
+            .result = result,
+        } });
+    }
+
+    /// Drain all queued connection-lifecycle events on the single coordinator
+    /// thread (shard 0). The only place `host.onConnection*` is invoked.
+    fn drainConnLifecycle(self: *QuicRuntime) void {
+        // Move the queue out under the lock, then process without holding it so
+        // the heavy host callbacks don't block other shards' enqueues.
+        var batch: std.ArrayList(ConnLifecycleEvent) = .empty;
+        defer batch.deinit(self.allocator);
+        {
+            self.conn_lifecycle_lock.lock();
+            defer self.conn_lifecycle_lock.unlock();
+            if (self.conn_lifecycle_queue.items.len == 0) return;
+            batch.appendSlice(self.allocator, self.conn_lifecycle_queue.items) catch return;
+            self.conn_lifecycle_queue.clearRetainingCapacity();
+        }
+        for (batch.items) |ev| switch (ev) {
+            .established => |e| self.host.onConnectionEstablished(e.conn_id, e.peer, e.direction, e.opts) catch |err| {
+                log.warn("quic_runtime: onConnectionEstablished failed: {s}", .{@errorName(err)});
+            },
+            .closed => |c| self.host.onConnectionClosed(c.now_ms, c.conn_id, c.peer, c.reason) catch |err| {
+                log.warn("quic_runtime: onConnectionClosed failed: {s}", .{@errorName(err)});
+            },
+            .dial_failure => |d| self.host.onDialFailure(d.now_ms, d.conn_id, d.peer, d.direction, d.result) catch |err| {
+                log.warn("quic_runtime: onDialFailure failed: {s}", .{@errorName(err)});
+            },
+        };
+    }
+
     // ── QuicListener lifecycle ─────────────────────────────────────────────
 
     fn onLifecycleConnected(ctx: ?*anyopaque, slot: usize, _: *ZIo.ConnState) void {
@@ -751,8 +915,7 @@ pub const QuicRuntime = struct {
             // We don't yet have the verified peer id (TLS handshake might be
             // freshly complete). Delay onConnectionEstablished until first
             // inbound stream when peer id is available.
-            sh.inbound_conn_ids[slot] = self.next_conn_id;
-            self.next_conn_id += 1;
+            sh.inbound_conn_ids[slot] = self.nextConnId();
         }
     }
 
@@ -763,9 +926,7 @@ pub const QuicRuntime = struct {
             const peer = sh.inbound_conn_peer[slot] orelse identity.PeerId.random() catch return;
             const cid = sh.inbound_conn_ids[slot];
             const now_ms = self.opts.now_ms_fn();
-            self.host.onConnectionClosed(now_ms, cid, peer, .remote_close) catch |e| {
-                log.warn("quic_runtime: onConnectionClosed failed: {s}", .{@errorName(e)});
-            };
+            self.notifyConnClosed(now_ms, cid, peer, .remote_close);
             _ = sh.inbound_by_peer.remove(peer);
             self.destroyPersistentGossipStream(sh, peer);
         }
@@ -785,13 +946,10 @@ pub const QuicRuntime = struct {
         sh.inbound_conn_peer[slot] = sender;
         sh.inbound_by_peer.put(sender, .{ .slot = slot, .conn = conn }) catch {};
         if (sh.inbound_conn_ids[slot] == 0) {
-            sh.inbound_conn_ids[slot] = self.next_conn_id;
-            self.next_conn_id += 1;
+            sh.inbound_conn_ids[slot] = self.nextConnId();
         }
         const cid = sh.inbound_conn_ids[slot];
-        self.host.onConnectionEstablished(cid, sender, .inbound, .{}) catch |err| {
-            log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
-        };
+        self.notifyConnEstablished(cid, sender, .inbound, .{});
         self.replaySubscribeToPeer(sh, sender);
     }
 
@@ -866,9 +1024,7 @@ pub const QuicRuntime = struct {
                 "quic_runtime: outbound QUIC connection closed by remote (cid={d}); notifying host",
                 .{cid},
             );
-            self.host.onConnectionClosed(now_ms, cid, peer, .remote_close) catch |e| {
-                log.warn("quic_runtime: outbound onConnectionClosed failed: {s}", .{@errorName(e)});
-            };
+            self.notifyConnClosed(now_ms, cid, peer, .remote_close);
             self.destroyPersistentGossipStream(sh, peer);
             if (sh.outbound_by_peer.fetchRemove(peer)) |kv| {
                 kv.value.outbound.deinit();
@@ -1195,6 +1351,13 @@ pub const QuicRuntime = struct {
             // routing of directed hook work / gossip deliveries to non-zero
             // shards is the Phase-3 cross-shard outbox follow-up.
             if (sh.index == 0) {
+                // Coordinator funnel: drain connection-lifecycle notifications
+                // from ALL shards and apply them to `connection_manager` on this
+                // one thread (step 9). Done before hook work + periodic ticks so
+                // a just-established conn is known to the conn-manager / dial
+                // scheduler this iteration.
+                self.drainConnLifecycle();
+
                 self.drainHookWork(&work_scratch);
                 for (work_scratch.items) |w| {
                     self.handleHookWork(sh, w) catch |err| {
@@ -1204,6 +1367,11 @@ pub const QuicRuntime = struct {
                 }
                 work_scratch.clearRetainingCapacity();
             }
+
+            // Cross-shard gossip (Phase 3): deliver any directed/broadcast gossip
+            // frames the owner (shard 0) routed to THIS shard. Every shard drains
+            // its own inbox; only the owning shard touches its connection state.
+            self.drainGossipInbox(sh);
 
             // Advance inbound streams (multistream + framing).
             self.advanceInboundStreams(sh) catch |err| {
@@ -1339,10 +1507,17 @@ pub const QuicRuntime = struct {
         }
     }
 
-    /// Outbound gossipsub publish path.
+    /// Whether `sh` owns a live connection (outbound or inbound) to `peer`.
     ///
-    fn peerHasActiveConnection(self: *QuicRuntime, peer: identity.PeerId) bool {
-        return self.host.connection_manager.hasActiveConnection(peer);
+    /// Reads only the shard's OWN connection maps, which it mutates exclusively
+    /// from its own drive thread — so this is safe to call from that thread with
+    /// no lock, unlike `connection_manager.hasActiveConnection` (not thread-safe)
+    /// which the pre-sharding code consulted. It is also the authoritative answer
+    /// for "can THIS shard deliver gossip to this peer": delivery rides the
+    /// per-peer persistent `/meshsub` stream which lives in `sh.persistent_gossip`
+    /// and is opened from `sh.outbound_by_peer` / `sh.inbound_by_peer`.
+    fn shardOwnsConnectionTo(_: *QuicRuntime, sh: *Shard, peer: identity.PeerId) bool {
+        return sh.outbound_by_peer.contains(peer) or sh.inbound_by_peer.contains(peer);
     }
 
     fn peerBase58(peer: identity.PeerId, buf: *[128]u8) []const u8 {
@@ -1486,31 +1661,103 @@ pub const QuicRuntime = struct {
     /// [`onSubscribeCommand`] still records the topic in `subscribed_topics`
     /// so it can be replayed to *future* connections; this fan-out covers
     /// already-connected peers in the same tick.
+    /// Drained ONLY on shard 0 (the gossipsub owner runs there). Each delivery
+    /// is routed to the shard that OWNS the destination peer's connection
+    /// (Phase 3): with N shards a directed `to=peerX` may belong to a different
+    /// shard than the one draining, and a broadcast must reach every shard's
+    /// peers. No shard ever writes another shard's connection state — entries
+    /// for other shards are pushed onto their `gossip_inbox` (SpinLock-guarded)
+    /// and that shard's drive thread delivers them via [`drainGossipInbox`].
+    /// Shard 0's own peers are delivered inline here. Single shard (mask 0):
+    /// every peer maps to shard 0, so this is the pre-sharding inline path.
     fn drainGossipsubOutbox(self: *QuicRuntime, sh: *Shard) void {
         const a = self.allocator;
         const gs = self.host.gossipsub;
         while (gs.popOutboxDelivery()) |d| {
             defer a.free(d.wire);
             if (d.to) |peer| {
-                if (!self.peerHasActiveConnection(peer)) continue;
+                // Directed: length-prefix once, then deliver on the owning shard.
                 const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
-                self.enqueueGossipFrame(sh, peer, framed);
+                const owner = self.shardIndexForPeer(peer);
+                if (owner == sh.index) {
+                    // We own this peer: deliver inline (drop if no live conn).
+                    if (!self.shardOwnsConnectionTo(sh, peer)) {
+                        a.free(framed);
+                        continue;
+                    }
+                    self.enqueueGossipFrame(sh, peer, framed);
+                } else {
+                    // Hand off to the owning shard's drive thread.
+                    self.routeGossipDelivery(owner, peer, framed);
+                }
             } else {
-                // Broadcast (SUBSCRIBE/UNSUBSCRIBE). Length-prefix once, clone per peer.
-                // Targets every currently-connected peer (outbound and inbound)
-                // so late `Gossipsub.subscribe` calls also reach existing peers,
-                // not just future connections. New connections still get
-                // SUBSCRIBE via `subscribed_topics` replay in
-                // `onConnectionEstablished` / inbound-stream notify path.
+                // Broadcast (SUBSCRIBE/UNSUBSCRIBE): every shard fans this out to
+                // its OWN peers. Deliver shard 0's inline; route a per-shard copy
+                // to every other shard's inbox (peer==null = broadcast entry).
                 const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
                 defer a.free(framed);
-                var peers: std.ArrayList(identity.PeerId) = .empty;
-                defer peers.deinit(a);
-                self.collectConnectedPeers(sh, &peers) catch continue;
-                for (peers.items) |peer| {
+                self.broadcastToOwnPeers(sh, framed);
+                var i: u8 = 0;
+                while (i < self.shard_count) : (i += 1) {
+                    if (i == sh.index) continue;
                     const dup = a.dupe(u8, framed) catch continue;
-                    self.enqueueGossipFrame(sh, peer, dup);
+                    self.routeGossipDelivery(i, null, dup);
                 }
+            }
+        }
+    }
+
+    /// Fan a single framed gossip wire out to every peer THIS shard owns,
+    /// duping per peer. `framed` is borrowed (caller frees).
+    fn broadcastToOwnPeers(self: *QuicRuntime, sh: *Shard, framed: []const u8) void {
+        const a = self.allocator;
+        var peers: std.ArrayList(identity.PeerId) = .empty;
+        defer peers.deinit(a);
+        self.collectConnectedPeers(sh, &peers) catch return;
+        for (peers.items) |peer| {
+            const dup = a.dupe(u8, framed) catch continue;
+            self.enqueueGossipFrame(sh, peer, dup);
+        }
+    }
+
+    /// Push an owned gossip delivery onto `shards[owner].gossip_inbox` for that
+    /// shard's drive thread to deliver. `wire` ownership transfers to the inbox
+    /// (freed by the consumer, or here on append failure). `peer == null` marks
+    /// a broadcast entry (the owning shard fans it out to its own peers).
+    fn routeGossipDelivery(self: *QuicRuntime, owner: u8, peer: ?identity.PeerId, wire: []u8) void {
+        const dst = &self.shards[owner];
+        dst.gossip_inbox_lock.lock();
+        defer dst.gossip_inbox_lock.unlock();
+        dst.gossip_inbox.append(self.allocator, .{ .peer = peer, .wire = wire }) catch {
+            self.allocator.free(wire);
+        };
+    }
+
+    /// Drain the cross-shard gossip deliveries routed to THIS shard (Phase 3).
+    /// Runs on every shard's drive thread each iteration. Directed entries go to
+    /// the peer's persistent stream; broadcast entries (`peer == null`) fan out
+    /// over this shard's own peers. Only this shard touches its connection state.
+    fn drainGossipInbox(self: *QuicRuntime, sh: *Shard) void {
+        const a = self.allocator;
+        var batch: std.ArrayList(GossipDelivery) = .empty;
+        defer batch.deinit(a);
+        {
+            sh.gossip_inbox_lock.lock();
+            defer sh.gossip_inbox_lock.unlock();
+            if (sh.gossip_inbox.items.len == 0) return;
+            batch.appendSlice(a, sh.gossip_inbox.items) catch return;
+            sh.gossip_inbox.clearRetainingCapacity();
+        }
+        for (batch.items) |d| {
+            if (d.peer) |peer| {
+                if (!self.shardOwnsConnectionTo(sh, peer)) {
+                    a.free(d.wire);
+                    continue;
+                }
+                self.enqueueGossipFrame(sh, peer, d.wire);
+            } else {
+                self.broadcastToOwnPeers(sh, d.wire);
+                a.free(d.wire);
             }
         }
     }
@@ -2366,9 +2613,8 @@ pub const QuicRuntime = struct {
         };
         slot.* = .{
             .outbound = outbound,
-            .conn_id = self.next_conn_id,
+            .conn_id = self.nextConnId(),
         };
-        self.next_conn_id += 1;
 
         sh.pending_dials.append(a, .{
             .slot = slot,
@@ -2458,9 +2704,7 @@ pub const QuicRuntime = struct {
         };
 
         slot.notified = true;
-        self.host.onConnectionEstablished(slot.conn_id, verified, .outbound, .{}) catch |err| {
-            log.warn("quic_runtime: onConnectionEstablished failed: {s}", .{@errorName(err)});
-        };
+        self.notifyConnEstablished(slot.conn_id, verified, .outbound, .{});
 
         // Tear down any stale gossip publish stream that was bound to a
         // peer-dialed inbound leg (pre-fix builds) before replaying SUBSCRIBE
@@ -2510,11 +2754,8 @@ pub const QuicRuntime = struct {
 
     fn failDial(self: *QuicRuntime, expected_peer: ?identity.PeerId) void {
         const now_ms = self.opts.now_ms_fn();
-        const cid = self.next_conn_id;
-        self.next_conn_id += 1;
-        self.host.onDialFailure(now_ms, cid, expected_peer, .outbound, .{ .err = error.DialFailed }) catch |err| {
-            log.warn("quic_runtime: onDialFailure failed: {s}", .{@errorName(err)});
-        };
+        const cid = self.nextConnId();
+        self.notifyDialFailure(now_ms, cid, expected_peer, .outbound, .{ .err = error.DialFailed });
     }
 
     fn startOutboundRequest(
@@ -2740,9 +2981,7 @@ pub const QuicRuntime = struct {
 
     fn relayHookRelayedConnected(ctx: ?*anyopaque, target: identity.PeerId, conn_id: connection_manager_mod.ConnectionId) void {
         const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
-        self.host.onConnectionEstablished(conn_id, target, .outbound, .{ .via_relay = true }) catch |err| {
-            log.warn("quic_runtime: relayed onConnectionEstablished failed: {s}", .{@errorName(err)});
-        };
+        self.notifyConnEstablished(conn_id, target, .outbound, .{ .via_relay = true });
         self.tryScheduleDcutrFromVirtual(target, conn_id);
     }
 
@@ -2757,9 +2996,7 @@ pub const QuicRuntime = struct {
         sh.relayed_conn_by_peer.put(remote_peer, conn_id) catch {
             log.warn("quic_runtime: relayed_conn_by_peer put failed", .{});
         };
-        self.host.onConnectionEstablished(conn_id, remote_peer, .inbound, .{ .via_relay = true }) catch |err| {
-            log.warn("quic_runtime: inbound relay bridge onConnectionEstablished failed: {s}", .{@errorName(err)});
-        };
+        self.notifyConnEstablished(conn_id, remote_peer, .inbound, .{ .via_relay = true });
         self.tryScheduleDcutrInitiator(remote_peer, conn_id, stop_client);
     }
 
@@ -2803,9 +3040,7 @@ pub const QuicRuntime = struct {
 
     fn relayHookNextConnId(ctx: ?*anyopaque) connection_manager_mod.ConnectionId {
         const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
-        const cid = self.next_conn_id;
-        self.next_conn_id += 1;
-        return cid;
+        return self.nextConnId();
     }
 
     fn relayHookRelayReservation(
@@ -2860,9 +3095,7 @@ pub const QuicRuntime = struct {
         const sh: *Shard = @ptrCast(@alignCast(ctx.?));
         const self = sh.rt;
         _ = sh.relayed_conn_by_peer.remove(peer);
-        self.host.onConnectionEstablished(direct_conn_id, peer, .outbound, .{}) catch |err| {
-            log.warn("quic_runtime: DCUtR direct onConnectionEstablished failed: {s}", .{@errorName(err)});
-        };
+        self.notifyConnEstablished(direct_conn_id, peer, .outbound, .{});
         self.host.swarm.queueEvent(.{ .dcutr_succeeded = .{
             .peer = peer,
             .relayed_conn_id = relayed_conn_id,

@@ -158,12 +158,19 @@ pub const QuicRuntimeOptions = struct {
     /// `[1, 8]` and rounded down to a power of two. `1` reproduces the
     /// single-thread behaviour exactly (mask 0, demux is a no-op router).
     ///
-    /// NOTE: the default is `1` until the cross-shard gossip outbox + per-shard
-    /// hook-queue routing (Phase 3) land — with `> 1` a directed gossip delivery
-    /// or a hook command for a peer owned by a different shard is drained by the
-    /// wrong shard's drive thread and dropped. The N-thread demux/ring/dial-
-    /// routing machinery is wired and active when this is raised; raising it is
-    /// gated on Phase 3.
+    /// NOTE: the default is `1` until the remaining N>1 routing gaps close.
+    /// Landed: the connection-lifecycle coordinator funnel (step 9 — one thread
+    /// touches `connection_manager`) and cross-shard gossip-outbox routing
+    /// (Phase 3 — each directed/broadcast delivery is handed to the shard that
+    /// owns the destination peer's connection). STILL open for `> 1`: (a) the
+    /// hook queue (dial / send_request / send_response_chunk) is drained only by
+    /// shard 0, so a req/resp for a peer owned by another shard is processed on
+    /// the wrong shard; (b) an inbound connection is owned by the shard the demux
+    /// CID-routed it to, which may differ from `hash(peer)&mask` used to route
+    /// gossip/hook work — so gossip/req-resp over an inbound-only leg can land on
+    /// a shard that holds no connection to the peer. Both are the Phase-4
+    /// coordinator-funnel follow-up. The N-thread demux/ring/dial-routing
+    /// machinery is wired and active when this is raised.
     drive_shards: u8 = 1,
     /// Circuit relay v2 server/client (#91).
     relay: RelayRuntimeOptions = .{},
