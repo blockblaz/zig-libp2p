@@ -320,12 +320,29 @@ pub const PersistentGossipStream = struct {
     /// underlying QUIC connection's lifetime; new outbox enqueues are dropped
     /// and the drain loop skips this entry.
     broken: bool = false,
-    /// Queue of `uvarint(len) + RPC protobuf` frames waiting to be flushed
-    /// once the multistream-select handshake completes. Bytes are heap-owned;
-    /// drained in FIFO order. Capped at [`persistent_gossip_outbox_cap`] so a
-    /// peer that never reads cannot make us hold unbounded memory before the
-    /// QUIC keepalive notices and tears down the connection.
+    /// PRIORITY lane: queue of `uvarint(len) + RPC protobuf` frames waiting to
+    /// be flushed once the multistream-select handshake completes. Bytes are
+    /// heap-owned; drained in FIFO order. Capped at
+    /// [`persistent_gossip_outbox_cap`] so a peer that never reads cannot make
+    /// us hold unbounded memory before the QUIC keepalive notices and tears
+    /// down the connection.
+    ///
+    /// This lane carries small, time-sensitive frames (subnet attestations,
+    /// aggregations, control: SUBSCRIBE/GRAFT/PRUNE/IHAVE/IWANT, keepalives) —
+    /// any frame `<= persistent_gossip_priority_max_bytes`. The drain always
+    /// empties this lane FIRST so a multi-MB block sitting in [`outbox_bulk`]
+    /// can never head-of-line-block a tiny attestation that must reach the mesh
+    /// inside its aggregation window. Named `outbox` (not `outbox_priority`) to
+    /// minimize churn to the proven drain loop, which keeps operating on it.
     outbox: std.ArrayList([]u8) = .empty,
+    /// BULK lane: queue of large frames (blocks — any frame
+    /// `> persistent_gossip_priority_max_bytes`). Heap-owned, FIFO, capped at
+    /// [`persistent_gossip_bulk_outbox_cap`] (small — blocks are big and few,
+    /// so drop-oldest sheds stale blocks). Drained AFTER the priority lane is
+    /// empty, and only `persistent_gossip_bulk_drain_budget_bytes` per tick so
+    /// a big block dribbles out in chunks while each tick's fresh attestations
+    /// jump ahead of it on the priority lane.
+    outbox_bulk: std.ArrayList([]u8) = .empty,
     /// Wall-clock time of the most recent successful flush on this stream.
     /// Used by [`maybeSendPersistentGossipKeepalive`] to emit an empty-control
     /// RPC every [`persistent_gossip_keepalive_interval_ms`] when the stream
@@ -362,6 +379,27 @@ pub const PersistentGossipStream = struct {
 /// stream is marked broken. Picked to accommodate ~30 seconds of gossip on a
 /// healthy mainnet topic without unbounded growth on a wedged peer.
 pub const persistent_gossip_outbox_cap: usize = 1024;
+
+/// Size threshold for the two-lane priority outbox: frames whose wire length is
+/// `<=` this go to the PRIORITY lane ([`PersistentGossipStream.outbox`]), larger
+/// frames go to the BULK lane ([`PersistentGossipStream.outbox_bulk`]). 16 KiB
+/// comfortably holds attestations, aggregations, and gossipsub control frames
+/// (typically 100 B – a few KiB) while routing block frames (multi-MB) to the
+/// bulk lane so they cannot HOL-block time-sensitive attestations.
+pub const persistent_gossip_priority_max_bytes: usize = 16 * 1024;
+
+/// Hard cap on queued BULK-lane frames per peer. Small because blocks are big
+/// and few; dropping the OLDEST queued block on overflow sheds stale blocks
+/// (the consensus layer re-syncs missed blocks by root) while keeping the
+/// connection and the priority lane alive.
+pub const persistent_gossip_bulk_outbox_cap: usize = 64;
+
+/// Maximum BULK-lane bytes offered to the transport per drive tick. Bounding
+/// the bulk pass means a multi-MB block dribbles out across several ticks and
+/// each tick's freshly-enqueued attestations (priority lane, drained first)
+/// jump ahead of the block's remaining suffix instead of waiting behind the
+/// whole block.
+pub const persistent_gossip_bulk_drain_budget_bytes: usize = 64 * 1024;
 
 /// Scratch size for coalescing consecutive queued gossip frames into one
 /// MTU-chunked stream write. gossipsub RPC frames are self-delimiting (uvarint

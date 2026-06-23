@@ -285,6 +285,8 @@ pub const Shard = struct {
         while (git.next()) |g| {
             for (g.*.outbox.items) |w| a.free(w);
             g.*.outbox.deinit(a);
+            for (g.*.outbox_bulk.items) |w| a.free(w);
+            g.*.outbox_bulk.deinit(a);
             a.destroy(g.*);
         }
         self.persistent_gossip.deinit();
@@ -2081,8 +2083,32 @@ pub const QuicRuntime = struct {
             self.allocator.free(wire);
             return;
         }
-        if (g.outbox.items.len >= conn_table.persistent_gossip_outbox_cap) {
-            // The outbox is full because this peer's per-stream pending queue is
+        self.enqueueGossipFrameIntoLane(g, peer_str, wire);
+    }
+
+    /// Classify `wire` by size into the two-lane priority outbox and append it,
+    /// applying per-lane drop-oldest on cap. Small/time-sensitive frames
+    /// (attestations, aggregations, gossipsub control:
+    /// `<= persistent_gossip_priority_max_bytes`) go to the PRIORITY lane
+    /// (`g.outbox`), which the drain empties first; larger block frames go to the
+    /// BULK lane (`g.outbox_bulk`), drained only after the priority lane is empty
+    /// and budget-bounded per tick. This stops a multi-MB block from HOL-blocking
+    /// the tiny attestation frames behind it on a single ordered stream. Takes
+    /// ownership of `wire` (freed here on drop/append failure).
+    fn enqueueGossipFrameIntoLane(
+        self: *QuicRuntime,
+        g: *conn_table.PersistentGossipStream,
+        peer_str: []const u8,
+        wire: []u8,
+    ) void {
+        const is_bulk = wire.len > conn_table.persistent_gossip_priority_max_bytes;
+        const lane: *std.ArrayList([]u8) = if (is_bulk) &g.outbox_bulk else &g.outbox;
+        const lane_cap: usize = if (is_bulk)
+            conn_table.persistent_gossip_bulk_outbox_cap
+        else
+            conn_table.persistent_gossip_outbox_cap;
+        if (lane.items.len >= lane_cap) {
+            // The lane is full because this peer's per-stream pending queue is
             // backpressured (transient real-network congestion: cwnd in
             // recovery). Do NOT tear down the connection here — gossip is
             // best-effort, and closing a slow-but-alive peer spirals into
@@ -2093,23 +2119,24 @@ pub const QuicRuntime = struct {
             // — one making NO send progress at all — is still torn down by the
             // `outbox_stuck_since_ms` path in `advancePersistentGossipStreams`,
             // and a dead transport by the QUIC no-ACK/idle reaper.
-            const oldest = g.outbox.orderedRemove(0);
+            const oldest = lane.orderedRemove(0);
             self.allocator.free(oldest);
             const now_ms = self.opts.now_ms_fn();
             if (now_ms - g.outbox_drop_warn_ms >= 5_000) {
                 g.outbox_drop_warn_ms = now_ms;
                 log.warn(
-                    "quic_runtime: persistent gossip outbox cap ({d}) hit for peer={s}; dropping oldest frame (congestion backpressure, conn kept)",
-                    .{ conn_table.persistent_gossip_outbox_cap, peer_str },
+                    "quic_runtime: persistent gossip {s} outbox cap ({d}) hit for peer={s}; dropping oldest frame (congestion backpressure, conn kept)",
+                    .{ if (is_bulk) "bulk" else "priority", lane_cap, peer_str },
                 );
             }
         }
-        log.debug("quic_runtime: gossip frame queued peer={s} wire_bytes={d} outbox_depth={d}", .{
+        log.debug("quic_runtime: gossip frame queued peer={s} wire_bytes={d} lane={s} lane_depth={d}", .{
             peer_str,
             wire.len,
-            g.outbox.items.len + 1,
+            if (is_bulk) "bulk" else "priority",
+            lane.items.len + 1,
         });
-        g.outbox.append(self.allocator, wire) catch {
+        lane.append(self.allocator, wire) catch {
             log.info("quic_runtime: gossip frame dropped peer={s} wire_bytes={d}: outbox append failed", .{
                 peer_str,
                 wire.len,
@@ -2134,6 +2161,8 @@ pub const QuicRuntime = struct {
         g.broken = true;
         for (g.outbox.items) |w| self.allocator.free(w);
         g.outbox.clearRetainingCapacity();
+        for (g.outbox_bulk.items) |w| self.allocator.free(w);
+        g.outbox_bulk.clearRetainingCapacity();
         self.closePeerConnectionForGossipRecovery(sh, peer);
     }
 
@@ -2163,6 +2192,8 @@ pub const QuicRuntime = struct {
         const g = sh.persistent_gossip.fetchRemove(peer) orelse return;
         for (g.value.outbox.items) |w| self.allocator.free(w);
         g.value.outbox.deinit(self.allocator);
+        for (g.value.outbox_bulk.items) |w| self.allocator.free(w);
+        g.value.outbox_bulk.deinit(self.allocator);
         self.allocator.destroy(g.value);
     }
 
@@ -2201,6 +2232,125 @@ pub const QuicRuntime = struct {
             const w = self.buildSubscribeWire(topic) orelse continue;
             self.enqueueGossipFrame(sh, peer, w);
         }
+    }
+
+    /// Drain one outbox lane onto the wire with the proven coalesce +
+    /// partial-accept discipline shared by both the priority and bulk lanes.
+    ///
+    /// Drains via direct chunked `sendChunk` calls (NOT `std.Io.Writer.writeAll`).
+    /// Rationale: when zquic's per-stream pending queue is at its cap it returns
+    /// `accepted == 0` — a *transient* backpressure signal. Routing that through
+    /// `std.Io.Writer` surfaces it as `error.WriteFailed` (writeAll requires all
+    /// bytes accepted), which the previous implementation misinterpreted as the
+    /// stream being unrecoverably broken and dropped the entire outbox + closed
+    /// the underlying QUIC connection. That is the failure mode quinn /
+    /// rust-libp2p deliberately avoid: quinn's `SendStream::poll_write` returns
+    /// `Poll::Pending` on flow-control backpressure and the writer task simply
+    /// suspends until the stream is writable again; the stream is *not* dropped.
+    /// We mirror that by tracking partial-frame progress in the lane head
+    /// (rewriting it to the unsent suffix) and pausing the drain without
+    /// disturbing the stream state. The stream is only marked broken by
+    /// handshake failures, peer-side closures, or a partial-suffix alloc failure
+    /// here (sets `g.broken`; callers must check it after this returns).
+    ///
+    /// `byte_budget` (when non-null) caps the total bytes offered to `sendChunk`
+    /// this call so a multi-MB block (bulk lane) dribbles out across ticks while
+    /// fresh priority-lane frames jump ahead next tick.
+    ///
+    /// Coalescing: gossipsub RPC frames are self-delimiting (uvarint length
+    /// prefix) and the /meshsub stream is a byte stream, so concatenating frames
+    /// is wire-identical to sending them one at a time — but it lets zquic fill
+    /// 1-RTT packets (~a dozen small forwarded attestations each) instead of one
+    /// mostly-empty packet per frame. The offset bookkeeping removes EXACTLY the
+    /// bytes accepted (whole head frames + a suffix rewrite of the straddling
+    /// frame), so a partial accept never corrupts the STREAM layout.
+    fn drainGossipLane(
+        self: *QuicRuntime,
+        sh: *Shard,
+        g: *conn_table.PersistentGossipStream,
+        lane: *std.ArrayList([]u8),
+        byte_budget: ?usize,
+        coalesce_buf: []u8,
+    ) struct { accepted_any: bool, backpressured: bool } {
+        const a = self.allocator;
+        var accepted_any: bool = false;
+        var backpressured: bool = false;
+        var offered: usize = 0;
+        while (lane.items.len > 0) {
+            if (byte_budget) |budget| {
+                if (offered >= budget) break;
+            }
+            var packed_len: usize = 0;
+            var packed_frames: usize = 0;
+            for (lane.items) |fw| {
+                if (fw.len > coalesce_buf.len) break; // oversize: send alone
+                if (packed_len + fw.len > coalesce_buf.len) break; // buffer full
+                @memcpy(coalesce_buf[packed_len..][0..fw.len], fw);
+                packed_len += fw.len;
+                packed_frames += 1;
+            }
+            // A single head frame larger than the scratch buffer is sent on its
+            // own, chunked, referencing the frame directly.
+            var send_slice: []const u8 = if (packed_frames == 0)
+                lane.items[0]
+            else
+                coalesce_buf[0..packed_len];
+            // Respect the per-call byte budget: never offer more than the
+            // remaining budget allows. Offering a prefix is safe — the offset
+            // bookkeeping below removes exactly what was accepted and the
+            // straddling-suffix rewrite leaves the rest queued for next tick.
+            if (byte_budget) |budget| {
+                const remaining = budget - offered;
+                if (send_slice.len > remaining) send_slice = send_slice[0..remaining];
+            }
+
+            var sent: usize = 0;
+            while (sent < send_slice.len) {
+                const n = @min(
+                    quic_raw_stream_io.raw_stream_send_chunk_len,
+                    send_slice.len - sent,
+                );
+                const accepted = g.raw.sendChunk(send_slice[sent..][0..n], false);
+                if (accepted == 0) break;
+                sent += accepted;
+            }
+            if (sent == 0) {
+                backpressured = true;
+                break;
+            }
+            accepted_any = true;
+            offered += sent;
+            g.last_write_ms = self.opts.now_ms_fn();
+
+            // Drop fully-sent head frames; rewrite the straddling frame (if any)
+            // to its unsent suffix.
+            var consumed: usize = 0;
+            while (lane.items.len > 0 and consumed + lane.items[0].len <= sent) {
+                consumed += lane.items[0].len;
+                const done = lane.orderedRemove(0);
+                a.free(done);
+            }
+            if (sent > consumed and lane.items.len > 0) {
+                const fw = lane.items[0];
+                const suffix = a.dupe(u8, fw[sent - consumed ..]) catch {
+                    log.warn(
+                        "quic_runtime: persistent gossip partial-frame suffix alloc failed; marking stream broken",
+                        .{},
+                    );
+                    self.markPersistentGossipBroken(sh, g, "partial_suffix_alloc_failed");
+                    return .{ .accepted_any = accepted_any, .backpressured = backpressured };
+                };
+                a.free(fw);
+                lane.items[0] = suffix;
+            }
+            // Stop if the pending queue did not take everything we offered
+            // (transient backpressure).
+            if (sent < send_slice.len) {
+                backpressured = true;
+                break;
+            }
+        }
+        return .{ .accepted_any = accepted_any, .backpressured = backpressured };
     }
 
     /// Per-tick driver for the persistent /meshsub streams: complete the
@@ -2298,101 +2448,36 @@ pub const QuicRuntime = struct {
             // otherwise the gossipsub RPC bytes would arrive before the
             // peer's responder negotiates `/meshsub/1.1.0` and rust-libp2p's
             // gossipsub codec would see them as a malformed initial frame.
-            if (g.handshake_done and g.outbox.items.len > 0) {
+            if (g.handshake_done and (g.outbox.items.len > 0 or g.outbox_bulk.items.len > 0)) {
                 if (sh.outbound_by_peer.get(g.peer)) |slot| {
                     slot.outbound.client.drainDeferredStreamSends();
                 }
-                // Drain the outbox via direct chunked `sendRawStreamData`
-                // calls (NOT `std.Io.Writer.writeAll`).  Rationale: when
-                // zquic's per-stream pending queue is at its cap it returns
-                // `accepted == 0` from `sendRawStreamData` — a *transient*
-                // backpressure signal.  Routing that through `std.Io.Writer`
-                // surfaces it as `error.WriteFailed` (since writeAll requires
-                // all bytes accepted), which the previous implementation
-                // misinterpreted as the stream being unrecoverably broken
-                // and dropped the entire outbox + closed the underlying QUIC
-                // connection.  That is the same failure mode quinn /
-                // rust-libp2p deliberately avoid: quinn's `SendStream::poll_
-                // write` returns `Poll::Pending` on flow-control backpressure
-                // and the writer task simply suspends until the stream is
-                // writable again; the stream is *not* dropped.  We mirror
-                // that by tracking partial-frame progress in the outbox head
-                // (rewriting it to the unsent suffix) and pausing the drain
-                // without disturbing the stream state.  The stream is only
-                // marked broken by handshake failures or peer-side closures
-                // handled in other code paths.
-                var any_accepted_this_tick: bool = false;
-                while (g.outbox.items.len > 0) {
-                    // Coalesce consecutive queued frames into one MTU-chunked
-                    // write. gossipsub RPC frames are self-delimiting (uvarint
-                    // length prefix) and the /meshsub stream is a byte stream,
-                    // so concatenating frames is wire-identical to sending them
-                    // one at a time — but it lets zquic fill 1-RTT packets (~a
-                    // dozen small forwarded attestations each) instead of one
-                    // mostly-empty packet per frame. That packet-rate cut is
-                    // what keeps the loss detector's in-flight table and the
-                    // single drive loop from saturating once a subnet mesh is
-                    // live. The offset bookkeeping below removes EXACTLY the
-                    // bytes accepted (whole head frames + a suffix rewrite of
-                    // the straddling frame), so a partial accept never corrupts
-                    // the STREAM layout.
-                    var packed_len: usize = 0;
-                    var packed_frames: usize = 0;
-                    for (g.outbox.items) |fw| {
-                        if (fw.len > coalesce_buf.len) break; // oversize: send alone
-                        if (packed_len + fw.len > coalesce_buf.len) break; // buffer full
-                        @memcpy(coalesce_buf[packed_len..][0..fw.len], fw);
-                        packed_len += fw.len;
-                        packed_frames += 1;
-                    }
-                    // A single head frame larger than the scratch buffer is sent
-                    // on its own, chunked, referencing the frame directly.
-                    const send_slice: []const u8 = if (packed_frames == 0)
-                        g.outbox.items[0]
-                    else
-                        coalesce_buf[0..packed_len];
-
-                    var sent: usize = 0;
-                    while (sent < send_slice.len) {
-                        const n = @min(
-                            quic_raw_stream_io.raw_stream_send_chunk_len,
-                            send_slice.len - sent,
-                        );
-                        const accepted = g.raw.sendChunk(send_slice[sent..][0..n], false);
-                        if (accepted == 0) break;
-                        sent += accepted;
-                    }
-                    if (sent == 0) break;
-                    any_accepted_this_tick = true;
-                    g.last_write_ms = self.opts.now_ms_fn();
-
-                    // Drop fully-sent head frames; rewrite the straddling frame
-                    // (if any) to its unsent suffix.
-                    var consumed: usize = 0;
-                    while (g.outbox.items.len > 0 and consumed + g.outbox.items[0].len <= sent) {
-                        consumed += g.outbox.items[0].len;
-                        const done = g.outbox.orderedRemove(0);
-                        a.free(done);
-                    }
-                    if (sent > consumed and g.outbox.items.len > 0) {
-                        const fw = g.outbox.items[0];
-                        const suffix = a.dupe(u8, fw[sent - consumed ..]) catch {
-                            log.warn(
-                                "quic_runtime: persistent gossip partial-frame suffix alloc failed; marking stream broken",
-                                .{},
-                            );
-                            self.markPersistentGossipBroken(sh, g, "partial_suffix_alloc_failed");
-                            break;
-                        };
-                        a.free(fw);
-                        g.outbox.items[0] = suffix;
-                    }
-                    // Stop the tick if the pending queue did not take everything
-                    // we offered (transient backpressure).
-                    if (sent < send_slice.len) break;
-                }
+                // Two-lane drain. The PRIORITY lane (`outbox`: attestations,
+                // aggregations, control) is drained first, unbounded, with the
+                // proven coalesce + partial-accept discipline. The BULK lane
+                // (`outbox_bulk`: blocks) is drained ONLY when the priority lane
+                // is now empty AND was not left backpressured this tick, and is
+                // bounded to `persistent_gossip_bulk_drain_budget_bytes` bytes
+                // offered to the transport so a multi-MB block dribbles out over
+                // several ticks while each tick's fresh attestations (priority
+                // lane, drained first) jump ahead of the block's suffix.
+                const pri = self.drainGossipLane(sh, g, &g.outbox, null, &coalesce_buf);
                 if (g.broken) continue;
-                if (g.outbox.items.len > 0) {
+                var bulk_accepted = false;
+                if (g.outbox.items.len == 0 and !pri.backpressured and g.outbox_bulk.items.len > 0) {
+                    const bres = self.drainGossipLane(
+                        sh,
+                        g,
+                        &g.outbox_bulk,
+                        conn_table.persistent_gossip_bulk_drain_budget_bytes,
+                        &coalesce_buf,
+                    );
+                    if (g.broken) continue;
+                    bulk_accepted = bres.accepted_any;
+                }
+                const any_accepted_this_tick = pri.accepted_any or bulk_accepted;
+                const queued_after = g.outbox.items.len + g.outbox_bulk.items.len;
+                if (queued_after > 0) {
                     // Wedge timer: outbox has frames waiting but the drain
                     // accepted nothing this tick (zquic full per-stream
                     // pending queue). Start (or continue) the stuck clock;
@@ -2412,8 +2497,8 @@ pub const QuicRuntime = struct {
                     else
                         0;
                     log.info(
-                        "quic_runtime: persistent gossip outbox paused peer={s} outbox_frames={d} zquic_pending_bytes={d}",
-                        .{ peerBase58(g.peer, &peer_buf), g.outbox.items.len, backlog },
+                        "quic_runtime: persistent gossip outbox paused peer={s} priority_frames={d} bulk_frames={d} zquic_pending_bytes={d}",
+                        .{ peerBase58(g.peer, &peer_buf), g.outbox.items.len, g.outbox_bulk.items.len, backlog },
                     );
                     if (g.outbox_stuck_since_ms) |since| {
                         const stuck_ms = now_ms - since;
@@ -4652,6 +4737,91 @@ test "appendInboundAccBounded rejects growth past cap" {
     try acc.appendSlice(a, &[_]u8{0} ** (cap - 1));
     try std.testing.expectError(error.PayloadTooLarge, rt.appendInboundAccBounded(&acc, &[_]u8{ 1, 2 }, cap));
     try std.testing.expectEqual(cap - 1, acc.items.len);
+}
+
+fn testZeroNowMs() i64 {
+    return 0;
+}
+
+test "gossip outbox classifies by size into priority/bulk lanes + per-lane drop-oldest" {
+    const a = std.testing.allocator;
+    var rt: QuicRuntime = undefined;
+    rt.allocator = a;
+    rt.opts.now_ms_fn = testZeroNowMs;
+
+    var g: conn_table.PersistentGossipStream = .{
+        .peer = undefined,
+        .stream_id = 0,
+        .raw = undefined,
+    };
+    defer {
+        for (g.outbox.items) |w| a.free(w);
+        g.outbox.deinit(a);
+        for (g.outbox_bulk.items) |w| a.free(w);
+        g.outbox_bulk.deinit(a);
+    }
+
+    const peer_str = "test-peer";
+
+    // One large frame (> priority threshold) -> BULK lane.
+    const big = try a.alloc(u8, conn_table.persistent_gossip_priority_max_bytes + 1);
+    @memset(big, 0xBB);
+    rt.enqueueGossipFrameIntoLane(&g, peer_str, big);
+
+    // Several small frames (<= threshold) -> PRIORITY lane.
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const small = try a.alloc(u8, 100);
+        @memset(small, @intCast(i));
+        rt.enqueueGossipFrameIntoLane(&g, peer_str, small);
+    }
+
+    // Classification: small frames sit in the priority lane (drained first by
+    // advancePersistentGossipStreams), the large block sits in the bulk lane
+    // (drained only after the priority lane empties + budget-bounded), so a
+    // block can never head-of-line-block the time-sensitive attestations.
+    try std.testing.expectEqual(@as(usize, 5), g.outbox.items.len);
+    try std.testing.expectEqual(@as(usize, 1), g.outbox_bulk.items.len);
+    try std.testing.expectEqual(
+        conn_table.persistent_gossip_priority_max_bytes + 1,
+        g.outbox_bulk.items[0].len,
+    );
+
+    // A frame exactly at the threshold stays on the priority lane (boundary).
+    const at_threshold = try a.alloc(u8, conn_table.persistent_gossip_priority_max_bytes);
+    @memset(at_threshold, 0xAA);
+    rt.enqueueGossipFrameIntoLane(&g, peer_str, at_threshold);
+    try std.testing.expectEqual(@as(usize, 6), g.outbox.items.len);
+    try std.testing.expectEqual(@as(usize, 1), g.outbox_bulk.items.len);
+
+    // Bulk-lane drop-oldest: fill the bulk lane to its cap, then one more frame
+    // evicts the OLDEST bulk frame (stale block) — cap holds, conn kept alive.
+    // Tag each big frame's first byte so we can prove FIFO drop-oldest.
+    {
+        var k: usize = 0;
+        while (k < conn_table.persistent_gossip_bulk_outbox_cap - 1) : (k += 1) {
+            const blk = try a.alloc(u8, conn_table.persistent_gossip_priority_max_bytes + 1);
+            @memset(blk, @intCast(k & 0xff));
+            rt.enqueueGossipFrameIntoLane(&g, peer_str, blk);
+        }
+        try std.testing.expectEqual(
+            conn_table.persistent_gossip_bulk_outbox_cap,
+            g.outbox_bulk.items.len,
+        );
+        const oldest_first_byte = g.outbox_bulk.items[0][0];
+        // One more bulk frame: cap stays, the previous oldest is evicted.
+        const overflow = try a.alloc(u8, conn_table.persistent_gossip_priority_max_bytes + 1);
+        @memset(overflow, 0x7E);
+        rt.enqueueGossipFrameIntoLane(&g, peer_str, overflow);
+        try std.testing.expectEqual(
+            conn_table.persistent_gossip_bulk_outbox_cap,
+            g.outbox_bulk.items.len,
+        );
+        // New head is no longer the evicted oldest; new tail is the overflow.
+        try std.testing.expect(g.outbox_bulk.items[0][0] != oldest_first_byte or
+            conn_table.persistent_gossip_bulk_outbox_cap == 1);
+        try std.testing.expectEqual(@as(u8, 0x7E), g.outbox_bulk.items[g.outbox_bulk.items.len - 1][0]);
+    }
 }
 
 test "gossip inbound drain skips oversize frame without drop_stream" {
