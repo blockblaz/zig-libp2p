@@ -120,6 +120,13 @@ pub const Shard = struct {
     outbound_autonat_probes: std.AutoHashMap(u64, *conn_table.OutboundAutonatProbe),
     /// Inbound relay-bridge conn ids for this shard's relayed peers (#205).
     relayed_conn_by_peer: conn_table.RelayedConnIdMap,
+    /// Back-pointer to the owning runtime, so a zquic callback that recovers a
+    /// `*Shard` from its ctx can reach the global state (host, gossipsub,
+    /// counters). Set in `create`.
+    rt: *QuicRuntime = undefined,
+    /// This shard's index (0-based). Used to tag minted CIDs and route work.
+    /// Single shard today → 0.
+    index: u8 = 0,
 
     pub fn init(a: std.mem.Allocator, listener: *quic_endpoint.QuicListener) Shard {
         return .{
@@ -252,7 +259,7 @@ pub const QuicRuntime = struct {
         errdefer a.destroy(self);
 
         const relay_hooks = quic_relay_live.RuntimeHooks{
-            .ctx = self,
+            .ctx = &self.shard,
             .dial_plain = relayHookDialPlain,
             .outbound_client = relayHookOutboundClient,
             .next_bidi_stream = relayHookNextBidiStream,
@@ -263,7 +270,7 @@ pub const QuicRuntime = struct {
             .on_inbound_relay_bridge = relayHookInboundBridge,
         };
         const dcutr_hooks = quic_dcutr_live.RuntimeHooks{
-            .ctx = self,
+            .ctx = &self.shard,
             .now_ms = opts.now_ms_fn,
             .listener_port_v4 = dcutrHookListenerPort,
             .tls_pem_paths = dcutrHookTlsPaths,
@@ -292,6 +299,8 @@ pub const QuicRuntime = struct {
             }, dcutr_hooks),
             .subscribed_topics = std.StringHashMap(void).init(a),
         };
+        self.shard.rt = self;
+        self.shard.index = 0;
 
         const bound = listener.boundUdpPortIpv4() catch null;
         self.bound_port_v4 = bound;
@@ -310,15 +319,15 @@ pub const QuicRuntime = struct {
             self.auto_reserve_pending = true;
         }
 
-        self.autonat_server.dial_back_ctx = self;
+        self.autonat_server.dial_back_ctx = &self.shard;
 
         self.host.setIdentifyPushDispatch(.{
-            .ctx = self,
+            .ctx = &self.shard,
             .dispatch = identifyPushDispatch,
         });
         if (opts.autonat.enable) {
             self.host.setAutonatProbeDispatch(.{
-                .ctx = self,
+                .ctx = &self.shard,
                 .dispatch = autonatProbeDispatch,
             });
         }
@@ -335,9 +344,11 @@ pub const QuicRuntime = struct {
             .dispatch = swarmHookDispatch,
         };
 
-        // Install QUIC lifecycle hooks for inbound stream readiness.
+        // Install QUIC lifecycle hooks for inbound stream readiness. The hook
+        // ctx is the owning `*Shard` (callbacks recover `self` via `sh.rt`) so
+        // each shard's listener routes lifecycle events to its own state.
         listener.lifecycle = .{
-            .ctx = self,
+            .ctx = &self.shard,
             .on_connection_established = onLifecycleConnected,
             .on_connection_closed = onLifecycleClosed,
             .on_inbound_stream_ready = onLifecycleInboundStream,
@@ -613,31 +624,33 @@ pub const QuicRuntime = struct {
     // ── QuicListener lifecycle ─────────────────────────────────────────────
 
     fn onLifecycleConnected(ctx: ?*anyopaque, slot: usize, _: *ZIo.ConnState) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        if (!self.shard.inbound_conn_notified[slot]) {
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const self = sh.rt;
+        if (!sh.inbound_conn_notified[slot]) {
             // We don't yet have the verified peer id (TLS handshake might be
             // freshly complete). Delay onConnectionEstablished until first
             // inbound stream when peer id is available.
-            self.shard.inbound_conn_ids[slot] = self.next_conn_id;
+            sh.inbound_conn_ids[slot] = self.next_conn_id;
             self.next_conn_id += 1;
         }
     }
 
     fn onLifecycleClosed(ctx: ?*anyopaque, slot: usize) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        if (self.shard.inbound_conn_notified[slot]) {
-            const peer = self.shard.inbound_conn_peer[slot] orelse identity.PeerId.random() catch return;
-            const cid = self.shard.inbound_conn_ids[slot];
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const self = sh.rt;
+        if (sh.inbound_conn_notified[slot]) {
+            const peer = sh.inbound_conn_peer[slot] orelse identity.PeerId.random() catch return;
+            const cid = sh.inbound_conn_ids[slot];
             const now_ms = self.opts.now_ms_fn();
             self.host.onConnectionClosed(now_ms, cid, peer, .remote_close) catch |e| {
                 log.warn("quic_runtime: onConnectionClosed failed: {s}", .{@errorName(e)});
             };
-            _ = self.shard.inbound_by_peer.remove(peer);
-            self.destroyPersistentGossipStream(peer);
+            _ = sh.inbound_by_peer.remove(peer);
+            self.destroyPersistentGossipStream(sh, peer);
         }
-        self.shard.inbound_conn_notified[slot] = false;
-        self.shard.inbound_conn_peer[slot] = null;
-        self.shard.inbound_conn_ids[slot] = 0;
+        sh.inbound_conn_notified[slot] = false;
+        sh.inbound_conn_peer[slot] = null;
+        sh.inbound_conn_ids[slot] = 0;
     }
 
     /// Register an established inbound connection with the host exactly once per
@@ -645,20 +658,20 @@ pub const QuicRuntime = struct {
     /// and replay our SUBSCRIBEs so an inbound-only peer learns our topics and
     /// GRAFTs us into its mesh. Shared by the handshake-time poll
     /// (`pollInboundRegistrations`) and the first-inbound-stream fallback.
-    fn notifyInboundEstablished(self: *QuicRuntime, slot: usize, sender: identity.PeerId, conn: *ZIo.ConnState) void {
-        if (slot == inbound_slot_none or self.shard.inbound_conn_notified[slot]) return;
-        self.shard.inbound_conn_notified[slot] = true;
-        self.shard.inbound_conn_peer[slot] = sender;
-        self.shard.inbound_by_peer.put(sender, .{ .slot = slot, .conn = conn }) catch {};
-        if (self.shard.inbound_conn_ids[slot] == 0) {
-            self.shard.inbound_conn_ids[slot] = self.next_conn_id;
+    fn notifyInboundEstablished(self: *QuicRuntime, sh: *Shard, slot: usize, sender: identity.PeerId, conn: *ZIo.ConnState) void {
+        if (slot == inbound_slot_none or sh.inbound_conn_notified[slot]) return;
+        sh.inbound_conn_notified[slot] = true;
+        sh.inbound_conn_peer[slot] = sender;
+        sh.inbound_by_peer.put(sender, .{ .slot = slot, .conn = conn }) catch {};
+        if (sh.inbound_conn_ids[slot] == 0) {
+            sh.inbound_conn_ids[slot] = self.next_conn_id;
             self.next_conn_id += 1;
         }
-        const cid = self.shard.inbound_conn_ids[slot];
+        const cid = sh.inbound_conn_ids[slot];
         self.host.onConnectionEstablished(cid, sender, .inbound, .{}) catch |err| {
             log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
         };
-        self.replaySubscribeToPeer(sender);
+        self.replaySubscribeToPeer(sh, sender);
     }
 
     /// Register inbound connections as soon as the QUIC handshake completes —
@@ -672,11 +685,11 @@ pub const QuicRuntime = struct {
     /// time that further delays that very stream. Polling here closes those mesh
     /// holes and stops the doomed redials. Cheap: a slot scan that only does cert
     /// extraction for connected-but-unregistered inbound slots.
-    fn pollInboundRegistrations(self: *QuicRuntime) void {
+    fn pollInboundRegistrations(self: *QuicRuntime, sh: *Shard) void {
         var slot: usize = 0;
         while (slot < ZIo.MAX_CONNECTIONS) : (slot += 1) {
-            if (self.shard.inbound_conn_notified[slot]) continue;
-            const conn = self.shard.listener.server.conns[slot] orelse continue;
+            if (sh.inbound_conn_notified[slot]) continue;
+            const conn = sh.listener.server.conns[slot] orelse continue;
             if (conn.phase != .connected or conn.draining) continue;
             const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
             const sender = quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn(
@@ -685,7 +698,7 @@ pub const QuicRuntime = struct {
                 null,
                 now_sec,
             ) catch continue; // cert not ready yet / not a libp2p peer — retry next tick
-            self.notifyInboundEstablished(slot, sender, conn);
+            self.notifyInboundEstablished(sh, slot, sender, conn);
         }
     }
 
@@ -698,14 +711,14 @@ pub const QuicRuntime = struct {
     ///
     /// Mirrors the listener-side [`QuicListener.syncSeenFlags`] which fires
     /// [`onLifecycleClosed`] for inbound connections.
-    fn detectOutboundConnectionClose(self: *QuicRuntime) void {
+    fn detectOutboundConnectionClose(self: *QuicRuntime, sh: *Shard) void {
         // Two-pass: collect peers to evict, then mutate the map. Avoids invalidating
         // the iterator on `fetchRemove` and keeps the close handling identical to
         // the inbound path (host callback then destroyPersistentGossipStream).
         var to_close: std.ArrayList(identity.PeerId) = .empty;
         defer to_close.deinit(self.allocator);
 
-        var it = self.shard.outbound_by_peer.iterator();
+        var it = sh.outbound_by_peer.iterator();
         while (it.next()) |entry| {
             const slot = entry.value_ptr.*;
             const conn = &slot.outbound.client.conn;
@@ -725,7 +738,7 @@ pub const QuicRuntime = struct {
         }
 
         for (to_close.items) |peer| {
-            const slot = self.shard.outbound_by_peer.get(peer) orelse continue;
+            const slot = sh.outbound_by_peer.get(peer) orelse continue;
             const cid = slot.conn_id;
             const now_ms = self.opts.now_ms_fn();
             log.warn(
@@ -735,8 +748,8 @@ pub const QuicRuntime = struct {
             self.host.onConnectionClosed(now_ms, cid, peer, .remote_close) catch |e| {
                 log.warn("quic_runtime: outbound onConnectionClosed failed: {s}", .{@errorName(e)});
             };
-            self.destroyPersistentGossipStream(peer);
-            if (self.shard.outbound_by_peer.fetchRemove(peer)) |kv| {
+            self.destroyPersistentGossipStream(sh, peer);
+            if (sh.outbound_by_peer.fetchRemove(peer)) |kv| {
                 kv.value.outbound.deinit();
                 self.allocator.destroy(kv.value);
             }
@@ -750,25 +763,26 @@ pub const QuicRuntime = struct {
         conn: *ZIo.ConnState,
         stream_id: u64,
     ) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        self.startInboundStream(slot, conn, stream_id) catch |err| {
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const self = sh.rt;
+        self.startInboundStream(sh, slot, conn, stream_id) catch |err| {
             log.warn("quic_runtime: startInboundStream failed: {s}", .{@errorName(err)});
         };
     }
 
-    fn startInboundStream(self: *QuicRuntime, slot: usize, conn: *ZIo.ConnState, stream_id: u64) !void {
+    fn startInboundStream(self: *QuicRuntime, sh: *Shard, slot: usize, conn: *ZIo.ConnState, stream_id: u64) !void {
         const ist = try self.allocator.create(conn_table.InboundStream);
         ist.* = .{
             .slot = slot,
             .conn = conn,
             .stream_id = stream_id,
             .raw = .{
-                .server = self.shard.listener.server,
+                .server = sh.listener.server,
                 .conn = conn,
                 .stream_id = stream_id,
             },
         };
-        try self.shard.inbound_streams.append(self.allocator, ist);
+        try sh.inbound_streams.append(self.allocator, ist);
     }
 
     /// Sentinel slot value for [`conn_table.InboundStream.slot`] when the stream arrived on an outbound
@@ -784,7 +798,7 @@ pub const QuicRuntime = struct {
     /// initiated bidi).  The listener lifecycle callback fires only for connections that
     /// zeam accepted, so without this sweep those streams are never added to
     /// `inbound_streams` and ethlambda's gossipsub messages are silently lost.
-    fn dispatchOutboundPeerStreams(self: *QuicRuntime, slot: *conn_table.OutboundConn) void {
+    fn dispatchOutboundPeerStreams(self: *QuicRuntime, sh: *Shard, slot: *conn_table.OutboundConn) void {
         const peer_id = slot.peer_id orelse return;
         const client = slot.outbound.client;
         while (true) {
@@ -799,14 +813,14 @@ pub const QuicRuntime = struct {
                 .conn = &client.conn,
                 .stream_id = sid,
                 .raw = .{
-                    .server = self.shard.listener.server, // placeholder; writes go through .client
+                    .server = sh.listener.server, // placeholder; writes go through .client
                     .conn = &client.conn,
                     .stream_id = sid,
                     .client = client,
                 },
                 .known_peer_id = peer_id,
             };
-            self.shard.inbound_streams.append(self.allocator, ist) catch {
+            sh.inbound_streams.append(self.allocator, ist) catch {
                 self.allocator.destroy(ist);
                 break;
             };
@@ -944,14 +958,14 @@ pub const QuicRuntime = struct {
     /// `drive_inbound_pump_interval_ms` has elapsed since the last pump. Cheap
     /// when called too soon (a clock read + compare). Called from inside the
     /// heavy per-entity loops so no single phase starves inbound ACK I/O.
-    fn maybePumpInbound(self: *QuicRuntime) void {
+    fn maybePumpInbound(self: *QuicRuntime, sh: *Shard) void {
         const now = self.opts.now_ms_fn();
         if (now -% self.last_inbound_pump_ms < drive_inbound_pump_interval_ms) return;
         self.last_inbound_pump_ms = now;
-        if (self.shard.inbound_ring) |*ring| {
-            _ = self.shard.listener.pumpFromRing(ring, inbound_drain_per_call);
+        if (sh.inbound_ring) |*ring| {
+            _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
         } else {
-            _ = self.shard.listener.pumpInbound(&self.pump_buf) catch |err| {
+            _ = sh.listener.pumpInbound(&self.pump_buf) catch |err| {
                 log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
             };
         }
@@ -959,10 +973,14 @@ pub const QuicRuntime = struct {
         // keep getting ACKed through this long phase and don't hit the 60s no-ACK
         // teardown (which also stalls their gossip outbox into dropping
         // attestation frames). Non-reaping, so safe to interleave mid-phase.
-        self.shard.listener.server.flushAppAcks();
+        sh.listener.server.flushAppAcks();
     }
 
     fn driveLoop(self: *QuicRuntime) !void {
+        // The single shard this drive thread owns. With N>1 (step 7) each drive
+        // thread runs this loop over its own `&self.shards[i]`; the per-shard
+        // methods below take `sh` so they operate on that shard's state alone.
+        const sh = &self.shard;
         var recv_buf: [65536]u8 = undefined;
         var work_scratch: std.ArrayList(conn_table.HookWork) = .empty;
         defer work_scratch.deinit(self.allocator);
@@ -973,7 +991,7 @@ pub const QuicRuntime = struct {
             const poll_to: u32 = 5; // short timeout so we can multiplex
             // Drive listener: consume datagrams the demux thread queued, or read
             // the socket inline if the demux thread isn't running (fallback).
-            if (self.shard.inbound_ring) |*ring| {
+            if (sh.inbound_ring) |*ring| {
                 // Brief passive wait when the ring is empty so we don't hot-spin
                 // now that the demux thread (not a blocking poll here) owns the
                 // socket. The demux fills the ring concurrently; we wake within
@@ -985,38 +1003,38 @@ pub const QuicRuntime = struct {
                     var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
                     _ = std.c.nanosleep(&req, &rem);
                 }
-                self.shard.listener.driveFromRing(ring, inbound_drain_per_call);
+                sh.listener.driveFromRing(ring, inbound_drain_per_call);
             } else {
-                self.shard.listener.drive(&recv_buf, poll_to) catch |err| {
+                sh.listener.drive(&recv_buf, poll_to) catch |err| {
                     log.warn("quic_runtime: listener.drive: {s}", .{@errorName(err)});
                 };
             }
             // pollAccept once per loop so the lifecycle callback fires.
-            _ = self.shard.listener.pollAccept();
+            _ = sh.listener.pollAccept();
             // Register inbound conns at handshake completion (mesh membership
             // without waiting for the peer's first stream — closes mesh holes for
             // inbound-only peers and stops the doomed redial storm).
-            self.pollInboundRegistrations();
+            self.pollInboundRegistrations(sh);
             const iter_tL = self.opts.now_ms_fn(); // after listener.drive + pollAccept
 
             // Advance in-flight dials non-blocking. Must run alongside (not
             // instead of) the listener + pollAccept above so two peers dialing
             // each other both accept the other's inbound and complete the
             // handshake instead of mutually wedging in Initial.
-            self.advancePendingDials(&recv_buf);
+            self.advancePendingDials(sh, &recv_buf);
             const iter_tD = self.opts.now_ms_fn(); // after advancePendingDials
 
             // Drive every active outbound, then surface any remote-initiated streams.
             {
-                var it = self.shard.outbound_by_peer.valueIterator();
+                var it = sh.outbound_by_peer.valueIterator();
                 while (it.next()) |v| {
                     v.*.outbound.drive(&recv_buf, 0) catch |err| {
                         log.warn("quic_runtime: outbound.drive: {s}", .{@errorName(err)});
                     };
-                    self.dispatchOutboundPeerStreams(v.*);
+                    self.dispatchOutboundPeerStreams(sh, v.*);
                     // Work budget (#2): keep inbound ACKs flowing while we walk
                     // every outbound conn.
-                    self.maybePumpInbound();
+                    self.maybePumpInbound(sh);
                 }
             }
 
@@ -1026,10 +1044,10 @@ pub const QuicRuntime = struct {
             // kernel receive buffer doesn't overflow (dropping peers' ACKs →
             // "no ACK for 60s" teardowns → mesh churn) while we spend the
             // iteration on outbound conns + stream advancement.
-            if (self.shard.inbound_ring) |*ring| {
-                _ = self.shard.listener.pumpFromRing(ring, inbound_drain_per_call);
+            if (sh.inbound_ring) |*ring| {
+                _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
-                _ = self.shard.listener.pumpInbound(&recv_buf) catch |err| {
+                _ = sh.listener.pumpInbound(&recv_buf) catch |err| {
                     log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
                 };
             }
@@ -1038,12 +1056,12 @@ pub const QuicRuntime = struct {
             // timeout) and surface to the host so connection_manager can redial.
             // Must run AFTER outbound.drive so zquic has processed any inbound packets
             // that triggered the phase transition this tick.
-            self.detectOutboundConnectionClose();
+            self.detectOutboundConnectionClose(sh);
 
             // Drain hook queue.
             self.drainHookWork(&work_scratch);
             for (work_scratch.items) |w| {
-                self.handleHookWork(w) catch |err| {
+                self.handleHookWork(sh, w) catch |err| {
                     log.warn("quic_runtime: hook handler error: {s}", .{@errorName(err)});
                     conn_table.freeHookWork(self.allocator, w);
                 };
@@ -1051,7 +1069,7 @@ pub const QuicRuntime = struct {
             work_scratch.clearRetainingCapacity();
 
             // Advance inbound streams (multistream + framing).
-            self.advanceInboundStreams() catch |err| {
+            self.advanceInboundStreams(sh) catch |err| {
                 log.warn("quic_runtime: advanceInboundStreams: {s}", .{@errorName(err)});
             };
 
@@ -1059,29 +1077,29 @@ pub const QuicRuntime = struct {
 
             // Second interleaved inbound drain (see note above) — stream
             // advancement over a full mesh is the other heavy phase.
-            if (self.shard.inbound_ring) |*ring| {
-                _ = self.shard.listener.pumpFromRing(ring, inbound_drain_per_call);
+            if (sh.inbound_ring) |*ring| {
+                _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
-                _ = self.shard.listener.pumpInbound(&recv_buf) catch |err| {
+                _ = sh.listener.pumpInbound(&recv_buf) catch |err| {
                     log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
                 };
             }
 
             // Advance outbound request streams.
-            self.advanceOutboundRequests() catch |err| {
+            self.advanceOutboundRequests(sh) catch |err| {
                 log.warn("quic_runtime: advanceOutboundRequests: {s}", .{@errorName(err)});
             };
 
             // Advance outbound gossipsub publish streams.
-            self.advanceOutboundPublishes() catch |err| {
+            self.advanceOutboundPublishes(sh) catch |err| {
                 log.warn("quic_runtime: advanceOutboundPublishes: {s}", .{@errorName(err)});
             };
 
-            self.advanceOutboundIdentifyPushes() catch |err| {
+            self.advanceOutboundIdentifyPushes(sh) catch |err| {
                 log.warn("quic_runtime: advanceOutboundIdentifyPushes: {s}", .{@errorName(err)});
             };
 
-            self.advanceOutboundAutonatProbes() catch |err| {
+            self.advanceOutboundAutonatProbes(sh) catch |err| {
                 log.warn("quic_runtime: advanceOutboundAutonatProbes: {s}", .{@errorName(err)});
             };
 
@@ -1102,7 +1120,7 @@ pub const QuicRuntime = struct {
                             }
                         }
                         if (relay_peer) |rp| {
-                            if (self.shard.outbound_by_peer.contains(rp)) {
+                            if (sh.outbound_by_peer.contains(rp)) {
                                 self.relay_live.reserveOnRelay(rp) catch |err| {
                                     log.warn("quic_runtime: auto reserve failed: {s}", .{@errorName(err)});
                                 };
@@ -1114,7 +1132,7 @@ pub const QuicRuntime = struct {
             }
 
             // Advance persistent per-peer /meshsub streams (#183).
-            self.advancePersistentGossipStreams();
+            self.advancePersistentGossipStreams(sh);
             const iter_t3 = self.opts.now_ms_fn(); // after outbound reqs/publishes/gossip drain
 
             // Periodic host ticks (~ every 100ms).
@@ -1124,7 +1142,7 @@ pub const QuicRuntime = struct {
                 self.host.runPeriodicTicks(now_ms) catch |err| {
                     log.warn("quic_runtime: host periodic ticks: {s}", .{@errorName(err)});
                 };
-                self.drainGossipsubOutbox();
+                self.drainGossipsubOutbox(sh);
             }
 
             // Drive-iteration watchdog. A long iteration stops ACKs flowing to
@@ -1141,40 +1159,40 @@ pub const QuicRuntime = struct {
                     iter_t2 - iter_t1,
                     iter_t3 - iter_t2,
                     iter_t4 - iter_t3,
-                    self.shard.outbound_by_peer.count(),
+                    sh.outbound_by_peer.count(),
                 });
             }
         }
     }
 
-    fn handleHookWork(self: *QuicRuntime, w: conn_table.HookWork) !void {
+    fn handleHookWork(self: *QuicRuntime, sh: *Shard, w: conn_table.HookWork) !void {
         switch (w) {
             .dial => |d| {
                 defer self.allocator.free(d.addr);
-                self.handleDial(d.addr, d.expected_peer);
+                self.handleDial(sh, d.addr, d.expected_peer);
             },
             .send_request => |r| {
-                try self.startOutboundRequest(r.peer, r.proto, r.request_id, r.payload);
+                try self.startOutboundRequest(sh, r.peer, r.proto, r.request_id, r.payload);
                 // payload ownership moved into conn_table.OutboundRequest; do NOT free here.
             },
             .send_response_chunk => |r| {
                 defer self.allocator.free(r.chunk);
-                self.handleSendResponseChunk(r.peer, r.request_id, r.chunk);
+                self.handleSendResponseChunk(sh, r.peer, r.request_id, r.chunk);
             },
             .send_end_of_stream => |e| {
-                self.handleEndOfStream(e.peer, e.request_id);
+                self.handleEndOfStream(sh, e.peer, e.request_id);
             },
             .send_error_response => |e| {
-                self.handleEndOfStream(e.peer, e.request_id);
+                self.handleEndOfStream(sh, e.peer, e.request_id);
             },
             .publish => |p| {
                 defer self.allocator.free(p.topic);
                 defer self.allocator.free(p.payload);
-                self.onPublishCommand(p.topic, p.payload);
+                self.onPublishCommand(sh, p.topic, p.payload);
             },
             .subscribe => |s| {
                 defer self.allocator.free(s.topic);
-                self.onSubscribeCommand(s.topic);
+                self.onSubscribeCommand(sh, s.topic);
             },
         }
     }
@@ -1195,7 +1213,7 @@ pub const QuicRuntime = struct {
     /// `RPC.publish[]`), length-prefix it with an unsigned varint per the
     /// libp2p gossipsub wire spec, and open a fresh `/meshsub/1.1.0` stream
     /// to every currently connected peer (outbound dials and inbound accepts).
-    fn onPublishCommand(self: *QuicRuntime, topic: []const u8, payload: []const u8) void {
+    fn onPublishCommand(self: *QuicRuntime, sh: *Shard, topic: []const u8, payload: []const u8) void {
         const a = self.allocator;
 
         // Build the gossipsub `Message` and wrap as `RPC.publish[0]`.
@@ -1232,7 +1250,7 @@ pub const QuicRuntime = struct {
 
         var peers: std.ArrayList(identity.PeerId) = .empty;
         defer peers.deinit(a);
-        self.collectConnectedPeers(&peers) catch return;
+        self.collectConnectedPeers(sh, &peers) catch return;
 
         if (peers.items.len == 0) {
             log.debug("quic_runtime: gossipsub publish topic={s} inner_bytes={d} wire_bytes={d}: no connected peers", .{
@@ -1256,7 +1274,7 @@ pub const QuicRuntime = struct {
             // alongside SUBSCRIBE / GRAFT / PRUNE. See [`conn_table.PersistentGossipStream`]
             // for why opening a per-message stream here would trip rust-libp2p's
             // `MaxInboundSubstreams` cap and kill all gossip on the connection.
-            self.enqueueGossipFrame(peer, wire_dup);
+            self.enqueueGossipFrame(sh, peer, wire_dup);
         }
     }
 
@@ -1264,7 +1282,7 @@ pub const QuicRuntime = struct {
     /// so we replay SUBSCRIBE on every future peer connection, then queue a
     /// SUBSCRIBE RPC into every currently-connected peer's persistent
     /// `/meshsub/1.1.0` stream.
-    fn onSubscribeCommand(self: *QuicRuntime, topic: []const u8) void {
+    fn onSubscribeCommand(self: *QuicRuntime, sh: *Shard, topic: []const u8) void {
         const a = self.allocator;
         if (!self.subscribed_topics.contains(topic)) {
             const owned = a.dupe(u8, topic) catch return;
@@ -1276,20 +1294,20 @@ pub const QuicRuntime = struct {
 
         var peers: std.ArrayList(identity.PeerId) = .empty;
         defer peers.deinit(a);
-        self.collectConnectedPeers(&peers) catch return;
+        self.collectConnectedPeers(sh, &peers) catch return;
         for (peers.items) |peer| {
             const w = self.buildSubscribeWire(topic) orelse continue;
-            self.enqueueGossipFrame(peer, w);
+            self.enqueueGossipFrame(sh, peer, w);
         }
     }
 
-    fn collectConnectedPeers(self: *QuicRuntime, out: *std.ArrayList(identity.PeerId)) !void {
+    fn collectConnectedPeers(self: *QuicRuntime, sh: *Shard, out: *std.ArrayList(identity.PeerId)) !void {
         const a = self.allocator;
-        var it = self.shard.outbound_by_peer.iterator();
+        var it = sh.outbound_by_peer.iterator();
         while (it.next()) |e| try out.append(a, e.key_ptr.*);
-        var iit = self.shard.inbound_by_peer.iterator();
+        var iit = sh.inbound_by_peer.iterator();
         while (iit.next()) |e| {
-            if (self.shard.outbound_by_peer.contains(e.key_ptr.*)) continue;
+            if (sh.outbound_by_peer.contains(e.key_ptr.*)) continue;
             try out.append(a, e.key_ptr.*);
         }
     }
@@ -1326,7 +1344,7 @@ pub const QuicRuntime = struct {
     /// [`onSubscribeCommand`] still records the topic in `subscribed_topics`
     /// so it can be replayed to *future* connections; this fan-out covers
     /// already-connected peers in the same tick.
-    fn drainGossipsubOutbox(self: *QuicRuntime) void {
+    fn drainGossipsubOutbox(self: *QuicRuntime, sh: *Shard) void {
         const a = self.allocator;
         const gs = self.host.gossipsub;
         while (gs.popOutboxDelivery()) |d| {
@@ -1334,7 +1352,7 @@ pub const QuicRuntime = struct {
             if (d.to) |peer| {
                 if (!self.peerHasActiveConnection(peer)) continue;
                 const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
-                self.enqueueGossipFrame(peer, framed);
+                self.enqueueGossipFrame(sh, peer, framed);
             } else {
                 // Broadcast (SUBSCRIBE/UNSUBSCRIBE). Length-prefix once, clone per peer.
                 // Targets every currently-connected peer (outbound and inbound)
@@ -1346,10 +1364,10 @@ pub const QuicRuntime = struct {
                 defer a.free(framed);
                 var peers: std.ArrayList(identity.PeerId) = .empty;
                 defer peers.deinit(a);
-                self.collectConnectedPeers(&peers) catch continue;
+                self.collectConnectedPeers(sh, &peers) catch continue;
                 for (peers.items) |peer| {
                     const dup = a.dupe(u8, framed) catch continue;
-                    self.enqueueGossipFrame(peer, dup);
+                    self.enqueueGossipFrame(sh, peer, dup);
                 }
             }
         }
@@ -1369,8 +1387,8 @@ pub const QuicRuntime = struct {
     /// for the duplicate-connection redial churn. If an outbound dial later
     /// completes, `onVerifiedPeerOutbound` migrates the stream back to the
     /// outbound leg (its `g.raw == .inbound` branch).
-    fn ensurePersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) ?*conn_table.PersistentGossipStream {
-        if (self.shard.persistent_gossip.get(peer)) |existing| return existing;
+    fn ensurePersistentGossipStream(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) ?*conn_table.PersistentGossipStream {
+        if (sh.persistent_gossip.get(peer)) |existing| return existing;
 
         const a = self.allocator;
         var peer_buf: [128]u8 = undefined;
@@ -1379,7 +1397,7 @@ pub const QuicRuntime = struct {
         var stream_id: u64 = undefined;
         var leg: []const u8 = undefined;
 
-        if (self.shard.outbound_by_peer.get(peer)) |slot| {
+        if (sh.outbound_by_peer.get(peer)) |slot| {
             const sid = slot.outbound.nextLocalBidiStream() catch |err| {
                 log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=outbound err={s}", .{
                     peerBase58(peer, &peer_buf),
@@ -1393,12 +1411,12 @@ pub const QuicRuntime = struct {
                 .stream_id = sid,
             } };
             leg = "outbound";
-        } else if (self.shard.inbound_by_peer.get(peer)) |ic| {
+        } else if (sh.inbound_by_peer.get(peer)) |ic| {
             // Server-initiated bidi stream on the inbound leg (zquic #171).
             // `openRawAppStream` registers the receive slot so the peer's
             // multistream-select reply reassembles into it and the connection
             // participates in the reap-pin UAF guard while the stream is live.
-            const sid = self.shard.listener.server.openRawAppStream(ic.conn) catch |err| {
+            const sid = sh.listener.server.openRawAppStream(ic.conn) catch |err| {
                 log.debug("quic_runtime: persistent gossip stream open failed peer={s} direction=inbound err={s}", .{
                     peerBase58(peer, &peer_buf),
                     @errorName(err),
@@ -1407,7 +1425,7 @@ pub const QuicRuntime = struct {
             };
             stream_id = sid;
             raw = .{ .inbound = .{
-                .server = self.shard.listener.server,
+                .server = sh.listener.server,
                 .conn = ic.conn,
                 .stream_id = sid,
             } };
@@ -1422,7 +1440,7 @@ pub const QuicRuntime = struct {
             .stream_id = stream_id,
             .raw = raw,
         };
-        self.shard.persistent_gossip.put(peer, g) catch {
+        sh.persistent_gossip.put(peer, g) catch {
             a.destroy(g);
             return null;
         };
@@ -1434,11 +1452,11 @@ pub const QuicRuntime = struct {
         return g;
     }
 
-    fn enqueueGossipFrame(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) void {
+    fn enqueueGossipFrame(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, wire: []u8) void {
         var peer_buf: [128]u8 = undefined;
         const peer_str = peerBase58(peer, &peer_buf);
 
-        const g = self.ensurePersistentGossipStream(peer) orelse {
+        const g = self.ensurePersistentGossipStream(sh, peer) orelse {
             log.info("quic_runtime: gossip frame dropped peer={s} wire_bytes={d}: no persistent stream", .{
                 peer_str,
                 wire.len,
@@ -1495,7 +1513,7 @@ pub const QuicRuntime = struct {
     /// kept in the map so subsequent enqueues short-circuit instead of opening
     /// a replacement (which would trip rust-libp2p's `MaxInboundSubstreams`).
     /// Also closes the QUIC connection so connection_manager can redial promptly.
-    fn markPersistentGossipBroken(self: *QuicRuntime, g: *conn_table.PersistentGossipStream, reason: []const u8) void {
+    fn markPersistentGossipBroken(self: *QuicRuntime, sh: *Shard, g: *conn_table.PersistentGossipStream, reason: []const u8) void {
         const peer = g.peer;
         var peer_buf: [128]u8 = undefined;
         log.warn("quic_runtime: persistent gossip stream broken peer={s} reason={s} stream_id={d} queued_frames={d}", .{
@@ -1507,32 +1525,33 @@ pub const QuicRuntime = struct {
         g.broken = true;
         for (g.outbox.items) |w| self.allocator.free(w);
         g.outbox.clearRetainingCapacity();
-        self.closePeerConnectionForGossipRecovery(peer);
+        self.closePeerConnectionForGossipRecovery(sh, peer);
     }
 
     /// Tear down the QUIC connection after a persistent `/meshsub` stream wedge.
     /// A broken stream cannot be recreated on the same connection (rust-libp2p
     /// `MaxInboundSubstreams`); closing the connection is the only recovery path.
-    fn closePeerConnectionForGossipRecovery(self: *QuicRuntime, peer: identity.PeerId) void {
+    fn closePeerConnectionForGossipRecovery(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) void {
+        _ = self; // pure per-shard op; receiver kept for call-site uniformity
         var peer_buf: [128]u8 = undefined;
         const peer_str = peerBase58(peer, &peer_buf);
-        if (self.shard.outbound_by_peer.get(peer)) |slot| {
+        if (sh.outbound_by_peer.get(peer)) |slot| {
             if (slot.outbound.client.conn.phase != .closed) {
                 log.warn("quic_runtime: closing outbound QUIC connection for gossip recovery peer={s}", .{peer_str});
                 slot.outbound.closeConnection();
             }
             return;
         }
-        if (self.shard.inbound_by_peer.get(peer)) |ic| {
+        if (sh.inbound_by_peer.get(peer)) |ic| {
             if (ic.conn.phase != .closed) {
                 log.warn("quic_runtime: closing inbound QUIC connection for gossip recovery peer={s}", .{peer_str});
-                self.shard.listener.server.closeConnection(ic.conn, 0, "gossip stream wedge");
+                sh.listener.server.closeConnection(ic.conn, 0, "gossip stream wedge");
             }
         }
     }
 
-    fn destroyPersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {
-        const g = self.shard.persistent_gossip.fetchRemove(peer) orelse return;
+    fn destroyPersistentGossipStream(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) void {
+        const g = sh.persistent_gossip.fetchRemove(peer) orelse return;
         for (g.value.outbox.items) |w| self.allocator.free(w);
         g.value.outbox.deinit(self.allocator);
         self.allocator.destroy(g.value);
@@ -1540,18 +1559,18 @@ pub const QuicRuntime = struct {
 
     /// FIN the wire stream and drop the map entry. Used when migrating gossip
     /// publish from a peer-dialed inbound leg to our outbound dial leg.
-    fn dropPersistentGossipStream(self: *QuicRuntime, peer: identity.PeerId) void {
-        const g = self.shard.persistent_gossip.get(peer) orelse return;
+    fn dropPersistentGossipStream(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) void {
+        const g = sh.persistent_gossip.get(peer) orelse return;
         if (g.handshake_sent and !g.broken) g.raw.finStream();
-        self.destroyPersistentGossipStream(peer);
+        self.destroyPersistentGossipStream(sh, peer);
     }
 
-    fn replaySubscribeToPeer(self: *QuicRuntime, peer: identity.PeerId) void {
+    fn replaySubscribeToPeer(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) void {
         if (self.subscribed_topics.count() == 0) return;
         var t_it = self.subscribed_topics.keyIterator();
         while (t_it.next()) |topic_key| {
             const w = self.buildSubscribeWire(topic_key.*) orelse continue;
-            self.enqueueGossipFrame(peer, w);
+            self.enqueueGossipFrame(sh, peer, w);
         }
     }
 
@@ -1564,13 +1583,13 @@ pub const QuicRuntime = struct {
     /// stream. See [`conn_table.PersistentGossipStream`] for why opening a second
     /// `/meshsub` stream would kill all gossip to the peer instead of
     /// recovering anything.
-    fn advancePersistentGossipStreams(self: *QuicRuntime) void {
+    fn advancePersistentGossipStreams(self: *QuicRuntime, sh: *Shard) void {
         const a = self.allocator;
         // Reused scratch for coalescing each peer's queued gossip frames into
         // MTU-dense stream writes (see the drain loop below).
         var coalesce_buf: [conn_table.persistent_gossip_coalesce_bytes]u8 = undefined;
 
-        var it = self.shard.persistent_gossip.valueIterator();
+        var it = sh.persistent_gossip.valueIterator();
         while (it.next()) |g_ptr| {
             const g = g_ptr.*;
             if (g.broken) continue;
@@ -1597,13 +1616,13 @@ pub const QuicRuntime = struct {
                     .delimited,
                 ) catch {
                     log.warn("quic_runtime: persistent gossip handshake build failed; marking stream broken", .{});
-                    self.markPersistentGossipBroken(g, "handshake_build_failed");
+                    self.markPersistentGossipBroken(sh, g, "handshake_build_failed");
                     continue;
                 };
                 var w = g.raw.writer();
                 std.Io.Writer.writeAll(&w, out.items) catch {
                     log.warn("quic_runtime: persistent gossip handshake write failed; marking stream broken", .{});
-                    self.markPersistentGossipBroken(g, "handshake_write_failed");
+                    self.markPersistentGossipBroken(sh, g, "handshake_write_failed");
                     continue;
                 };
                 std.Io.Writer.flush(&w) catch {};
@@ -1627,14 +1646,14 @@ pub const QuicRuntime = struct {
                         "quic_runtime: persistent gossip handshake failed: {s}; marking stream broken",
                         .{@errorName(err)},
                     );
-                    self.markPersistentGossipBroken(g, "handshake_read_failed");
+                    self.markPersistentGossipBroken(sh, g, "handshake_read_failed");
                     continue;
                 };
                 switch (neg_res) {
                     .incomplete => continue, // wait for the next reply (or just re-offered)
                     .exhausted => {
                         log.warn("quic_runtime: persistent gossip: peer supports no /meshsub version we offer; marking stream broken", .{});
-                        self.markPersistentGossipBroken(g, "no_common_meshsub_version");
+                        self.markPersistentGossipBroken(sh, g, "no_common_meshsub_version");
                         continue;
                     },
                     .accepted => {},
@@ -1651,7 +1670,7 @@ pub const QuicRuntime = struct {
             // peer's responder negotiates `/meshsub/1.1.0` and rust-libp2p's
             // gossipsub codec would see them as a malformed initial frame.
             if (g.handshake_done and g.outbox.items.len > 0) {
-                if (self.shard.outbound_by_peer.get(g.peer)) |slot| {
+                if (sh.outbound_by_peer.get(g.peer)) |slot| {
                     slot.outbound.client.drainDeferredStreamSends();
                 }
                 // Drain the outbox via direct chunked `sendRawStreamData`
@@ -1733,7 +1752,7 @@ pub const QuicRuntime = struct {
                                 "quic_runtime: persistent gossip partial-frame suffix alloc failed; marking stream broken",
                                 .{},
                             );
-                            self.markPersistentGossipBroken(g, "partial_suffix_alloc_failed");
+                            self.markPersistentGossipBroken(sh, g, "partial_suffix_alloc_failed");
                             break;
                         };
                         a.free(fw);
@@ -1759,7 +1778,7 @@ pub const QuicRuntime = struct {
                         g.outbox_stuck_since_ms = null;
                     }
                     var peer_buf: [128]u8 = undefined;
-                    const backlog = if (self.shard.outbound_by_peer.get(g.peer)) |slot|
+                    const backlog = if (sh.outbound_by_peer.get(g.peer)) |slot|
                         slot.outbound.client.pendingStreamSendBacklog()
                     else
                         0;
@@ -1774,7 +1793,7 @@ pub const QuicRuntime = struct {
                                 "quic_runtime: persistent gossip outbox stuck peer={s} for {d}ms (>= {d}ms); declaring wedge to trigger redial",
                                 .{ peerBase58(g.peer, &peer_buf), stuck_ms, conn_table.persistent_gossip_outbox_stuck_timeout_ms },
                             );
-                            self.markPersistentGossipBroken(g, "outbox_stuck_timeout");
+                            self.markPersistentGossipBroken(sh, g, "outbox_stuck_timeout");
                             continue;
                         }
                     }
@@ -1789,7 +1808,7 @@ pub const QuicRuntime = struct {
             // `conn_table.persistent_gossip_keepalive_interval_ms`. See the field doc
             // on [`conn_table.PersistentGossipStream.last_write_ms`] for rationale.
             if (g.handshake_done and !g.broken) {
-                self.maybeSendPersistentGossipKeepalive(g);
+                self.maybeSendPersistentGossipKeepalive(sh, g);
             }
         }
     }
@@ -1806,7 +1825,7 @@ pub const QuicRuntime = struct {
     /// parses it as a valid RPC with no subscriptions, no publishes, and
     /// no control sub-messages — a true no-op at the gossipsub layer that
     /// still produces real bytes on the wire.
-    fn maybeSendPersistentGossipKeepalive(self: *QuicRuntime, g: *conn_table.PersistentGossipStream) void {
+    fn maybeSendPersistentGossipKeepalive(self: *QuicRuntime, sh: *Shard, g: *conn_table.PersistentGossipStream) void {
         const a = self.allocator;
         const now_ms = self.opts.now_ms_fn();
         if (g.last_write_ms == 0) g.last_write_ms = now_ms; // safety net
@@ -1827,7 +1846,7 @@ pub const QuicRuntime = struct {
                 "quic_runtime: persistent gossip keepalive write failed peer={s}; marking stream broken",
                 .{peerBase58(g.peer, &peer_buf)},
             );
-            self.markPersistentGossipBroken(g, "keepalive_write_failed");
+            self.markPersistentGossipBroken(sh, g, "keepalive_write_failed");
             return;
         };
         std.Io.Writer.flush(&w) catch {
@@ -1836,7 +1855,7 @@ pub const QuicRuntime = struct {
                 "quic_runtime: persistent gossip keepalive flush failed peer={s}; marking stream broken",
                 .{peerBase58(g.peer, &peer_buf)},
             );
-            self.markPersistentGossipBroken(g, "keepalive_flush_failed");
+            self.markPersistentGossipBroken(sh, g, "keepalive_flush_failed");
             return;
         };
         g.last_write_ms = now_ms;
@@ -1847,8 +1866,8 @@ pub const QuicRuntime = struct {
         );
     }
 
-    fn startOutboundPublish(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) !void {
-        const slot = self.shard.outbound_by_peer.get(peer) orelse return error.NotConnected;
+    fn startOutboundPublish(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, wire: []u8) !void {
+        const slot = sh.outbound_by_peer.get(peer) orelse return error.NotConnected;
         const sid = try slot.outbound.nextLocalBidiStream();
         const pub_id = self.next_publish_id;
         self.next_publish_id += 1;
@@ -1863,11 +1882,11 @@ pub const QuicRuntime = struct {
             } },
             .wire = wire,
         };
-        try self.shard.outbound_publishes.put(pub_id, op);
+        try sh.outbound_publishes.put(pub_id, op);
     }
 
-    fn startInboundPublish(self: *QuicRuntime, peer: identity.PeerId, wire: []u8) !void {
-        const ic = self.shard.inbound_by_peer.get(peer) orelse return error.NotConnected;
+    fn startInboundPublish(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, wire: []u8) !void {
+        const ic = sh.inbound_by_peer.get(peer) orelse return error.NotConnected;
         const sid = try ZIo.rawAllocateNextLocalBidiStream(ic.conn);
         const pub_id = self.next_publish_id;
         self.next_publish_id += 1;
@@ -1877,36 +1896,39 @@ pub const QuicRuntime = struct {
             .peer = peer,
             .stream_id = sid,
             .raw = .{ .inbound = .{
-                .server = self.shard.listener.server,
+                .server = sh.listener.server,
                 .conn = ic.conn,
                 .stream_id = sid,
             } },
             .wire = wire,
         };
-        try self.shard.outbound_publishes.put(pub_id, op);
+        try sh.outbound_publishes.put(pub_id, op);
     }
 
     fn identifyPushDispatch(ctx: *anyopaque, peer: identity.PeerId) void {
-        const rt: *QuicRuntime = @ptrCast(@alignCast(ctx));
-        rt.startOutboundIdentifyPush(peer) catch |err| {
+        const sh: *Shard = @ptrCast(@alignCast(ctx));
+        const rt = sh.rt;
+        rt.startOutboundIdentifyPush(sh, peer) catch |err| {
             log.warn("quic_runtime: startOutboundIdentifyPush failed: {s}", .{@errorName(err)});
         };
     }
 
     fn autonatProbeDispatch(ctx: *anyopaque, peer: identity.PeerId) void {
-        const rt: *QuicRuntime = @ptrCast(@alignCast(ctx));
-        rt.startOutboundAutonatProbe(peer) catch |err| {
+        const sh: *Shard = @ptrCast(@alignCast(ctx));
+        const rt = sh.rt;
+        rt.startOutboundAutonatProbe(sh, peer) catch |err| {
             log.warn("quic_runtime: startOutboundAutonatProbe failed: {s}", .{@errorName(err)});
         };
     }
 
     fn autonatDialBack(ctx: ?*anyopaque, addr_bytes: []const u8, nonce: u64) autonat_mod.DialBackResult {
         _ = nonce;
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const self = sh.rt;
         // Real reachability check: only report `.ok` if the dial-back actually
         // connects, otherwise `.dial_error`. Returning `.ok` unconditionally
         // would make us a server that always votes "reachable" (#206).
-        return if (self.dialBackProbe(addr_bytes)) .ok else .dial_error;
+        return if (self.dialBackProbe(sh, addr_bytes)) .ok else .dial_error;
     }
 
     /// AutoNAT v1 dial-back deadline (#206). Bounded short because this blocks
@@ -1917,7 +1939,7 @@ pub const QuicRuntime = struct {
     /// completes within the deadline. The probe connection is always torn down
     /// — it is never retained as a peer. Any parse/dial error returns false so
     /// we never falsely claim reachability (#206).
-    fn dialBackProbe(self: *QuicRuntime, addr_str: []const u8) bool {
+    fn dialBackProbe(self: *QuicRuntime, sh: *Shard, addr_str: []const u8) bool {
         const a = self.allocator;
         var ma = multiaddr.Multiaddr.fromString(a, addr_str) catch return false;
         defer ma.deinit();
@@ -1944,10 +1966,10 @@ pub const QuicRuntime = struct {
             // Keep the listener drained so its TLS handshake responses move. Use
             // the demux ring when present — reading the socket inline here would
             // race the demux thread for datagrams.
-            if (self.shard.inbound_ring) |*ring| {
-                self.shard.listener.driveFromRing(ring, inbound_drain_per_call);
+            if (sh.inbound_ring) |*ring| {
+                sh.listener.driveFromRing(ring, inbound_drain_per_call);
             } else {
-                self.shard.listener.drive(&recv_buf, 0) catch {};
+                sh.listener.drive(&recv_buf, 0) catch {};
             }
             if (outbound.client.conn.phase == .connected) return true;
             if (self.shutdown_requested.load(.acquire)) return false;
@@ -1966,14 +1988,14 @@ pub const QuicRuntime = struct {
         };
     }
 
-    fn startOutboundAutonatProbe(self: *QuicRuntime, peer: identity.PeerId) !void {
+    fn startOutboundAutonatProbe(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) !void {
         const probe = self.host.takeAutonatProbeForPeer(peer) orelse return;
         // We took ownership of the probe message; always free it (we dup into
         // the long-lived conn_table.OutboundAutonatProbe below). `defer` — not `errdefer`
         // after an explicit free — avoids the double-free on a failed `put`.
         defer self.host.freeAutonatProbeMessage(probe.wire_message);
 
-        const opened = try self.openPushStreamForPeer(peer);
+        const opened = try self.openPushStreamForPeer(sh, peer);
 
         const probe_wire = try self.allocator.dupe(u8, probe.wire_message);
         errdefer self.allocator.free(probe_wire);
@@ -1988,7 +2010,7 @@ pub const QuicRuntime = struct {
         };
 
         const probe_id = self.next_autonat_probe_id;
-        try self.shard.outbound_autonat_probes.put(probe_id, op);
+        try sh.outbound_autonat_probes.put(probe_id, op);
         self.next_autonat_probe_id += 1;
     }
 
@@ -2060,8 +2082,9 @@ pub const QuicRuntime = struct {
         raw: conn_table.PublishBidiStream,
     };
 
-    fn openPushStreamForPeer(self: *QuicRuntime, peer: identity.PeerId) !OpenedPushStream {
-        if (self.shard.outbound_by_peer.get(peer)) |slot| {
+    fn openPushStreamForPeer(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) !OpenedPushStream {
+        _ = self; // pure per-shard op; receiver kept for call-site uniformity
+        if (sh.outbound_by_peer.get(peer)) |slot| {
             const sid = try slot.outbound.nextLocalBidiStream();
             return .{
                 .stream_id = sid,
@@ -2071,12 +2094,12 @@ pub const QuicRuntime = struct {
                 } },
             };
         }
-        if (self.shard.inbound_by_peer.get(peer)) |ic| {
-            const sid = try self.shard.listener.server.openRawAppStream(ic.conn);
+        if (sh.inbound_by_peer.get(peer)) |ic| {
+            const sid = try sh.listener.server.openRawAppStream(ic.conn);
             return .{
                 .stream_id = sid,
                 .raw = .{ .inbound = .{
-                    .server = self.shard.listener.server,
+                    .server = sh.listener.server,
                     .conn = ic.conn,
                     .stream_id = sid,
                 } },
@@ -2085,8 +2108,8 @@ pub const QuicRuntime = struct {
         return error.NotConnected;
     }
 
-    fn startOutboundIdentifyPush(self: *QuicRuntime, peer: identity.PeerId) !void {
-        const opened = self.openPushStreamForPeer(peer) catch |err| switch (err) {
+    fn startOutboundIdentifyPush(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) !void {
+        const opened = self.openPushStreamForPeer(sh, peer) catch |err| switch (err) {
             error.NotConnected => return,
             else => return err,
         };
@@ -2101,10 +2124,10 @@ pub const QuicRuntime = struct {
             .raw = opened.raw,
             .wire = wire,
         };
-        try self.shard.outbound_identify_pushes.put(push_id, op);
+        try sh.outbound_identify_pushes.put(push_id, op);
     }
 
-    fn handleDial(self: *QuicRuntime, addr_str: []const u8, expected_peer: ?identity.PeerId) void {
+    fn handleDial(self: *QuicRuntime, sh: *Shard, addr_str: []const u8, expected_peer: ?identity.PeerId) void {
         const a = self.allocator;
 
         if (quic_relay_live.LiveRelay.isCircuitDialAddr(addr_str)) {
@@ -2134,10 +2157,10 @@ pub const QuicRuntime = struct {
             // also matched inbound-only state and silently short-circuited
             // every connection_manager redial-on-outbound-death, leaving
             // gossip permanently broken to the affected peer.
-            if (self.shard.outbound_by_peer.contains(ep)) return;
+            if (sh.outbound_by_peer.contains(ep)) return;
             // A dial to this peer is already advancing in `pending_dials`;
             // don't open a second QUIC connection for it.
-            if (self.hasPendingDial(ep)) return;
+            if (self.hasPendingDial(sh, ep)) return;
         }
 
         var ma = multiaddr.Multiaddr.fromString(a, addr_str) catch |err| {
@@ -2183,7 +2206,7 @@ pub const QuicRuntime = struct {
         };
         self.next_conn_id += 1;
 
-        self.shard.pending_dials.append(a, .{
+        sh.pending_dials.append(a, .{
             .slot = slot,
             .expected_peer = expected_peer,
             .deadline_ms = self.opts.now_ms_fn() + dial_handshake_timeout_ms,
@@ -2198,8 +2221,9 @@ pub const QuicRuntime = struct {
     /// True when an outbound dial to `ep` is already in flight (handshake not
     /// yet complete). Mirrors the `outbound_by_peer.contains` dedupe but for
     /// the pre-`.connected` window.
-    fn hasPendingDial(self: *QuicRuntime, ep: identity.PeerId) bool {
-        for (self.shard.pending_dials.items) |pd| {
+    fn hasPendingDial(self: *QuicRuntime, sh: *Shard, ep: identity.PeerId) bool {
+        _ = self; // pure per-shard op; receiver kept for call-site uniformity
+        for (sh.pending_dials.items) |pd| {
             if (pd.expected_peer) |p| {
                 if (p.eql(&ep)) return true;
             }
@@ -2210,28 +2234,28 @@ pub const QuicRuntime = struct {
     /// Non-blocking driver for in-flight dials. Called once per `driveLoop`
     /// tick. Advances each pending handshake; promotes connected dials into
     /// `outbound_by_peer`, and abandons dials that miss their deadline.
-    fn advancePendingDials(self: *QuicRuntime, recv_buf: []u8) void {
+    fn advancePendingDials(self: *QuicRuntime, sh: *Shard, recv_buf: []u8) void {
         const now = self.opts.now_ms_fn();
         const shutting_down = self.shutdown_requested.load(.acquire);
         var i: usize = 0;
-        while (i < self.shard.pending_dials.items.len) {
-            const pd = self.shard.pending_dials.items[i];
+        while (i < sh.pending_dials.items.len) {
+            const pd = sh.pending_dials.items[i];
             pd.slot.outbound.drive(recv_buf, 0) catch {};
             if (pd.slot.outbound.client.conn.phase == .connected) {
-                _ = self.shard.pending_dials.swapRemove(i);
-                self.promoteDial(pd);
+                _ = sh.pending_dials.swapRemove(i);
+                self.promoteDial(sh, pd);
                 continue; // swapRemove moved the tail element into slot `i`.
             }
             if (shutting_down) {
                 // Quiet teardown: no warn, no failDial event during shutdown.
-                _ = self.shard.pending_dials.swapRemove(i);
+                _ = sh.pending_dials.swapRemove(i);
                 pd.slot.outbound.deinit();
                 self.allocator.destroy(pd.slot);
                 continue;
             }
             if (now >= pd.deadline_ms) {
-                _ = self.shard.pending_dials.swapRemove(i);
-                self.failPendingDial(pd);
+                _ = sh.pending_dials.swapRemove(i);
+                self.failPendingDial(sh, pd);
                 continue;
             }
             i += 1;
@@ -2241,7 +2265,7 @@ pub const QuicRuntime = struct {
     /// A pending dial reached `phase == .connected`: verify the remote peer id
     /// from its TLS leaf, register it in `outbound_by_peer`, fire
     /// `onConnectionEstablished`, and replay our SUBSCRIBE state onto it.
-    fn promoteDial(self: *QuicRuntime, pd: PendingDial) void {
+    fn promoteDial(self: *QuicRuntime, sh: *Shard, pd: PendingDial) void {
         const a = self.allocator;
         const slot = pd.slot;
         const expected_peer = pd.expected_peer;
@@ -2262,7 +2286,7 @@ pub const QuicRuntime = struct {
         };
 
         slot.peer_id = verified;
-        self.shard.outbound_by_peer.put(verified, slot) catch {
+        sh.outbound_by_peer.put(verified, slot) catch {
             slot.outbound.deinit();
             a.destroy(slot);
             self.failDial(expected_peer);
@@ -2277,27 +2301,27 @@ pub const QuicRuntime = struct {
         // Tear down any stale gossip publish stream that was bound to a
         // peer-dialed inbound leg (pre-fix builds) before replaying SUBSCRIBE
         // on this outbound dial leg.
-        if (self.shard.persistent_gossip.get(verified)) |g| {
+        if (sh.persistent_gossip.get(verified)) |g| {
             if (g.raw == .inbound) {
                 var peer_buf: [128]u8 = undefined;
                 log.warn(
                     "quic_runtime: migrating persistent gossip from inbound to outbound leg peer={s}",
                     .{peerBase58(verified, &peer_buf)},
                 );
-                self.dropPersistentGossipStream(verified);
+                self.dropPersistentGossipStream(sh, verified);
             }
         }
 
         // SUBSCRIBE replay rides the outbound dial leg only (see
         // `ensurePersistentGossipStream`). Inbound notification may arrive
         // before our dial completes; defer gossip wire setup until then.
-        self.replaySubscribeToPeer(verified);
+        self.replaySubscribeToPeer(sh, verified);
     }
 
     /// A pending dial missed its handshake deadline. Emit one warn with the
     /// stalled phase (so packet captures / zquic logs aren't the only signal
     /// for cross-impl TLS gaps), tear it down, and surface the failure.
-    fn failPendingDial(self: *QuicRuntime, pd: PendingDial) void {
+    fn failPendingDial(self: *QuicRuntime, sh: *Shard, pd: PendingDial) void {
         const a = self.allocator;
         var peer_buf: [128]u8 = undefined;
         const peer_str: []const u8 = if (pd.expected_peer) |p|
@@ -2315,7 +2339,7 @@ pub const QuicRuntime = struct {
             // inbound-only state must NOT swallow the dial failure, otherwise
             // connection_manager keeps `dial_inflight=true` forever and never
             // retries the outbound we still need.
-            if (self.shard.outbound_by_peer.contains(ep)) return;
+            if (sh.outbound_by_peer.contains(ep)) return;
         }
         self.failDial(pd.expected_peer);
     }
@@ -2331,6 +2355,7 @@ pub const QuicRuntime = struct {
 
     fn startOutboundRequest(
         self: *QuicRuntime,
+        sh: *Shard,
         peer: identity.PeerId,
         proto: protocol_mod.LeanSupportedProtocol,
         request_id: u64,
@@ -2345,19 +2370,19 @@ pub const QuicRuntime = struct {
         // which on a full-mesh devnet is most peers, breaking block-by-root sync.
         var sid: u64 = undefined;
         const raw: conn_table.PublishBidiStream = blk: {
-            if (self.shard.outbound_by_peer.get(peer)) |slot| {
+            if (sh.outbound_by_peer.get(peer)) |slot| {
                 sid = slot.outbound.nextLocalBidiStream() catch |err| {
                     self.failOutboundRequestStart(peer, request_id, payload, error.IoError, "nextLocalBidiStream", err);
                     return;
                 };
                 break :blk .{ .outbound = .{ .client = slot.outbound.client, .stream_id = sid } };
             }
-            if (self.shard.inbound_by_peer.get(peer)) |ic| {
-                sid = self.shard.listener.server.openRawAppStream(ic.conn) catch |err| {
+            if (sh.inbound_by_peer.get(peer)) |ic| {
+                sid = sh.listener.server.openRawAppStream(ic.conn) catch |err| {
                     self.failOutboundRequestStart(peer, request_id, payload, error.IoError, "openRawAppStream", err);
                     return;
                 };
-                break :blk .{ .inbound = .{ .server = self.shard.listener.server, .conn = ic.conn, .stream_id = sid } };
+                break :blk .{ .inbound = .{ .server = sh.listener.server, .conn = ic.conn, .stream_id = sid } };
             }
             // Genuinely no connection to this peer in either direction.
             self.failOutboundRequestStart(peer, request_id, payload, error.Disconnected, "no conn to peer", null);
@@ -2373,7 +2398,7 @@ pub const QuicRuntime = struct {
             .raw = raw,
             .payload = payload,
         };
-        try self.shard.outbound_requests.put(request_id, req);
+        try sh.outbound_requests.put(request_id, req);
     }
 
     /// Free the request payload and surface an `rpc_error_response` when a
@@ -2400,12 +2425,12 @@ pub const QuicRuntime = struct {
         } }) catch {};
     }
 
-    fn handleSendResponseChunk(self: *QuicRuntime, peer: identity.PeerId, request_id: u64, chunk: []const u8) void {
+    fn handleSendResponseChunk(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, request_id: u64, chunk: []const u8) void {
         _ = peer;
         // Look up channel via request_id (`stream_request_id` == request_id
         // for inbound channels). Iterate channel_to_inbound to find a match.
         var found: ?*conn_table.InboundStream = null;
-        var it = self.shard.channel_to_inbound.iterator();
+        var it = sh.channel_to_inbound.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.*.request_id_for_channel == request_id) {
                 found = e.value_ptr.*;
@@ -2432,12 +2457,13 @@ pub const QuicRuntime = struct {
         std.Io.Writer.flush(&w) catch {};
     }
 
-    fn handleEndOfStream(self: *QuicRuntime, peer: identity.PeerId, request_id: u64) void {
+    fn handleEndOfStream(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, request_id: u64) void {
+        _ = self; // pure per-shard op; receiver kept for call-site uniformity
         _ = peer;
         // Find the inbound stream and close it (send a fin via 0-byte STREAM frame).
         var found_key: ?u64 = null;
         var found_stream: ?*conn_table.InboundStream = null;
-        var it = self.shard.channel_to_inbound.iterator();
+        var it = sh.channel_to_inbound.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.*.request_id_for_channel == request_id) {
                 found_key = e.key_ptr.*;
@@ -2454,7 +2480,7 @@ pub const QuicRuntime = struct {
 
         // Drop from channel map; advanceInboundStreams releases the zquic
         // raw-app slot once the peer FINs (see ch4r10t33r/zquic#149).
-        if (found_key) |k| _ = self.shard.channel_to_inbound.remove(k);
+        if (found_key) |k| _ = sh.channel_to_inbound.remove(k);
     }
 
     fn appendInboundAccBounded(
@@ -2468,8 +2494,8 @@ pub const QuicRuntime = struct {
         try list.appendSlice(self.allocator, new_bytes);
     }
 
-    fn removeInboundStreamAt(self: *QuicRuntime, index: usize) void {
-        const ist = self.shard.inbound_streams.items[index];
+    fn removeInboundStreamAt(self: *QuicRuntime, sh: *Shard, index: usize) void {
+        const ist = sh.inbound_streams.items[index];
         // Release the zquic-side raw_app slot so the connection's 64-slot
         // table doesn't fill up.  Without this, the libp2p
         // per-message-stream gossipsub pattern (each publish opens a fresh
@@ -2477,14 +2503,14 @@ pub const QuicRuntime = struct {
         // of normal traffic and every subsequent inbound STREAM frame is
         // silently dropped by zquic.  See ch4r10t33r/zquic#149.
         _ = ist.raw.release(self.allocator);
-        if (ist.channel_id) |cid| _ = self.shard.channel_to_inbound.remove(cid);
+        if (ist.channel_id) |cid| _ = sh.channel_to_inbound.remove(cid);
         ist.req_acc.deinit(self.allocator);
         ist.gossip_acc.deinit(self.allocator);
         ist.relay_acc.deinit(self.allocator);
         ist.ms_acc.deinit(self.allocator);
         ist.ms_tail.deinit(self.allocator);
         self.allocator.destroy(ist);
-        _ = self.shard.inbound_streams.swapRemove(index);
+        _ = sh.inbound_streams.swapRemove(index);
     }
 
     fn tryTakeLengthPrefixedFrame(acc: []const u8, max_payload: usize) ?struct { frame: []const u8, total: usize } {
@@ -2524,31 +2550,32 @@ pub const QuicRuntime = struct {
     // ── Relay / DCUtR runtime hooks ─────────────────────────────────────────
 
     fn relayHookDialPlain(ctx: ?*anyopaque, addr: []const u8, expected: ?identity.PeerId) bool {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        self.handleDial(addr, expected);
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const self = sh.rt;
+        self.handleDial(sh, addr, expected);
         // Dials are now non-blocking: a freshly-initiated dial sits in
         // `pending_dials` until its handshake completes. The relay state
         // machine's `.hop_handshake` phase already polls `outbound_client`
         // until the connection appears, so "dial initiated" (pending) is
         // success here; only a dial that failed to even start is a failure.
-        if (expected) |ep| return self.shard.outbound_by_peer.contains(ep) or self.hasPendingDial(ep);
+        if (expected) |ep| return sh.outbound_by_peer.contains(ep) or self.hasPendingDial(sh, ep);
         return true;
     }
 
     fn relayHookOutboundClient(ctx: ?*anyopaque, peer: identity.PeerId) ?*ZIo.Client {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        const slot = self.shard.outbound_by_peer.get(peer) orelse return null;
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const slot = sh.outbound_by_peer.get(peer) orelse return null;
         return slot.outbound.client;
     }
 
     fn relayHookNextBidiStream(ctx: ?*anyopaque, peer: identity.PeerId) ?u64 {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        const slot = self.shard.outbound_by_peer.get(peer) orelse return null;
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const slot = sh.outbound_by_peer.get(peer) orelse return null;
         return slot.outbound.nextLocalBidiStream() catch null;
     }
 
     fn relayHookRelayedConnected(ctx: ?*anyopaque, target: identity.PeerId, conn_id: connection_manager_mod.ConnectionId) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
         self.host.onConnectionEstablished(conn_id, target, .outbound, .{ .via_relay = true }) catch |err| {
             log.warn("quic_runtime: relayed onConnectionEstablished failed: {s}", .{@errorName(err)});
         };
@@ -2561,8 +2588,9 @@ pub const QuicRuntime = struct {
         conn_id: connection_manager_mod.ConnectionId,
         stop_client: *ZIo.Client,
     ) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        self.shard.relayed_conn_by_peer.put(remote_peer, conn_id) catch {
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const self = sh.rt;
+        sh.relayed_conn_by_peer.put(remote_peer, conn_id) catch {
             log.warn("quic_runtime: relayed_conn_by_peer put failed", .{});
         };
         self.host.onConnectionEstablished(conn_id, remote_peer, .inbound, .{ .via_relay = true }) catch |err| {
@@ -2599,18 +2627,18 @@ pub const QuicRuntime = struct {
         };
     }
 
-    fn relayedConnIdForPeer(self: *QuicRuntime, peer: identity.PeerId) connection_manager_mod.ConnectionId {
+    fn relayedConnIdForPeer(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId) connection_manager_mod.ConnectionId {
         if (self.relay_live.relay_virtual.get(peer)) |vc| return vc.conn_id;
-        return self.shard.relayed_conn_by_peer.get(peer) orelse 0;
+        return sh.relayed_conn_by_peer.get(peer) orelse 0;
     }
 
     fn relayHookRelayedDialFailed(ctx: ?*anyopaque, target: ?identity.PeerId) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
         self.failDial(target);
     }
 
     fn relayHookNextConnId(ctx: ?*anyopaque) connection_manager_mod.ConnectionId {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
         const cid = self.next_conn_id;
         self.next_conn_id += 1;
         return cid;
@@ -2622,7 +2650,7 @@ pub const QuicRuntime = struct {
         kind: quic_relay_live.ReservationEventKind,
         expire_unix: ?u64,
     ) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
         const swarm_kind: swarm_mod.RelayReservationKind = switch (kind) {
             .acquired => .acquired,
             .refreshed => .refreshed,
@@ -2638,12 +2666,12 @@ pub const QuicRuntime = struct {
     }
 
     fn dcutrHookListenerPort(ctx: ?*anyopaque) ?u16 {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
         return self.bound_port_v4;
     }
 
     fn dcutrHookTlsPaths(ctx: ?*anyopaque) quic_dcutr_live.TlsPemRef {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
         return switch (self.tls_pem_resolved) {
             .paths => |p| .{ .cert = p.cert_path, .key = p.key_path },
             .bytes => |b| .{ .cert = b.cert_pem, .key = b.key_pem },
@@ -2655,7 +2683,7 @@ pub const QuicRuntime = struct {
     }
 
     fn dcutrHookUsePemBytes(ctx: ?*anyopaque) bool {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
         return self.tls_pem_resolved == .bytes;
     }
 
@@ -2665,8 +2693,9 @@ pub const QuicRuntime = struct {
         relayed_conn_id: connection_manager_mod.ConnectionId,
         direct_conn_id: connection_manager_mod.ConnectionId,
     ) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        _ = self.shard.relayed_conn_by_peer.remove(peer);
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const self = sh.rt;
+        _ = sh.relayed_conn_by_peer.remove(peer);
         self.host.onConnectionEstablished(direct_conn_id, peer, .outbound, .{}) catch |err| {
             log.warn("quic_runtime: DCUtR direct onConnectionEstablished failed: {s}", .{@errorName(err)});
         };
@@ -2685,7 +2714,7 @@ pub const QuicRuntime = struct {
         relayed_conn_id: connection_manager_mod.ConnectionId,
         reason: quic_dcutr_live.FailReason,
     ) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
+        const self = (@as(*Shard, @ptrCast(@alignCast(ctx.?)))).rt;
         const swarm_reason: swarm_mod.DcutrFailReason = switch (reason) {
             .exchange_failed => .exchange_failed,
             .punch_failed => .punch_failed,
@@ -2701,8 +2730,9 @@ pub const QuicRuntime = struct {
     }
 
     fn dcutrHookCloseRelayed(ctx: ?*anyopaque, peer: identity.PeerId) void {
-        const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        _ = self.shard.relayed_conn_by_peer.remove(peer);
+        const sh: *Shard = @ptrCast(@alignCast(ctx.?));
+        const self = sh.rt;
+        _ = sh.relayed_conn_by_peer.remove(peer);
         if (self.relay_live.relay_virtual.fetchRemove(peer)) |kv| {
             self.allocator.destroy(kv.value);
         }
@@ -2769,15 +2799,15 @@ pub const QuicRuntime = struct {
         return self.identify_reply_wire.?;
     }
 
-    fn advanceInboundStreams(self: *QuicRuntime) !void {
+    fn advanceInboundStreams(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
         var i: usize = 0;
-        while (i < self.shard.inbound_streams.items.len) {
+        while (i < sh.inbound_streams.items.len) {
             // Work budget (#2): flush inbound ACKs while walking many streams.
             // Before the deref below so the draining/closed guard catches any
             // conn the pump reaps; pumpInbound never mutates `inbound_streams`.
-            self.maybePumpInbound();
-            const ist = self.shard.inbound_streams.items[i];
+            self.maybePumpInbound(sh);
+            const ist = sh.inbound_streams.items[i];
 
             // 0. Drop streams whose underlying QUIC connection is gone before we
             //    touch `ist.raw` (which holds a reference into that conn).  On a
@@ -2790,7 +2820,7 @@ pub const QuicRuntime = struct {
             //    catches the close long before the reap.  `removeInboundStreamAt`
             //    releases the (still-valid) raw slot and frees the stream.
             if (ist.conn.draining or ist.conn.phase == .closed) {
-                self.removeInboundStreamAt(i);
+                self.removeInboundStreamAt(sh, i);
                 continue;
             }
 
@@ -2809,7 +2839,7 @@ pub const QuicRuntime = struct {
                         const new_bytes = rb[ist.raw.read_cursor..];
                         ist.ms_acc.appendSlice(a, new_bytes) catch {
                             log.warn("quic_runtime: ms_acc append failed", .{});
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         };
                         ist.raw.read_cursor = rb.len;
@@ -2853,7 +2883,7 @@ pub const QuicRuntime = struct {
                                 _ = ist.raw.server.sendRawStreamData(ist.conn, ist.stream_id, ist.raw.send_offset, &[_]u8{}, true);
                             }
                         }
-                        self.removeInboundStreamAt(i);
+                        self.removeInboundStreamAt(sh, i);
                         continue;
                     },
                 };
@@ -2879,7 +2909,7 @@ pub const QuicRuntime = struct {
                         now_sec,
                     ) catch |perr| {
                         log.warn("quic_runtime: verify inbound peer failed: {s}", .{@errorName(perr)});
-                        self.removeInboundStreamAt(i);
+                        self.removeInboundStreamAt(sh, i);
                         continue;
                     };
                 };
@@ -2891,8 +2921,8 @@ pub const QuicRuntime = struct {
                 // Normally `pollInboundRegistrations` already did this at handshake
                 // time; this is the fallback from the first negotiated stream.
                 // Streams on outbound connections have slot == inbound_slot_none.
-                if (ist.slot != inbound_slot_none and !self.shard.inbound_conn_notified[ist.slot]) {
-                    self.notifyInboundEstablished(ist.slot, sender, ist.conn);
+                if (ist.slot != inbound_slot_none and !sh.inbound_conn_notified[ist.slot]) {
+                    self.notifyInboundEstablished(sh, ist.slot, sender, ist.conn);
                 }
             }
 
@@ -2921,7 +2951,7 @@ pub const QuicRuntime = struct {
                         const new_bytes = recv_buf[ist.raw.read_cursor..];
                         self.appendInboundAccBounded(&ist.gossip_acc, new_bytes, config.max_inbound_gossip_acc_bytes) catch {
                             log.warn("quic_runtime: gossip_acc cap exceeded, dropping inbound stream", .{});
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         };
                         ist.raw.read_cursor = recv_buf.len;
@@ -2934,7 +2964,7 @@ pub const QuicRuntime = struct {
                         // Without this, finned-and-drained streams stay in
                         // inbound_streams forever and the slot table fills.
                         if (ist.raw.finReceived()) {
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         }
                         i += 1;
@@ -2979,7 +3009,7 @@ pub const QuicRuntime = struct {
                         frames += 1;
                     }
                     if (drop_stream) {
-                        self.removeInboundStreamAt(i);
+                        self.removeInboundStreamAt(sh, i);
                         continue;
                     }
                     if (consumed > 0) {
@@ -2997,7 +3027,7 @@ pub const QuicRuntime = struct {
                     // it so the zquic 64-slot raw-app table can take the
                     // next inbound stream (see ch4r10t33r/zquic#149).
                     if (ist.gossip_acc.items.len == 0 and ist.raw.finReceived()) {
-                        self.removeInboundStreamAt(i);
+                        self.removeInboundStreamAt(sh, i);
                         continue;
                     }
                 },
@@ -3021,7 +3051,7 @@ pub const QuicRuntime = struct {
                     const hop_leg: quic_relay_live.StreamLeg = .{ .inbound = ist.raw };
                     if (pi == config.proto_relay_hop) {
                         const resp = self.relay_live.handleHopFrame(hop_leg, sender_peer, taken.frame, false) catch {
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         };
                         if (resp.len > 0) {
@@ -3031,7 +3061,7 @@ pub const QuicRuntime = struct {
                         }
                     } else {
                         self.relay_live.handleStopFrame(hop_leg, self.host.swarm.local_peer, taken.frame) catch {
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         };
                     }
@@ -3043,14 +3073,14 @@ pub const QuicRuntime = struct {
                     } else {
                         ist.relay_acc.clearRetainingCapacity();
                     }
-                    self.removeInboundStreamAt(i);
+                    self.removeInboundStreamAt(sh, i);
                     continue;
                 },
                 config.proto_dcutr => {
                     if (!ist.relay_control_done) {
-                        const relayed_conn_id = self.relayedConnIdForPeer(sender_peer);
+                        const relayed_conn_id = self.relayedConnIdForPeer(sh, sender_peer);
                         self.dcutr_live.startResponderInbound(sender_peer, relayed_conn_id, ist.raw) catch {
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         };
                         ist.relay_control_done = true;
@@ -3072,7 +3102,7 @@ pub const QuicRuntime = struct {
                     }
                     if (ist.req_acc.items.len < 4) {
                         if (ist.raw.finReceived()) {
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                         } else {
                             i += 1;
                         }
@@ -3085,11 +3115,11 @@ pub const QuicRuntime = struct {
                     // hardcoded 0.0.0.0 would bypass that protection (#206).
                     const observed = observedIpFromConn(ist.conn);
                     self.autonat_server.handleV1Stream(&r, &w, observed, false) catch {
-                        self.removeInboundStreamAt(i);
+                        self.removeInboundStreamAt(sh, i);
                         continue;
                     };
                     ist.raw.writeAllFin(&.{});
-                    self.removeInboundStreamAt(i);
+                    self.removeInboundStreamAt(sh, i);
                     continue;
                 },
                 config.proto_identify => {
@@ -3110,11 +3140,11 @@ pub const QuicRuntime = struct {
                     }
                     const wire = self.ensureIdentifyReplyWire() catch |err| {
                         log.warn("quic_runtime: identify reply build failed: {s}", .{@errorName(err)});
-                        self.removeInboundStreamAt(i);
+                        self.removeInboundStreamAt(sh, i);
                         continue;
                     };
                     ist.raw.writeAllFin(wire);
-                    self.removeInboundStreamAt(i);
+                    self.removeInboundStreamAt(sh, i);
                     continue;
                 },
                 config.proto_ping => {
@@ -3126,12 +3156,12 @@ pub const QuicRuntime = struct {
                     var w = ist.raw.writer();
                     ping_mod.handleInboundPrefixed(ist.ms_tail.items, &r, &w) catch |err| {
                         log.warn("quic_runtime: ping inbound failed: {s}", .{@errorName(err)});
-                        self.removeInboundStreamAt(i);
+                        self.removeInboundStreamAt(sh, i);
                         continue;
                     };
                     ist.ms_tail.clearRetainingCapacity();
                     ist.raw.writeAllFin(&.{});
-                    self.removeInboundStreamAt(i);
+                    self.removeInboundStreamAt(sh, i);
                     continue;
                 },
                 config.proto_identify_push => {
@@ -3152,14 +3182,14 @@ pub const QuicRuntime = struct {
                     }
                     ist.req_acc.clearRetainingCapacity();
                     ist.raw.writeAllFin(&.{});
-                    self.removeInboundStreamAt(i);
+                    self.removeInboundStreamAt(sh, i);
                     continue;
                 },
                 else => |idx| {
                     // SSZ req/resp path.
                     if (ist.response_fin_sent) {
                         if (ist.raw.finReceived()) {
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         }
                         i += 1;
@@ -3192,7 +3222,7 @@ pub const QuicRuntime = struct {
                         const new_bytes = recv_buf[ist.raw.read_cursor..];
                         self.appendInboundAccBounded(&ist.req_acc, new_bytes, config.max_inbound_req_acc_bytes) catch {
                             log.warn("quic_runtime: req_acc cap exceeded, dropping inbound stream", .{});
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         };
                         ist.raw.read_cursor = recv_buf.len;
@@ -3211,7 +3241,7 @@ pub const QuicRuntime = struct {
                     const peer_fin = ist.raw.fullyReceived();
                     if (ist.req_acc.items.len == 0) {
                         if (peer_fin) {
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         }
                         i += 1;
@@ -3226,7 +3256,7 @@ pub const QuicRuntime = struct {
                                     ist.req_acc.items.len,
                                 });
                                 ist.raw.writeAllFin(&.{});
-                                self.removeInboundStreamAt(i);
+                                self.removeInboundStreamAt(sh, i);
                                 continue;
                             }
                             i += 1;
@@ -3234,7 +3264,7 @@ pub const QuicRuntime = struct {
                         },
                         else => |e| {
                             log.warn("quic_runtime: decodeRequestSsz failed: {s}", .{@errorName(e)});
-                            self.removeInboundStreamAt(i);
+                            self.removeInboundStreamAt(sh, i);
                             continue;
                         },
                     };
@@ -3251,7 +3281,7 @@ pub const QuicRuntime = struct {
                     };
                     ist.channel_id = channel_id;
                     ist.request_id_for_channel = stream_rid;
-                    self.shard.channel_to_inbound.put(channel_id, ist) catch {};
+                    sh.channel_to_inbound.put(channel_id, ist) catch {};
 
                     // Hand the request payload to the embedder via swarm.
                     const payload_dup = a.dupe(u8, req_ssz) catch {
@@ -3275,9 +3305,9 @@ pub const QuicRuntime = struct {
         }
     }
 
-    fn advanceOutboundRequests(self: *QuicRuntime) !void {
+    fn advanceOutboundRequests(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
-        var it = self.shard.outbound_requests.iterator();
+        var it = sh.outbound_requests.iterator();
         while (it.next()) |e| {
             const req = e.value_ptr.*;
             if (req.finished) continue;
@@ -3382,7 +3412,7 @@ pub const QuicRuntime = struct {
                         .request_id = req.request_id,
                         .kind = error.InvalidData,
                     } }) catch {};
-                    self.finishOutboundReq(req);
+                    self.finishOutboundReq(sh, req);
                     req_done = true;
                     break;
                 }
@@ -3409,12 +3439,12 @@ pub const QuicRuntime = struct {
                     .peer = req.peer,
                     .request_id = req.request_id,
                 } }) catch {};
-                self.finishOutboundReq(req);
+                self.finishOutboundReq(sh, req);
             }
         }
     }
 
-    fn finishOutboundReq(self: *QuicRuntime, req: *conn_table.OutboundRequest) void {
+    fn finishOutboundReq(self: *QuicRuntime, sh: *Shard, req: *conn_table.OutboundRequest) void {
         req.finished = true;
         // NOTE: the FIN-on-finish that lived here regressed zeam↔zeam
         // protocol negotiation — sending an empty-data + FIN STREAM frame on
@@ -3425,7 +3455,7 @@ pub const QuicRuntime = struct {
         // MAX_STREAMS replenishment from #130 + the cap from #133.
 
         // Remove from map and free.
-        if (self.shard.outbound_requests.fetchRemove(req.request_id)) |kv| {
+        if (sh.outbound_requests.fetchRemove(req.request_id)) |kv| {
             self.allocator.free(kv.value.payload);
             kv.value.resp_acc.deinit(self.allocator);
             self.allocator.destroy(kv.value);
@@ -3435,13 +3465,13 @@ pub const QuicRuntime = struct {
     /// Drive every in-flight gossipsub publish stream: send the multistream
     /// initiator handshake, read the responder ack, write the length-prefixed
     /// RPC frame, FIN the stream, then drop the entry.
-    fn advanceOutboundPublishes(self: *QuicRuntime) !void {
+    fn advanceOutboundPublishes(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
         // Collect ids to remove after iteration so we don't mutate the map mid-walk.
         var to_remove: std.ArrayList(u64) = .empty;
         defer to_remove.deinit(a);
 
-        var it = self.shard.outbound_publishes.iterator();
+        var it = sh.outbound_publishes.iterator();
         while (it.next()) |e| {
             const op = e.value_ptr.*;
             if (op.finished) {
@@ -3506,19 +3536,19 @@ pub const QuicRuntime = struct {
         }
 
         for (to_remove.items) |id| {
-            if (self.shard.outbound_publishes.fetchRemove(id)) |kv| {
+            if (sh.outbound_publishes.fetchRemove(id)) |kv| {
                 a.free(kv.value.wire);
                 a.destroy(kv.value);
             }
         }
     }
 
-    fn advanceOutboundIdentifyPushes(self: *QuicRuntime) !void {
+    fn advanceOutboundIdentifyPushes(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
         var to_remove: std.ArrayList(u64) = .empty;
         defer to_remove.deinit(a);
 
-        var it = self.shard.outbound_identify_pushes.iterator();
+        var it = sh.outbound_identify_pushes.iterator();
         while (it.next()) |e| {
             const op = e.value_ptr.*;
             if (op.finished) {
@@ -3583,19 +3613,19 @@ pub const QuicRuntime = struct {
         }
 
         for (to_remove.items) |id| {
-            if (self.shard.outbound_identify_pushes.fetchRemove(id)) |kv| {
+            if (sh.outbound_identify_pushes.fetchRemove(id)) |kv| {
                 a.free(kv.value.wire);
                 a.destroy(kv.value);
             }
         }
     }
 
-    fn advanceOutboundAutonatProbes(self: *QuicRuntime) !void {
+    fn advanceOutboundAutonatProbes(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
         var to_remove: std.ArrayList(u64) = .empty;
         defer to_remove.deinit(a);
 
-        var it = self.shard.outbound_autonat_probes.iterator();
+        var it = sh.outbound_autonat_probes.iterator();
         while (it.next()) |e| {
             const op = e.value_ptr.*;
             if (op.finished) {
@@ -3664,7 +3694,7 @@ pub const QuicRuntime = struct {
         }
 
         for (to_remove.items) |id| {
-            if (self.shard.outbound_autonat_probes.fetchRemove(id)) |kv| {
+            if (sh.outbound_autonat_probes.fetchRemove(id)) |kv| {
                 a.free(kv.value.probe_wire);
                 a.destroy(kv.value);
             }
