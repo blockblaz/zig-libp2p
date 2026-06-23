@@ -26,8 +26,8 @@
             .hash = "zig_varint-0.1.0-JouQHUVXAAAGN-XdMYrVEmYrzJd6zXtI7zk9bPnKYXVK",
         },
         .zquic = .{
-            .url = "https://github.com/ch4r10t33r/zquic/archive/1a06f9967e619b2f65ab33c5bf33f2775e315dbb.tar.gz",
-            .hash = "zquic-1.7.0-2zRc1KBCFwDxpYZuQd4MMFXlCrNr8HQ-xF9va7sLOOGm",
+            .url = "https://github.com/ch4r10t33r/zquic/archive/78ad0dc81dfc320bd77dfcb39da349e308915b40.tar.gz",
+            .hash = "zquic-1.7.0-2zRc1BdVFwBoSx_R-WmHPHVNr3ecXOSCHb3547quibbp",
         },
     },
     .paths = .{

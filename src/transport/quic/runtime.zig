@@ -142,6 +142,80 @@ pub const Shard = struct {
             .relayed_conn_by_peer = conn_table.RelayedConnIdMap.init(a),
         };
     }
+
+    /// Free all per-shard transport state and the shard's listener. Mirrors the
+    /// frees that used to live inline in `QuicRuntime.destroy` for the single
+    /// shard. The drive/demux threads are already joined (caller does `stop`
+    /// first), so no concurrent access. `inbound_ring` is freed by `stop`.
+    pub fn deinit(self: *Shard, a: std.mem.Allocator) void {
+        self.relayed_conn_by_peer.deinit();
+
+        for (self.pending_dials.items) |pd| {
+            pd.slot.outbound.deinit();
+            a.destroy(pd.slot);
+        }
+        self.pending_dials.deinit(a);
+
+        var it = self.outbound_by_peer.valueIterator();
+        while (it.next()) |v| {
+            v.*.outbound.deinit();
+            a.destroy(v.*);
+        }
+        self.outbound_by_peer.deinit();
+        self.inbound_by_peer.deinit();
+
+        for (self.inbound_streams.items) |s| {
+            s.req_acc.deinit(a);
+            s.gossip_acc.deinit(a);
+            s.relay_acc.deinit(a);
+            s.ms_acc.deinit(a);
+            s.ms_tail.deinit(a);
+            a.destroy(s);
+        }
+        self.inbound_streams.deinit(a);
+
+        var rit = self.outbound_requests.valueIterator();
+        while (rit.next()) |r| {
+            a.free(r.*.payload);
+            r.*.resp_acc.deinit(a);
+            a.destroy(r.*);
+        }
+        self.outbound_requests.deinit();
+
+        var pit = self.outbound_publishes.valueIterator();
+        while (pit.next()) |p| {
+            a.free(p.*.wire);
+            a.destroy(p.*);
+        }
+        self.outbound_publishes.deinit();
+
+        var ipit = self.outbound_identify_pushes.valueIterator();
+        while (ipit.next()) |p| {
+            a.free(p.*.wire);
+            a.destroy(p.*);
+        }
+        self.outbound_identify_pushes.deinit();
+
+        var apit = self.outbound_autonat_probes.valueIterator();
+        while (apit.next()) |p| {
+            a.free(p.*.probe_wire);
+            a.destroy(p.*);
+        }
+        self.outbound_autonat_probes.deinit();
+
+        var git = self.persistent_gossip.valueIterator();
+        while (git.next()) |g| {
+            for (g.*.outbox.items) |w| a.free(w);
+            g.*.outbox.deinit(a);
+            a.destroy(g.*);
+        }
+        self.persistent_gossip.deinit();
+
+        self.channel_to_inbound.deinit();
+
+        self.listener.lifecycle = .{};
+        self.listener.deinit();
+    }
 };
 
 pub const QuicRuntime = struct {
@@ -197,19 +271,28 @@ pub const QuicRuntime = struct {
     relay_addrs_buf: ?[]u8 = null,
     auto_reserve_pending: bool = false,
 
-    /// Drive thread control.
-    drive_thread: ?std.Thread = null,
+    /// Drive thread control. One drive thread per shard (`drive_threads.len ==
+    /// shard_count`); each runs `driveLoop` over its own `&shards[i]`.
+    drive_threads: []std.Thread = &.{},
     shutdown_requested: std.atomic.Value(bool) = .init(false),
     /// Listener/demux thread (multi-shard drive loop): reads the shared listen
-    /// socket and queues datagrams into `inbound_ring`; the drive thread consumes
-    /// them. Keeps recvfrom off the drive thread. `inbound_ring` is null until
-    /// `start` allocates it. With a single shard today this is one ring + one
-    /// demux thread feeding the one drive loop (behavior-preserving).
+    /// socket and routes each datagram to the owning shard's `inbound_ring` (by
+    /// shard-tagged CID byte for 1-RTT, by source-address hash for long-header
+    /// Initials). Keeps recvfrom off the drive threads. Each shard's
+    /// `inbound_ring` is null until `start` allocates it. With a single shard
+    /// (mask 0) the demux is a no-op router feeding the one drive loop
+    /// (behavior-preserving).
     demux_thread: ?std.Thread = null,
-    /// Per-shard transport state (Phase 2b migration in progress). Single shard
-    /// today; becomes `shards: [N]Shard` when N drive threads land. Initialized
-    /// via `Shard.init` in `create` (holds allocator-backed maps).
-    shard: Shard,
+    /// Per-shard transport state (quinn model). `shards.len == shard_count`,
+    /// allocated in `create`. Each shard owns a disjoint slice of connections
+    /// and is driven by its own thread; the demux routes inbound datagrams to
+    /// the right one. Single shard reproduces the pre-sharding behaviour.
+    shards: []Shard = &.{},
+    /// Number of drive-loop shards (power of two, `[1, 8]`).
+    shard_count: u8 = 1,
+    /// `shard_count - 1`. Tags minted CIDs and routes inbound datagrams. Mask 0
+    /// (single shard) makes the demux a no-op.
+    shard_mask: u8 = 0,
     started: bool = false,
 
     /// Inbound gossip processing is offloaded from the drive thread to this
@@ -252,14 +335,61 @@ pub const QuicRuntime = struct {
                 listen_opts.key_pem = b.key_pem;
             },
         }
-        const listener = try quic_endpoint.QuicListener.listen(a, listen_ma, listen_opts);
-        errdefer listener.deinit();
+        // Shard count: clamp to [1,8], round DOWN to a power of two so the mask
+        // (count-1) is contiguous. 1 == the single-thread pre-sharding path.
+        const shard_count: u8 = roundDownPow2(std.math.clamp(opts.drive_shards, @as(u8, 1), @as(u8, 8)));
+        const shard_mask: u8 = shard_count - 1;
+
+        // Shard 0's listener owns the bound listen fd; shards 1..N share it via
+        // their own `Server` (`take_ownership = false`) so all shards receive on
+        // the one UDP port. `listeners` is a scratch array of pointers; the
+        // pointers are copied into the shards below, so it is freed (its backing
+        // array, not the listeners) on every path. On any error before the
+        // shards take ownership, deinit the listeners built so far.
+        const listeners = try a.alloc(*quic_endpoint.QuicListener, shard_count);
+        defer a.free(listeners);
+        var built: usize = 0;
+        var shards_own_listeners = false;
+        errdefer if (!shards_own_listeners) {
+            for (listeners[0..built]) |l| l.deinit();
+        };
+        listeners[0] = try quic_endpoint.QuicListener.listen(a, listen_ma, listen_opts);
+        built = 1;
+        const bound = listeners[0].boundUdpPortIpv4() catch null;
+        if (shard_count > 1) {
+            const port = bound orelse return error.QuicListenerNoPort;
+            const shared_fd = listeners[0].server.sock;
+            while (built < shard_count) : (built += 1) {
+                listeners[built] = try quic_endpoint.QuicListener.listenSharingSocket(a, shared_fd, port, listen_opts);
+            }
+        }
 
         const self = try a.create(QuicRuntime);
         errdefer a.destroy(self);
 
+        // Allocate the per-shard state up front so the relay/dcutr/autonat hook
+        // contexts can point at a stable `*Shard` (the slice memory survives the
+        // `self.*` literal below). Each shard wraps its own listener, knows its
+        // index (for CID tagging) and back-references the runtime.
+        const shards = try a.alloc(Shard, shard_count);
+        errdefer a.free(shards);
+        for (shards, 0..) |*sh, i| {
+            sh.* = Shard.init(a, listeners[i]);
+            sh.rt = self;
+            sh.index = @intCast(i);
+            listeners[i].server.setShard(@intCast(i), shard_mask);
+        }
+        // The shards now own the listeners (their `deinit` runs them); the
+        // listener-teardown errdefer above must no longer fire.
+        shards_own_listeners = true;
+        // Global protocol hooks (relay/dcutr/autonat/identify) are single-
+        // instance per runtime; they recover the runtime via `sh.rt` and only
+        // touch shard-0's connection state today (multi-shard relay/dcutr is the
+        // Phase-4 coordinator-funnel follow-up).
+        const hook_shard = &shards[0];
+
         const relay_hooks = quic_relay_live.RuntimeHooks{
-            .ctx = &self.shard,
+            .ctx = hook_shard,
             .dial_plain = relayHookDialPlain,
             .outbound_client = relayHookOutboundClient,
             .next_bidi_stream = relayHookNextBidiStream,
@@ -270,7 +400,7 @@ pub const QuicRuntime = struct {
             .on_inbound_relay_bridge = relayHookInboundBridge,
         };
         const dcutr_hooks = quic_dcutr_live.RuntimeHooks{
-            .ctx = &self.shard,
+            .ctx = hook_shard,
             .now_ms = opts.now_ms_fn,
             .listener_port_v4 = dcutrHookListenerPort,
             .tls_pem_paths = dcutrHookTlsPaths,
@@ -287,7 +417,9 @@ pub const QuicRuntime = struct {
             .host = opts.host,
             .opts = opts,
             .tls_pem_resolved = tls_pem_resolved,
-            .shard = Shard.init(a, listener),
+            .shards = shards,
+            .shard_count = shard_count,
+            .shard_mask = shard_mask,
             .autonat_server = autonat_mod.Server.init(a, .{}, autonatDialBack),
             .relay_live = quic_relay_live.LiveRelay.init(a, opts.host.swarm.local_peer, .{
                 .enable_server = opts.relay.enable_server,
@@ -299,10 +431,7 @@ pub const QuicRuntime = struct {
             }, dcutr_hooks),
             .subscribed_topics = std.StringHashMap(void).init(a),
         };
-        self.shard.rt = self;
-        self.shard.index = 0;
 
-        const bound = listener.boundUdpPortIpv4() catch null;
         self.bound_port_v4 = bound;
 
         if (bound) |port| {
@@ -319,15 +448,15 @@ pub const QuicRuntime = struct {
             self.auto_reserve_pending = true;
         }
 
-        self.autonat_server.dial_back_ctx = &self.shard;
+        self.autonat_server.dial_back_ctx = hook_shard;
 
         self.host.setIdentifyPushDispatch(.{
-            .ctx = &self.shard,
+            .ctx = hook_shard,
             .dispatch = identifyPushDispatch,
         });
         if (opts.autonat.enable) {
             self.host.setAutonatProbeDispatch(.{
-                .ctx = &self.shard,
+                .ctx = hook_shard,
                 .dispatch = autonatProbeDispatch,
             });
         }
@@ -344,17 +473,28 @@ pub const QuicRuntime = struct {
             .dispatch = swarmHookDispatch,
         };
 
-        // Install QUIC lifecycle hooks for inbound stream readiness. The hook
-        // ctx is the owning `*Shard` (callbacks recover `self` via `sh.rt`) so
-        // each shard's listener routes lifecycle events to its own state.
-        listener.lifecycle = .{
-            .ctx = &self.shard,
-            .on_connection_established = onLifecycleConnected,
-            .on_connection_closed = onLifecycleClosed,
-            .on_inbound_stream_ready = onLifecycleInboundStream,
-        };
+        // Install QUIC lifecycle hooks for inbound stream readiness. Each
+        // shard's listener routes lifecycle events to ITS OWN shard (ctx =
+        // `&self.shards[i]`); callbacks recover the runtime via `sh.rt`. This is
+        // what makes inbound-connection ownership follow the demux's CID routing.
+        for (self.shards) |*sh| {
+            sh.listener.lifecycle = .{
+                .ctx = sh,
+                .on_connection_established = onLifecycleConnected,
+                .on_connection_closed = onLifecycleClosed,
+                .on_inbound_stream_ready = onLifecycleInboundStream,
+            };
+        }
 
         return self;
+    }
+
+    /// Largest power of two `<= n` (n in `[1, 8]`). Used to snap `drive_shards`
+    /// to a power of two so `shard_mask = count - 1` is a contiguous low-bit mask.
+    fn roundDownPow2(n: u8) u8 {
+        var p: u8 = 1;
+        while (p << 1 <= n) p <<= 1;
+        return p;
     }
 
     pub fn destroy(self: *QuicRuntime) void {
@@ -370,90 +510,24 @@ pub const QuicRuntime = struct {
 
         self.relay_live.deinit();
         self.dcutr_live.deinit();
-        self.shard.relayed_conn_by_peer.deinit();
         if (self.relay_addrs_buf) |b| self.allocator.free(b);
         if (self.identify_reply_wire) |w| self.allocator.free(w);
-
-        // Free any dials still in flight at teardown.
-        for (self.shard.pending_dials.items) |pd| {
-            pd.slot.outbound.deinit();
-            self.allocator.destroy(pd.slot);
-        }
-        self.shard.pending_dials.deinit(self.allocator);
-
-        // Free outbound conns.
-        var it = self.shard.outbound_by_peer.valueIterator();
-        while (it.next()) |v| {
-            v.*.outbound.deinit();
-            self.allocator.destroy(v.*);
-        }
-        self.shard.outbound_by_peer.deinit();
-        self.shard.inbound_by_peer.deinit();
-
-        // Free inbound streams.
-        for (self.shard.inbound_streams.items) |s| {
-            s.req_acc.deinit(self.allocator);
-            s.gossip_acc.deinit(self.allocator);
-            s.relay_acc.deinit(self.allocator);
-            s.ms_acc.deinit(self.allocator);
-            s.ms_tail.deinit(self.allocator);
-            self.allocator.destroy(s);
-        }
-        self.shard.inbound_streams.deinit(self.allocator);
-
-        // Free outbound requests.
-        var rit = self.shard.outbound_requests.valueIterator();
-        while (rit.next()) |r| {
-            self.allocator.free(r.*.payload);
-            r.*.resp_acc.deinit(self.allocator);
-            self.allocator.destroy(r.*);
-        }
-        self.shard.outbound_requests.deinit();
-
-        // Free outbound publishes.
-        var pit = self.shard.outbound_publishes.valueIterator();
-        while (pit.next()) |p| {
-            self.allocator.free(p.*.wire);
-            self.allocator.destroy(p.*);
-        }
-        self.shard.outbound_publishes.deinit();
-
-        var ipit = self.shard.outbound_identify_pushes.valueIterator();
-        while (ipit.next()) |p| {
-            self.allocator.free(p.*.wire);
-            self.allocator.destroy(p.*);
-        }
-        self.shard.outbound_identify_pushes.deinit();
-
-        var apit = self.shard.outbound_autonat_probes.valueIterator();
-        while (apit.next()) |p| {
-            self.allocator.free(p.*.probe_wire);
-            self.allocator.destroy(p.*);
-        }
-        self.shard.outbound_autonat_probes.deinit();
-
-        // Free persistent gossip streams + their outbox bytes.
-        var git = self.shard.persistent_gossip.valueIterator();
-        while (git.next()) |g| {
-            for (g.*.outbox.items) |w| self.allocator.free(w);
-            g.*.outbox.deinit(self.allocator);
-            self.allocator.destroy(g.*);
-        }
-        self.shard.persistent_gossip.deinit();
 
         var st_it = self.subscribed_topics.keyIterator();
         while (st_it.next()) |k| self.allocator.free(k.*);
         self.subscribed_topics.deinit();
 
-        self.shard.channel_to_inbound.deinit();
-
+        // Unlink global hooks first so neither the swarm nor identify dispatch
+        // calls into shard state we are about to free.
         self.host.setIdentifyPushDispatch(null);
-
-        // Unlink the hook so swarm doesn't keep calling into freed memory.
         self.host.swarm.command_dispatch = null;
-        self.shard.listener.lifecycle = .{};
 
-        self.shard.listener.deinit();
+        // Tear down each shard's transport state + listener. Shard 0's listener
+        // owns the shared fd and closes it last (it is the only one with
+        // `owns_socket = true`); the others' `deinit` leaves the fd open.
+        for (self.shards) |*sh| sh.deinit(self.allocator);
+        self.allocator.free(self.shards);
+
         // `tls_pem_resolved` borrows the embedder's config.TlsPemSource slices —
         // nothing to free.
         self.allocator.destroy(self);
@@ -467,22 +541,65 @@ pub const QuicRuntime = struct {
         if (self.started) return;
         self.started = true;
         self.shutdown_requested.store(false, .release);
-        // Listener/demux thread: own the listen socket's recv, queue datagrams
-        // into the ring for the drive thread. If either the ring alloc or the
-        // thread spawn fails, leave inbound_ring null and the drive loop falls
-        // back to reading the socket inline (the pre-sharding path).
-        if (shard_ring.InboundRing.init(self.allocator, inbound_ring_capacity)) |r| {
-            self.shard.inbound_ring = r;
-            self.demux_thread = std.Thread.spawn(.{}, demuxTrampoline, .{self}) catch |err| blk: {
-                log.warn("quic_runtime: demux thread spawn failed ({s}); drive loop will read the socket inline", .{@errorName(err)});
-                if (self.shard.inbound_ring) |*ring| ring.deinit(self.allocator);
-                self.shard.inbound_ring = null;
+
+        // Allocate one inbound datagram ring per shard. The single demux thread
+        // reads the shared listen socket and routes each datagram to the owning
+        // shard's ring (by tagged CID / source hash); each shard's drive thread
+        // drains its own ring. For a single shard the demux is a no-op router
+        // (mask 0), preserving the pre-sharding path; if the ring alloc or demux
+        // spawn fails there, that shard's drive loop falls back to reading the
+        // socket inline. For N>1 the rings + demux are required (only shard 0
+        // owns the fd), so a failure there propagates as an error.
+        var rings_ok = true;
+        for (self.shards) |*sh| {
+            sh.inbound_ring = shard_ring.InboundRing.init(self.allocator, inbound_ring_capacity) catch |err| blk: {
+                log.warn("quic_runtime: inbound ring alloc failed ({s})", .{@errorName(err)});
+                rings_ok = false;
                 break :blk null;
             };
-        } else |err| {
-            log.warn("quic_runtime: inbound ring alloc failed ({s}); drive loop will read the socket inline", .{@errorName(err)});
+            if (!rings_ok) break;
         }
-        self.drive_thread = try std.Thread.spawn(.{}, driveTrampoline, .{self});
+        if (rings_ok) {
+            self.demux_thread = std.Thread.spawn(.{}, demuxTrampoline, .{self}) catch |err| blk: {
+                log.warn("quic_runtime: demux thread spawn failed ({s})", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+        if (self.demux_thread == null) {
+            // No demux: drop the rings so each drive loop reads the socket
+            // inline (only valid for a single shard — every other shard would be
+            // starved of inbound traffic). Refuse to run a starved multi-shard
+            // config.
+            for (self.shards) |*sh| if (sh.inbound_ring) |*r| {
+                r.deinit(self.allocator);
+                sh.inbound_ring = null;
+            };
+            if (self.shard_count > 1) {
+                self.started = false;
+                return error.QuicDemuxThreadUnavailable;
+            }
+        }
+
+        // One drive thread per shard, each running `driveLoop` over its shard.
+        self.drive_threads = try self.allocator.alloc(std.Thread, self.shard_count);
+        var spawned: usize = 0;
+        errdefer {
+            // Unwind on partial spawn: signal shutdown, join what started, free.
+            self.shutdown_requested.store(true, .release);
+            for (self.drive_threads[0..spawned]) |t| t.join();
+            if (self.demux_thread) |t| t.join();
+            self.demux_thread = null;
+            for (self.shards) |*sh| if (sh.inbound_ring) |*r| {
+                r.deinit(self.allocator);
+                sh.inbound_ring = null;
+            };
+            self.allocator.free(self.drive_threads);
+            self.drive_threads = &.{};
+            self.started = false;
+        }
+        while (spawned < self.shard_count) : (spawned += 1) {
+            self.drive_threads[spawned] = try std.Thread.spawn(.{}, driveTrampoline, .{ self, @as(u8, @intCast(spawned)) });
+        }
         self.gossip_worker_thread = std.Thread.spawn(.{}, gossipWorkerTrampoline, .{self}) catch |err| blk: {
             // Worker is an optimization; if it can't spawn, fall back to inline
             // processing on the drive thread (the pre-offload behaviour).
@@ -505,18 +622,22 @@ pub const QuicRuntime = struct {
     pub fn stop(self: *QuicRuntime) void {
         if (!self.started) return;
         self.shutdown_requested.store(true, .release);
-        if (self.drive_thread) |t| {
-            t.join();
-            self.drive_thread = null;
+        // Join the N drive threads, then the demux (drive loops drain their
+        // rings; joining them first means no shard is still consuming when we
+        // free the rings).
+        for (self.drive_threads) |t| t.join();
+        if (self.drive_threads.len != 0) {
+            self.allocator.free(self.drive_threads);
+            self.drive_threads = &.{};
         }
         if (self.demux_thread) |t| {
             t.join();
             self.demux_thread = null;
         }
-        if (self.shard.inbound_ring) |*r| {
+        for (self.shards) |*sh| if (sh.inbound_ring) |*r| {
             r.deinit(self.allocator);
-            self.shard.inbound_ring = null;
-        }
+            sh.inbound_ring = null;
+        };
         if (self.gossip_worker_thread) |t| {
             t.join();
             self.gossip_worker_thread = null;
@@ -829,9 +950,9 @@ pub const QuicRuntime = struct {
 
     // ── Drive thread ───────────────────────────────────────────────────────
 
-    fn driveTrampoline(self: *QuicRuntime) void {
-        self.driveLoop() catch |err| {
-            log.err("quic_runtime: drive loop exited with {s}", .{@errorName(err)});
+    fn driveTrampoline(self: *QuicRuntime, shard_index: u8) void {
+        self.driveLoop(&self.shards[shard_index]) catch |err| {
+            log.err("quic_runtime: drive loop (shard {d}) exited with {s}", .{ shard_index, @errorName(err) });
         };
     }
 
@@ -844,16 +965,28 @@ pub const QuicRuntime = struct {
         self.demuxLoop();
     }
 
-    /// Listener/demux thread: read the shared listen socket and queue datagrams
-    /// into `inbound_ring` for the drive thread. Touches ONLY the socket + ring
-    /// (never Server/ConnState), so all QUIC state stays single-threaded on the
-    /// drive thread. Polls with a 100ms timeout so it observes shutdown promptly.
+    /// Listener/demux thread: read the shared listen socket (shard 0's, which
+    /// owns the fd) and route each datagram to the owning shard's `inbound_ring`
+    /// (`shard_ring.shardForDatagram` — tagged CID byte for 1-RTT, source hash
+    /// for long-header Initials). Touches ONLY the socket + rings (never any
+    /// Server/ConnState), so all QUIC state stays single-threaded on each
+    /// shard's drive thread. Polls with a 100ms timeout so it observes shutdown
+    /// promptly. With a single shard (mask 0) every datagram routes to ring 0 —
+    /// behaviour-preserving.
     fn demuxLoop(self: *QuicRuntime) void {
-        const ring = if (self.shard.inbound_ring) |*r| r else return;
+        // Collect the per-shard ring pointers. Every shard's ring is non-null
+        // here (start() only spawns the demux after allocating them all).
+        var ring_ptrs: [8]*shard_ring.InboundRing = undefined;
+        for (self.shards, 0..) |*sh, i| {
+            ring_ptrs[i] = if (sh.inbound_ring) |*r| r else return;
+        }
+        const rings = ring_ptrs[0..self.shard_count];
+        // The shared listen fd is shard 0's listener's Server socket.
+        const listener = self.shards[0].listener;
         var scratch: [shard_ring.max_datagram_bytes]u8 = undefined;
         while (!self.shutdown_requested.load(.acquire)) {
-            self.shard.listener.pollAndDrainToRing(ring, &scratch, 100) catch |err| {
-                log.warn("quic_runtime: demux pollAndDrainToRing: {s}", .{@errorName(err)});
+            listener.pollAndRouteToRings(rings, &scratch, self.shard_mask, 100) catch |err| {
+                log.warn("quic_runtime: demux pollAndRouteToRings: {s}", .{@errorName(err)});
             };
         }
     }
@@ -976,11 +1109,9 @@ pub const QuicRuntime = struct {
         sh.listener.server.flushAppAcks();
     }
 
-    fn driveLoop(self: *QuicRuntime) !void {
-        // The single shard this drive thread owns. With N>1 (step 7) each drive
-        // thread runs this loop over its own `&self.shards[i]`; the per-shard
-        // methods below take `sh` so they operate on that shard's state alone.
-        const sh = &self.shard;
+    fn driveLoop(self: *QuicRuntime, sh: *Shard) !void {
+        // `sh` is the shard this drive thread owns; every per-shard method below
+        // takes it so the loop operates only on that shard's connection state.
         var recv_buf: [65536]u8 = undefined;
         var work_scratch: std.ArrayList(conn_table.HookWork) = .empty;
         defer work_scratch.deinit(self.allocator);
@@ -1058,15 +1189,21 @@ pub const QuicRuntime = struct {
             // that triggered the phase transition this tick.
             self.detectOutboundConnectionClose(sh);
 
-            // Drain hook queue.
-            self.drainHookWork(&work_scratch);
-            for (work_scratch.items) |w| {
-                self.handleHookWork(sh, w) catch |err| {
-                    log.warn("quic_runtime: hook handler error: {s}", .{@errorName(err)});
-                    conn_table.freeHookWork(self.allocator, w);
-                };
+            // Drain hook queue. The queue + the gossipsub outbox + host periodic
+            // ticks + relay/dcutr are GLOBAL single-writer state; only shard 0
+            // touches them (single shard today → always taken). Per-shard
+            // routing of directed hook work / gossip deliveries to non-zero
+            // shards is the Phase-3 cross-shard outbox follow-up.
+            if (sh.index == 0) {
+                self.drainHookWork(&work_scratch);
+                for (work_scratch.items) |w| {
+                    self.handleHookWork(sh, w) catch |err| {
+                        log.warn("quic_runtime: hook handler error: {s}", .{@errorName(err)});
+                        conn_table.freeHookWork(self.allocator, w);
+                    };
+                }
+                work_scratch.clearRetainingCapacity();
             }
-            work_scratch.clearRetainingCapacity();
 
             // Advance inbound streams (multistream + framing).
             self.advanceInboundStreams(sh) catch |err| {
@@ -1103,10 +1240,14 @@ pub const QuicRuntime = struct {
                 log.warn("quic_runtime: advanceOutboundAutonatProbes: {s}", .{@errorName(err)});
             };
 
-            self.relay_live.advance();
-            self.dcutr_live.advance();
+            // relay/dcutr live state + auto-reserve are single-instance globals;
+            // shard 0 owns them (Phase-4 coordinator funnel will generalize).
+            if (sh.index == 0) {
+                self.relay_live.advance();
+                self.dcutr_live.advance();
+            }
 
-            if (self.auto_reserve_pending) {
+            if (sh.index == 0 and self.auto_reserve_pending) {
                 if (self.opts.relay.auto_reserve_relay) |relay_ma| {
                     var ma = multiaddr.Multiaddr.fromString(self.allocator, relay_ma) catch null;
                     if (ma) |*m| {
@@ -1135,9 +1276,10 @@ pub const QuicRuntime = struct {
             self.advancePersistentGossipStreams(sh);
             const iter_t3 = self.opts.now_ms_fn(); // after outbound reqs/publishes/gossip drain
 
-            // Periodic host ticks (~ every 100ms).
+            // Periodic host ticks (~ every 100ms). Host ticks + the gossipsub
+            // outbox drain are global; shard 0 only.
             const now_ms = self.opts.now_ms_fn();
-            if (now_ms - last_tick_ms >= 100) {
+            if (sh.index == 0 and now_ms - last_tick_ms >= 100) {
                 last_tick_ms = now_ms;
                 self.host.runPeriodicTicks(now_ms) catch |err| {
                     log.warn("quic_runtime: host periodic ticks: {s}", .{@errorName(err)});
@@ -2127,8 +2269,30 @@ pub const QuicRuntime = struct {
         try sh.outbound_identify_pushes.put(push_id, op);
     }
 
+    /// Shard that owns outbound dials to `peer`: `hash(peer_id) & shard_mask`
+    /// (quinn model). Deterministic so every node maps a given peer's outbound
+    /// leg to the same shard. At `shard_count == 1` (mask 0) this is always 0.
+    /// Inbound legs are NOT hash-routed — the demux assigns them by tagged CID
+    /// to whichever shard accepted the handshake.
+    fn shardIndexForPeer(self: *const QuicRuntime, peer: identity.PeerId) u8 {
+        if (self.shard_mask == 0) return 0;
+        const h = conn_table.PeerIdContext.hash(.{}, peer);
+        return @intCast(h & self.shard_mask);
+    }
+
     fn handleDial(self: *QuicRuntime, sh: *Shard, addr_str: []const u8, expected_peer: ?identity.PeerId) void {
         const a = self.allocator;
+        // Dial routing (quinn model): the outbound leg to `expected_peer` is
+        // owned by `shardIndexForPeer(peer)`. Under the current single-writer
+        // model the hook queue is drained only by shard 0, so `sh` is shard 0
+        // and (at shard_count == 1) the target is shard 0 too — no cross-shard
+        // write. When Phase 3 moves hook-work routing to enqueue time, the
+        // owning shard's drive thread will run this and `dial_shard` will equal
+        // `sh`; the selector below documents that mapping. We never write
+        // another shard's `pending_dials` from here (that would race its drive
+        // thread).
+        const dial_shard = if (expected_peer) |ep| self.shardIndexForPeer(ep) else sh.index;
+        _ = dial_shard;
 
         if (quic_relay_live.LiveRelay.isCircuitDialAddr(addr_str)) {
             self.relay_live.enqueueCircuitDial(addr_str, expected_peer) catch |err| {
@@ -4066,7 +4230,7 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
     {
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_b.shard.outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
                 connected = true;
                 break;
             }
@@ -4201,7 +4365,7 @@ test "QuicRuntime: two instances exchange a large (~300 KB) req/resp response ov
     {
         const dl = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < dl) {
-            if (rt_b.shard.outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
                 connected = true;
                 break;
             }
@@ -4321,7 +4485,7 @@ test "QuicRuntime: empty req/resp response (responder finishes with no chunk) en
     {
         const dl = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < dl) {
-            if (rt_b.shard.outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
                 connected = true;
                 break;
             }
@@ -4455,7 +4619,7 @@ test "QuicRuntime: multi-chunk req/resp response (blocks_by_range shape) deliver
     {
         const dl = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < dl) {
-            if (rt_b.shard.outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
                 connected = true;
                 break;
             }
@@ -4573,8 +4737,8 @@ test "QuicRuntime: simultaneous mutual dial completes both handshakes (no Initia
     var b_has_a = false;
     const deadline_ms = wall_time.milliTimestamp() + 20_000;
     while (wall_time.milliTimestamp() < deadline_ms and !(a_has_b and b_has_a)) {
-        if (rt_a.shard.outbound_by_peer.get(bundle_b.peer)) |_| a_has_b = true;
-        if (rt_b.shard.outbound_by_peer.get(bundle_a.peer)) |_| b_has_a = true;
+        if (rt_a.shards[0].outbound_by_peer.get(bundle_b.peer)) |_| a_has_b = true;
+        if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| b_has_a = true;
         var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
         var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
         _ = std.c.nanosleep(&req, &rem);
@@ -4719,7 +4883,7 @@ test "QuicRuntime: two instances exchange a gossipsub message over UDP loopback"
     {
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_b.shard.outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
                 connected = true;
                 break;
             }
@@ -4852,7 +5016,7 @@ test "QuicRuntime: gossip publishes over the inbound leg when no outbound exists
         var connected = false;
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_b.shard.outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
                 connected = true;
                 break;
             }
@@ -4876,8 +5040,8 @@ test "QuicRuntime: gossip publishes over the inbound leg when no outbound exists
         var learned = false;
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_a.shard.inbound_by_peer.get(bundle_b.peer)) |_| {
-                if (rt_a.shard.outbound_by_peer.get(bundle_b.peer) == null) {
+            if (rt_a.shards[0].inbound_by_peer.get(bundle_b.peer)) |_| {
+                if (rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) == null) {
                     learned = true;
                     break;
                 }
@@ -4909,7 +5073,7 @@ test "QuicRuntime: gossip publishes over the inbound leg when no outbound exists
 
     // Confirm the publish really rode the inbound leg: A still has no outbound
     // to B, so the delivered gossip could only have used the inbound stream.
-    try testing.expect(rt_a.shard.outbound_by_peer.get(bundle_b.peer) == null);
+    try testing.expect(rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) == null);
 }
 
 test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-outbound-conn fix)" {
@@ -5010,7 +5174,7 @@ test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-ou
         var connected = false;
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_b.shard.outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
                 connected = true;
                 break;
             }
@@ -5038,8 +5202,8 @@ test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-ou
                 var e = ev_in;
                 e.deinit(a);
             } else |_| {}
-            if (rt_a.shard.inbound_by_peer.get(bundle_b.peer)) |_| {
-                if (rt_a.shard.outbound_by_peer.get(bundle_b.peer) == null) {
+            if (rt_a.shards[0].inbound_by_peer.get(bundle_b.peer)) |_| {
+                if (rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) == null) {
                     learned = true;
                     break;
                 }
@@ -5089,7 +5253,7 @@ test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-ou
     try testing.expect(saw_chunk);
     try testing.expect(saw_end);
     // Prove it rode the inbound leg: A never gained an outbound conn to B.
-    try testing.expect(rt_a.shard.outbound_by_peer.get(bundle_b.peer) == null);
+    try testing.expect(rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) == null);
 }
 
 /// Validator-context that just counts how many distinct payloads arrived,
@@ -5276,23 +5440,23 @@ test "QuicRuntime: 3-node gossipsub propagation under sustained publishes" {
     {
         const dl = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < dl) {
-            const ab = rt_a.shard.outbound_by_peer.get(bundle_b.peer) != null;
-            const ac = rt_a.shard.outbound_by_peer.get(bundle_c.peer) != null;
-            const ba = rt_b.shard.outbound_by_peer.get(bundle_a.peer) != null;
-            const bc = rt_b.shard.outbound_by_peer.get(bundle_c.peer) != null;
-            const ca = rt_c.shard.outbound_by_peer.get(bundle_a.peer) != null;
-            const cb = rt_c.shard.outbound_by_peer.get(bundle_b.peer) != null;
+            const ab = rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) != null;
+            const ac = rt_a.shards[0].outbound_by_peer.get(bundle_c.peer) != null;
+            const ba = rt_b.shards[0].outbound_by_peer.get(bundle_a.peer) != null;
+            const bc = rt_b.shards[0].outbound_by_peer.get(bundle_c.peer) != null;
+            const ca = rt_c.shards[0].outbound_by_peer.get(bundle_a.peer) != null;
+            const cb = rt_c.shards[0].outbound_by_peer.get(bundle_b.peer) != null;
             if (ab and ac and ba and bc and ca and cb) break;
             var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
             var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
             _ = std.c.nanosleep(&req, &rem);
         }
-        try testing.expect(rt_a.shard.outbound_by_peer.get(bundle_b.peer) != null);
-        try testing.expect(rt_a.shard.outbound_by_peer.get(bundle_c.peer) != null);
-        try testing.expect(rt_b.shard.outbound_by_peer.get(bundle_a.peer) != null);
-        try testing.expect(rt_b.shard.outbound_by_peer.get(bundle_c.peer) != null);
-        try testing.expect(rt_c.shard.outbound_by_peer.get(bundle_a.peer) != null);
-        try testing.expect(rt_c.shard.outbound_by_peer.get(bundle_b.peer) != null);
+        try testing.expect(rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) != null);
+        try testing.expect(rt_a.shards[0].outbound_by_peer.get(bundle_c.peer) != null);
+        try testing.expect(rt_b.shards[0].outbound_by_peer.get(bundle_a.peer) != null);
+        try testing.expect(rt_b.shards[0].outbound_by_peer.get(bundle_c.peer) != null);
+        try testing.expect(rt_c.shards[0].outbound_by_peer.get(bundle_a.peer) != null);
+        try testing.expect(rt_c.shards[0].outbound_by_peer.get(bundle_b.peer) != null);
     }
 
     // All subscribe so the gossipsub mesh forms on the common topic.
@@ -5440,7 +5604,7 @@ fn waitMeshConverged(cluster: []ClusterHost, deadline_ms: i64) bool {
         for (cluster) |*hi| {
             for (cluster) |*hj| {
                 if (hi.bundle.peer.eql(&hj.bundle.peer)) continue;
-                if (hi.rt.shard.outbound_by_peer.get(hj.bundle.peer) == null) {
+                if (hi.rt.shards[0].outbound_by_peer.get(hj.bundle.peer) == null) {
                     all_ok = false;
                     break;
                 }

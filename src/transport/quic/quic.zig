@@ -141,6 +141,23 @@ pub fn initLibp2pQuicServerFromMultiaddr(
     return ZIo.Server.initFromSocket(allocator, cfg, sock, true);
 }
 
+/// Build a second/Nth `*ZIo.Server` that shares an already-bound listen socket
+/// (multi-shard drive loop). `sock` is the fd shard 0's Server owns; this Server
+/// is created with `take_ownership = false` so its `deinit` never closes the fd.
+/// `port` must match the bound port so the config is consistent. The caller then
+/// calls `server.setShard(index, mask)` so the CIDs it mints route back to it.
+pub fn initLibp2pQuicServerSharingSocket(
+    allocator: std.mem.Allocator,
+    sock: std.posix.socket_t,
+    port: u16,
+    options: quic_v1.Libp2pZquicServerOptions,
+) !*ZIo.Server {
+    var cfg_opts = options;
+    cfg_opts.port = port;
+    const cfg = quic_v1.libp2pZquicServerConfig(cfg_opts);
+    return ZIo.Server.initFromSocket(allocator, cfg, sock, false);
+}
+
 /// Options shared with [`quic_v1.Libp2pZquicClientOptions`] except `host` / `port` (taken from the endpoint).
 pub const Libp2pZquicClientDialOptions = struct {
     keylog_path: ?[]const u8 = null,

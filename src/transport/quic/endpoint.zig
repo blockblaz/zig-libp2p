@@ -200,6 +200,36 @@ pub const QuicListener = struct {
         return self;
     }
 
+    /// Build an additional listener for a multi-shard drive loop that shares an
+    /// already-bound listen socket (`sock`, owned by shard 0's Server). The
+    /// wrapped Server is created with `take_ownership = false`, so this
+    /// listener's `deinit` closes only its own Server allocation, never the fd.
+    /// Call `self.server.setShard(index, mask)` afterwards so the CIDs it mints
+    /// route inbound packets back to this shard.
+    pub fn listenSharingSocket(
+        allocator: std.mem.Allocator,
+        sock: posix.socket_t,
+        port: u16,
+        options: quic_v1.Libp2pZquicServerOptions,
+    ) !*QuicListener {
+        const srv = try quic.initLibp2pQuicServerSharingSocket(allocator, sock, port, options);
+        const self = try allocator.create(QuicListener);
+        self.* = .{
+            .allocator = allocator,
+            .server = srv,
+            .seen_connected = .{false} ** ZIo.MAX_CONNECTIONS,
+            .lifecycle = .{},
+            .inbound_stream_reported = [_]std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams){std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams).initEmpty()} ** ZIo.MAX_CONNECTIONS,
+            .inbound_streams_reported_total = 0,
+            .silently_skipped_inbound_streams_total = 0,
+            .over_cap_count = .{0} ** ZIo.MAX_CONNECTIONS,
+            .over_cap_window_start_ms = .{0} ** ZIo.MAX_CONNECTIONS,
+            .over_cap_policy = .{},
+            .over_cap_breaches_total = 0,
+        };
+        return self;
+    }
+
     /// Configure the rate-based over-cap policy (#105). `OverCapPolicy { .threshold = 0 }`
     /// (the default) disables it; any positive threshold enables the breach callback.
     pub fn setOverCapPolicy(self: *QuicListener, policy: OverCapPolicy) void {
@@ -346,6 +376,38 @@ pub const QuicListener = struct {
             };
             const addr: feed_addr.Address = .{ .any = @as(*const posix.sockaddr, @ptrCast(&sa)).* };
             _ = ring.push(scratch[0..n], addr);
+        }
+    }
+
+    /// Demux-thread side, multi-shard: poll the shared listen socket and route
+    /// each waiting datagram to the ring of the shard that owns its connection
+    /// (`shard_ring.shardForDatagram` — short-header by tagged DCID byte, long-
+    /// header by source-address hash). `rings.len` must be the shard count and
+    /// `mask` = `rings.len - 1` (power of two). Drop-newest per ring on overflow.
+    /// The demux thread touches only the socket + rings (never any Server), so
+    /// all QUIC state stays single-threaded on each shard's drive thread.
+    pub fn pollAndRouteToRings(
+        self: *QuicListener,
+        rings: []const *shard_ring.InboundRing,
+        scratch: []u8,
+        mask: u8,
+        poll_timeout_ms: u32,
+    ) DriveError!void {
+        var fds = [1]posix.pollfd{.{ .fd = self.server.sock, .events = posix.POLL.IN, .revents = 0 }};
+        _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
+        if (fds[0].revents & posix.POLL.IN == 0) return;
+        var recv_n: usize = 0;
+        while (recv_n < max_recv_drain_per_call) : (recv_n += 1) {
+            var sa: posix.sockaddr.storage = undefined;
+            var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            const n = feed_addr.recvfrom(self.server.sock, scratch, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => |e| return e,
+            };
+            const addr: feed_addr.Address = .{ .any = @as(*const posix.sockaddr, @ptrCast(&sa)).* };
+            const src_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&addr.any));
+            const idx = shard_ring.shardForDatagram(scratch[0..n], src_hash, mask);
+            _ = rings[idx].push(scratch[0..n], addr);
         }
     }
 

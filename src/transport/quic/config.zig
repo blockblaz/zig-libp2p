@@ -150,6 +150,21 @@ pub const QuicRuntimeOptions = struct {
     now_ms_fn: *const fn () i64 = wall_time.milliTimestamp,
     /// Per-iteration poll timeout for the drive loop.
     poll_timeout_ms: u32 = 50,
+    /// Number of drive-loop shards (quinn model). Connections are partitioned
+    /// across this many drive threads to break single-thread saturation at a
+    /// full mesh. One demux thread reads the shared listen socket and routes
+    /// each datagram to the owning shard's ring (by shard-tagged CID byte for
+    /// 1-RTT, by source-address hash for long-header Initials). Clamped to
+    /// `[1, 8]` and rounded down to a power of two. `1` reproduces the
+    /// single-thread behaviour exactly (mask 0, demux is a no-op router).
+    ///
+    /// NOTE: the default is `1` until the cross-shard gossip outbox + per-shard
+    /// hook-queue routing (Phase 3) land — with `> 1` a directed gossip delivery
+    /// or a hook command for a peer owned by a different shard is drained by the
+    /// wrong shard's drive thread and dropped. The N-thread demux/ring/dial-
+    /// routing machinery is wired and active when this is raised; raising it is
+    /// gated on Phase 3.
+    drive_shards: u8 = 1,
     /// Circuit relay v2 server/client (#91).
     relay: RelayRuntimeOptions = .{},
     /// DCUtR hole punching over relayed connections (#91).
