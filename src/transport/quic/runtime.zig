@@ -3379,6 +3379,19 @@ pub const QuicRuntime = struct {
                     self.failOutboundRequestStart(peer, request_id, payload, error.IoError, "openRawAppStream", err);
                     return;
                 };
+                // Diagnostic (status only, to keep noise low — status is the
+                // RPC timing out): this request rides the INBOUND-leg fallback
+                // (we never dialed this peer → server-initiated stream).
+                // Correlate a timed-out status request_id in consensus.log with
+                // these lines to confirm whether status timeouts are the
+                // inbound-leg fallback vs the outbound leg. WARN level because
+                // quic_runtime info logs are filtered on the devnet.
+                if (proto == .status) {
+                    var pbuf: [128]u8 = undefined;
+                    log.warn("quic_runtime: status req request_id={d} peer={s} via INBOUND-leg fallback (server-initiated stream_id={d})", .{
+                        request_id, peerBase58(peer, &pbuf), sid,
+                    });
+                }
                 break :blk .{ .inbound = .{ .server = sh.listener.server, .conn = ic.conn, .stream_id = sid } };
             }
             // Genuinely no connection to this peer in either direction.
