@@ -527,6 +527,20 @@ pub const InboundGossipWork = struct {
 pub const inbound_gossip_work_cap_entries: usize = 1024;
 pub const inbound_gossip_work_cap_bytes: usize = 64 * 1024 * 1024;
 
+/// Size proxy that separates consensus-critical blocks (large) from redundant
+/// attestations (small) in the inbound gossip backlog. On a full queue,
+/// `enqueueInboundGossip` evicts small frames first and never drops a block for
+/// an attestation. gossipsub/transport are topic-agnostic (opaque frame bytes),
+/// so size is the only cheap classifier — same proxy the outbound priority/bulk
+/// outbox uses.
+pub const inbound_gossip_block_size_bytes: usize = 16 * 1024;
+
+/// Max inbound gossip frames the worker drains per loop iteration before
+/// running command/heartbeat processing. Batch-draining amortizes the
+/// per-iteration overhead so the single validation thread keeps up with the
+/// full-mesh inbound rate instead of letting the backlog hit its cap.
+pub const inbound_gossip_drain_batch: usize = 64;
+
 /// Fairness bound: max gossip frames drained from one inbound stream's
 /// accumulator per drive iteration. Draining a large post-stall `gossip_acc`
 /// backlog (varint-decode + dupe + enqueue per frame) in one call monopolized

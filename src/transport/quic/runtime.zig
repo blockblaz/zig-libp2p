@@ -452,6 +452,8 @@ pub const QuicRuntime = struct {
     gossip_work: std.ArrayList(conn_table.InboundGossipWork) = .empty,
     gossip_work_lock: conn_table.SpinLock = .{},
     gossip_work_bytes: usize = 0,
+    /// Rate-limit clock for the inbound-gossip backlog eviction/drop warning.
+    gossip_work_drop_warn_ms: i64 = 0,
     gossip_worker_thread: ?std.Thread = null,
 
     /// Cached raw Identify protobuf for inbound `/ipfs/id/1.0.0` replies.
@@ -482,10 +484,21 @@ pub const QuicRuntime = struct {
                 listen_opts.key_pem = b.key_pem;
             },
         }
-        // Shard count: clamp to [1,8], round DOWN to a power of two so the mask
-        // (count-1) is contiguous. 1 == the single-thread pre-sharding path.
-        const shard_count: u8 = roundDownPow2(std.math.clamp(opts.drive_shards, @as(u8, 1), @as(u8, 8)));
+        // Shard count: `0` means auto-detect from the core count; otherwise the
+        // configured value. Either way clamp to [1,8] and round DOWN to a power
+        // of two so the mask (count-1) is contiguous. 1 == the single-thread
+        // pre-sharding path.
+        const requested_shards: u8 = if (opts.drive_shards == 0)
+            autoDriveShards()
+        else
+            opts.drive_shards;
+        const shard_count: u8 = roundDownPow2(std.math.clamp(requested_shards, @as(u8, 1), @as(u8, 8)));
         const shard_mask: u8 = shard_count - 1;
+        if (opts.drive_shards == 0) {
+            log.info("quic_runtime: drive_shards=auto -> {d} (cores={d})", .{
+                shard_count, std.Thread.getCpuCount() catch 0,
+            });
+        }
 
         // Shard 0's listener owns the bound listen fd; shards 1..N share it via
         // their own `Server` (`take_ownership = false`) so all shards receive on
@@ -655,6 +668,20 @@ pub const QuicRuntime = struct {
         var p: u8 = 1;
         while (p << 1 <= n) p <<= 1;
         return p;
+    }
+
+    /// Auto drive-shard count from the host core count, used when
+    /// `drive_shards == 0`. We target ~1/4 of the cores for QUIC drive threads,
+    /// leaving the rest for the demux thread, the gossip-validation worker, the
+    /// consensus/STF parallel pool, and the main loop. The result is clamped to
+    /// [1,8] and rounded down to a power of two by the caller. Examples (after
+    /// the caller's pow2 snap): 4 cores -> 1, 8 cores -> 2, 16 cores -> 4,
+    /// 32+ cores -> 8. Falls back to 2 if the core count can't be read.
+    fn autoDriveShards() u8 {
+        const cores = std.Thread.getCpuCount() catch return 2;
+        if (cores <= 4) return 1;
+        const quarter = cores / 4; // usize
+        return @intCast(std.math.clamp(quarter, @as(usize, 1), @as(usize, 8)));
     }
 
     pub fn destroy(self: *QuicRuntime) void {
@@ -1366,8 +1393,17 @@ pub const QuicRuntime = struct {
         while (!self.shutdown_requested.load(.acquire)) {
             var did_work = false;
             // 1. Inbound gossip frames the drive thread queued (heavy validation
-            //    runs here, off the drive thread).
-            if (self.popInboundGossip()) |w| {
+            //    runs here, off the drive thread). BATCH-drain up to
+            //    `inbound_gossip_drain_batch` frames before falling through to
+            //    command/heartbeat processing: popping one-at-a-time paid the
+            //    per-iteration `processCommands` + clock overhead on every
+            //    frame, capping worker throughput well below the inbound rate
+            //    under a full 31-peer mesh and letting the work queue hit its
+            //    cap (dropping blocks → forks). Draining a batch amortizes that
+            //    overhead so the single validation thread keeps up.
+            var drained: usize = 0;
+            while (drained < conn_table.inbound_gossip_drain_batch) : (drained += 1) {
+                const w = self.popInboundGossip() orelse break;
                 self.host.handleGossipRpc(w.sender, w.frame) catch |err| {
                     log.warn("quic_runtime: handleGossipRpc (worker) failed: {s}", .{@errorName(err)});
                 };
@@ -1404,10 +1440,16 @@ pub const QuicRuntime = struct {
     }
 
     /// Drive-thread producer: copy a reassembled gossip frame onto the worker
-    /// queue.  Drops (with a warning) if the worker has fallen far behind, so a
-    /// slow validator can't grow the backlog without bound — the network stays
-    /// live regardless.  Falls back to inline processing if the worker thread
-    /// never started.
+    /// queue.  When the worker has fallen behind and the backlog is at its cap,
+    /// we shed load — but NEVER at the expense of a block. Blocks are
+    /// consensus-critical (a dropped block forks the node); attestations are
+    /// redundant (8 per subnet, only ⅔ needed). So on a full queue we evict the
+    /// OLDEST small frame (an attestation, by `inbound_gossip_block_size_bytes`
+    /// size proxy — gossipsub/transport are topic-agnostic) to make room. Only
+    /// when the queue is entirely blocks do we touch a block, and then only to
+    /// admit another (newer) block (FIFO). An incoming attestation is dropped
+    /// rather than evict a queued block. Falls back to inline processing if the
+    /// worker thread never started.
     fn enqueueInboundGossip(self: *QuicRuntime, sender: identity.PeerId, frame_view: []const u8) void {
         if (self.gossip_worker_thread == null) {
             // No worker (spawn failed): preserve original inline behaviour.
@@ -1416,22 +1458,59 @@ pub const QuicRuntime = struct {
             };
             return;
         }
+        const a = self.allocator;
+        const block_threshold = conn_table.inbound_gossip_block_size_bytes;
+        const incoming_is_block = frame_view.len >= block_threshold;
+
         self.gossip_work_lock.lock();
         defer self.gossip_work_lock.unlock();
-        if (self.gossip_work.items.len >= conn_table.inbound_gossip_work_cap_entries or
+
+        // Make room while over either cap. Bounded: each pass removes one entry,
+        // and the empty-queue guard prevents spinning on a single frame larger
+        // than the byte cap.
+        while (self.gossip_work.items.len >= conn_table.inbound_gossip_work_cap_entries or
             self.gossip_work_bytes +| frame_view.len > conn_table.inbound_gossip_work_cap_bytes)
         {
-            log.warn("quic_runtime: inbound gossip work backlog full ({d} entries, {d} bytes); dropping frame", .{
-                self.gossip_work.items.len, self.gossip_work_bytes,
-            });
-            return;
+            if (self.gossip_work.items.len == 0) break; // single oversized frame: admit it
+            // Prefer evicting the oldest SMALL frame (attestation).
+            var evict_idx: ?usize = null;
+            for (self.gossip_work.items, 0..) |w, idx| {
+                if (w.frame.len < block_threshold) {
+                    evict_idx = idx;
+                    break;
+                }
+            }
+            if (evict_idx == null) {
+                // Queue is all blocks. Only evict the oldest block to admit a
+                // NEWER block; never evict a block for an attestation.
+                if (!incoming_is_block) {
+                    self.noteGossipWorkDrop("queue saturated with blocks; dropping attestation");
+                    return;
+                }
+                evict_idx = 0;
+            }
+            const ev = self.gossip_work.orderedRemove(evict_idx.?);
+            self.gossip_work_bytes -|= ev.frame.len;
+            a.free(ev.frame);
+            self.noteGossipWorkDrop(if (incoming_is_block) "evicted to admit block" else "evicted stale attestation");
         }
-        const frame = self.allocator.dupe(u8, frame_view) catch return;
-        self.gossip_work.append(self.allocator, .{ .sender = sender, .frame = frame }) catch {
-            self.allocator.free(frame);
+        const frame = a.dupe(u8, frame_view) catch return;
+        self.gossip_work.append(a, .{ .sender = sender, .frame = frame }) catch {
+            a.free(frame);
             return;
         };
         self.gossip_work_bytes +|= frame.len;
+    }
+
+    /// Rate-limited (5s) warning for inbound-gossip-backlog evictions/drops, so a
+    /// sustained-overload window doesn't flood the log.
+    fn noteGossipWorkDrop(self: *QuicRuntime, reason: []const u8) void {
+        const now_ms = self.opts.now_ms_fn();
+        if (now_ms - self.gossip_work_drop_warn_ms < 5_000) return;
+        self.gossip_work_drop_warn_ms = now_ms;
+        log.warn("quic_runtime: inbound gossip work backlog full ({d} entries, {d} bytes); {s} (blocks preserved)", .{
+            self.gossip_work.items.len, self.gossip_work_bytes, reason,
+        });
     }
 
     /// Global drive-loop work budget (#2): max wall-ms between interleaved

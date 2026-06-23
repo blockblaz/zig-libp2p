@@ -154,11 +154,17 @@ pub const QuicRuntimeOptions = struct {
     /// across this many drive threads to break single-thread saturation at a
     /// full mesh. One demux thread reads the shared listen socket and routes
     /// each datagram to the owning shard's ring (by shard-tagged CID byte for
-    /// 1-RTT, by source-address hash for long-header Initials). Clamped to
-    /// `[1, 8]` and rounded down to a power of two. `1` reproduces the
-    /// single-thread behaviour exactly (mask 0, demux is a no-op router).
+    /// 1-RTT, by source-address hash for long-header Initials).
     ///
-    /// Default `2` as of Phase 4: the full N>1 routing path is correct. Landed:
+    /// `0` (the default) means AUTO: derive the count from the host core count
+    /// (~1/4 of cores, leaving the rest for the demux thread, gossip-validation
+    /// worker, consensus/STF pool, and main loop) — see `autoDriveShards`.
+    /// A non-zero value forces that count. Either way the result is clamped to
+    /// `[1, 8]` and rounded down to a power of two, so `shard_mask = count - 1`
+    /// is a contiguous low-bit mask. `1` reproduces the single-thread behaviour
+    /// exactly (mask 0, demux is a no-op router).
+    ///
+    /// The full N>1 routing path is correct as of Phase 4. Landed:
     /// the connection-lifecycle coordinator funnel (one thread touches
     /// `connection_manager`); cross-shard gossip-outbox routing (each directed/
     /// broadcast delivery is handed to the shard owning the destination peer's
@@ -174,7 +180,7 @@ pub const QuicRuntimeOptions = struct {
     /// RESIDUAL (safe because zeam disables these protocols): relay / dcutr /
     /// autonat inbound handlers in `advanceInboundStreams` still touch shard-0
     /// connection state unfunneled.
-    drive_shards: u8 = 2,
+    drive_shards: u8 = 0,
     /// Circuit relay v2 server/client (#91).
     relay: RelayRuntimeOptions = .{},
     /// DCUtR hole punching over relayed connections (#91).
