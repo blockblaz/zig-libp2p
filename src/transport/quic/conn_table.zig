@@ -339,10 +339,30 @@ pub const PersistentGossipStream = struct {
     /// `> persistent_gossip_priority_max_bytes`). Heap-owned, FIFO, capped at
     /// [`persistent_gossip_bulk_outbox_cap`] (small — blocks are big and few,
     /// so drop-oldest sheds stale blocks). Drained AFTER the priority lane is
-    /// empty, and only `persistent_gossip_bulk_drain_budget_bytes` per tick so
-    /// a big block dribbles out in chunks while each tick's fresh attestations
-    /// jump ahead of it on the priority lane.
+    /// empty, but each FRAME is written ATOMICALLY: once any byte of a bulk
+    /// frame has hit the wire the lane is locked (see [`outbox_bulk_partial`])
+    /// until that frame completes, and only THEN can the priority lane
+    /// preempt. This mirrors rust-libp2p's gossipsub `Framed` sink:
+    /// `poll_ready=Pending` while a partial frame is in flight, no interleave
+    /// possible. HOL bound shrinks from "whole queued backlog" (6-8 slots,
+    /// observed) to "one block's transmit" (~1 slot), at zero corruption risk.
     outbox_bulk: std.ArrayList([]u8) = .empty,
+    /// True iff `outbox.items[0]` is a partial suffix from a backpressured
+    /// `sendChunk` — the frame on the wire is in mid-flight and MUST complete
+    /// before any other frame (incl. a fresh bulk frame) is written, else the
+    /// receiver reads inter-frame bytes as the next length prefix and the
+    /// `/meshsub` byte stream desyncs. Mirrors rust-libp2p's `Framed` sink
+    /// semantics: `poll_ready` returns `Pending` while a partial frame is in
+    /// flight; the next message is not started until the current one drains.
+    /// Set when `drainGossipLane` leaves a suffix; cleared when the lane's head
+    /// frame is fully consumed.
+    outbox_partial: bool = false,
+    /// Same invariant for the BULK lane. At most one of `outbox_partial` /
+    /// `outbox_bulk_partial` may be true; the orchestration in
+    /// `advancePersistentGossipStreams` enforces "if a lane is partial, only
+    /// that lane drains this tick", so an attestation cannot slip between two
+    /// bytes of a block (or vice versa).
+    outbox_bulk_partial: bool = false,
     /// Wall-clock time of the most recent successful flush on this stream.
     /// Used by [`maybeSendPersistentGossipKeepalive`] to emit an empty-control
     /// RPC every [`persistent_gossip_keepalive_interval_ms`] when the stream
@@ -393,13 +413,6 @@ pub const persistent_gossip_priority_max_bytes: usize = 16 * 1024;
 /// (the consensus layer re-syncs missed blocks by root) while keeping the
 /// connection and the priority lane alive.
 pub const persistent_gossip_bulk_outbox_cap: usize = 64;
-
-/// Maximum BULK-lane bytes offered to the transport per drive tick. Bounding
-/// the bulk pass means a multi-MB block dribbles out across several ticks and
-/// each tick's freshly-enqueued attestations (priority lane, drained first)
-/// jump ahead of the block's remaining suffix instead of waiting behind the
-/// whole block.
-pub const persistent_gossip_bulk_drain_budget_bytes: usize = 64 * 1024;
 
 /// Scratch size for coalescing consecutive queued gossip frames into one
 /// MTU-chunked stream write. gossipsub RPC frames are self-delimiting (uvarint
