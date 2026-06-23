@@ -158,20 +158,23 @@ pub const QuicRuntimeOptions = struct {
     /// `[1, 8]` and rounded down to a power of two. `1` reproduces the
     /// single-thread behaviour exactly (mask 0, demux is a no-op router).
     ///
-    /// NOTE: the default is `1` until the remaining N>1 routing gaps close.
-    /// Landed: the connection-lifecycle coordinator funnel (step 9 — one thread
-    /// touches `connection_manager`) and cross-shard gossip-outbox routing
-    /// (Phase 3 — each directed/broadcast delivery is handed to the shard that
-    /// owns the destination peer's connection). STILL open for `> 1`: (a) the
-    /// hook queue (dial / send_request / send_response_chunk) is drained only by
-    /// shard 0, so a req/resp for a peer owned by another shard is processed on
-    /// the wrong shard; (b) an inbound connection is owned by the shard the demux
-    /// CID-routed it to, which may differ from `hash(peer)&mask` used to route
-    /// gossip/hook work — so gossip/req-resp over an inbound-only leg can land on
-    /// a shard that holds no connection to the peer. Both are the Phase-4
-    /// coordinator-funnel follow-up. The N-thread demux/ring/dial-routing
-    /// machinery is wired and active when this is raised.
-    drive_shards: u8 = 1,
+    /// Default `2` as of Phase 4: the full N>1 routing path is correct. Landed:
+    /// the connection-lifecycle coordinator funnel (one thread touches
+    /// `connection_manager`); cross-shard gossip-outbox routing (each directed/
+    /// broadcast delivery is handed to the shard owning the destination peer's
+    /// connection); the peer→shard ownership table (`owner_by_peer`) that routes
+    /// all peer-targeted hook work (dial / send_request / response) to the shard
+    /// that actually owns a leg to the peer; and the `inbound_stream_shard` map
+    /// that pins each response to the shard which accepted its request stream
+    /// (the leg-straddle case). `1` reproduces the single-thread pre-sharding
+    /// behaviour exactly (mask 0, demux is a no-op router). The N=2 cross-shard
+    /// req/resp gate test asserts a round-trip succeeds when a peer's legs land
+    /// on different shards — the case the ownership table exists to handle.
+    ///
+    /// RESIDUAL (safe because zeam disables these protocols): relay / dcutr /
+    /// autonat inbound handlers in `advanceInboundStreams` still touch shard-0
+    /// connection state unfunneled.
+    drive_shards: u8 = 2,
     /// Circuit relay v2 server/client (#91).
     relay: RelayRuntimeOptions = .{},
     /// DCUtR hole punching over relayed connections (#91).

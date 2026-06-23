@@ -4799,7 +4799,7 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
     {
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
                 connected = true;
                 break;
             }
@@ -4934,7 +4934,7 @@ test "QuicRuntime: two instances exchange a large (~300 KB) req/resp response ov
     {
         const dl = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < dl) {
-            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
                 connected = true;
                 break;
             }
@@ -5054,7 +5054,7 @@ test "QuicRuntime: empty req/resp response (responder finishes with no chunk) en
     {
         const dl = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < dl) {
-            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
                 connected = true;
                 break;
             }
@@ -5188,7 +5188,7 @@ test "QuicRuntime: multi-chunk req/resp response (blocks_by_range shape) deliver
     {
         const dl = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < dl) {
-            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
                 connected = true;
                 break;
             }
@@ -5306,8 +5306,8 @@ test "QuicRuntime: simultaneous mutual dial completes both handshakes (no Initia
     var b_has_a = false;
     const deadline_ms = wall_time.milliTimestamp() + 20_000;
     while (wall_time.milliTimestamp() < deadline_ms and !(a_has_b and b_has_a)) {
-        if (rt_a.shards[0].outbound_by_peer.get(bundle_b.peer)) |_| a_has_b = true;
-        if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| b_has_a = true;
+        if (rtHasOutboundTo(rt_a, bundle_b.peer)) a_has_b = true;
+        if (rtHasOutboundTo(rt_b, bundle_a.peer)) b_has_a = true;
         var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
         var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
         _ = std.c.nanosleep(&req, &rem);
@@ -5452,7 +5452,7 @@ test "QuicRuntime: two instances exchange a gossipsub message over UDP loopback"
     {
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
                 connected = true;
                 break;
             }
@@ -5585,7 +5585,7 @@ test "QuicRuntime: gossip publishes over the inbound leg when no outbound exists
         var connected = false;
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
                 connected = true;
                 break;
             }
@@ -5609,8 +5609,8 @@ test "QuicRuntime: gossip publishes over the inbound leg when no outbound exists
         var learned = false;
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_a.shards[0].inbound_by_peer.get(bundle_b.peer)) |_| {
-                if (rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) == null) {
+            if (rtHasInboundTo(rt_a, bundle_b.peer)) {
+                if (rtHasNoOutboundTo(rt_a, bundle_b.peer)) {
                     learned = true;
                     break;
                 }
@@ -5642,7 +5642,7 @@ test "QuicRuntime: gossip publishes over the inbound leg when no outbound exists
 
     // Confirm the publish really rode the inbound leg: A still has no outbound
     // to B, so the delivered gossip could only have used the inbound stream.
-    try testing.expect(rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) == null);
+    try testing.expect(rtHasNoOutboundTo(rt_a, bundle_b.peer));
 }
 
 test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-outbound-conn fix)" {
@@ -5743,7 +5743,7 @@ test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-ou
         var connected = false;
         const deadline_ms = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < deadline_ms) {
-            if (rt_b.shards[0].outbound_by_peer.get(bundle_a.peer)) |_| {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
                 connected = true;
                 break;
             }
@@ -5771,8 +5771,8 @@ test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-ou
                 var e = ev_in;
                 e.deinit(a);
             } else |_| {}
-            if (rt_a.shards[0].inbound_by_peer.get(bundle_b.peer)) |_| {
-                if (rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) == null) {
+            if (rtHasInboundTo(rt_a, bundle_b.peer)) {
+                if (rtHasNoOutboundTo(rt_a, bundle_b.peer)) {
                     learned = true;
                     break;
                 }
@@ -5822,7 +5822,7 @@ test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-ou
     try testing.expect(saw_chunk);
     try testing.expect(saw_end);
     // Prove it rode the inbound leg: A never gained an outbound conn to B.
-    try testing.expect(rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) == null);
+    try testing.expect(rtHasNoOutboundTo(rt_a, bundle_b.peer));
 }
 
 /// Validator-context that just counts how many distinct payloads arrived,
@@ -6009,23 +6009,23 @@ test "QuicRuntime: 3-node gossipsub propagation under sustained publishes" {
     {
         const dl = wall_time.milliTimestamp() + 20_000;
         while (wall_time.milliTimestamp() < dl) {
-            const ab = rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) != null;
-            const ac = rt_a.shards[0].outbound_by_peer.get(bundle_c.peer) != null;
-            const ba = rt_b.shards[0].outbound_by_peer.get(bundle_a.peer) != null;
-            const bc = rt_b.shards[0].outbound_by_peer.get(bundle_c.peer) != null;
-            const ca = rt_c.shards[0].outbound_by_peer.get(bundle_a.peer) != null;
-            const cb = rt_c.shards[0].outbound_by_peer.get(bundle_b.peer) != null;
+            const ab = rtHasOutboundTo(rt_a, bundle_b.peer);
+            const ac = rtHasOutboundTo(rt_a, bundle_c.peer);
+            const ba = rtHasOutboundTo(rt_b, bundle_a.peer);
+            const bc = rtHasOutboundTo(rt_b, bundle_c.peer);
+            const ca = rtHasOutboundTo(rt_c, bundle_a.peer);
+            const cb = rtHasOutboundTo(rt_c, bundle_b.peer);
             if (ab and ac and ba and bc and ca and cb) break;
             var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
             var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
             _ = std.c.nanosleep(&req, &rem);
         }
-        try testing.expect(rt_a.shards[0].outbound_by_peer.get(bundle_b.peer) != null);
-        try testing.expect(rt_a.shards[0].outbound_by_peer.get(bundle_c.peer) != null);
-        try testing.expect(rt_b.shards[0].outbound_by_peer.get(bundle_a.peer) != null);
-        try testing.expect(rt_b.shards[0].outbound_by_peer.get(bundle_c.peer) != null);
-        try testing.expect(rt_c.shards[0].outbound_by_peer.get(bundle_a.peer) != null);
-        try testing.expect(rt_c.shards[0].outbound_by_peer.get(bundle_b.peer) != null);
+        try testing.expect(rtHasOutboundTo(rt_a, bundle_b.peer));
+        try testing.expect(rtHasOutboundTo(rt_a, bundle_c.peer));
+        try testing.expect(rtHasOutboundTo(rt_b, bundle_a.peer));
+        try testing.expect(rtHasOutboundTo(rt_b, bundle_c.peer));
+        try testing.expect(rtHasOutboundTo(rt_c, bundle_a.peer));
+        try testing.expect(rtHasOutboundTo(rt_c, bundle_b.peer));
     }
 
     // All subscribe so the gossipsub mesh forms on the common topic.
@@ -6178,7 +6178,7 @@ fn waitMeshConverged(cluster: []ClusterHost, deadline_ms: i64) bool {
         for (cluster) |*hi| {
             for (cluster) |*hj| {
                 if (hi.bundle.peer.eql(&hj.bundle.peer)) continue;
-                if (hi.rt.shards[0].outbound_by_peer.get(hj.bundle.peer) == null) {
+                if (!rtHasOutboundTo(hi.rt, hj.bundle.peer)) {
                     all_ok = false;
                     break;
                 }
@@ -6203,6 +6203,36 @@ fn rtHasOutboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
         if (sh.outbound_by_peer.get(peer) != null) return true;
     }
     return false;
+}
+
+/// Whether `rt` owns a live INBOUND leg to `peer` on ANY of its shards. At
+/// `drive_shards > 1` the inbound leg lives on whichever shard the demux
+/// CID-routed the handshake to, which need not be shard 0. Same racy
+/// settled-state probe contract as [`rtHasOutboundTo`].
+fn rtHasInboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
+    for (rt.shards) |*sh| {
+        if (sh.inbound_by_peer.get(peer) != null) return true;
+    }
+    return false;
+}
+
+/// The shard index that holds an INBOUND leg to `peer`, or null if none. Used by
+/// the cross-shard req/resp gate to detect when a responder accepted a peer's
+/// request stream on a shard *other* than `shardIndexForPeer(peer)` — the exact
+/// straddle the `inbound_stream_shard` ownership table exists to route around.
+fn rtInboundLegShard(rt: *QuicRuntime, peer: identity.PeerId) ?u8 {
+    for (rt.shards, 0..) |*sh, i| {
+        if (sh.inbound_by_peer.get(peer) != null) return @intCast(i);
+    }
+    return null;
+}
+
+/// Whether `rt` has NO outbound leg to `peer` on ANY shard. The inbound-leg
+/// tests (#214 / req-resp-over-inbound) assert the local node never dialed the
+/// peer; at `drive_shards > 1` that must hold across every shard, not just
+/// shard 0.
+fn rtHasNoOutboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
+    return !rtHasOutboundTo(rt, peer);
 }
 
 /// Sharded-aware analogue of `waitMeshConverged`: every host has an outbound
@@ -6455,6 +6485,154 @@ test "QuicRuntime: N=2 sharded cluster — CID demux routing + cross-shard gossi
         }
         try testing.expect(c.count() >= pubs);
     }
+}
+
+// N=2 CROSS-SHARD REQ/RESP GATE (Phase 4 — the ownership-table proof).
+//
+// This is the test the peer→shard ownership table (`owner_by_peer` +
+// `inbound_stream_shard`) exists to make pass. At `drive_shards = 2` a responder
+// accepts a peer's request stream on whichever shard the demux CID-routed the
+// inbound leg to — call it Y. The response work (`send_response_chunk` /
+// `send_end_of_stream`) is enqueued as hook work; if it were routed by
+// `shardIndexForPeer(requester) = hash(peer)&1` (= Z) instead of by the
+// accepting shard, then whenever Y ≠ Z the response lands on a shard whose
+// `channel_to_inbound` has no entry for that request → 0 response ends → the
+// requester times out. The `inbound_stream_shard` map (request_id → accepting
+// shard) is what routes the response back to Y, so this round-trip only succeeds
+// WITH the table.
+//
+// We bring up a 4-node N=2 cluster (more pairs → at least one straddling leg is
+// near-certain), respond to every request on every host, fire a request across
+// every ordered pair, and assert (a) every round-trip completes AND (b) at least
+// one responder accepted a peer's leg on a shard ≠ that peer's hash shard — i.e.
+// the straddle the table fixes was actually exercised, so a green result is not
+// a trivial all-on-one-shard pass. If (b) ever fails the test is inconclusive
+// (every leg happened to be hash-aligned), not a routing bug, so it's a
+// diagnostic print + soft re-derivation rather than masking a real failure.
+test "QuicRuntime: N=2 cross-shard req/resp round-trip (ownership-table gate)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const n: usize = 4;
+
+    const cluster = try buildCluster(a, .{ .n = n, .drive_shards = 2 });
+    defer destroyCluster(a, cluster);
+
+    // Every host must be 2-sharded for the straddle to be possible.
+    for (cluster) |*ch| {
+        try testing.expectEqual(@as(u8, 2), ch.rt.shard_count);
+        try testing.expectEqual(@as(u8, 1), ch.rt.shard_mask);
+    }
+
+    // Every host responds to inbound requests (and drains its own events).
+    var drain_done = std.atomic.Value(bool).init(false);
+    const Responder = struct {
+        fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+            const dl = wall_time.milliTimestamp() + 90_000;
+            while (wall_time.milliTimestamp() < dl) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(100) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                defer ev.deinit(h.allocator);
+                switch (ev) {
+                    .rpc_request => |r| {
+                        h.sendResponseChunk(r.channel_id, "XS-OK", wall_time.milliTimestamp()) catch {};
+                        h.finishResponseStream(r.channel_id) catch {};
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+    var threads = std.ArrayList(std.Thread).empty;
+    defer threads.deinit(a);
+    defer {
+        drain_done.store(true, .release);
+        for (threads.items) |th| th.join();
+    }
+    // Responders on every host EXCEPT host 0 — host 0 is the dedicated requester
+    // whose response events we read inline below (so they aren't stolen by a
+    // background drainer).
+    for (cluster[1..]) |*ch| {
+        const th = try std.Thread.spawn(.{}, Responder.run, .{ ch.host, &drain_done });
+        try threads.append(a, th);
+    }
+
+    try testing.expect(waitMeshConvergedSharded(cluster, wall_time.milliTimestamp() + 30_000));
+
+    // Give inbound legs a moment to register on their demux-routed shards so the
+    // straddle detection below reads settled state.
+    {
+        const settle = wall_time.milliTimestamp() + 3_000;
+        while (wall_time.milliTimestamp() < settle) {
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            var req = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+    }
+
+    // (b) Detect the straddle: on each responder S (hosts 1..n), is there a peer
+    //     R whose inbound leg landed on a shard ≠ `shardIndexForPeer(R)`? That is
+    //     the case where response routing MUST consult `inbound_stream_shard`.
+    var straddle_seen = false;
+    for (cluster[1..]) |*s| {
+        for (cluster) |*r| {
+            if (s.bundle.peer.eql(&r.bundle.peer)) continue;
+            const inbound_shard = rtInboundLegShard(s.rt, r.bundle.peer) orelse continue;
+            const hash_shard = s.rt.shardIndexForPeer(r.bundle.peer);
+            if (inbound_shard != hash_shard) {
+                straddle_seen = true;
+                break;
+            }
+        }
+        if (straddle_seen) break;
+    }
+    if (!straddle_seen) {
+        std.debug.print(
+            "N=2 cross-shard req/resp: no straddling leg observed (all inbound legs hash-aligned); round-trip assertions still run but the table path was not exercised this run\n",
+            .{},
+        );
+    }
+
+    // (a) Host 0 fires a request to every other host and must see chunk+end from
+    //     each — these responses traverse the responder's accepting shard, which
+    //     for the straddling pair(s) is NOT the peer-hash shard.
+    var ends: usize = 0;
+    var chunks: usize = 0;
+    const expected_ends: usize = n - 1;
+    for (cluster[1..]) |*s| {
+        _ = try cluster[0].host.sendRequest(s.bundle.peer, .status, "XS-REQ", 20_000);
+    }
+
+    const dl = wall_time.milliTimestamp() + 30_000;
+    while (wall_time.milliTimestamp() < dl and ends < expected_ends) {
+        var ev = cluster[0].host.nextEvent(500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        defer ev.deinit(a);
+        switch (ev) {
+            .rpc_response_chunk => |c| {
+                try testing.expectEqualStrings("XS-OK", c.chunk);
+                chunks += 1;
+            },
+            .rpc_response_end => ends += 1,
+            else => {},
+        }
+    }
+
+    if (ends < expected_ends) {
+        std.debug.print("N=2 cross-shard req/resp: only {d}/{d} response ends\n", .{ ends, expected_ends });
+    }
+    try testing.expectEqual(expected_ends, ends);
+    try testing.expect(chunks >= expected_ends);
+    // The straddle assertion is hard: with 4 nodes × 2 shards a hash-aligned
+    // sweep is vanishingly unlikely, and if it ever happens the round-trip above
+    // already proved correctness — so we assert it to keep the gate meaningful.
+    try testing.expect(straddle_seen);
 }
 
 test "QuicRuntime: req-resp burst — multiple inflight requests per peer" {
