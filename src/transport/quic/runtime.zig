@@ -97,12 +97,21 @@ pub const Shard = struct {
     inbound_by_peer: conn_table.InboundPeerMap,
     /// Persistent per-peer `/meshsub` streams for this shard's peers (#183).
     persistent_gossip: conn_table.PersistentGossipMap,
+    /// Inbound streams on this shard's connections (index-walked).
+    inbound_streams: std.ArrayList(*conn_table.InboundStream) = .empty,
+    /// req/resp `channel_id` -> inbound stream, for this shard's conns.
+    channel_to_inbound: std.AutoHashMap(u64, *conn_table.InboundStream),
+    /// Per-listener-slot inbound connection bookkeeping (this shard's Server).
+    inbound_conn_ids: [ZIo.MAX_CONNECTIONS]connection_manager_mod.ConnectionId = .{0} ** ZIo.MAX_CONNECTIONS,
+    inbound_conn_notified: [ZIo.MAX_CONNECTIONS]bool = .{false} ** ZIo.MAX_CONNECTIONS,
+    inbound_conn_peer: [ZIo.MAX_CONNECTIONS]?identity.PeerId = .{null} ** ZIo.MAX_CONNECTIONS,
 
     pub fn init(a: std.mem.Allocator) Shard {
         return .{
             .outbound_by_peer = conn_table.PeerIdMap.init(a),
             .inbound_by_peer = conn_table.InboundPeerMap.init(a),
             .persistent_gossip = conn_table.PersistentGossipMap.init(a),
+            .channel_to_inbound = std.AutoHashMap(u64, *conn_table.InboundStream).init(a),
         };
     }
 };
@@ -120,9 +129,6 @@ pub const QuicRuntime = struct {
     /// non-blocking each `driveLoop` tick; promoted into `outbound_by_peer`
     /// on `.connected`, or failed on deadline. See [`PendingDial`].
     pending_dials: std.ArrayList(PendingDial) = .empty,
-    /// Inbound streams keyed by an internal monotonic id; supports lookup by
-    /// (slot, stream_id) for incoming-stream callbacks.
-    inbound_streams: std.ArrayList(*conn_table.InboundStream),
     /// Outbound request streams indexed by req/resp `request_id`.
     outbound_requests: std.AutoHashMap(u64, *conn_table.OutboundRequest),
     /// Outbound gossipsub publish streams (one stream per publish per peer).
@@ -160,17 +166,7 @@ pub const QuicRuntime = struct {
     /// Dedicated scratch for `maybePumpInbound` so interleaved pumps never alias
     /// the drive loop's in-use `recv_buf`.
     pump_buf: [65536]u8 = undefined,
-    /// Inbound channels: req/resp's `channel_id` -> the conn_table.InboundStream that
-    /// originated it. So when `.send_response_chunk` etc. arrive we can find
-    /// the stream to write back on.
-    channel_to_inbound: std.AutoHashMap(u64, *conn_table.InboundStream),
-
     next_conn_id: connection_manager_mod.ConnectionId = 1,
-    /// Per-slot conn id for inbound. Populated when an inbound stream first
-    /// fires (lazy verify of remote peer id from TLS).
-    inbound_conn_ids: [ZIo.MAX_CONNECTIONS]connection_manager_mod.ConnectionId = .{0} ** ZIo.MAX_CONNECTIONS,
-    inbound_conn_notified: [ZIo.MAX_CONNECTIONS]bool = .{false} ** ZIo.MAX_CONNECTIONS,
-    inbound_conn_peer: [ZIo.MAX_CONNECTIONS]?identity.PeerId = .{null} ** ZIo.MAX_CONNECTIONS,
 
     /// Cross-thread hook → drive-thread work queue. Hook runs on swarm
     /// thread; drive thread drains via [`drainHookWork`]. Synchronization
@@ -279,13 +275,11 @@ pub const QuicRuntime = struct {
             .tls_pem_resolved = tls_pem_resolved,
             .listener = listener,
             .shard = Shard.init(a),
-            .inbound_streams = .empty,
             .outbound_requests = std.AutoHashMap(u64, *conn_table.OutboundRequest).init(a),
             .outbound_publishes = std.AutoHashMap(u64, *conn_table.OutboundPublish).init(a),
             .outbound_identify_pushes = std.AutoHashMap(u64, *conn_table.OutboundIdentifyPush).init(a),
             .outbound_autonat_probes = std.AutoHashMap(u64, *conn_table.OutboundAutonatProbe).init(a),
             .autonat_server = autonat_mod.Server.init(a, .{}, autonatDialBack),
-            .channel_to_inbound = std.AutoHashMap(u64, *conn_table.InboundStream).init(a),
             .relay_live = quic_relay_live.LiveRelay.init(a, opts.host.swarm.local_peer, .{
                 .enable_server = opts.relay.enable_server,
                 .enable_client = opts.relay.enable_client,
@@ -385,7 +379,7 @@ pub const QuicRuntime = struct {
         self.shard.inbound_by_peer.deinit();
 
         // Free inbound streams.
-        for (self.inbound_streams.items) |s| {
+        for (self.shard.inbound_streams.items) |s| {
             s.req_acc.deinit(self.allocator);
             s.gossip_acc.deinit(self.allocator);
             s.relay_acc.deinit(self.allocator);
@@ -393,7 +387,7 @@ pub const QuicRuntime = struct {
             s.ms_tail.deinit(self.allocator);
             self.allocator.destroy(s);
         }
-        self.inbound_streams.deinit(self.allocator);
+        self.shard.inbound_streams.deinit(self.allocator);
 
         // Free outbound requests.
         var rit = self.outbound_requests.valueIterator();
@@ -439,7 +433,7 @@ pub const QuicRuntime = struct {
         while (st_it.next()) |k| self.allocator.free(k.*);
         self.subscribed_topics.deinit();
 
-        self.channel_to_inbound.deinit();
+        self.shard.channel_to_inbound.deinit();
 
         self.host.setIdentifyPushDispatch(null);
 
@@ -619,20 +613,20 @@ pub const QuicRuntime = struct {
 
     fn onLifecycleConnected(ctx: ?*anyopaque, slot: usize, _: *ZIo.ConnState) void {
         const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        if (!self.inbound_conn_notified[slot]) {
+        if (!self.shard.inbound_conn_notified[slot]) {
             // We don't yet have the verified peer id (TLS handshake might be
             // freshly complete). Delay onConnectionEstablished until first
             // inbound stream when peer id is available.
-            self.inbound_conn_ids[slot] = self.next_conn_id;
+            self.shard.inbound_conn_ids[slot] = self.next_conn_id;
             self.next_conn_id += 1;
         }
     }
 
     fn onLifecycleClosed(ctx: ?*anyopaque, slot: usize) void {
         const self: *QuicRuntime = @ptrCast(@alignCast(ctx.?));
-        if (self.inbound_conn_notified[slot]) {
-            const peer = self.inbound_conn_peer[slot] orelse identity.PeerId.random() catch return;
-            const cid = self.inbound_conn_ids[slot];
+        if (self.shard.inbound_conn_notified[slot]) {
+            const peer = self.shard.inbound_conn_peer[slot] orelse identity.PeerId.random() catch return;
+            const cid = self.shard.inbound_conn_ids[slot];
             const now_ms = self.opts.now_ms_fn();
             self.host.onConnectionClosed(now_ms, cid, peer, .remote_close) catch |e| {
                 log.warn("quic_runtime: onConnectionClosed failed: {s}", .{@errorName(e)});
@@ -640,9 +634,9 @@ pub const QuicRuntime = struct {
             _ = self.shard.inbound_by_peer.remove(peer);
             self.destroyPersistentGossipStream(peer);
         }
-        self.inbound_conn_notified[slot] = false;
-        self.inbound_conn_peer[slot] = null;
-        self.inbound_conn_ids[slot] = 0;
+        self.shard.inbound_conn_notified[slot] = false;
+        self.shard.inbound_conn_peer[slot] = null;
+        self.shard.inbound_conn_ids[slot] = 0;
     }
 
     /// Register an established inbound connection with the host exactly once per
@@ -651,15 +645,15 @@ pub const QuicRuntime = struct {
     /// GRAFTs us into its mesh. Shared by the handshake-time poll
     /// (`pollInboundRegistrations`) and the first-inbound-stream fallback.
     fn notifyInboundEstablished(self: *QuicRuntime, slot: usize, sender: identity.PeerId, conn: *ZIo.ConnState) void {
-        if (slot == inbound_slot_none or self.inbound_conn_notified[slot]) return;
-        self.inbound_conn_notified[slot] = true;
-        self.inbound_conn_peer[slot] = sender;
+        if (slot == inbound_slot_none or self.shard.inbound_conn_notified[slot]) return;
+        self.shard.inbound_conn_notified[slot] = true;
+        self.shard.inbound_conn_peer[slot] = sender;
         self.shard.inbound_by_peer.put(sender, .{ .slot = slot, .conn = conn }) catch {};
-        if (self.inbound_conn_ids[slot] == 0) {
-            self.inbound_conn_ids[slot] = self.next_conn_id;
+        if (self.shard.inbound_conn_ids[slot] == 0) {
+            self.shard.inbound_conn_ids[slot] = self.next_conn_id;
             self.next_conn_id += 1;
         }
-        const cid = self.inbound_conn_ids[slot];
+        const cid = self.shard.inbound_conn_ids[slot];
         self.host.onConnectionEstablished(cid, sender, .inbound, .{}) catch |err| {
             log.warn("quic_runtime: onConnectionEstablished (inbound) failed: {s}", .{@errorName(err)});
         };
@@ -680,7 +674,7 @@ pub const QuicRuntime = struct {
     fn pollInboundRegistrations(self: *QuicRuntime) void {
         var slot: usize = 0;
         while (slot < ZIo.MAX_CONNECTIONS) : (slot += 1) {
-            if (self.inbound_conn_notified[slot]) continue;
+            if (self.shard.inbound_conn_notified[slot]) continue;
             const conn = self.listener.server.conns[slot] orelse continue;
             if (conn.phase != .connected or conn.draining) continue;
             const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
@@ -773,7 +767,7 @@ pub const QuicRuntime = struct {
                 .stream_id = stream_id,
             },
         };
-        try self.inbound_streams.append(self.allocator, ist);
+        try self.shard.inbound_streams.append(self.allocator, ist);
     }
 
     /// Sentinel slot value for [`conn_table.InboundStream.slot`] when the stream arrived on an outbound
@@ -811,7 +805,7 @@ pub const QuicRuntime = struct {
                 },
                 .known_peer_id = peer_id,
             };
-            self.inbound_streams.append(self.allocator, ist) catch {
+            self.shard.inbound_streams.append(self.allocator, ist) catch {
                 self.allocator.destroy(ist);
                 break;
             };
@@ -2410,7 +2404,7 @@ pub const QuicRuntime = struct {
         // Look up channel via request_id (`stream_request_id` == request_id
         // for inbound channels). Iterate channel_to_inbound to find a match.
         var found: ?*conn_table.InboundStream = null;
-        var it = self.channel_to_inbound.iterator();
+        var it = self.shard.channel_to_inbound.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.*.request_id_for_channel == request_id) {
                 found = e.value_ptr.*;
@@ -2442,7 +2436,7 @@ pub const QuicRuntime = struct {
         // Find the inbound stream and close it (send a fin via 0-byte STREAM frame).
         var found_key: ?u64 = null;
         var found_stream: ?*conn_table.InboundStream = null;
-        var it = self.channel_to_inbound.iterator();
+        var it = self.shard.channel_to_inbound.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.*.request_id_for_channel == request_id) {
                 found_key = e.key_ptr.*;
@@ -2459,7 +2453,7 @@ pub const QuicRuntime = struct {
 
         // Drop from channel map; advanceInboundStreams releases the zquic
         // raw-app slot once the peer FINs (see ch4r10t33r/zquic#149).
-        if (found_key) |k| _ = self.channel_to_inbound.remove(k);
+        if (found_key) |k| _ = self.shard.channel_to_inbound.remove(k);
     }
 
     fn appendInboundAccBounded(
@@ -2474,7 +2468,7 @@ pub const QuicRuntime = struct {
     }
 
     fn removeInboundStreamAt(self: *QuicRuntime, index: usize) void {
-        const ist = self.inbound_streams.items[index];
+        const ist = self.shard.inbound_streams.items[index];
         // Release the zquic-side raw_app slot so the connection's 64-slot
         // table doesn't fill up.  Without this, the libp2p
         // per-message-stream gossipsub pattern (each publish opens a fresh
@@ -2482,14 +2476,14 @@ pub const QuicRuntime = struct {
         // of normal traffic and every subsequent inbound STREAM frame is
         // silently dropped by zquic.  See ch4r10t33r/zquic#149.
         _ = ist.raw.release(self.allocator);
-        if (ist.channel_id) |cid| _ = self.channel_to_inbound.remove(cid);
+        if (ist.channel_id) |cid| _ = self.shard.channel_to_inbound.remove(cid);
         ist.req_acc.deinit(self.allocator);
         ist.gossip_acc.deinit(self.allocator);
         ist.relay_acc.deinit(self.allocator);
         ist.ms_acc.deinit(self.allocator);
         ist.ms_tail.deinit(self.allocator);
         self.allocator.destroy(ist);
-        _ = self.inbound_streams.swapRemove(index);
+        _ = self.shard.inbound_streams.swapRemove(index);
     }
 
     fn tryTakeLengthPrefixedFrame(acc: []const u8, max_payload: usize) ?struct { frame: []const u8, total: usize } {
@@ -2777,12 +2771,12 @@ pub const QuicRuntime = struct {
     fn advanceInboundStreams(self: *QuicRuntime) !void {
         const a = self.allocator;
         var i: usize = 0;
-        while (i < self.inbound_streams.items.len) {
+        while (i < self.shard.inbound_streams.items.len) {
             // Work budget (#2): flush inbound ACKs while walking many streams.
             // Before the deref below so the draining/closed guard catches any
             // conn the pump reaps; pumpInbound never mutates `inbound_streams`.
             self.maybePumpInbound();
-            const ist = self.inbound_streams.items[i];
+            const ist = self.shard.inbound_streams.items[i];
 
             // 0. Drop streams whose underlying QUIC connection is gone before we
             //    touch `ist.raw` (which holds a reference into that conn).  On a
@@ -2896,7 +2890,7 @@ pub const QuicRuntime = struct {
                 // Normally `pollInboundRegistrations` already did this at handshake
                 // time; this is the fallback from the first negotiated stream.
                 // Streams on outbound connections have slot == inbound_slot_none.
-                if (ist.slot != inbound_slot_none and !self.inbound_conn_notified[ist.slot]) {
+                if (ist.slot != inbound_slot_none and !self.shard.inbound_conn_notified[ist.slot]) {
                     self.notifyInboundEstablished(ist.slot, sender, ist.conn);
                 }
             }
@@ -3256,7 +3250,7 @@ pub const QuicRuntime = struct {
                     };
                     ist.channel_id = channel_id;
                     ist.request_id_for_channel = stream_rid;
-                    self.channel_to_inbound.put(channel_id, ist) catch {};
+                    self.shard.channel_to_inbound.put(channel_id, ist) catch {};
 
                     // Hand the request payload to the embedder via swarm.
                     const payload_dup = a.dupe(u8, req_ssz) catch {
