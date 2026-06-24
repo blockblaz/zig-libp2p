@@ -60,8 +60,7 @@ pub const OutboundConn = struct {
     /// are opened by the remote peer on the connection zeam dialled; without this tracking they
     /// would be silently ignored because only the listener's lifecycle callback detects new
     /// inbound streams. See [`QuicRuntime.dispatchOutboundPeerStreams`].
-    peer_stream_reported: std.bit_set.StaticBitSet(quic_endpoint.max_tracked_peer_bidi_streams) =
-        std.bit_set.StaticBitSet(quic_endpoint.max_tracked_peer_bidi_streams).initEmpty(),
+    peer_stream_reported: quic_endpoint.SurfacedStreamSet = .{},
 };
 
 /// Per-inbound-stream state: tracks where in the per-protocol read flow we are.
@@ -106,12 +105,26 @@ pub const InboundStream = struct {
     ms_tail: std.ArrayList(u8) = .empty,
 };
 
+/// Hard upper bound on how long an in-flight outbound request may hold its
+/// zquic raw-app slot before the drive loop reaps it. The embedder applies its
+/// own (shorter) request timeout and stops waiting for the response, but it
+/// never tells the runtime to drop the request — so without this reaper an
+/// orphaned request (response lost, peer never replied) holds one of the conn's
+/// 64 raw_app slots forever. On a long-lived inbound-leg connection a handful
+/// of such orphans per peer exhaust the table and every later request fails with
+/// RawAppStreamSlotsFull. Set well above any real RPC round-trip.
+pub const outbound_request_reap_ms: i64 = 15_000;
+
 pub const OutboundRequest = struct {
     /// The peer this request is destined for.
     peer: identity.PeerId,
     request_id: u64,
     proto: protocol_mod.LeanSupportedProtocol,
     stream_id: u64,
+    /// Wall-clock ms after which the drive loop reaps this request even if no
+    /// response/FIN arrived, releasing its raw-app slot. See
+    /// [`outbound_request_reap_ms`].
+    deadline_ms: i64 = 0,
     /// Outbound (client) leg when we dialed the peer; inbound (server-initiated)
     /// leg when the peer dialed us and we have no outbound conn. libp2p req/resp
     /// rides whichever single connection exists — see `startOutboundRequest`.
@@ -183,6 +196,20 @@ pub const PublishBidiStream = union(enum) {
             .outbound => |*c| c.read_cursor = v,
             .inbound => |*s| s.read_cursor = v,
         }
+    }
+
+    /// Release the underlying zquic raw-app slot for this stream. For the
+    /// `.inbound` (server-initiated) leg this frees the listener-side
+    /// `raw_app_streams` slot on `conn`; for the `.outbound` leg it frees the
+    /// client-side `raw_app_recv` slot. Without this an inbound-leg req/resp
+    /// permanently burns one of the conn's 64 slots — after ~64 cumulative
+    /// inbound-leg requests `openRawAppStream` returns `RawAppStreamSlotsFull`
+    /// and every later request fails forever (the live status-RPC ~94% timeout).
+    pub fn release(self: *PublishBidiStream, allocator: std.mem.Allocator) bool {
+        return switch (self.*) {
+            .outbound => |*c| c.release(allocator),
+            .inbound => |*s| s.release(allocator),
+        };
     }
 
     pub fn finStream(self: *PublishBidiStream) void {

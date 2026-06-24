@@ -64,42 +64,108 @@ fn zquicAddr(a: feed_addr.Address) ZquicAddress {
     return @bitCast(a);
 }
 
-/// Tracks up to 256 **client-initiated** bidirectional streams (`stream_id` 0, 4, 8, …) per server connection slot.
+/// Historical cap on the per-connection reported-bitset. RETAINED only as the
+/// type parameter for the `over_cap` policy machinery and the legacy
+/// `StaticBitSet` fields that other call sites still pass; the inbound-stream
+/// discovery sweeps below no longer cap surfacing by absolute stream id — they
+/// dedup with [`SurfacedStreamSet`], which is bounded by *concurrently-active*
+/// streams (≤ the 64-slot raw_app recv table), not by lifetime stream id.
 pub const max_tracked_peer_bidi_streams = 256;
+
+/// Dedup state for inbound-stream discovery, bounded by the number of
+/// concurrently-active server-/peer-initiated streams rather than by absolute
+/// stream id. A stream only needs to be surfaced ONCE while it is live in the
+/// zquic recv table (`conn.raw_app_streams` / `client.raw_app_recv`); once the
+/// embedder reaps it (releasing the slot) it can never reappear in a scan, so
+/// its surfaced-marker is pruned. This removes the 256-stream lifetime cap that
+/// permanently buried later server-initiated req/resp streams (stream id ≥ 1024)
+/// on a long-lived inbound-leg connection — the dominant secondary boundary
+/// behind the live status-RPC timeout. Handles out-of-slot-order arrival because
+/// membership is keyed by stream id, not slot index.
+pub const SurfacedStreamSet = struct {
+    ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    pub fn deinit(self: *SurfacedStreamSet, allocator: std.mem.Allocator) void {
+        self.ids.deinit(allocator);
+    }
+
+    pub fn isSet(self: *const SurfacedStreamSet, stream_id: u64) bool {
+        return self.ids.contains(stream_id);
+    }
+
+    /// Mark `stream_id` surfaced. Best-effort: on OOM the id is treated as
+    /// un-surfaced (it may be re-reported on a later scan, which the inbound
+    /// handler dedups on its own slot table) rather than failing the sweep.
+    pub fn set(self: *SurfacedStreamSet, allocator: std.mem.Allocator, stream_id: u64) void {
+        self.ids.put(allocator, stream_id, {}) catch {};
+    }
+
+    /// Drop every surfaced id that is no longer present among the currently
+    /// active streams (`live`), so the set stays bounded by active streams.
+    fn pruneToLive(self: *SurfacedStreamSet, live: []const u64) void {
+        if (self.ids.count() == 0) return;
+        var stale: [128]u64 = undefined;
+        var n: usize = 0;
+        var it = self.ids.keyIterator();
+        outer: while (it.next()) |k| {
+            for (live) |l| {
+                if (l == k.*) continue :outer;
+            }
+            if (n < stale.len) {
+                stale[n] = k.*;
+                n += 1;
+            }
+        }
+        for (stale[0..n]) |sid| _ = self.ids.remove(sid);
+    }
+
+    pub fn clear(self: *SurfacedStreamSet) void {
+        self.ids.clearRetainingCapacity();
+    }
+};
 
 /// Outcome of one stream-discovery sweep over `conn.raw_app_streams`.
 ///
-/// `over_cap` is non-zero when a peer-initiated bidi stream id ≥ `4 * max_tracked_peer_bidi_streams`
-/// was seen — those are silently skipped by [`popNextUnreportedPeerBidiStream`] because the per-slot
-/// reported-bitset has no room. Embedders can observe pressure via [`QuicListener.silentlySkippedInboundStreamsCount`].
+/// `over_cap` is retained for API/observability compatibility but is now always
+/// zero: inbound-stream surfacing is no longer capped by absolute stream id (see
+/// [`SurfacedStreamSet`]). Embedders can still observe per-window pressure via
+/// the over-cap policy on the listener.
 pub const InboundStreamScan = struct {
     stream_id: ?u64 = null,
     over_cap: u32 = 0,
 };
 
 /// Next peer-initiated raw bidi stream on `conn` that has not yet been reported to
-/// [`QuicLifecycleHooks.on_inbound_stream_ready`]. Counts (and skips) streams whose id is
-/// beyond what the per-connection bitset can track.
+/// [`QuicLifecycleHooks.on_inbound_stream_ready`].
 ///
 /// Use this for **listener (server-side)** connections where the remote is the QUIC client:
-/// client-initiated bidi streams have IDs `0, 4, 8, …` (type bits = 00).
-pub fn popNextUnreportedPeerBidiStream(conn: *ZIo.ConnState, reported: *std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams)) InboundStreamScan {
-    var over_cap: u32 = 0;
+/// client-initiated bidi streams have IDs `0, 4, 8, …` (type bits = 00). Surfacing is
+/// deduped via [`SurfacedStreamSet`] (bounded by active streams), NOT by absolute stream
+/// id, so a long-lived connection that opens thousands of streams over its lifetime never
+/// silently buries later ones. `over_cap` is always 0 now.
+pub fn popNextUnreportedPeerBidiStream(
+    allocator: std.mem.Allocator,
+    conn: *ZIo.ConnState,
+    reported: *SurfacedStreamSet,
+) InboundStreamScan {
+    var live: [64]u64 = undefined;
+    var live_n: usize = 0;
     for (&conn.raw_app_streams) |*slot| {
         if (!slot.active) continue;
-        const sid = slot.stream_id;
-        if (sid % 4 != 0) continue;
-        const n = sid / 4;
-        if (n >= max_tracked_peer_bidi_streams) {
-            over_cap += 1;
-            continue;
+        if (slot.stream_id % 4 != 0) continue;
+        if (live_n < live.len) {
+            live[live_n] = slot.stream_id;
+            live_n += 1;
         }
-        const ui: usize = @intCast(n);
-        if (reported.isSet(ui)) continue;
-        reported.set(ui);
-        return .{ .stream_id = sid, .over_cap = over_cap };
     }
-    return .{ .stream_id = null, .over_cap = over_cap };
+    reported.pruneToLive(live[0..live_n]);
+
+    for (live[0..live_n]) |sid| {
+        if (reported.isSet(sid)) continue;
+        reported.set(allocator, sid);
+        return .{ .stream_id = sid, .over_cap = 0 };
+    }
+    return .{ .stream_id = null, .over_cap = 0 };
 }
 
 /// Next server-initiated raw bidi stream on a **client-side** QUIC connection that has not
@@ -108,30 +174,39 @@ pub fn popNextUnreportedPeerBidiStream(conn: *ZIo.ConnState, reported: *std.bit_
 /// Use this for **outbound (client-side)** connections where the remote is the QUIC server:
 /// server-initiated bidi streams have IDs `1, 5, 9, …` (type bits = 01). This mirrors
 /// [`popNextUnreportedPeerBidiStream`] but selects the opposite parity so that remote-opened
-/// gossipsub streams on a zeam-dialled connection are surfaced to the inbound-stream handler.
+/// gossipsub streams on a zeam-dialled connection — and the server-initiated req/resp streams
+/// of the inbound-leg fallback — are surfaced to the inbound-stream handler.
 ///
 /// Note: STREAM frames received by a [`ZIo.Client`] land in `Client.raw_app_recv` (a
 /// separate slot table from the server-side `conn.raw_app_streams`), so this helper must
 /// iterate the client-side recv table — using `conn.raw_app_streams` here would never see
 /// any server-initiated streams. This was the silent miss behind ethlambda → zeam gossip
-/// being dropped entirely.
-pub fn popNextUnreportedServerBidiStream(client: *ZIo.Client, reported: *std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams)) InboundStreamScan {
-    var over_cap: u32 = 0;
+/// being dropped entirely. Surfacing is deduped via [`SurfacedStreamSet`] (bounded by active
+/// streams), NOT by absolute stream id, so the inbound-leg fallback's repeated
+/// server-initiated streams (ids climbing past 1024) are never buried. `over_cap` is 0 now.
+pub fn popNextUnreportedServerBidiStream(
+    allocator: std.mem.Allocator,
+    client: *ZIo.Client,
+    reported: *SurfacedStreamSet,
+) InboundStreamScan {
+    var live: [64]u64 = undefined;
+    var live_n: usize = 0;
     for (&client.raw_app_recv) |*slot| {
         if (!slot.active) continue;
-        const sid = slot.stream_id;
-        if (sid % 4 != 1) continue; // server-initiated bidi: type bits = 01
-        const n = sid / 4; // 1→0, 5→1, 9→2, …
-        if (n >= max_tracked_peer_bidi_streams) {
-            over_cap += 1;
-            continue;
+        if (slot.stream_id % 4 != 1) continue; // server-initiated bidi: type bits = 01
+        if (live_n < live.len) {
+            live[live_n] = slot.stream_id;
+            live_n += 1;
         }
-        const ui: usize = @intCast(n);
-        if (reported.isSet(ui)) continue;
-        reported.set(ui);
-        return .{ .stream_id = sid, .over_cap = over_cap };
     }
-    return .{ .stream_id = null, .over_cap = over_cap };
+    reported.pruneToLive(live[0..live_n]);
+
+    for (live[0..live_n]) |sid| {
+        if (reported.isSet(sid)) continue;
+        reported.set(allocator, sid);
+        return .{ .stream_id = sid, .over_cap = 0 };
+    }
+    return .{ .stream_id = null, .over_cap = 0 };
 }
 
 /// Optional callbacks after [`QuicListener.drive`] / [`QuicListener.pollAccept`] (single-threaded embedder assumption).
@@ -160,7 +235,7 @@ pub const QuicListener = struct {
     /// Per-slot: already surfaced by [`pollAccept`] for the current connection occupying the slot.
     seen_connected: [ZIo.MAX_CONNECTIONS]bool,
     lifecycle: QuicLifecycleHooks,
-    inbound_stream_reported: [ZIo.MAX_CONNECTIONS]std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams),
+    inbound_stream_reported: [ZIo.MAX_CONNECTIONS]SurfacedStreamSet,
     /// Total inbound streams handed to [`QuicLifecycleHooks.on_inbound_stream_ready`].
     inbound_streams_reported_total: u64,
     /// Total inbound streams ignored because their id is beyond the per-slot bitset capacity
@@ -189,7 +264,7 @@ pub const QuicListener = struct {
             .server = srv,
             .seen_connected = .{false} ** ZIo.MAX_CONNECTIONS,
             .lifecycle = .{},
-            .inbound_stream_reported = [_]std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams){std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams).initEmpty()} ** ZIo.MAX_CONNECTIONS,
+            .inbound_stream_reported = [_]SurfacedStreamSet{.{}} ** ZIo.MAX_CONNECTIONS,
             .inbound_streams_reported_total = 0,
             .silently_skipped_inbound_streams_total = 0,
             .over_cap_count = .{0} ** ZIo.MAX_CONNECTIONS,
@@ -219,7 +294,7 @@ pub const QuicListener = struct {
             .server = srv,
             .seen_connected = .{false} ** ZIo.MAX_CONNECTIONS,
             .lifecycle = .{},
-            .inbound_stream_reported = [_]std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams){std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams).initEmpty()} ** ZIo.MAX_CONNECTIONS,
+            .inbound_stream_reported = [_]SurfacedStreamSet{.{}} ** ZIo.MAX_CONNECTIONS,
             .inbound_streams_reported_total = 0,
             .silently_skipped_inbound_streams_total = 0,
             .over_cap_count = .{0} ** ZIo.MAX_CONNECTIONS,
@@ -262,6 +337,7 @@ pub const QuicListener = struct {
     }
 
     pub fn deinit(self: *QuicListener) void {
+        for (&self.inbound_stream_reported) |*r| r.deinit(self.allocator);
         self.server.deinit();
         self.allocator.destroy(self);
     }
@@ -281,7 +357,7 @@ pub const QuicListener = struct {
                     if (self.lifecycle.on_connection_closed) |cb| {
                         cb(self.lifecycle.ctx, i);
                     }
-                    self.inbound_stream_reported[i] = std.bit_set.StaticBitSet(max_tracked_peer_bidi_streams).initEmpty();
+                    self.inbound_stream_reported[i].clear();
                 }
                 self.seen_connected[i] = false;
             }
@@ -295,7 +371,7 @@ pub const QuicListener = struct {
             if (!self.seen_connected[i]) continue;
             if (self.server.conns[i]) |c| {
                 while (true) {
-                    const scan = popNextUnreportedPeerBidiStream(c, &self.inbound_stream_reported[i]);
+                    const scan = popNextUnreportedPeerBidiStream(self.allocator, c, &self.inbound_stream_reported[i]);
                     self.silently_skipped_inbound_streams_total += scan.over_cap;
                     if (scan.over_cap > 0) self.recordOverCap(i, scan.over_cap, now_ms);
                     const sid = scan.stream_id orelse break;

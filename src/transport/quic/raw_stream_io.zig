@@ -189,6 +189,16 @@ pub const RawAppBidiClient = struct {
         _ = self.client.sendRawStreamData(self.stream_id, self.send_offset, &[_]u8{}, true);
     }
 
+    /// Release the client-side `raw_app_recv` slot backing a locally opened
+    /// (client-initiated) bidi stream so the 64-slot table doesn't leak. The
+    /// allocator is unused on the client path (slot buffer is freed inline by
+    /// the zquic helper) but is taken to keep the signature symmetric with
+    /// `RawAppBidiServer.release`.
+    pub fn release(self: *RawAppBidiClient, allocator: std.mem.Allocator) bool {
+        _ = allocator;
+        return self.client.releaseRawAppStream(self.stream_id);
+    }
+
     /// Send `data` on the raw stream with FIN set on the last chunk (go-libp2p identify expects EOF).
     pub fn writeAllFin(self: *RawAppBidiClient, data: []const u8) void {
         if (data.len == 0) {
