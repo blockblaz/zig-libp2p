@@ -571,13 +571,6 @@ pub const QuicOutbound = struct {
     /// Heap-allocated: [`ZIo.Client`] is very large; embedding it here overflows typical stacks.
     client: *ZIo.Client,
     server_addr: feed_addr.Address,
-    /// Heap-allocated batched receiver (recvmmsg) for this conn's client socket
-    /// — same reason as `client`: too large to embed (QuicOutbound is sometimes
-    /// stack-allocated). Gossip from peers WE dialed arrives on this outbound
-    /// socket, not the listen socket; batching keeps the drive thread from
-    /// falling behind and letting the kernel buffer overflow (drops -> cwnd
-    /// collapse -> stalled sends).
-    recv_batch: *feed_addr.RecvBatch,
 
     /// Parse `/udp/.../quic-v1` (IPv4), create zquic client, and send the Initial to `server_addr`.
     pub fn dial(
@@ -599,19 +592,15 @@ pub const QuicOutbound = struct {
         const ep = try quic.parseQuicV1Endpoint(ma);
         const server_addr = try compatAddressFromIp(ep.address);
         try client.startHandshake(zquicAddr(server_addr));
-        const recv_batch = try allocator.create(feed_addr.RecvBatch);
-        recv_batch.* = .{};
-        return .{ .allocator = allocator, .client = client, .server_addr = server_addr, .recv_batch = recv_batch };
+        return .{ .allocator = allocator, .client = client, .server_addr = server_addr };
     }
 
     pub fn deinit(self: *QuicOutbound) void {
         self.client.deinit();
         self.allocator.destroy(self.client);
-        self.allocator.destroy(self.recv_batch);
     }
 
     pub fn drive(self: *QuicOutbound, recv_buf: []u8, poll_timeout_ms: u32) DriveError!void {
-        _ = recv_buf; // superseded by the per-conn batched receiver
         var fds = [1]posix.pollfd{.{
             .fd = self.client.sock,
             .events = posix.POLL.IN,
@@ -620,13 +609,14 @@ pub const QuicOutbound = struct {
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN != 0) {
             var recv_n: usize = 0;
-            while (recv_n < max_recv_drain_per_call) {
-                const got = self.recv_batch.recv(self.client.sock);
-                if (got == 0) break;
-                for (0..got) |i| {
-                    self.client.feedPacket(self.recv_batch.slot(i).data);
-                }
-                recv_n += got;
+            while (recv_n < max_recv_drain_per_call) : (recv_n += 1) {
+                var sa: posix.sockaddr.storage = undefined;
+                var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+                const n = feed_addr.recvfrom(self.client.sock, recv_buf, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
+                    error.WouldBlock => break,
+                    else => |e| return e,
+                };
+                self.client.feedPacket(recv_buf[0..n]);
             }
         }
         self.client.processPendingWork(zquicAddr(self.server_addr));
