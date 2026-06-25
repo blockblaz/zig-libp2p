@@ -1569,6 +1569,16 @@ pub const QuicRuntime = struct {
         // teardown (which also stalls their gossip outbox into dropping
         // attestation frames). Non-reaping, so safe to interleave mid-phase.
         sh.listener.server.flushAppAcks();
+        // Also recv-drain the OUTBOUND client sockets: gossip from peers we
+        // dialed arrives there, and the full per-conn `outbound.drive` is only
+        // reached once per (under load, long) drive-loop iteration — long enough
+        // that the client sockets overflow between visits even with recvmmsg.
+        // Pump them here every interval, reusing `pump_batch` sequentially after
+        // the listener pump (drive-thread-only; no concurrent map mutation).
+        var ob_it = sh.outbound_by_peer.valueIterator();
+        while (ob_it.next()) |v| {
+            v.*.outbound.pumpRecv(&sh.pump_batch);
+        }
     }
 
     fn driveLoop(self: *QuicRuntime, sh: *Shard) !void {
