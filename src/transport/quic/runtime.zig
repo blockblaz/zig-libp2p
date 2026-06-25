@@ -150,6 +150,15 @@ pub const Shard = struct {
     outbound_by_peer: conn_table.PeerIdMap,
     /// Inbound connections this shard owns, keyed by remote peer id.
     inbound_by_peer: conn_table.InboundPeerMap,
+    /// Guard `outbound_by_peer` / `inbound_by_peer` against a CROSS-THREAD read:
+    /// the test-only settled-state probes (`rtHasOutboundTo`/`rtHasInboundTo`,
+    /// called from the test thread) must not read the map while this shard's
+    /// drive thread is adding/removing a conn — a concurrent read mid-resize
+    /// panics on a corrupted key. Only the (rare) put/remove on the drive thread
+    /// and the test probe take these; the drive thread's own lookups stay
+    /// lock-free (it never mutates concurrently with itself).
+    outbound_by_peer_lock: conn_table.SpinLock = .{},
+    inbound_by_peer_lock: conn_table.SpinLock = .{},
     /// Persistent per-peer `/meshsub` streams for this shard's peers (#183).
     persistent_gossip: conn_table.PersistentGossipMap,
     /// Inbound streams on this shard's connections (index-walked).
@@ -1155,7 +1164,9 @@ pub const QuicRuntime = struct {
             const cid = sh.inbound_conn_ids[slot];
             const now_ms = self.opts.now_ms_fn();
             self.notifyConnClosed(now_ms, cid, peer, .remote_close);
+            sh.inbound_by_peer_lock.lock();
             _ = sh.inbound_by_peer.remove(peer);
+            sh.inbound_by_peer_lock.unlock();
             self.clearOwner(peer, sh.index);
             self.destroyPersistentGossipStream(sh, peer);
         }
@@ -1173,7 +1184,9 @@ pub const QuicRuntime = struct {
         if (slot == inbound_slot_none or sh.inbound_conn_notified[slot]) return;
         sh.inbound_conn_notified[slot] = true;
         sh.inbound_conn_peer[slot] = sender;
+        sh.inbound_by_peer_lock.lock();
         sh.inbound_by_peer.put(sender, .{ .slot = slot, .conn = conn }) catch {};
+        sh.inbound_by_peer_lock.unlock();
         if (sh.inbound_conn_ids[slot] == 0) {
             sh.inbound_conn_ids[slot] = self.nextConnId();
         }
@@ -1257,7 +1270,10 @@ pub const QuicRuntime = struct {
             self.notifyConnClosed(now_ms, cid, peer, .remote_close);
             self.clearOwner(peer, sh.index);
             self.destroyPersistentGossipStream(sh, peer);
-            if (sh.outbound_by_peer.fetchRemove(peer)) |kv| {
+            sh.outbound_by_peer_lock.lock();
+            const removed_ob = sh.outbound_by_peer.fetchRemove(peer);
+            sh.outbound_by_peer_lock.unlock();
+            if (removed_ob) |kv| {
                 kv.value.peer_stream_reported.deinit(self.allocator);
                 kv.value.outbound.deinit();
                 self.allocator.destroy(kv.value);
@@ -3319,12 +3335,15 @@ pub const QuicRuntime = struct {
         };
 
         slot.peer_id = verified;
+        sh.outbound_by_peer_lock.lock();
         sh.outbound_by_peer.put(verified, slot) catch {
+            sh.outbound_by_peer_lock.unlock();
             slot.outbound.deinit();
             a.destroy(slot);
             self.failDial(expected_peer);
             return;
         };
+        sh.outbound_by_peer_lock.unlock();
 
         slot.notified = true;
         self.setOwner(verified, sh.index, false);
@@ -6940,7 +6959,10 @@ fn waitMeshConverged(cluster: []ClusterHost, deadline_ms: i64) bool {
 /// map mutation but only used as a settled-state probe in tests.
 fn rtHasOutboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
     for (rt.shards) |*sh| {
-        if (sh.outbound_by_peer.get(peer) != null) return true;
+        sh.outbound_by_peer_lock.lock();
+        const found = sh.outbound_by_peer.get(peer) != null;
+        sh.outbound_by_peer_lock.unlock();
+        if (found) return true;
     }
     return false;
 }
@@ -6951,7 +6973,10 @@ fn rtHasOutboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
 /// settled-state probe contract as [`rtHasOutboundTo`].
 fn rtHasInboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
     for (rt.shards) |*sh| {
-        if (sh.inbound_by_peer.get(peer) != null) return true;
+        sh.inbound_by_peer_lock.lock();
+        const found = sh.inbound_by_peer.get(peer) != null;
+        sh.inbound_by_peer_lock.unlock();
+        if (found) return true;
     }
     return false;
 }
