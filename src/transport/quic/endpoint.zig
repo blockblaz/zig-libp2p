@@ -44,6 +44,10 @@ const zquic = @import("zquic");
 const ZIo = zquic.transport.io;
 const feed_addr = @import("../zquic_feed_addr.zig");
 
+/// Batched UDP receiver (recvmmsg). Callers allocate one per socket-reading
+/// thread and pass it to `drive`/`pumpInbound`/`pollAndRouteToRings`.
+pub const RecvBatch = feed_addr.RecvBatch;
+
 const quic = @import("quic.zig");
 const quic_posix_udp = @import("posix_udp.zig");
 const wall_time = @import("../../primitives/wall_time.zig");
@@ -403,7 +407,9 @@ pub const QuicListener = struct {
     }
 
     /// Poll UDP (up to `poll_timeout_ms`), feed zquic, run loss recovery / flush. Call from your reactor.
-    pub fn drive(self: *QuicListener, recv_buf: []u8, poll_timeout_ms: u32) DriveError!void {
+    /// `rb` is a caller-owned `RecvBatch` (one per socket-reading thread); the
+    /// batched `recvmmsg` drain keeps the kernel buffer from overflowing under load.
+    pub fn drive(self: *QuicListener, rb: *feed_addr.RecvBatch, poll_timeout_ms: u32) DriveError!void {
         self.syncSeenFlags();
         var fds = [1]posix.pollfd{.{
             .fd = self.server.sock,
@@ -413,15 +419,14 @@ pub const QuicListener = struct {
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN != 0) {
             var recv_n: usize = 0;
-            while (recv_n < max_recv_drain_per_call) : (recv_n += 1) {
-                var sa: posix.sockaddr.storage = undefined;
-                var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-                const n = feed_addr.recvfrom(self.server.sock, recv_buf, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
-                    error.WouldBlock => break,
-                    else => |e| return e,
-                };
-                const addr: feed_addr.Address = .{ .any = @as(*const posix.sockaddr, @ptrCast(&sa)).* };
-                self.server.feedPacket(recv_buf[0..n], zquicAddr(addr));
+            while (recv_n < max_recv_drain_per_call) {
+                const got = rb.recv(self.server.sock);
+                if (got == 0) break;
+                for (0..got) |i| {
+                    const s = rb.slot(i);
+                    self.server.feedPacket(s.data, zquicAddr(s.addr));
+                }
+                recv_n += got;
             }
         }
         self.server.processPendingWork();
@@ -438,20 +443,19 @@ pub const QuicListener = struct {
     /// Demux-thread side: poll the shared listen socket and copy any waiting
     /// datagrams into `ring` (drop-newest on overflow). `scratch` is a
     /// caller-owned datagram staging buffer (>= shard_ring.max_datagram_bytes).
-    pub fn pollAndDrainToRing(self: *QuicListener, ring: *shard_ring.InboundRing, scratch: []u8, poll_timeout_ms: u32) DriveError!void {
+    pub fn pollAndDrainToRing(self: *QuicListener, ring: *shard_ring.InboundRing, rb: *feed_addr.RecvBatch, poll_timeout_ms: u32) DriveError!void {
         var fds = [1]posix.pollfd{.{ .fd = self.server.sock, .events = posix.POLL.IN, .revents = 0 }};
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN == 0) return;
         var recv_n: usize = 0;
-        while (recv_n < max_recv_drain_per_call) : (recv_n += 1) {
-            var sa: posix.sockaddr.storage = undefined;
-            var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-            const n = feed_addr.recvfrom(self.server.sock, scratch, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
-                error.WouldBlock => break,
-                else => |e| return e,
-            };
-            const addr: feed_addr.Address = .{ .any = @as(*const posix.sockaddr, @ptrCast(&sa)).* };
-            _ = ring.push(scratch[0..n], addr);
+        while (recv_n < max_recv_drain_per_call) {
+            const got = rb.recv(self.server.sock);
+            if (got == 0) break;
+            for (0..got) |i| {
+                const s = rb.slot(i);
+                _ = ring.push(s.data, s.addr);
+            }
+            recv_n += got;
         }
     }
 
@@ -465,7 +469,7 @@ pub const QuicListener = struct {
     pub fn pollAndRouteToRings(
         self: *QuicListener,
         rings: []const *shard_ring.InboundRing,
-        scratch: []u8,
+        rb: *feed_addr.RecvBatch,
         mask: u8,
         poll_timeout_ms: u32,
     ) DriveError!void {
@@ -473,17 +477,16 @@ pub const QuicListener = struct {
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN == 0) return;
         var recv_n: usize = 0;
-        while (recv_n < max_recv_drain_per_call) : (recv_n += 1) {
-            var sa: posix.sockaddr.storage = undefined;
-            var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-            const n = feed_addr.recvfrom(self.server.sock, scratch, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
-                error.WouldBlock => break,
-                else => |e| return e,
-            };
-            const addr: feed_addr.Address = .{ .any = @as(*const posix.sockaddr, @ptrCast(&sa)).* };
-            const src_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&addr.any));
-            const idx = shard_ring.shardForDatagram(scratch[0..n], src_hash, mask);
-            _ = rings[idx].push(scratch[0..n], addr);
+        while (recv_n < max_recv_drain_per_call) {
+            const got = rb.recv(self.server.sock);
+            if (got == 0) break;
+            for (0..got) |i| {
+                const s = rb.slot(i);
+                const src_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&s.addr.any));
+                const idx = shard_ring.shardForDatagram(s.data, src_hash, mask);
+                _ = rings[idx].push(s.data, s.addr);
+            }
+            recv_n += got;
         }
     }
 
@@ -526,18 +529,16 @@ pub const QuicListener = struct {
     /// — including peers' ACKs — which manifests as "no ACK for 60s" teardowns
     /// and mesh churn. Recorded ACK ranges are flushed by the next `drive`'s
     /// `processPendingWork`. Returns the number of datagrams drained.
-    pub fn pumpInbound(self: *QuicListener, recv_buf: []u8) DriveError!usize {
+    pub fn pumpInbound(self: *QuicListener, rb: *feed_addr.RecvBatch) DriveError!usize {
         var drained: usize = 0;
         while (drained < max_recv_drain_per_call) {
-            var sa: posix.sockaddr.storage = undefined;
-            var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-            const n = feed_addr.recvfrom(self.server.sock, recv_buf, recv_flags_dontwait, @ptrCast(&sa), &sl) catch |err| switch (err) {
-                error.WouldBlock => break,
-                else => |e| return e,
-            };
-            const addr: feed_addr.Address = .{ .any = @as(*const posix.sockaddr, @ptrCast(&sa)).* };
-            self.server.feedPacket(recv_buf[0..n], zquicAddr(addr));
-            drained += 1;
+            const got = rb.recv(self.server.sock);
+            if (got == 0) break;
+            for (0..got) |i| {
+                const s = rb.slot(i);
+                self.server.feedPacket(s.data, zquicAddr(s.addr));
+            }
+            drained += got;
         }
         return drained;
     }
@@ -729,7 +730,8 @@ fn pumpBoth(
     out: *QuicOutbound,
     recv_buf: []u8,
 ) DriveError!void {
-    try ln.drive(recv_buf, 0);
+    var rb: RecvBatch = .{};
+    try ln.drive(&rb, 0);
     try out.drive(recv_buf, 0);
 }
 
@@ -1057,11 +1059,12 @@ test "quic tls remote peer id matches listener key" {
     defer outbound.deinit();
 
     var recv_buf: [65536]u8 = undefined;
+    var rb: RecvBatch = .{};
     const deadline_ms = wall_time.milliTimestamp() + 20_000;
 
     var accepted = false;
     while (wall_time.milliTimestamp() < deadline_ms) {
-        try listener.drive(&recv_buf, 50);
+        try listener.drive(&rb, 50);
         try outbound.drive(&recv_buf, 50);
         if (listener.pollAccept() != null) accepted = true;
         if (accepted and outbound.client.conn.phase == .connected) break;

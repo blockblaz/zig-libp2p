@@ -201,10 +201,12 @@ pub const Shard = struct {
     last_inbound_pump_ms: i64 = 0,
     /// Wall-ms of this shard's last slow-iteration watchdog log (rate-limit).
     last_slow_iter_log_ms: i64 = 0,
-    /// Per-shard scratch for the no-ring (N=1) `maybePumpInbound` fallback so
-    /// interleaved pumps never alias the drive loop's in-use `recv_buf`. Only
-    /// touched by this shard's own drive thread.
-    pump_buf: [65536]u8 = undefined,
+    /// Per-shard batched receiver for the no-ring (N=1) `maybePumpInbound`
+    /// fallback. Separate from the drive loop's batch so an interleaved pump
+    /// (which can fire mid-iteration via a feedPacket callback) never clobbers
+    /// the datagrams the drive loop is still iterating. Only touched by this
+    /// shard's own drive thread.
+    pump_batch: quic_endpoint.RecvBatch = .{},
 
     pub fn init(a: std.mem.Allocator, listener: *quic_endpoint.QuicListener) Shard {
         return .{
@@ -1370,9 +1372,14 @@ pub const QuicRuntime = struct {
         const rings = ring_ptrs[0..self.shard_count];
         // The shared listen fd is shard 0's listener's Server socket.
         const listener = self.shards[0].listener;
-        var scratch: [shard_ring.max_datagram_bytes]u8 = undefined;
+        // ~134 KiB recvmmsg batch, owned solely by this demux thread.
+        const route_batch = self.allocator.create(quic_endpoint.RecvBatch) catch {
+            log.err("quic_runtime: demux RecvBatch alloc failed", .{});
+            return;
+        };
+        defer self.allocator.destroy(route_batch);
         while (!self.shutdown_requested.load(.acquire)) {
-            listener.pollAndRouteToRings(rings, &scratch, self.shard_mask, 100) catch |err| {
+            listener.pollAndRouteToRings(rings, route_batch, self.shard_mask, 100) catch |err| {
                 log.warn("quic_runtime: demux pollAndRouteToRings: {s}", .{@errorName(err)});
             };
         }
@@ -1537,7 +1544,7 @@ pub const QuicRuntime = struct {
         if (sh.inbound_ring) |*ring| {
             _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
         } else {
-            _ = sh.listener.pumpInbound(&sh.pump_buf) catch |err| {
+            _ = sh.listener.pumpInbound(&sh.pump_batch) catch |err| {
                 log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
             };
         }
@@ -1552,6 +1559,10 @@ pub const QuicRuntime = struct {
         // `sh` is the shard this drive thread owns; every per-shard method below
         // takes it so the loop operates only on that shard's connection state.
         var recv_buf: [65536]u8 = undefined;
+        // ~134 KiB recvmmsg batch for this shard's listener reads (drive +
+        // non-interleaved pumpInbound). Heap, not stack, given its size.
+        const recv_batch = try self.allocator.create(quic_endpoint.RecvBatch);
+        defer self.allocator.destroy(recv_batch);
         var work_scratch: std.ArrayList(conn_table.HookWork) = .empty;
         defer work_scratch.deinit(self.allocator);
 
@@ -1575,7 +1586,7 @@ pub const QuicRuntime = struct {
                 }
                 sh.listener.driveFromRing(ring, inbound_drain_per_call);
             } else {
-                sh.listener.drive(&recv_buf, poll_to) catch |err| {
+                sh.listener.drive(recv_batch, poll_to) catch |err| {
                     log.warn("quic_runtime: listener.drive: {s}", .{@errorName(err)});
                 };
             }
@@ -1617,7 +1628,7 @@ pub const QuicRuntime = struct {
             if (sh.inbound_ring) |*ring| {
                 _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
-                _ = sh.listener.pumpInbound(&recv_buf) catch |err| {
+                _ = sh.listener.pumpInbound(recv_batch) catch |err| {
                     log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
                 };
             }
@@ -1675,7 +1686,7 @@ pub const QuicRuntime = struct {
             if (sh.inbound_ring) |*ring| {
                 _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
-                _ = sh.listener.pumpInbound(&recv_buf) catch |err| {
+                _ = sh.listener.pumpInbound(recv_batch) catch |err| {
                     log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
                 };
             }
@@ -2892,6 +2903,8 @@ pub const QuicRuntime = struct {
         defer outbound.deinit();
 
         var recv_buf: [65536]u8 = undefined;
+        const recv_batch = self.allocator.create(quic_endpoint.RecvBatch) catch return false;
+        defer self.allocator.destroy(recv_batch);
         const deadline_ms = self.opts.now_ms_fn() + autonat_dial_back_deadline_ms;
         while (self.opts.now_ms_fn() < deadline_ms) {
             outbound.drive(&recv_buf, 5) catch {};
@@ -2901,7 +2914,7 @@ pub const QuicRuntime = struct {
             if (sh.inbound_ring) |*ring| {
                 sh.listener.driveFromRing(ring, inbound_drain_per_call);
             } else {
-                sh.listener.drive(&recv_buf, 0) catch {};
+                sh.listener.drive(recv_batch, 0) catch {};
             }
             if (outbound.client.conn.phase == .connected) return true;
             if (self.shutdown_requested.load(.acquire)) return false;
