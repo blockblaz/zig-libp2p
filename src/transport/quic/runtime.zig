@@ -150,6 +150,15 @@ pub const Shard = struct {
     outbound_by_peer: conn_table.PeerIdMap,
     /// Inbound connections this shard owns, keyed by remote peer id.
     inbound_by_peer: conn_table.InboundPeerMap,
+    /// Guard `outbound_by_peer` / `inbound_by_peer` against a CROSS-THREAD read:
+    /// the test-only settled-state probes (`rtHasOutboundTo`/`rtHasInboundTo`,
+    /// called from the test thread) must not read the map while this shard's
+    /// drive thread is adding/removing a conn — a concurrent read mid-resize
+    /// panics on a corrupted key. Only the (rare) put/remove on the drive thread
+    /// and the test probe take these; the drive thread's own lookups stay
+    /// lock-free (it never mutates concurrently with itself).
+    outbound_by_peer_lock: conn_table.SpinLock = .{},
+    inbound_by_peer_lock: conn_table.SpinLock = .{},
     /// Persistent per-peer `/meshsub` streams for this shard's peers (#183).
     persistent_gossip: conn_table.PersistentGossipMap,
     /// Inbound streams on this shard's connections (index-walked).
@@ -201,10 +210,12 @@ pub const Shard = struct {
     last_inbound_pump_ms: i64 = 0,
     /// Wall-ms of this shard's last slow-iteration watchdog log (rate-limit).
     last_slow_iter_log_ms: i64 = 0,
-    /// Per-shard scratch for the no-ring (N=1) `maybePumpInbound` fallback so
-    /// interleaved pumps never alias the drive loop's in-use `recv_buf`. Only
-    /// touched by this shard's own drive thread.
-    pump_buf: [65536]u8 = undefined,
+    /// Per-shard batched receiver for the no-ring (N=1) `maybePumpInbound`
+    /// fallback. Separate from the drive loop's batch so an interleaved pump
+    /// (which can fire mid-iteration via a feedPacket callback) never clobbers
+    /// the datagrams the drive loop is still iterating. Only touched by this
+    /// shard's own drive thread.
+    pump_batch: quic_endpoint.RecvBatch = .{},
 
     pub fn init(a: std.mem.Allocator, listener: *quic_endpoint.QuicListener) Shard {
         return .{
@@ -1153,7 +1164,9 @@ pub const QuicRuntime = struct {
             const cid = sh.inbound_conn_ids[slot];
             const now_ms = self.opts.now_ms_fn();
             self.notifyConnClosed(now_ms, cid, peer, .remote_close);
+            sh.inbound_by_peer_lock.lock();
             _ = sh.inbound_by_peer.remove(peer);
+            sh.inbound_by_peer_lock.unlock();
             self.clearOwner(peer, sh.index);
             self.destroyPersistentGossipStream(sh, peer);
         }
@@ -1171,7 +1184,9 @@ pub const QuicRuntime = struct {
         if (slot == inbound_slot_none or sh.inbound_conn_notified[slot]) return;
         sh.inbound_conn_notified[slot] = true;
         sh.inbound_conn_peer[slot] = sender;
+        sh.inbound_by_peer_lock.lock();
         sh.inbound_by_peer.put(sender, .{ .slot = slot, .conn = conn }) catch {};
+        sh.inbound_by_peer_lock.unlock();
         if (sh.inbound_conn_ids[slot] == 0) {
             sh.inbound_conn_ids[slot] = self.nextConnId();
         }
@@ -1255,7 +1270,10 @@ pub const QuicRuntime = struct {
             self.notifyConnClosed(now_ms, cid, peer, .remote_close);
             self.clearOwner(peer, sh.index);
             self.destroyPersistentGossipStream(sh, peer);
-            if (sh.outbound_by_peer.fetchRemove(peer)) |kv| {
+            sh.outbound_by_peer_lock.lock();
+            const removed_ob = sh.outbound_by_peer.fetchRemove(peer);
+            sh.outbound_by_peer_lock.unlock();
+            if (removed_ob) |kv| {
                 kv.value.peer_stream_reported.deinit(self.allocator);
                 kv.value.outbound.deinit();
                 self.allocator.destroy(kv.value);
@@ -1370,9 +1388,14 @@ pub const QuicRuntime = struct {
         const rings = ring_ptrs[0..self.shard_count];
         // The shared listen fd is shard 0's listener's Server socket.
         const listener = self.shards[0].listener;
-        var scratch: [shard_ring.max_datagram_bytes]u8 = undefined;
+        // ~134 KiB recvmmsg batch, owned solely by this demux thread.
+        const route_batch = self.allocator.create(quic_endpoint.RecvBatch) catch {
+            log.err("quic_runtime: demux RecvBatch alloc failed", .{});
+            return;
+        };
+        defer self.allocator.destroy(route_batch);
         while (!self.shutdown_requested.load(.acquire)) {
-            listener.pollAndRouteToRings(rings, &scratch, self.shard_mask, 100) catch |err| {
+            listener.pollAndRouteToRings(rings, route_batch, self.shard_mask, 100) catch |err| {
                 log.warn("quic_runtime: demux pollAndRouteToRings: {s}", .{@errorName(err)});
             };
         }
@@ -1537,7 +1560,7 @@ pub const QuicRuntime = struct {
         if (sh.inbound_ring) |*ring| {
             _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
         } else {
-            _ = sh.listener.pumpInbound(&sh.pump_buf) catch |err| {
+            _ = sh.listener.pumpInbound(&sh.pump_batch) catch |err| {
                 log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
             };
         }
@@ -1552,6 +1575,10 @@ pub const QuicRuntime = struct {
         // `sh` is the shard this drive thread owns; every per-shard method below
         // takes it so the loop operates only on that shard's connection state.
         var recv_buf: [65536]u8 = undefined;
+        // ~134 KiB recvmmsg batch for this shard's listener reads (drive +
+        // non-interleaved pumpInbound). Heap, not stack, given its size.
+        const recv_batch = try self.allocator.create(quic_endpoint.RecvBatch);
+        defer self.allocator.destroy(recv_batch);
         var work_scratch: std.ArrayList(conn_table.HookWork) = .empty;
         defer work_scratch.deinit(self.allocator);
 
@@ -1575,7 +1602,7 @@ pub const QuicRuntime = struct {
                 }
                 sh.listener.driveFromRing(ring, inbound_drain_per_call);
             } else {
-                sh.listener.drive(&recv_buf, poll_to) catch |err| {
+                sh.listener.drive(recv_batch, poll_to) catch |err| {
                     log.warn("quic_runtime: listener.drive: {s}", .{@errorName(err)});
                 };
             }
@@ -1617,7 +1644,7 @@ pub const QuicRuntime = struct {
             if (sh.inbound_ring) |*ring| {
                 _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
-                _ = sh.listener.pumpInbound(&recv_buf) catch |err| {
+                _ = sh.listener.pumpInbound(recv_batch) catch |err| {
                     log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
                 };
             }
@@ -1675,7 +1702,7 @@ pub const QuicRuntime = struct {
             if (sh.inbound_ring) |*ring| {
                 _ = sh.listener.pumpFromRing(ring, inbound_drain_per_call);
             } else {
-                _ = sh.listener.pumpInbound(&recv_buf) catch |err| {
+                _ = sh.listener.pumpInbound(recv_batch) catch |err| {
                     log.warn("quic_runtime: pumpInbound: {s}", .{@errorName(err)});
                 };
             }
@@ -2892,6 +2919,8 @@ pub const QuicRuntime = struct {
         defer outbound.deinit();
 
         var recv_buf: [65536]u8 = undefined;
+        const recv_batch = self.allocator.create(quic_endpoint.RecvBatch) catch return false;
+        defer self.allocator.destroy(recv_batch);
         const deadline_ms = self.opts.now_ms_fn() + autonat_dial_back_deadline_ms;
         while (self.opts.now_ms_fn() < deadline_ms) {
             outbound.drive(&recv_buf, 5) catch {};
@@ -2901,7 +2930,7 @@ pub const QuicRuntime = struct {
             if (sh.inbound_ring) |*ring| {
                 sh.listener.driveFromRing(ring, inbound_drain_per_call);
             } else {
-                sh.listener.drive(&recv_buf, 0) catch {};
+                sh.listener.drive(recv_batch, 0) catch {};
             }
             if (outbound.client.conn.phase == .connected) return true;
             if (self.shutdown_requested.load(.acquire)) return false;
@@ -3306,12 +3335,15 @@ pub const QuicRuntime = struct {
         };
 
         slot.peer_id = verified;
+        sh.outbound_by_peer_lock.lock();
         sh.outbound_by_peer.put(verified, slot) catch {
+            sh.outbound_by_peer_lock.unlock();
             slot.outbound.deinit();
             a.destroy(slot);
             self.failDial(expected_peer);
             return;
         };
+        sh.outbound_by_peer_lock.unlock();
 
         slot.notified = true;
         self.setOwner(verified, sh.index, false);
@@ -3398,16 +3430,17 @@ pub const QuicRuntime = struct {
                     self.failOutboundRequestStart(peer, request_id, payload, error.IoError, "openRawAppStream", err);
                     return;
                 };
-                // Diagnostic (status only, to keep noise low — status is the
-                // RPC timing out): this request rides the INBOUND-leg fallback
-                // (we never dialed this peer → server-initiated stream).
-                // Correlate a timed-out status request_id in consensus.log with
-                // these lines to confirm whether status timeouts are the
-                // inbound-leg fallback vs the outbound leg. WARN level because
-                // quic_runtime info logs are filtered on the devnet.
+                // Quiet diagnostic (status only). On a full-mesh devnet, peers
+                // reject duplicate connections, so ~half of every node's peers
+                // are inbound-only (they dialed us; we cannot dial back) and
+                // their status RPCs ALWAYS ride this inbound-leg fallback — it
+                // is the correct, working path, not an error. Kept at debug so
+                // a timed-out status request_id can still be correlated when
+                // explicitly debugging, without flooding the devnet logs (the
+                // slot-leak root cause it was added to chase is fixed).
                 if (proto == .status) {
                     var pbuf: [128]u8 = undefined;
-                    log.warn("quic_runtime: status req request_id={d} peer={s} via INBOUND-leg fallback (server-initiated stream_id={d})", .{
+                    log.debug("quic_runtime: status req request_id={d} peer={s} via INBOUND-leg fallback (server-initiated stream_id={d})", .{
                         request_id, peerBase58(peer, &pbuf), sid,
                     });
                 }
@@ -6926,7 +6959,10 @@ fn waitMeshConverged(cluster: []ClusterHost, deadline_ms: i64) bool {
 /// map mutation but only used as a settled-state probe in tests.
 fn rtHasOutboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
     for (rt.shards) |*sh| {
-        if (sh.outbound_by_peer.get(peer) != null) return true;
+        sh.outbound_by_peer_lock.lock();
+        const found = sh.outbound_by_peer.get(peer) != null;
+        sh.outbound_by_peer_lock.unlock();
+        if (found) return true;
     }
     return false;
 }
@@ -6937,7 +6973,10 @@ fn rtHasOutboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
 /// settled-state probe contract as [`rtHasOutboundTo`].
 fn rtHasInboundTo(rt: *QuicRuntime, peer: identity.PeerId) bool {
     for (rt.shards) |*sh| {
-        if (sh.inbound_by_peer.get(peer) != null) return true;
+        sh.inbound_by_peer_lock.lock();
+        const found = sh.inbound_by_peer.get(peer) != null;
+        sh.inbound_by_peer_lock.unlock();
+        if (found) return true;
     }
     return false;
 }

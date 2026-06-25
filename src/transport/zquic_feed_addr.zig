@@ -6,6 +6,7 @@
 //! Zig 0.16 does not expose `std.posix.recvfrom`; this mirrors zquic's `compat.recvfrom` (`posix.system`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const system = posix.system;
 
@@ -57,3 +58,86 @@ pub fn recvfrom(
         }
     }
 }
+
+/// Largest UDP datagram we will receive (matches `shard_ring.max_datagram_bytes`
+/// and exceeds zquic's `max_datagram_size`).
+pub const max_datagram_bytes: usize = 2048;
+/// Datagrams pulled per `recvmmsg(2)` syscall.
+pub const recv_batch_size: usize = 64;
+
+const RecvSlot = struct {
+    buf: [max_datagram_bytes]u8 = undefined,
+    len: usize = 0,
+    addr: Address = undefined,
+};
+
+/// Batched non-blocking UDP receive. On Linux a single `recvmmsg(2)` pulls up to
+/// `recv_batch_size` datagrams already queued in the kernel buffer — ~64× fewer
+/// syscalls than per-datagram `recvfrom`, so the drive/demux thread drains the
+/// socket fast enough to keep `SO_RCVBUF` from overflowing under a high inbound
+/// packet rate (31-peer gossip). quinn/rust-libp2p use the same recvmmsg path;
+/// the prior per-`recvfrom` loop here was the throughput regression that let the
+/// kernel drop millions of datagrams → QUIC loss → cwnd collapse → no finality.
+/// ~134 KiB — heap-allocate one per socket-reading thread (demux / drive); never
+/// shared (the listen socket has a single reader by construction).
+pub const RecvBatch = struct {
+    slots: [recv_batch_size]RecvSlot = undefined,
+
+    /// Receive every datagram currently queued (up to `recv_batch_size`),
+    /// non-blocking. Returns the count; 0 if none are ready or on error.
+    pub fn recv(self: *RecvBatch, sock: posix.socket_t) usize {
+        if (builtin.target.os.tag == .linux) return self.recvLinux(sock);
+        return self.recvPortable(sock);
+    }
+
+    fn recvLinux(self: *RecvBatch, sock: posix.socket_t) usize {
+        const linux = std.os.linux;
+        var iovecs: [recv_batch_size]posix.iovec = undefined;
+        var addrs: [recv_batch_size]posix.sockaddr.storage = undefined;
+        var msgs: [recv_batch_size]linux.mmsghdr = undefined;
+        for (0..recv_batch_size) |i| {
+            iovecs[i] = .{ .base = &self.slots[i].buf, .len = max_datagram_bytes };
+            msgs[i] = .{
+                .hdr = .{
+                    .name = @ptrCast(&addrs[i]),
+                    .namelen = @sizeOf(posix.sockaddr.storage),
+                    .iov = @ptrCast(&iovecs[i]),
+                    .iovlen = 1,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                },
+                .len = 0,
+            };
+        }
+        // MSG_DONTWAIT: read all queued datagrams and return immediately (the
+        // tail recvmsg hits EAGAIN, which recvmmsg reports as the count so far).
+        const rc = linux.recvmmsg(@intCast(sock), msgs[0..].ptr, recv_batch_size, linux.MSG.DONTWAIT, null);
+        if (@as(isize, @bitCast(rc)) <= 0) return 0;
+        const n: usize = @intCast(rc);
+        for (0..n) |i| {
+            self.slots[i].len = msgs[i].len;
+            self.slots[i].addr = .{ .any = @as(*const posix.sockaddr, @ptrCast(&addrs[i])).* };
+        }
+        return n;
+    }
+
+    fn recvPortable(self: *RecvBatch, sock: posix.socket_t) usize {
+        const MSG_DONTWAIT: u32 = if (@hasDecl(posix.MSG, "DONTWAIT")) posix.MSG.DONTWAIT else 0;
+        var count: usize = 0;
+        while (count < recv_batch_size) {
+            var sa: posix.sockaddr.storage = undefined;
+            var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            const n = recvfrom(sock, &self.slots[count].buf, MSG_DONTWAIT, @ptrCast(&sa), &sl) catch break;
+            self.slots[count].len = n;
+            self.slots[count].addr = .{ .any = @as(*const posix.sockaddr, @ptrCast(&sa)).* };
+            count += 1;
+        }
+        return count;
+    }
+
+    /// One datagram filled by the last `recv` (i in `0..return-of-recv`).
+    pub fn slot(self: *RecvBatch, i: usize) struct { data: []u8, addr: Address } {
+        return .{ .data = self.slots[i].buf[0..self.slots[i].len], .addr = self.slots[i].addr };
+    }
+};

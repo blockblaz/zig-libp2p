@@ -44,6 +44,7 @@ const ZIo = zquic.transport.io;
 const ZIoConnState = ZIo.ConnState;
 
 const QuicListener = zl.transport.quic_endpoint.QuicListener;
+const RecvBatch = zl.transport.quic_endpoint.RecvBatch;
 const QuicOutbound = zl.transport.quic_endpoint.QuicOutbound;
 const dialExtended = zl.transport.quic_endpoint.dialExtended;
 const QuicOutboundDialOptions = zl.transport.quic_endpoint.QuicOutboundDialOptions;
@@ -219,7 +220,7 @@ fn serveInboundIdentifyUntil(
     a: std.mem.Allocator,
     listener: *QuicListener,
     conn: *ZIoConnState,
-    recv_buf: *[65536]u8,
+    rb: *RecvBatch,
     until_ms: i64,
     cert_path: []const u8,
 ) !void {
@@ -243,7 +244,7 @@ fn serveInboundIdentifyUntil(
 
     while (wall_time.milliTimestamp() < until_ms) {
         while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < until_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
         }
         if (ctx.pending.items.len == 0) continue;
         const sid = ctx.pending.orderedRemove(0);
@@ -257,7 +258,7 @@ fn serveInboundIdentifyUntil(
         var r = raw.reader();
         var w = raw.writer();
         negotiate: while (wall_time.milliTimestamp() < until_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
             _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &cands, a, null) catch |err| {
                 switch (err) {
                     error.DialFailed => continue,
@@ -266,7 +267,7 @@ fn serveInboundIdentifyUntil(
             };
             raw.writeAllFin(identify_payload);
             const flush_until = wall_time.milliTimestamp() + 200;
-            while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
+            while (wall_time.milliTimestamp() < flush_until) listener.drive(rb, 5) catch {};
             break;
         }
     }
@@ -339,11 +340,11 @@ fn runServer(
 
     std.debug.print("interop_quic_node[server]: listening on udp/{d}\n", .{port});
 
-    var recv_buf: [65536]u8 = undefined;
+    var rb: RecvBatch = .{};
     const dl = wall_time.milliTimestamp() + deadline_ms;
     var accepted: ?*ZIoConnState = null;
     while (wall_time.milliTimestamp() < dl) {
-        listener.drive(&recv_buf, 5) catch {};
+        listener.drive(&rb, 5) catch {};
         if (listener.pollAccept()) |acc| {
             accepted = acc.conn;
             break;
@@ -357,26 +358,26 @@ fn runServer(
 
     if (std.mem.eql(u8, testcase, "handshake")) {
         const settle = wall_time.milliTimestamp() + 2_000;
-        try serveInboundIdentifyUntil(a, listener, accepted.?, &recv_buf, settle, cert_path);
+        try serveInboundIdentifyUntil(a, listener, accepted.?, &rb, settle, cert_path);
         std.debug.print("interop_quic_node[server]: handshake ok\n", .{});
         return 0;
     }
 
     if (std.mem.eql(u8, testcase, "ping")) {
-        return serveOnePingResponder(a, listener, accepted.?, &recv_buf, dl, cert_path);
+        return serveOnePingResponder(a, listener, accepted.?, &rb, dl, cert_path);
     }
 
     if (std.mem.eql(u8, testcase, "reqresp")) {
         const payload_len = envInt(usize, "RR_PAYLOAD_LEN", default_reqresp_payload_len);
-        return serveOneReqRespResponder(a, listener, accepted.?, &recv_buf, dl, payload_len);
+        return serveOneReqRespResponder(a, listener, accepted.?, &rb, dl, payload_len);
     }
 
     if (std.mem.eql(u8, testcase, "relay")) {
-        return serveRelayHopReserve(a, listener, accepted.?, &recv_buf, dl);
+        return serveRelayHopReserve(a, listener, accepted.?, &rb, dl);
     }
 
     if (std.mem.eql(u8, testcase, "dcutr")) {
-        return serveDcutrConnect(a, listener, accepted.?, &recv_buf, dl);
+        return serveDcutrConnect(a, listener, accepted.?, &rb, dl);
     }
 
     std.debug.print("interop_quic_node[server]: unknown TESTCASE={s}\n", .{testcase});
@@ -389,7 +390,7 @@ fn serveOneReqRespResponder(
     a: std.mem.Allocator,
     listener: *QuicListener,
     conn: *ZIoConnState,
-    recv_buf: *[65536]u8,
+    rb: *RecvBatch,
     deadline_ms: i64,
     payload_len: usize,
 ) !u8 {
@@ -420,7 +421,7 @@ fn serveOneReqRespResponder(
 
     stream_loop: while (wall_time.milliTimestamp() < deadline_ms) {
         while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
         }
         if (ctx.pending.items.len == 0) break;
         const sid = ctx.pending.orderedRemove(0);
@@ -439,7 +440,7 @@ fn serveOneReqRespResponder(
         defer tail.deinit(a);
 
         negotiate: while (wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
             var r = raw.reader();
             var w = raw.writer();
             _ = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &cands, a, &tail) catch |err| {
@@ -453,12 +454,12 @@ fn serveOneReqRespResponder(
                         // later STREAM frames on other sids as
                         // FINAL_SIZE_ERROR-related (#184).
                         raw.writeAllFin(&.{});
-                        listener.drive(recv_buf, 5) catch {};
+                        listener.drive(rb, 5) catch {};
                         continue :stream_loop;
                     },
                     else => {
                         raw.writeAllFin(&.{});
-                        listener.drive(recv_buf, 5) catch {};
+                        listener.drive(rb, 5) catch {};
                         continue :stream_loop;
                     },
                 }
@@ -474,7 +475,7 @@ fn serveOneReqRespResponder(
         if (have_in_tail > 0) @memcpy(buf[0..have_in_tail], tail.items[0..have_in_tail]);
         var remaining = payload_len - have_in_tail;
         while (remaining > 0 and wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
             const avail = raw.unreadRecvLen();
             if (avail == 0) continue;
             const n = @min(avail, remaining);
@@ -489,7 +490,7 @@ fn serveOneReqRespResponder(
         raw.writeAllFin(buf);
 
         const flush_until = wall_time.milliTimestamp() + 3_000;
-        while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
+        while (wall_time.milliTimestamp() < flush_until) listener.drive(rb, 5) catch {};
 
         std.debug.print("interop_quic_node[server]: reqresp ok ({d} bytes)\n", .{payload_len});
         return 0;
@@ -502,7 +503,7 @@ fn serveOnePingResponder(
     a: std.mem.Allocator,
     listener: *QuicListener,
     conn: *ZIoConnState,
-    recv_buf: *[65536]u8,
+    rb: *RecvBatch,
     deadline_ms: i64,
     cert_path: []const u8,
 ) !u8 {
@@ -526,7 +527,7 @@ fn serveOnePingResponder(
 
     stream_loop: while (wall_time.milliTimestamp() < deadline_ms) {
         while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
         }
         if (ctx.pending.items.len == 0) break;
         const sid = ctx.pending.orderedRemove(0);
@@ -545,7 +546,7 @@ fn serveOnePingResponder(
             var w = raw.writer();
             var matched: ?usize = null;
             negotiate: while (wall_time.milliTimestamp() < deadline_ms) {
-                listener.drive(recv_buf, 5) catch {};
+                listener.drive(rb, 5) catch {};
                 matched = stream_multistream.responderHandshakeMultistreamAmong(&r, &w, &ping_cands, a, &tail) catch |err| {
                     switch (err) {
                         error.DialFailed => continue,
@@ -562,7 +563,7 @@ fn serveOnePingResponder(
             if (matched.? == 0) {
                 raw.writeAllFin(identify_payload);
                 const flush_until = wall_time.milliTimestamp() + 200;
-                while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
+                while (wall_time.milliTimestamp() < flush_until) listener.drive(rb, 5) catch {};
                 std.debug.print("interop_quic_node[server]: ping: answered identify on sid={d}\n", .{sid});
                 continue :stream_loop;
             }
@@ -577,7 +578,7 @@ fn serveOnePingResponder(
             // Stay bounded: a peer that half-closes before sending the full
             // payload would otherwise spin this loop forever.
             if (wall_time.milliTimestamp() >= deadline_ms) return 1;
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
             if (raw.unreadRecvLen() == 0) continue;
             var r = raw.reader();
             const need = ping.payload_len - have;
@@ -587,7 +588,7 @@ fn serveOnePingResponder(
         raw.writeAllFin(&pay);
 
         const flush_until = wall_time.milliTimestamp() + 500;
-        while (wall_time.milliTimestamp() < flush_until) listener.drive(recv_buf, 5) catch {};
+        while (wall_time.milliTimestamp() < flush_until) listener.drive(rb, 5) catch {};
 
         std.debug.print("interop_quic_node[server]: ping ok\n", .{});
         return 0;
@@ -1110,7 +1111,7 @@ fn serveRelayHopReserve(
     a: std.mem.Allocator,
     listener: *QuicListener,
     conn: *ZIoConnState,
-    recv_buf: *[65536]u8,
+    rb: *RecvBatch,
     deadline_ms: i64,
 ) !u8 {
     const Ctx = struct {
@@ -1135,14 +1136,14 @@ fn serveRelayHopReserve(
 
     while (wall_time.milliTimestamp() < deadline_ms) {
         while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
         }
         if (ctx.pending.items.len == 0) return 1;
         const sid = ctx.pending.orderedRemove(0);
         var raw = RawAppBidiServer{ .server = listener.server, .conn = conn, .stream_id = sid };
 
         negotiate: while (wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
             if (raw.unreadRecvLen() < 2) continue;
             var r = raw.reader();
             var w = raw.writer();
@@ -1151,7 +1152,7 @@ fn serveRelayHopReserve(
         } else return 1;
 
         while (wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
             if (raw.unreadRecvLen() < 4) continue;
             var r = raw.reader();
             var out_buf: [4096]u8 = undefined;
@@ -1172,7 +1173,7 @@ fn serveDcutrConnect(
     a: std.mem.Allocator,
     listener: *QuicListener,
     conn: *ZIoConnState,
-    recv_buf: *[65536]u8,
+    rb: *RecvBatch,
     deadline_ms: i64,
 ) !u8 {
     const Ctx = struct {
@@ -1195,14 +1196,14 @@ fn serveDcutrConnect(
 
     while (wall_time.milliTimestamp() < deadline_ms) {
         while (ctx.pending.items.len == 0 and wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
         }
         if (ctx.pending.items.len == 0) return 1;
         const sid = ctx.pending.orderedRemove(0);
         var raw = RawAppBidiServer{ .server = listener.server, .conn = conn, .stream_id = sid };
 
         negotiate: while (wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
             if (raw.unreadRecvLen() < 2) continue;
             var r = raw.reader();
             var w = raw.writer();
@@ -1211,7 +1212,7 @@ fn serveDcutrConnect(
         } else return 1;
 
         while (wall_time.milliTimestamp() < deadline_ms) {
-            listener.drive(recv_buf, 5) catch {};
+            listener.drive(rb, 5) catch {};
             if (raw.unreadRecvLen() < 4) continue;
             var r = raw.reader();
             const frame = try zl.dcutr.wire.readLengthPrefixedAlloc(&r, a, zl.dcutr.wire.Limits.standard.max_frame_bytes);
