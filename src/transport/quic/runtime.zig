@@ -3398,16 +3398,17 @@ pub const QuicRuntime = struct {
                     self.failOutboundRequestStart(peer, request_id, payload, error.IoError, "openRawAppStream", err);
                     return;
                 };
-                // Diagnostic (status only, to keep noise low — status is the
-                // RPC timing out): this request rides the INBOUND-leg fallback
-                // (we never dialed this peer → server-initiated stream).
-                // Correlate a timed-out status request_id in consensus.log with
-                // these lines to confirm whether status timeouts are the
-                // inbound-leg fallback vs the outbound leg. WARN level because
-                // quic_runtime info logs are filtered on the devnet.
+                // Quiet diagnostic (status only). On a full-mesh devnet, peers
+                // reject duplicate connections, so ~half of every node's peers
+                // are inbound-only (they dialed us; we cannot dial back) and
+                // their status RPCs ALWAYS ride this inbound-leg fallback — it
+                // is the correct, working path, not an error. Kept at debug so
+                // a timed-out status request_id can still be correlated when
+                // explicitly debugging, without flooding the devnet logs (the
+                // slot-leak root cause it was added to chase is fixed).
                 if (proto == .status) {
                     var pbuf: [128]u8 = undefined;
-                    log.warn("quic_runtime: status req request_id={d} peer={s} via INBOUND-leg fallback (server-initiated stream_id={d})", .{
+                    log.debug("quic_runtime: status req request_id={d} peer={s} via INBOUND-leg fallback (server-initiated stream_id={d})", .{
                         request_id, peerBase58(peer, &pbuf), sid,
                     });
                 }
