@@ -1633,9 +1633,17 @@ pub const QuicRuntime = struct {
 
             // Drive every active outbound, then surface any remote-initiated streams.
             {
+                // Bound the TOTAL outbound drain per drive iteration (~1024
+                // datagrams) sliced across conns, so a few peers flooding block
+                // data (unblocked by the per-stream FC fix) can't pin this single
+                // thread for hundreds of ms and starve gossip-publish + ticks ->
+                // finality stall. Undrained datagrams sit in the 32 MB socket
+                // buffer and drain on the next, now-fast iteration.
+                const n_out = sh.outbound_by_peer.count();
+                const per_conn_drain: usize = if (n_out == 0) 0 else @max(@as(usize, 64), 1024 / n_out);
                 var it = sh.outbound_by_peer.valueIterator();
                 while (it.next()) |v| {
-                    v.*.outbound.drive(&recv_buf, 0) catch |err| {
+                    v.*.outbound.drive(&recv_buf, 0, per_conn_drain) catch |err| {
                         log.warn("quic_runtime: outbound.drive: {s}", .{@errorName(err)});
                     };
                     self.dispatchOutboundPeerStreams(sh, v.*);
@@ -2933,7 +2941,7 @@ pub const QuicRuntime = struct {
         defer self.allocator.destroy(recv_batch);
         const deadline_ms = self.opts.now_ms_fn() + autonat_dial_back_deadline_ms;
         while (self.opts.now_ms_fn() < deadline_ms) {
-            outbound.drive(&recv_buf, 5) catch {};
+            outbound.drive(&recv_buf, 5, 0) catch {};
             // Keep the listener drained so its TLS handshake responses move. Use
             // the demux ring when present — reading the socket inline here would
             // race the demux thread for datagrams.
@@ -3299,7 +3307,7 @@ pub const QuicRuntime = struct {
         var i: usize = 0;
         while (i < sh.pending_dials.items.len) {
             const pd = sh.pending_dials.items[i];
-            pd.slot.outbound.drive(recv_buf, 0) catch {};
+            pd.slot.outbound.drive(recv_buf, 0, 0) catch {};
             if (pd.slot.outbound.client.conn.phase == .connected) {
                 _ = sh.pending_dials.swapRemove(i);
                 self.promoteDial(sh, pd);

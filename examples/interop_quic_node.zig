@@ -159,7 +159,7 @@ fn respondInboundIdentifyStreamsClient(
 ) void {
     state.initIfNeeded(outbound);
     const cands = [_][]const u8{ go_identify_protocol_id, ping.multistream_protocol_id };
-    outbound.drive(recv_buf, 5) catch {};
+    outbound.drive(recv_buf, 5, 0) catch {};
     for (ServerBidiSids, 0..) |sid, i| {
         if (sid == skip_sid) continue;
         const slot = &state.slots[i];
@@ -182,7 +182,7 @@ fn respondInboundIdentifyStreamsClient(
             };
             if (which == 0) {
                 slot.raw.writeAllFin(identify_payload);
-                outbound.drive(recv_buf, 5) catch {};
+                outbound.drive(recv_buf, 5, 0) catch {};
                 slot.phase = .done;
                 return;
             }
@@ -208,7 +208,7 @@ fn respondInboundIdentifyStreamsClient(
                 slot.ping_have += n;
             }
             slot.raw.writeAllFin(&slot.ping_payload);
-            outbound.drive(recv_buf, 5) catch {};
+            outbound.drive(recv_buf, 5, 0) catch {};
             slot.phase = .done;
             return;
         }
@@ -649,7 +649,7 @@ fn runClient(
 
     if (expected_peer == null) {
         while (wall_time.milliTimestamp() < dl) {
-            outbound.drive(&recv_buf, 5) catch {};
+            outbound.drive(&recv_buf, 5, 0) catch {};
             if (outbound.client.conn.phase == .connected) break;
         }
         if (outbound.client.conn.phase != .connected) {
@@ -721,7 +721,7 @@ fn clientOneReqRespInitiator(
     var ms_state: stream_multistream.InitiatorReadPhaseState = .{};
     defer ms_state.deinit(a);
     while (wall_time.milliTimestamp() < deadline_ms) {
-        outbound.drive(recv_buf, 5) catch {};
+        outbound.drive(recv_buf, 5, 0) catch {};
         var r = raw.reader();
         var w = raw.writer();
         stream_multistream.initiatorHandshakeMultistreamReadPhase(&r, &w, reqresp_protocol_id, a, null, &ms_state) catch |err| {
@@ -745,7 +745,7 @@ fn clientOneReqRespInitiator(
     raw.writeAllFin(req);
 
     while (wall_time.milliTimestamp() < deadline_ms) {
-        outbound.drive(recv_buf, 5) catch {};
+        outbound.drive(recv_buf, 5, 0) catch {};
         if (raw.unreadRecvLen() >= payload_len) break;
     } else return 1;
 
@@ -795,12 +795,12 @@ fn clientOnePingInitiator(
         Io.Writer.writeAll(&w, pre.items) catch return 1;
         Io.Writer.flush(&w) catch return 1;
     }
-    outbound.drive(recv_buf, 5) catch {};
+    outbound.drive(recv_buf, 5, 0) catch {};
 
     var ms_state: stream_multistream.InitiatorReadPhaseState = .{};
     defer ms_state.deinit(a);
     while (wall_time.milliTimestamp() < deadline_ms) {
-        outbound.drive(recv_buf, 5) catch {};
+        outbound.drive(recv_buf, 5, 0) catch {};
         respondInboundIdentifyStreamsClient(outbound, recv_buf, sid, a, identify_payload, &inbound_slots);
         var r = raw.reader();
         var w = raw.writer();
@@ -827,7 +827,7 @@ fn clientOnePingInitiator(
     }
 
     while (wall_time.milliTimestamp() < deadline_ms) {
-        outbound.drive(recv_buf, 5) catch {};
+        outbound.drive(recv_buf, 5, 0) catch {};
         respondInboundIdentifyStreamsClient(outbound, recv_buf, sid, a, identify_payload, &inbound_slots);
         if (raw.unreadRecvLen() >= ping.payload_len) break;
     } else return 1;
@@ -1250,7 +1250,7 @@ fn clientRelayReserve(
 
     const need = try stream_multistream.responderSuccessReplyWireLen(zl.relay.wire.hop_protocol_id);
     while (wall_time.milliTimestamp() < deadline_ms) {
-        outbound.drive(recv_buf, 5) catch {};
+        outbound.drive(recv_buf, 5, 0) catch {};
         if (raw.unreadRecvLen() >= need) break;
     }
     var r = raw.reader();
@@ -1281,7 +1281,7 @@ fn clientDcutrExchange(
 
     const need = try stream_multistream.responderSuccessReplyWireLen(zl.dcutr.wire.protocol_id);
     while (wall_time.milliTimestamp() < deadline_ms) {
-        outbound.drive(recv_buf, 5) catch {};
+        outbound.drive(recv_buf, 5, 0) catch {};
         if (raw.unreadRecvLen() >= need) break;
     }
     var r = raw.reader();

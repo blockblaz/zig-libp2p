@@ -494,7 +494,7 @@ pub const LiveDcutr = struct {
             }
             if (p.outbound) |*ob| {
                 var recv: [4096]u8 = undefined;
-                ob.drive(&recv, 0) catch {};
+                ob.drive(&recv, 0, 0) catch {};
                 if (ob.client.conn.phase == .connected) {
                     const direct_conn_id = self.hooks.next_conn_id(self.hooks.ctx);
                     self.hooks.on_direct_connected(

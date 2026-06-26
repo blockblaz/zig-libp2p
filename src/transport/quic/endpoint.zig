@@ -610,8 +610,16 @@ pub const QuicOutbound = struct {
         self.allocator.destroy(self.recv_batch);
     }
 
-    pub fn drive(self: *QuicOutbound, recv_buf: []u8, poll_timeout_ms: u32) DriveError!void {
+    /// `max_drain` caps datagrams pulled from this conn's socket in ONE call
+    /// (0 = use the default `max_recv_drain_per_call`). The multi-conn drive loop
+    /// passes a per-conn slice of a TOTAL per-iteration budget so a few conns
+    /// receiving a flood (e.g. unblocked 32 MB blocks_by_range responses) can't
+    /// monopolize the single drive thread for hundreds of ms — which would delay
+    /// gossip-publish + periodic ticks and stall finality. Undrained datagrams
+    /// stay in the (32 MB) socket buffer and drain on the next, fast iteration.
+    pub fn drive(self: *QuicOutbound, recv_buf: []u8, poll_timeout_ms: u32, max_drain: usize) DriveError!void {
         _ = recv_buf; // superseded by the per-conn batched receiver
+        const cap = if (max_drain == 0) max_recv_drain_per_call else max_drain;
         var fds = [1]posix.pollfd{.{
             .fd = self.client.sock,
             .events = posix.POLL.IN,
@@ -620,7 +628,7 @@ pub const QuicOutbound = struct {
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN != 0) {
             var recv_n: usize = 0;
-            while (recv_n < max_recv_drain_per_call) {
+            while (recv_n < cap) {
                 const got = self.recv_batch.recv(self.client.sock);
                 if (got == 0) break;
                 for (0..got) |i| {
@@ -656,7 +664,7 @@ pub const QuicOutbound = struct {
     pub fn waitConnected(self: *QuicOutbound, recv_buf: []u8, deadline_ms: i64) error{Timeout}!void {
         while (wall_time.milliTimestamp() < deadline_ms) {
             if (self.client.conn.phase == .connected) return;
-            self.drive(recv_buf, 50) catch {};
+            self.drive(recv_buf, 50, 0) catch {};
         }
         return error.Timeout;
     }
@@ -760,7 +768,7 @@ fn pumpBoth(
 ) DriveError!void {
     var rb: RecvBatch = .{};
     try ln.drive(&rb, 0);
-    try out.drive(recv_buf, 0);
+    try out.drive(recv_buf, 0, 0);
 }
 
 fn quicLoopbackOnePingOnStream(
@@ -1093,7 +1101,7 @@ test "quic tls remote peer id matches listener key" {
     var accepted = false;
     while (wall_time.milliTimestamp() < deadline_ms) {
         try listener.drive(&rb, 50);
-        try outbound.drive(&recv_buf, 50);
+        try outbound.drive(&recv_buf, 50, 0);
         if (listener.pollAccept() != null) accepted = true;
         if (accepted and outbound.client.conn.phase == .connected) break;
     } else return error.Timeout;
