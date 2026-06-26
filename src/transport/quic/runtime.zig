@@ -2075,19 +2075,34 @@ pub const QuicRuntime = struct {
         }
     }
 
-    /// Deliver a DIRECTED gossip frame to `peer` robustly across shards: fan a
-    /// per-shard copy to every shard; each delivers iff it holds a live leg to
-    /// `peer` (via `drainGossipInbox` / inline), else drops. This is correct
-    /// regardless of which shard owns the peer's leg — the fix for owner-table
-    /// straddle silently dropping directed gossip at scale (Phase 3). `framed` is
-    /// OWNED here and freed before return; each shard gets its own dupe.
+    /// Deliver a DIRECTED gossip frame to `peer`, robust to which shard owns its
+    /// live leg (Phase 3). A peer's two legs can only live on TWO shards: the
+    /// owner (inbound leg, set force=true) and `shardIndexForPeer` (the
+    /// outbound-dial placement, hash(peer)&mask). Route ONE copy to each (deduped
+    /// when they coincide); each delivers iff it holds a live leg (via
+    /// `drainGossipInbox` / inline), else drops. This covers the straddle that
+    /// the single owner-table entry alone missed (coverage collapsed to ~1/N at
+    /// scale) WITHOUT the all-N fan, which multiplied directed gossip traffic N×
+    /// and re-saturated the outbound path (bulk-outbox-cap drops, no-ACK
+    /// teardowns). At most 2 dupes; seen-cache dedups the both-legs-live case.
+    /// `framed` is OWNED here and freed before return.
     fn fanDirectedGossip(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, framed: []u8) void {
         const a = self.allocator;
         defer a.free(framed);
-        var i: u8 = 0;
-        while (i < self.shard_count) : (i += 1) {
+        var targets: [2]u8 = undefined;
+        var nt: usize = 0;
+        if (self.ownerShardForPeer(peer)) |o| {
+            targets[nt] = o;
+            nt += 1;
+        }
+        const h = self.shardIndexForPeer(peer);
+        if (nt == 0 or targets[0] != h) {
+            targets[nt] = h;
+            nt += 1;
+        }
+        for (targets[0..nt]) |ti| {
             const dup = a.dupe(u8, framed) catch continue;
-            if (i == sh.index) {
+            if (ti == sh.index) {
                 // This (drainer) shard delivers inline if it holds the leg.
                 if (self.shardOwnsConnectionTo(sh, peer)) {
                     self.enqueueGossipFrame(sh, peer, dup);
@@ -2096,7 +2111,7 @@ pub const QuicRuntime = struct {
                 }
             } else {
                 // Other shard: its drive thread checks ownership in drainGossipInbox.
-                self.routeGossipDelivery(i, peer, dup);
+                self.routeGossipDelivery(ti, peer, dup);
             }
         }
     }
