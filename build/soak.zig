@@ -15,6 +15,7 @@ pub fn addSoakStep(
         .root_module = d.mod,
         .filters = &.{
             "QuicRuntime: long-running sustained gossipsub",
+            "QuicRuntime: gossip saturation race repro",
         },
     });
     const run_soak = b.addRunArtifact(soak_tests);
