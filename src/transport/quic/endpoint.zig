@@ -635,6 +635,24 @@ pub const QuicOutbound = struct {
         self.client.flushDeferredAck();
     }
 
+    /// Recv-only drain of this conn's client socket (no poll, no pending-work
+    /// pass) — the interleaved-pump analogue of `QuicListener.pumpInbound`.
+    /// Keeps the outbound socket from overflowing during long drive-loop phases
+    /// when the full `drive()` isn't reached often enough (gossip from a peer we
+    /// dialed arrives here). `rb` is a caller-owned batch so this never aliases
+    /// the conn's own `recv_batch` used by `drive()`. Flushes ACKs for the drained
+    /// packets so the server keeps transmitting.
+    pub fn pumpRecv(self: *QuicOutbound, rb: *feed_addr.RecvBatch) void {
+        var drained: usize = 0;
+        while (drained < max_recv_drain_per_call) {
+            const got = rb.recv(self.client.sock);
+            if (got == 0) break;
+            for (0..got) |i| self.client.feedPacket(rb.slot(i).data);
+            drained += got;
+        }
+        if (drained > 0) self.client.flushDeferredAck();
+    }
+
     pub fn waitConnected(self: *QuicOutbound, recv_buf: []u8, deadline_ms: i64) error{Timeout}!void {
         while (wall_time.milliTimestamp() < deadline_ms) {
             if (self.client.conn.phase == .connected) return;
