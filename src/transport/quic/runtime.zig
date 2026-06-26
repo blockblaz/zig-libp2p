@@ -3557,6 +3557,52 @@ pub const QuicRuntime = struct {
         try list.appendSlice(self.allocator, new_bytes);
     }
 
+    /// Deref-free liveness check: is `ist`'s underlying ConnState still tracked
+    /// (not reaped/destroyed)?  Compares pointers ONLY — never dereferences
+    /// `ist.conn`, so it is safe with a pointer that was just freed mid-loop.
+    /// Two stream flavours, two conn pools:
+    ///   - listener-conn stream (`ist.raw.client == null`): `ist.conn` lives in
+    ///     `server.conns`; freed by `reapDrainedConnections`.
+    ///   - outbound-client stream (`ist.raw.client != null`,
+    ///     `dispatchOutboundPeerStreams`): `ist.conn == &client.conn`; the
+    ///     OutboundConn is freed by `detectOutboundConnectionClose` WITHOUT
+    ///     sweeping these streams, so validate it is still in `outbound_by_peer`.
+    fn inboundConnLive(sh: *Shard, ist: *conn_table.InboundStream) bool {
+        const target: *anyopaque = @ptrCast(ist.conn);
+        if (ist.raw.client != null) {
+            var it = sh.outbound_by_peer.valueIterator();
+            while (it.next()) |ocp| {
+                if (@as(*anyopaque, @ptrCast(&ocp.*.outbound.client.conn)) == target) return true;
+            }
+            return false;
+        }
+        for (sh.listener.server.conns) |slot| {
+            if (slot) |c| {
+                if (@as(*anyopaque, @ptrCast(c)) == target) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remove an inbound stream whose underlying ConnState has ALREADY been
+    /// reaped/freed by zquic.  Identical to `removeInboundStreamAt` EXCEPT it
+    /// must NOT call `ist.raw.release` — the server-leg release dereferences
+    /// `ist.raw.conn` (`releaseRawAppStream(conn, …)`), which is the freed
+    /// pointer; the raw-app slot died with the conn anyway, so there is nothing
+    /// to release.
+    fn removeInboundStreamAtConnGone(self: *QuicRuntime, sh: *Shard, index: usize) void {
+        const ist = sh.inbound_streams.items[index];
+        if (ist.channel_id) |cid| _ = sh.channel_to_inbound.remove(cid);
+        if (ist.request_id_for_channel != 0) self.clearInboundStreamShard(ist.request_id_for_channel);
+        ist.req_acc.deinit(self.allocator);
+        ist.gossip_acc.deinit(self.allocator);
+        ist.relay_acc.deinit(self.allocator);
+        ist.ms_acc.deinit(self.allocator);
+        ist.ms_tail.deinit(self.allocator);
+        self.allocator.destroy(ist);
+        _ = sh.inbound_streams.swapRemove(index);
+    }
+
     fn removeInboundStreamAt(self: *QuicRuntime, sh: *Shard, index: usize) void {
         const ist = sh.inbound_streams.items[index];
         // Release the zquic-side raw_app slot so the connection's 64-slot
@@ -3883,6 +3929,22 @@ pub const QuicRuntime = struct {
             // conn the pump reaps; pumpInbound never mutates `inbound_streams`.
             self.maybePumpInbound(sh);
             const ist = sh.inbound_streams.items[i];
+
+            // 0a. The `maybePumpInbound` above may have REAPED `ist.conn`: when a
+            //    peer FINs an inbound stream, zquic auto-clears its raw-app slot,
+            //    which unpins the conn from `connHasActiveRawAppStreams`, so the
+            //    very next `reapDrainedConnections` frees the ConnState while this
+            //    InboundStream still references it.  Validate liveness WITHOUT
+            //    dereferencing the (possibly freed) pointer before the
+            //    draining/closed guard below reads through it.  If reaped, drop
+            //    the stream conn-gone (its raw slot died with the conn).  Fixes
+            //    the `ist.conn` UAF segfault under N>1 shard saturation —
+            //    covers BOTH the listener-conn reap and the outbound-conn
+            //    destroy (see `inboundConnLive`).
+            if (!inboundConnLive(sh, ist)) {
+                self.removeInboundStreamAtConnGone(sh, i);
+                continue;
+            }
 
             // 0. Drop streams whose underlying QUIC connection is gone before we
             //    touch `ist.raw` (which holds a reference into that conn).  On a
@@ -7125,6 +7187,94 @@ test "QuicRuntime: 5-node gossipsub mesh under sustained publishes" {
         }
         try testing.expect(c.count() >= exp);
     }
+}
+
+test "QuicRuntime: gossip saturation race repro — burst publishes drive PublishQueueFull under checking allocator" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    // Soak-gated: a deliberately extreme multi-shard burst (heavier than live)
+    // used to REPRODUCE the advanceInboundStreams ist.conn UAF. It is heavy
+    // (~50s) and can flakily deadlock the harness teardown under the synthetic
+    // overload, so it is excluded from normal CI. Run with -Denable-soak-tests.
+    if (!@import("test_options").enable_soak_tests) return error.SkipZigTest;
+
+    // Multi-threaded repro for the live-devnet heap corruption (surfaces as
+    // `@memcpy arguments alias` in encodeIWant under `PublishQueueFull` +
+    // in-flight-cap saturation). Single-threaded send-path stress is clean
+    // (zquic side), so the bug is a cross-thread race between the gossip-worker
+    // owner thread and the per-shard drive threads. Drive every node to burst
+    // large+small publishes with no throttle so the per-peer outboxes saturate
+    // (PublishQueueFull) while the worker mutates gossipsub state and the drive
+    // threads drain/send concurrently. testing.allocator is a checking allocator
+    // (double-free / UAF / leak), so a racing corruption trips AT the site.
+    const a = testing.allocator;
+    const n: usize = 6;
+
+    var counters: [n]*GossipCounter = undefined;
+    for (0..n) |i| {
+        counters[i] = try a.create(GossipCounter);
+        counters[i].* = .{};
+    }
+    defer for (counters) |c| a.destroy(c);
+    var ctx: [n]?*anyopaque = undefined;
+    for (0..n) |i| ctx[i] = @as(*anyopaque, @ptrCast(counters[i]));
+
+    const cluster = try buildCluster(a, .{
+        .n = n,
+        // 2 drive threads + demux per node → exercises the cross-shard gossip
+        // handoff + demux→ring routing race without oversubscribing the test box
+        // (live devnet runs ~4 shards; full scale is the devnet's job).
+        .drive_shards = 2,
+        .topic_validator = gossipCountValidator,
+        .validator_ctxs = ctx[0..],
+    });
+    defer destroyCluster(a, cluster);
+
+    var drain_done = std.atomic.Value(bool).init(false);
+    var threads = std.ArrayList(std.Thread).empty;
+    defer threads.deinit(a);
+    defer {
+        drain_done.store(true, .release);
+        for (threads.items) |th| th.join();
+    }
+    for (cluster) |*ch| {
+        const th = try std.Thread.spawn(.{}, ClusterDrainer.run, .{ ch.host, &drain_done });
+        try threads.append(a, th);
+    }
+
+    try testing.expect(waitMeshConverged(cluster, wall_time.milliTimestamp() + 30_000));
+    for (cluster) |*ch| try ch.host.subscribe("sat/topic");
+
+    const big = try a.alloc(u8, 16 * 1024);
+    defer a.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast((i * 13) % 251);
+
+    // Burst window: every node publishes a big "block" + a fan of small
+    // "attestations" as fast as it can. Publishes that overflow the outbox
+    // return PublishQueueFull (ignored) — saturation is the point.
+    const window_ms: i64 = 20_000;
+    const start = wall_time.milliTimestamp();
+    var sent: usize = 0;
+    while (wall_time.milliTimestamp() - start < window_ms) {
+        for (cluster) |*ch| {
+            ch.host.publish("sat/topic", big) catch {};
+            var k: usize = 0;
+            while (k < 6) : (k += 1) {
+                var sb: [256]u8 = undefined;
+                std.mem.writeInt(u64, sb[0..8], sent +% k, .little);
+                ch.host.publish("sat/topic", sb[0..]) catch {};
+            }
+            sent += 7;
+        }
+        var req = std.c.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_us };
+        var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.nanosleep(&req, &rem);
+    }
+
+    // No delivery assertion — saturation drops are expected. The real assertion
+    // is implicit: surviving the burst under the checking allocator with no
+    // double-free / UAF / panic means no cross-thread corruption fired.
+    std.debug.print("saturation repro: published {d} msgs across {d} nodes (no corruption tripped)\n", .{ sent, n });
 }
 
 // N=2 SHARDING VERIFICATION GATE (Phase 2b).
