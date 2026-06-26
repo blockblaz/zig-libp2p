@@ -1937,25 +1937,9 @@ pub const Gossipsub = struct {
             }
 
             var c = mp.peers.count();
-            // Density-aware graft (per-topic). SPARSE topics — the lean
-            // per-subnet `attestation_<n>` topics, only ~8 members — must mesh
-            // EVERY available subscriber so each aggregator sees its whole
-            // subnet (the property that unblocked finality); a plain
-            // `mesh_n_low` floor parks them short. DENSE topics — `block` /
-            // `aggregate`, all 31 nodes — use the standard libp2p band: graft
-            // toward `mesh_n` only when below `mesh_n_low`, which keeps mesh
-            // degree (and block-forward duplication / per-stream backpressure)
-            // down. Detected at runtime by candidate count, since gossipsub is
-            // topic-agnostic. Only compute candidates when below the target.
-            if (c < self.cfg.mesh_n) {
+            if (c < self.cfg.mesh_n_low) {
+                const need: usize = self.cfg.mesh_n_low - c;
                 const cand = try self.candidatesOutsideMesh(topic);
-                const total = c + cand.len;
-                const need: usize = if (total <= self.cfg.mesh_n)
-                    cand.len // sparse: include every available subscriber
-                else if (c < self.cfg.mesh_n_low)
-                    self.cfg.mesh_n - c // dense + below floor: top up to D
-                else
-                    0; // dense + within [mesh_n_low, mesh_n): healthy, leave it
                 var i: usize = 0;
                 while (i < need and i < cand.len) : (i += 1) {
                     const target = cand[i];
@@ -2307,43 +2291,6 @@ test "heartbeat emits GRAFT when mesh below mesh_n_low" {
         }
     }
     try std.testing.expect(saw_graft);
-}
-
-test "heartbeat per-topic graft: sparse topic meshes ALL, dense topic caps at mesh_n" {
-    const a = std.testing.allocator;
-
-    // SPARSE topic: fewer available subscribers than mesh_n -> the mesh must
-    // include EVERY one of them (full mesh), the property that lets a subnet
-    // aggregator see all members. mesh_n_low(6) does NOT cap it short.
-    {
-        const me = try identity.PeerId.random();
-        var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 6, .mesh_n = 8, .mesh_n_high = 12 });
-        defer g.deinit();
-        try g.subscribe("t");
-        while (g.popOutboxDelivery()) |d| a.free(d.wire);
-        var i: usize = 0;
-        while (i < 4) : (i += 1) g.onPeerConnected(try identity.PeerId.random());
-        try g.heartbeat();
-        while (g.popOutboxDelivery()) |d| a.free(d.wire);
-        // 4 candidates, all grafted (4 + 0 <= mesh_n) -> full mesh of 4.
-        try std.testing.expectEqual(@as(usize, 4), g.mesh.getPtr("t").?.peers.count());
-    }
-
-    // DENSE topic: more available subscribers than mesh_n -> the mesh is
-    // capped at mesh_n (standard band), NOT grafted to every candidate.
-    {
-        const me = try identity.PeerId.random();
-        var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 6, .mesh_n = 8, .mesh_n_high = 12 });
-        defer g.deinit();
-        try g.subscribe("t");
-        while (g.popOutboxDelivery()) |d| a.free(d.wire);
-        var i: usize = 0;
-        while (i < 20) : (i += 1) g.onPeerConnected(try identity.PeerId.random());
-        try g.heartbeat();
-        while (g.popOutboxDelivery()) |d| a.free(d.wire);
-        // 20 candidates, below floor at c=0 -> graft up to mesh_n only.
-        try std.testing.expectEqual(@as(usize, 8), g.mesh.getPtr("t").?.peers.count());
-    }
 }
 
 test "heartbeat prunes mesh above mesh_n_high down to mesh_n" {

@@ -3,17 +3,21 @@
 
 /// Target mesh size per topic.
 pub const mesh_n: u8 = 8;
-/// Mesh maintenance floor (libp2p-standard 6). The heartbeat grafts a topic's
-/// mesh toward `mesh_n` when it drops below this. The earlier blanket floor of
-/// 8 (to converge the sparse per-subnet `attestation_<n>` topics — only ~8
-/// members each — to a full mesh) also densified the dense `block`/`aggregate`
-/// topics (all 31 nodes), raising block-forward duplication and per-stream
-/// backpressure. That is now handled PER-TOPIC in `heartbeatInner`: a sparse
-/// topic (where current mesh + available candidates <= `mesh_n`) grafts EVERY
-/// available subscriber (full mesh — the finality property), while a dense
-/// topic uses this standard [`mesh_n_low`, `mesh_n_high`] band. So the floor
-/// returns to 6 without losing the sparse-subnet convergence.
-pub const mesh_n_low: u8 = 6;
+/// Mesh maintenance floor. Heartbeat GRAFTs whenever a topic's mesh drops below
+/// this, topping it back up to this many peers (`runtime.zig` uses `mesh_n_low`
+/// as BOTH the trigger and the graft target). Set to `mesh_n` (8), not the
+/// libp2p-standard 6, on purpose: the lean per-subnet `attestation_<n>` topics
+/// are SPARSE — only the 8 validators assigned to a subnet subscribe. With a
+/// floor of 6, an aggregator's subnet mesh parks at 6 of its 7 fellow-subnet
+/// peers, so it only ever sees ~5-6/8 attestations, never reaches the 2/3
+/// quorum, and finality stalls (observed live: subnetN=5-6/8, mesh_peers=18=3
+/// topics x 6). A floor of 8 forces the maintenance heartbeat to keep grafting
+/// the remaining real subnet members as they connect, so the sparse subnet mesh
+/// converges to (near-)complete and the aggregator sees the full 8/8. The dense
+/// `block`/`aggregate` topics (all 31 nodes subscribe) are unaffected in
+/// reachability and merely run a slightly denser mesh; `mesh_n_high` (12) still
+/// bounds the ceiling, so the hysteresis band is [8,12].
+pub const mesh_n_low: u8 = 8;
 pub const mesh_n_high: u8 = 12;
 
 /// Random peers per heartbeat for lazy gossip (IHave).
