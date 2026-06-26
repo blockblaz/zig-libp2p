@@ -336,6 +336,13 @@ pub const QuicRuntime = struct {
     next_publish_id: std.atomic.Value(u64) = .init(1),
     next_identify_push_id: std.atomic.Value(u64) = .init(1),
     next_autonat_probe_id: std.atomic.Value(u64) = .init(1),
+    /// Globally-unique inbound req/resp stream correlator. MUST be process-global
+    /// (not `quic_stream_id +% 1`, which restarts per connection): the value keys
+    /// the GLOBAL `inbound_stream_shard` response-routing table, so a per-conn id
+    /// (every peer's first inbound stream → 0x2) collides across peers and routes
+    /// responses to the wrong shard → req/resp times out. Collision rate rises
+    /// with shard count (1-1/N). Atomic; fetchAdd on every inbound request.
+    next_stream_request_id: std.atomic.Value(u64) = .init(1),
     autonat_server: autonat_mod.Server,
 
     /// Topics we have subscribed to locally — used to (a) queue SUBSCRIBE
@@ -2012,28 +2019,20 @@ pub const QuicRuntime = struct {
         while (gs.popOutboxDelivery()) |d| {
             defer a.free(d.wire);
             if (d.to) |peer| {
-                // Directed: length-prefix once, then deliver on the owning shard.
-                // Route by the AUTHORITATIVE owner table (the shard that actually
-                // holds a live leg), NOT bare hash — an inbound-only peer (#214)
-                // is owned by the demux-CID-routed shard, which may differ from
-                // `shardIndexForPeer(peer)`; hashing would drop the frame on a
-                // shard that holds no connection. No owner → no live conn → drop.
+                // Directed (attestation forward / GRAFT / PRUNE / IHAVE / IWANT):
+                // FAN to every shard; only the shard(s) holding a live leg to
+                // `peer` deliver (others drop). A peer's inbound and outbound legs
+                // land on DIFFERENT shards (inbound by demux-CID/src-addr hash,
+                // outbound by peer hash), and the single owner-table entry pins
+                // just one — so as shard count grows the entry increasingly
+                // points at the leg that is NOT live, and owner-routed delivery
+                // silently dropped the frame (P(legs same shard)=1/N → ~7/8
+                // dropped at N=8 → subnet attestation coverage collapsed → no
+                // quorum → finality stall). Fanning is robust to which shard owns
+                // the leg. The gossip seen-cache dedups the rare both-legs-live
+                // double delivery. Phase 3.
                 const framed = lengthPrefixGossipRpcFrame(a, d.wire) orelse continue;
-                const owner = self.ownerShardForPeer(peer) orelse {
-                    a.free(framed);
-                    continue;
-                };
-                if (owner == sh.index) {
-                    // We own this peer: deliver inline (drop if no live conn).
-                    if (!self.shardOwnsConnectionTo(sh, peer)) {
-                        a.free(framed);
-                        continue;
-                    }
-                    self.enqueueGossipFrame(sh, peer, framed);
-                } else {
-                    // Hand off to the owning shard's drive thread.
-                    self.routeGossipDelivery(owner, peer, framed);
-                }
+                self.fanDirectedGossip(sh, peer, framed);
             } else {
                 // Broadcast (SUBSCRIBE/UNSUBSCRIBE): every shard fans this out to
                 // its OWN peers. Deliver shard 0's inline; route a per-shard copy
@@ -2073,6 +2072,32 @@ pub const QuicRuntime = struct {
         for (peers.items) |peer| {
             const dup = a.dupe(u8, framed) catch continue;
             self.enqueueGossipFrame(sh, peer, dup);
+        }
+    }
+
+    /// Deliver a DIRECTED gossip frame to `peer` robustly across shards: fan a
+    /// per-shard copy to every shard; each delivers iff it holds a live leg to
+    /// `peer` (via `drainGossipInbox` / inline), else drops. This is correct
+    /// regardless of which shard owns the peer's leg — the fix for owner-table
+    /// straddle silently dropping directed gossip at scale (Phase 3). `framed` is
+    /// OWNED here and freed before return; each shard gets its own dupe.
+    fn fanDirectedGossip(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, framed: []u8) void {
+        const a = self.allocator;
+        defer a.free(framed);
+        var i: u8 = 0;
+        while (i < self.shard_count) : (i += 1) {
+            const dup = a.dupe(u8, framed) catch continue;
+            if (i == sh.index) {
+                // This (drainer) shard delivers inline if it holds the leg.
+                if (self.shardOwnsConnectionTo(sh, peer)) {
+                    self.enqueueGossipFrame(sh, peer, dup);
+                } else {
+                    a.free(dup);
+                }
+            } else {
+                // Other shard: its drive thread checks ownership in drainGossipInbox.
+                self.routeGossipDelivery(i, peer, dup);
+            }
         }
     }
 
@@ -4437,9 +4462,12 @@ pub const QuicRuntime = struct {
                     };
                     defer a.free(req_ssz);
 
-                    // Synthesize a stream_request_id; we use the QUIC stream
-                    // id as the req/resp stream id correlator.
-                    const stream_rid = ist.stream_id +% 1; // any nonzero u64 unique within this peer
+                    // Synthesize a stream_request_id. MUST be process-globally
+                    // unique (NOT the per-conn QUIC stream id): it keys the global
+                    // `inbound_stream_shard` table that routes the response to the
+                    // accepting shard — a per-conn id collides across peers and
+                    // mis-routes responses across shards (req/resp timeout).
+                    const stream_rid = self.next_stream_request_id.fetchAdd(1, .monotonic);
                     const now_ms = self.opts.now_ms_fn();
                     const channel_id = self.host.registerInboundReqRespChannel(sender_peer, proto, stream_rid, now_ms) catch |err| {
                         log.warn("quic_runtime: registerInboundReqRespChannel failed: {s}", .{@errorName(err)});
