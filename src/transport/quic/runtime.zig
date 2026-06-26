@@ -684,17 +684,23 @@ pub const QuicRuntime = struct {
     }
 
     /// Auto drive-shard count from the host core count, used when
-    /// `drive_shards == 0`. We target ~1/4 of the cores for QUIC drive threads,
-    /// leaving the rest for the demux thread, the gossip-validation worker, the
-    /// consensus/STF parallel pool, and the main loop. The result is clamped to
-    /// [1,8] and rounded down to a power of two by the caller. Examples (after
-    /// the caller's pow2 snap): 4 cores -> 1, 8 cores -> 2, 16 cores -> 4,
-    /// 32+ cores -> 8. Falls back to 2 if the core count can't be read.
+    /// `drive_shards == 0`. We target ~1/2 of the cores for QUIC drive threads.
+    /// Raised from ~1/4: at 1/4 a 16-core host got only 4 drive threads, so each
+    /// owned ~8-11 of the 31 peer connections. One peer flooding block data
+    /// (unblocked `blocks_by_range` responses) then saturated that thread —
+    /// serializing gossip + req/resp on all its conns — and the node fell behind
+    /// while 12 cores sat idle. QUIC requires per-connection in-order decrypt, so
+    /// the only parallelism is ACROSS connections (the quinn/rust-libp2p model):
+    /// more drive threads → fewer conns each → one peer's flood no longer starves
+    /// the others. Still leaves ~half the cores for the demux thread, the
+    /// gossip-validation worker, the consensus/STF pool, and the main loop. Result
+    /// clamped to [1,8] and pow2-snapped by the caller. Examples (post-snap):
+    /// 4 cores -> 1, 8 cores -> 4, 16 cores -> 8, 32+ cores -> 8. Falls back to 2.
     fn autoDriveShards() u8 {
         const cores = std.Thread.getCpuCount() catch return 2;
         if (cores <= 4) return 1;
-        const quarter = cores / 4; // usize
-        return @intCast(std.math.clamp(quarter, @as(usize, 1), @as(usize, 8)));
+        const half = cores / 2; // usize
+        return @intCast(std.math.clamp(half, @as(usize, 1), @as(usize, 8)));
     }
 
     pub fn destroy(self: *QuicRuntime) void {
@@ -1633,9 +1639,17 @@ pub const QuicRuntime = struct {
 
             // Drive every active outbound, then surface any remote-initiated streams.
             {
+                // Bound the TOTAL outbound drain per drive iteration (~1024
+                // datagrams) sliced across conns, so a few peers flooding block
+                // data (unblocked by the per-stream FC fix) can't pin this single
+                // thread for hundreds of ms and starve gossip-publish + ticks ->
+                // finality stall. Undrained datagrams sit in the 32 MB socket
+                // buffer and drain on the next, now-fast iteration.
+                const n_out = sh.outbound_by_peer.count();
+                const per_conn_drain: usize = if (n_out == 0) 0 else @max(@as(usize, 64), 1024 / n_out);
                 var it = sh.outbound_by_peer.valueIterator();
                 while (it.next()) |v| {
-                    v.*.outbound.drive(&recv_buf, 0) catch |err| {
+                    v.*.outbound.drive(&recv_buf, 0, per_conn_drain) catch |err| {
                         log.warn("quic_runtime: outbound.drive: {s}", .{@errorName(err)});
                     };
                     self.dispatchOutboundPeerStreams(sh, v.*);
@@ -2933,7 +2947,7 @@ pub const QuicRuntime = struct {
         defer self.allocator.destroy(recv_batch);
         const deadline_ms = self.opts.now_ms_fn() + autonat_dial_back_deadline_ms;
         while (self.opts.now_ms_fn() < deadline_ms) {
-            outbound.drive(&recv_buf, 5) catch {};
+            outbound.drive(&recv_buf, 5, 0) catch {};
             // Keep the listener drained so its TLS handshake responses move. Use
             // the demux ring when present — reading the socket inline here would
             // race the demux thread for datagrams.
@@ -3299,7 +3313,7 @@ pub const QuicRuntime = struct {
         var i: usize = 0;
         while (i < sh.pending_dials.items.len) {
             const pd = sh.pending_dials.items[i];
-            pd.slot.outbound.drive(recv_buf, 0) catch {};
+            pd.slot.outbound.drive(recv_buf, 0, 0) catch {};
             if (pd.slot.outbound.client.conn.phase == .connected) {
                 _ = sh.pending_dials.swapRemove(i);
                 self.promoteDial(sh, pd);
