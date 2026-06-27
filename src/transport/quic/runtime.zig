@@ -1653,13 +1653,14 @@ pub const QuicRuntime = struct {
                 // finality stall. Undrained datagrams sit in the 32 MB socket
                 // buffer and drain on the next, now-fast iteration.
                 const n_out = sh.outbound_by_peer.count();
-                // Cap per-conn drain at 64: `maybePumpInbound` runs after EACH
-                // conn, so a large per-conn batch (e.g. 1024/n_out = 204 for 5
-                // conns) is 204 datagrams of send work before inbound is drained
-                // again -> peers' ACKs starve -> 60s no-ACK teardowns (seen live:
-                // outbound=727ms). 64 keeps each conn's slice short so ACKs keep
-                // flowing while still making steady block-sync progress.
-                const per_conn_drain: usize = if (n_out == 0) 0 else @max(@as(usize, 16), @min(@as(usize, 64), 1024 / n_out));
+                // NOTE: this bounds each conn's RECV drain (datagrams read from
+                // its socket per visit), NOT its send — the send is `processPending
+                // Work` inside `outbound.drive`, bounded by zquic's
+                // `max_pending_drain_per_call`. Keep recv generous so we read
+                // peers' ACKs + requested block responses promptly; a low recv cap
+                // STARVES ACK reading (the opposite of what we want). The SLOW
+                // outbound phase is the SEND, bounded zquic-side.
+                const per_conn_drain: usize = if (n_out == 0) 0 else @max(@as(usize, 64), 1024 / n_out);
                 var it = sh.outbound_by_peer.valueIterator();
                 while (it.next()) |v| {
                     v.*.outbound.drive(&recv_buf, 0, per_conn_drain) catch |err| {

@@ -399,6 +399,10 @@ pub const Gossipsub = struct {
     lazy_i_have_tx: u64,
     /// Lazy IHAVE entries dropped due to per-peer or global outbox backpressure (#39).
     dropped_lazy_ihave_backpressure: u64,
+    /// Directed (publish/forward) frames dropped oldest-first when the global
+    /// outbox is full of non-lazy entries. Drop-oldest (vs returning
+    /// PublishQueueFull) keeps the caller's per-mesh-peer fan-out complete.
+    dropped_generic_backpressure: u64 = 0,
     recent_seen: std.ArrayList(SeenMsg),
     pull_fifo: std.ArrayList(PullEntry),
     rng: std.Random.DefaultPrng,
@@ -1198,7 +1202,18 @@ pub const Gossipsub = struct {
     fn enforceGlobalOutboxCap(self: *Gossipsub) errors.GossipsubError!void {
         while (self.outbox.items.len >= self.cfg.max_outbox_entries) {
             if (self.dropOldestLazyIHaveAny()) continue;
-            return error.PublishQueueFull;
+            // Outbox full of DIRECTED frames (publish/forward). Drop the OLDEST
+            // (stalest) to make room instead of returning PublishQueueFull: that
+            // error is thrown from inside the caller's per-mesh-peer fan-out loop
+            // (publishInner / forwardPublishWithId), aborting the whole fan and
+            // dropping the NEW attestation to EVERY remaining mesh peer incl the
+            // aggregator -> sub-quorum coverage -> stalled justification. Drop-
+            // oldest keeps the fan complete; a stale dropped frame is recoverable
+            // via IHAVE/IWANT. Never returns PublishQueueFull now (signature kept
+            // for callers; the cap is always satisfied by eviction).
+            const removed = self.outbox.orderedRemove(0);
+            self.allocator.free(removed.wire);
+            self.dropped_generic_backpressure += 1;
         }
     }
 
@@ -2455,7 +2470,11 @@ test "Gossipsub init rejects zero max_outbox_entries" {
     );
 }
 
-test "publish returns PublishQueueFull when outbox is full" {
+test "publish drops oldest (not the new frame) when outbox is full" {
+    // Regression: a full outbox must NOT fail the publish — that aborts the
+    // caller's per-mesh-peer fan-out and drops the NEW attestation to every
+    // remaining peer. It must drop the OLDEST queued frame and let the new one
+    // through, accounted via dropped_generic_backpressure.
     const a = std.testing.allocator;
     const me = try identity.PeerId.random();
     const peer = try identity.PeerId.random();
@@ -2464,7 +2483,9 @@ test "publish returns PublishQueueFull when outbox is full" {
 
     g.onPeerConnected(peer);
     try g.publish("t", "one");
-    try std.testing.expectError(error.PublishQueueFull, g.publish("t", "two"));
+    try g.publish("t", "two"); // succeeds, evicting the stale "one"
+    try std.testing.expectEqual(@as(u64, 1), g.dropped_generic_backpressure);
+    try std.testing.expectEqual(@as(usize, 1), g.outbox.items.len);
 }
 
 test "inbound IHAVE and IWANT increment control counters" {
