@@ -670,13 +670,21 @@ pub const Host = struct {
         peer: identity.PeerId,
         reason: peer_events.DisconnectReason,
     ) (std.mem.Allocator.Error || swarm_mod.SubmitError)!void {
-        try self.connection_manager.onConnectionClosed(now_ms, conn_id, reason);
-        self.gossipsub.onPeerDisconnected(peer);
-        self.peer_protocols.removePeer(peer);
-        if (self.kad_dht_client) |kad| {
-            var peer_b58: [128]u8 = undefined;
-            const peer_str = peer.toBase58(&peer_b58) catch return;
-            kad.onPeerDisconnected(peer_str);
+        const fully_disconnected = try self.connection_manager.onConnectionClosed(now_ms, conn_id, reason);
+        // Only tear down PEER-level state (keyed by PeerId, not conn_id) when the
+        // peer's LAST leg closed. With sharding a peer commonly holds two legs on
+        // different shards; a single leg flap must NOT wipe gossipsub
+        // `remote_interest` / mesh membership, else sparse subnet meshes bleed a
+        // member on every flap and the heartbeat can never re-graft them (the
+        // candidate pool empties → coverage decays below quorum → finality stalls).
+        if (fully_disconnected) {
+            self.gossipsub.onPeerDisconnected(peer);
+            self.peer_protocols.removePeer(peer);
+            if (self.kad_dht_client) |kad| {
+                var peer_b58: [128]u8 = undefined;
+                const peer_str = peer.toBase58(&peer_b58) catch return;
+                kad.onPeerDisconnected(peer_str);
+            }
         }
     }
 
@@ -833,7 +841,7 @@ test "Host transport hooks update both connection_manager and gossipsub" {
     defer ev.deinit(a);
     try testing.expectEqual(@as(std.meta.Tag(swarm_mod.Event), .peer_connected), std.meta.activeTag(ev));
 
-    try host.onConnectionClosed(1_000, 1, peer, .remote_close);
+    _ = try host.onConnectionClosed(1_000, 1, peer, .remote_close);
     try testing.expect(!host.gossipsub.connected.contains(peer));
 }
 
@@ -981,7 +989,7 @@ test "Host onConnectionClosed evicts kad routing-table peer" {
     try testing.expect(kad.routingTable().contains(remote_b58));
 
     try host.onConnectionEstablished(1, remote, .outbound, .{});
-    try host.onConnectionClosed(1_000, 1, remote, .remote_close);
+    _ = try host.onConnectionClosed(1_000, 1, remote, .remote_close);
     try testing.expect(!kad.routingTable().contains(remote_b58));
 }
 

@@ -476,12 +476,18 @@ pub const ConnectionManager = struct {
         }
     }
 
+    /// Returns `true` iff this close removed the peer's LAST connection (the
+    /// peer is now fully disconnected, `peer_active` reached 0). The Host gates
+    /// peer-level teardown (gossipsub.onPeerDisconnected, peer_protocols, kad)
+    /// on this — a single leg closing while another leg is still up must NOT
+    /// wipe peer-level state (e.g. gossipsub `remote_interest`), or sparse
+    /// subnet meshes permanently bleed members on every leg flap.
     pub fn onConnectionClosed(
         self: *ConnectionManager,
         now_ms: i64,
         conn_id: ConnectionId,
         reason: peer_events.DisconnectReason,
-    ) !void {
+    ) !bool {
         const ent = self.conns.fetchRemove(conn_id) orelse {
             // Defensive: a close arrived for a conn we never recorded (or
             // already removed via a prior close). Without this log, a
@@ -492,7 +498,7 @@ pub const ConnectionManager = struct {
                 "onConnectionClosed: unknown conn_id={d} reason={s} (already closed or never registered)",
                 .{ conn_id, @tagName(reason) },
             );
-            return;
+            return false;
         };
         const peer = ent.value.peer;
         const direction = ent.value.direction;
@@ -503,7 +509,7 @@ pub const ConnectionManager = struct {
                 "onConnectionClosed: conn_id={d} dir={s} but peer not in peer_active map (skew)",
                 .{ conn_id, @tagName(direction) },
             );
-            return;
+            return false;
         };
         if (pr.* == 0) {
             // Would underflow — peer_active was already 0 when we still had
@@ -514,7 +520,7 @@ pub const ConnectionManager = struct {
                 .{ conn_id, @tagName(direction) },
             );
             _ = self.peer_active.remove(peer);
-            return;
+            return false;
         }
         pr.* -= 1;
         const count = pr.*;
@@ -560,6 +566,7 @@ pub const ConnectionManager = struct {
                 .{count},
             );
         }
+        return count == 0;
     }
 };
 
@@ -675,16 +682,43 @@ test "connection manager emits single peer_connected for two conns" {
 
     try std.testing.expectError(error.Timeout, swarm.nextEvent(20));
 
-    try cm.onConnectionClosed(1000, 1, .remote_close);
+    _ = try cm.onConnectionClosed(1000, 1, .remote_close);
     try std.testing.expectError(error.Timeout, swarm.nextEvent(20));
 
-    try cm.onConnectionClosed(1000, 2, .remote_close);
+    _ = try cm.onConnectionClosed(1000, 2, .remote_close);
 
     var ev2 = try swarm.nextEvent(100);
     defer ev2.deinit(a);
     try std.testing.expectEqual(@as(std.meta.Tag(swarm_mod.Event), .peer_disconnected), std.meta.activeTag(ev2));
     try std.testing.expect(ev2.peer_disconnected.peer.eql(&peer));
     try std.testing.expectEqual(@as(peer_events.Direction, .inbound), ev2.peer_disconnected.direction);
+}
+
+test "onConnectionClosed reports fully-disconnected only on the LAST leg (multi-leg gossipsub-state guard)" {
+    // Regression: the Host gates gossipsub.onPeerDisconnected (which wipes
+    // remote_interest / mesh membership) on this return. A peer with two legs
+    // (inbound + outbound, common under sharding) losing ONE leg must report
+    // false, or sparse subnet meshes bleed a member on every leg flap and the
+    // heartbeat can never re-graft them -> coverage decays -> finality stalls.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    const peer = try identity.PeerId.random();
+    try cm.onConnectionEstablished(1, peer, .outbound, .{});
+    try cm.onConnectionEstablished(2, peer, .inbound, .{});
+
+    // One leg down, other still up -> NOT fully disconnected.
+    try std.testing.expectEqual(false, try cm.onConnectionClosed(1000, 1, .remote_close));
+    // Last leg down -> fully disconnected.
+    try std.testing.expectEqual(true, try cm.onConnectionClosed(1000, 2, .remote_close));
+    // Duplicate/unknown close -> false (no spurious peer teardown).
+    try std.testing.expectEqual(false, try cm.onConnectionClosed(1000, 2, .remote_close));
 }
 
 test "tick submits dial after remote close backoff" {
@@ -705,7 +739,7 @@ test "tick submits dial after remote close backoff" {
     const peer = peerIdFromMultiaddr(&ma).?;
 
     try cm.onConnectionEstablished(1, peer, .outbound, .{});
-    try cm.onConnectionClosed(10_000, 1, .remote_close);
+    _ = try cm.onConnectionClosed(10_000, 1, .remote_close);
 
     // `registerKnownPeer` now eager-submits the first dial via the swarm,
     // which under the test stub completes as `peer_connection_failed`. The
@@ -798,7 +832,7 @@ test "local close does not set reconnect backoff" {
 
     try cm.onConnectionEstablished(1, peer, .outbound, .{});
     _ = try swarm.nextEvent(100);
-    try cm.onConnectionClosed(5_000, 1, .local_close);
+    _ = try cm.onConnectionClosed(5_000, 1, .local_close);
     _ = try swarm.nextEvent(100);
 
     const st = cm.knownPeerStatus(peer).?;
@@ -847,7 +881,7 @@ test "connection manager notifies ReqResp on last disconnect" {
     _ = try rr.registerInboundChannel(peer, .status, stream_rid, 0);
 
     try cm.onConnectionEstablished(1, peer, .outbound, .{});
-    try cm.onConnectionClosed(1000, 1, .remote_close);
+    _ = try cm.onConnectionClosed(1000, 1, .remote_close);
 
     // onConnectionEstablished queues peer_connected; drain it first so the next
     // assertion lines up with peer_disconnected.
@@ -1032,6 +1066,6 @@ test "trim entry is cleaned on close" {
     try cm.onConnectionEstablished(2, peer, .inbound, .{});
     try std.testing.expectEqual(@as(usize, 1), cm.trim_recommended.count());
 
-    try cm.onConnectionClosed(0, 1, .remote_close);
+    _ = try cm.onConnectionClosed(0, 1, .remote_close);
     try std.testing.expectEqual(@as(usize, 0), cm.trim_recommended.count());
 }
