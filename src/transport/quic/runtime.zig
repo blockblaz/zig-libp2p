@@ -1653,7 +1653,13 @@ pub const QuicRuntime = struct {
                 // finality stall. Undrained datagrams sit in the 32 MB socket
                 // buffer and drain on the next, now-fast iteration.
                 const n_out = sh.outbound_by_peer.count();
-                const per_conn_drain: usize = if (n_out == 0) 0 else @max(@as(usize, 64), 1024 / n_out);
+                // Cap per-conn drain at 64: `maybePumpInbound` runs after EACH
+                // conn, so a large per-conn batch (e.g. 1024/n_out = 204 for 5
+                // conns) is 204 datagrams of send work before inbound is drained
+                // again -> peers' ACKs starve -> 60s no-ACK teardowns (seen live:
+                // outbound=727ms). 64 keeps each conn's slice short so ACKs keep
+                // flowing while still making steady block-sync progress.
+                const per_conn_drain: usize = if (n_out == 0) 0 else @max(@as(usize, 16), @min(@as(usize, 64), 1024 / n_out));
                 var it = sh.outbound_by_peer.valueIterator();
                 while (it.next()) |v| {
                     v.*.outbound.drive(&recv_buf, 0, per_conn_drain) catch |err| {
@@ -2022,7 +2028,14 @@ pub const QuicRuntime = struct {
     fn drainGossipsubOutbox(self: *QuicRuntime, sh: *Shard) void {
         const a = self.allocator;
         const gs = self.host.gossipsub;
-        while (gs.popOutboxDelivery()) |d| {
+        // Bound entries drained per drive iteration: this runs EVERY iteration
+        // (not the old 100ms gate), so draining the whole outbox here would let a
+        // gossip burst pin the thread for 100ms+ ("outreqs+gossip" SLOW phase ->
+        // ACK starvation -> no-ACK teardowns). Drain up to 1024; the remainder
+        // goes next iteration, and the 16384 outbox cap absorbs the backlog.
+        var drained: usize = 0;
+        while (drained < 1024) : (drained += 1) {
+            const d = gs.popOutboxDelivery() orelse break;
             defer a.free(d.wire);
             if (d.to) |peer| {
                 // Directed (attestation forward / GRAFT / PRUNE / IHAVE / IWANT):
