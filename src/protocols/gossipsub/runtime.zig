@@ -125,7 +125,7 @@ pub const GossipsubConfig = struct {
     max_pull_cache_entries: usize = 1024,
     /// Max queued outbound RPC blobs (`OutDelivery`) before subscribe/publish/heartbeat return
     /// `errors.GossipsubError.PublishQueueFull` (#39).
-    max_outbox_entries: usize = 4096,
+    max_outbox_entries: usize = 16384,
     /// Per-peer cap on directed outbox entries; overflow drops oldest `lazy_ihave` to that peer first (#39).
     max_queued_per_peer: usize = 256,
     /// Fallback PRUNE back-off applied when an inbound PRUNE omits `backoff_seconds`,
