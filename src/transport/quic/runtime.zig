@@ -2109,31 +2109,58 @@ pub const QuicRuntime = struct {
     fn fanDirectedGossip(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, framed: []u8) void {
         const a = self.allocator;
         defer a.free(framed);
-        var targets: [2]u8 = undefined;
-        var nt: usize = 0;
+        // RELIABLE directed delivery (rust-libp2p model: a directed frame goes
+        // over the peer's single connection and is never silently dropped). The
+        // sharded equivalent: route ONE copy to a shard VERIFIED to hold a live
+        // leg to `peer`. The old optimistic {owner, hash}-shard route could miss
+        // when the live leg straddled a third shard or the owner entry was stale,
+        // and the miss was a SILENT drop — which, because gossipsub records mesh
+        // membership on GRAFT *send*, left a "phantom" mesh member (a dropped
+        // GRAFT never retried) -> permanent attestation coverage loss with a
+        // healthy transport. Only drop when NO shard holds a live leg (the peer
+        // is genuinely disconnected).
+        const target = self.liveLegShardForPeer(peer) orelse return;
+        const dup = a.dupe(u8, framed) catch return;
+        if (target == sh.index) {
+            self.enqueueGossipFrame(sh, peer, dup);
+        } else {
+            self.routeGossipDelivery(target, peer, dup);
+        }
+    }
+
+    /// True iff shard `idx` currently holds a live leg (inbound or outbound) to
+    /// `peer`. SAFE to call from any thread: takes the shard's per-map SpinLocks,
+    /// which the owning shard's drive thread also takes on mutation. (The
+    /// unlocked `shardOwnsConnectionTo` is for same-thread use only.)
+    fn shardHoldsLiveLegLocked(self: *QuicRuntime, idx: u8, peer: identity.PeerId) bool {
+        const s = &self.shards[idx];
+        s.inbound_by_peer_lock.lock();
+        const has_in = s.inbound_by_peer.contains(peer);
+        s.inbound_by_peer_lock.unlock();
+        if (has_in) return true;
+        s.outbound_by_peer_lock.lock();
+        const has_out = s.outbound_by_peer.contains(peer);
+        s.outbound_by_peer_lock.unlock();
+        return has_out;
+    }
+
+    /// Shard to route a DIRECTED frame to: one VERIFIED to hold a live leg to
+    /// `peer`. Fast path checks the owner-table shard then the hash placement
+    /// (covers both legs in steady state, 1 locked probe in the common case);
+    /// the fallback scans all shards (covers transient leg-establishment windows
+    /// and relay/dcutr/migrated legs that land off {owner, hash}). `null` only
+    /// when no shard holds a live leg — i.e. the peer is fully disconnected.
+    fn liveLegShardForPeer(self: *QuicRuntime, peer: identity.PeerId) ?u8 {
         if (self.ownerShardForPeer(peer)) |o| {
-            targets[nt] = o;
-            nt += 1;
+            if (self.shardHoldsLiveLegLocked(o, peer)) return o;
         }
         const h = self.shardIndexForPeer(peer);
-        if (nt == 0 or targets[0] != h) {
-            targets[nt] = h;
-            nt += 1;
+        if (self.shardHoldsLiveLegLocked(h, peer)) return h;
+        var i: u8 = 0;
+        while (i < self.shard_count) : (i += 1) {
+            if (self.shardHoldsLiveLegLocked(i, peer)) return i;
         }
-        for (targets[0..nt]) |ti| {
-            const dup = a.dupe(u8, framed) catch continue;
-            if (ti == sh.index) {
-                // This (drainer) shard delivers inline if it holds the leg.
-                if (self.shardOwnsConnectionTo(sh, peer)) {
-                    self.enqueueGossipFrame(sh, peer, dup);
-                } else {
-                    a.free(dup);
-                }
-            } else {
-                // Other shard: its drive thread checks ownership in drainGossipInbox.
-                self.routeGossipDelivery(ti, peer, dup);
-            }
-        }
+        return null;
     }
 
     /// Push an owned gossip delivery onto `shards[owner].gossip_inbox` for that
