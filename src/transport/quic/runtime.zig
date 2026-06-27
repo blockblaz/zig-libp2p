@@ -1792,15 +1792,21 @@ pub const QuicRuntime = struct {
             self.advancePersistentGossipStreams(sh);
             const iter_t3 = self.opts.now_ms_fn(); // after outbound reqs/publishes/gossip drain
 
-            // Periodic host ticks (~ every 100ms). Host ticks + the gossipsub
-            // outbox drain are global; shard 0 only.
+            // Drain the gossipsub outbox EVERY iteration (shard 0 — it owns the
+            // global outbox). Must NOT be throttled to the 100ms host-tick cadence:
+            // under the attestation storm the outbox (max_outbox_entries) fills in
+            // well under 100ms -> appendOutKind returns PublishQueueFull -> gossip
+            // dropped AND the cap-pressure trips a latent saturation race. Draining
+            // every iteration keeps the outbox shallow (cheap when near-empty).
+            if (sh.index == 0) self.drainGossipsubOutbox(sh);
+
+            // Periodic host ticks (~ every 100ms). Global; shard 0 only.
             const now_ms = self.opts.now_ms_fn();
             if (sh.index == 0 and now_ms - last_tick_ms >= 100) {
                 last_tick_ms = now_ms;
                 self.host.runPeriodicTicks(now_ms) catch |err| {
                     log.warn("quic_runtime: host periodic ticks: {s}", .{@errorName(err)});
                 };
-                self.drainGossipsubOutbox(sh);
             }
 
             // Drive-iteration watchdog. A long iteration stops ACKs flowing to
