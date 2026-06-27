@@ -1492,28 +1492,23 @@ pub const Gossipsub = struct {
             const ip = interest orelse break :blk false;
             break :blk ip.peers.count() > 0;
         };
-        // When the mesh is critically short (below mesh_n_low), a confirmed
-        // subscriber is too valuable to exclude for the full 60s PRUNE-backoff.
-        const critically_short = mp.peers.count() < self.cfg.mesh_n_low;
         var cit = self.connected.keyIterator();
         while (cit.next()) |kp| {
             const p = kp.*;
             if (p.eql(&self.cfg.local_peer_id)) continue;
             if (mp.peers.contains(p)) continue;
-            const is_sub = if (interest) |ip| ip.peers.contains(p) else false;
-            // Restricted topics only graft known subscribers (avoids grafting
-            // non-members into sparse meshes).
-            if (restrict and !self.direct_peers.contains(p) and !is_sub) continue;
-            // Skip peers in PRUNE back-off — EXCEPT direct peers (always-mesh)
-            // and, when the mesh is critically short, confirmed subscribers.
-            // Without the latter a degraded sparse subnet mesh can never re-graft
-            // its own 8 members during the 60s backoff window, so coverage bleeds
-            // to zero and finality stalls (the live "+0/-N" decay). Re-grafting a
-            // subscriber we need beats a sparse-mesh quorum loss; for a sparse
-            // subnet (mesh_n == subnet size) we never PRUNE members anyway, so
-            // backoff there is almost always churn-induced, not intentional.
-            const backoff_exempt = self.direct_peers.contains(p) or (critically_short and is_sub);
-            if (!backoff_exempt and self.isPeerBackedOffInner(p, topic)) continue;
+            if (restrict and !self.direct_peers.contains(p)) {
+                const ip = interest.?;
+                if (!ip.peers.contains(p)) continue;
+            }
+            // libp2p gossipsub v1.1: skip peers currently in PRUNE back-off for this topic.
+            // Direct peers bypass back-off entirely (always-mesh). (The v0.2.46
+            // "critically-short subscriber" back-off bypass was reverted: it
+            // re-grafts intentionally-pruned members on subnets larger than
+            // mesh_n_high -> GRAFT/PRUNE score-flap. The phantom-mesh decay it
+            // targeted is fixed at the root by reliable cross-shard directed
+            // delivery, so members are no longer lost to silently-dropped GRAFTs.)
+            if (!self.direct_peers.contains(p) and self.isPeerBackedOffInner(p, topic)) continue;
             try self.scratch_peers.append(self.allocator, p);
         }
         // Direct peers always sort to the front; otherwise score-desc, then bytes.
