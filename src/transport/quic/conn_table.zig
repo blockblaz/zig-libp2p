@@ -73,6 +73,9 @@ pub const InboundStream = struct {
     stream_id: u64,
     raw: quic_raw_stream_io.RawAppBidiServer,
     handshake_done: bool = false,
+    /// Wall-clock ms the stream was accepted; drives the inbound reap
+    /// ([`inbound_request_reap_ms`]). 0 = unset (never reaped on age).
+    created_ms: i64 = 0,
     protocol_index: ?usize = null,
     /// channel_id once we've called `host.registerInboundReqRespChannel`.
     channel_id: ?u64 = null,
@@ -114,6 +117,14 @@ pub const InboundStream = struct {
 /// of such orphans per peer exhaust the table and every later request fails with
 /// RawAppStreamSlotsFull. Set well above any real RPC round-trip.
 pub const outbound_request_reap_ms: i64 = 15_000;
+
+/// Deadline after which the drive loop reaps an INBOUND req/resp stream that has
+/// not finished its response. Catches a peer that opens a stream and stalls
+/// mid-request (never sends the body / never FINs), which otherwise leaks the
+/// InboundStream + its raw-app slot forever (→ RawAppStreamSlotsFull → the node
+/// silently stops serving sync). Generous (2× the outbound reaper) so a slow but
+/// legitimate response is never falsely reaped.
+pub const inbound_request_reap_ms: i64 = 30_000;
 
 pub const OutboundRequest = struct {
     /// The peer this request is destined for.
