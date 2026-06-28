@@ -175,6 +175,11 @@ pub const GossipsubConfig = struct {
     /// and dropping attestations (no quorum -> no finality). Below the threshold
     /// the IDONTWANT control frame isn't worth the saving. Tunable.
     idontwant_message_size_threshold: usize = 1024,
+    /// Max buffered out-of-order remote SUBSCRIBEs (for topics we are not yet
+    /// subscribed to). Bounds memory against a peer SUBSCRIBEing us to junk
+    /// topics; large enough to hold every peer's real subscriptions during the
+    /// boot-time subscribe/connect race. Tunable.
+    max_pending_remote_subs: usize = 4096,
     /// Max queued-forward CANCELLATIONS scanned per inbound IDONTWANT frame
     /// (rust-libp2p `remove_data_messages` is bounded by a per-peer queue; our
     /// outbox is global, so each cancellation is an O(outbox) scan). We emit one
@@ -249,6 +254,13 @@ pub const OutDeliveryKind = enum {
     /// (dropping it merely costs one redundant inbound copy), so the per-peer /
     /// global outbox caps evict it BEFORE `.generic` attestation/block data.
     idontwant,
+};
+
+/// A SUBSCRIBE received for a topic we do not (yet) subscribe to. `topic` is an
+/// owned dupe (freed on drain into remote_interest, or at deinit).
+pub const PendingRemoteSub = struct {
+    peer: identity.PeerId,
+    topic: []u8,
 };
 
 pub const OutDelivery = struct {
@@ -396,6 +408,18 @@ pub const Gossipsub = struct {
     fanout: std.StringHashMap(FanoutEntry),
     /// Peers that sent a SUBSCRIBE RPC for a topic (used to narrow GRAFT targets).
     remote_interest: std.StringHashMap(TopicMesh),
+    /// SUBSCRIBEs received for topics we are NOT (yet) subscribed to, retained so
+    /// the boot-time race — a peer's SUBSCRIBE arriving before our own
+    /// `subscribe()` call — does not permanently lose that peer's interest.
+    /// rust-libp2p tracks every peer's subscriptions regardless of local
+    /// interest; we cannot (topic keys here are owned by `subs`), so we buffer
+    /// these with their own owned topic key and drain them into `remote_interest`
+    /// in `subscribeInner`. Bounded by `cfg.max_pending_remote_subs` against a
+    /// peer that SUBSCRIBEs us to unbounded junk topics. Without this,
+    /// `remote_interest` for a sparse subnet stays empty/partial, the
+    /// `candidatesOutsideMesh` graft-everyone fallback fires, non-subscribers
+    /// PRUNE back, and the subnet mesh churns/decays (coverage 32 -> ~8).
+    pending_remote_subs: std.ArrayListUnmanaged(PendingRemoteSub) = .empty,
     connected: std.HashMap(identity.PeerId, void, connection_manager.PeerIdContext, std.hash_map.default_max_load_percentage),
     clock_ms: i64,
     outbox: std.ArrayList(OutDelivery),
@@ -649,6 +673,8 @@ pub const Gossipsub = struct {
             e.value_ptr.deinit();
         }
         self.remote_interest.deinit();
+        for (self.pending_remote_subs.items) |e| self.allocator.free(e.topic);
+        self.pending_remote_subs.deinit(self.allocator);
         for (self.outbox.items) |d| self.allocator.free(d.wire);
         self.outbox.deinit(self.allocator);
         for (self.cmd_queue.items) |c| freeCommand(self.allocator, c);
@@ -1320,6 +1346,12 @@ pub const Gossipsub = struct {
             while (it.next()) |e| {
                 if (std.mem.eql(u8, e.key_ptr.*, topic)) break :blk e.key_ptr.*;
             }
+            // We are not subscribed to this topic (yet). Buffer the interest so a
+            // SUBSCRIBE that races ahead of our own subscribe() is not lost — it
+            // is drained into remote_interest by subscribeInner. (rust-libp2p
+            // tracks all peer subscriptions; we buffer because our topic keys are
+            // owned by `subs`.)
+            try self.notePendingRemoteSub(sender, topic, want);
             return;
         };
         if (want) {
@@ -1330,6 +1362,45 @@ pub const Gossipsub = struct {
             if (self.remote_interest.getPtr(owned_topic)) |rp| {
                 _ = rp.peers.remove(sender);
             }
+        }
+    }
+
+    /// Buffer (or, on unsubscribe, remove) a remote SUBSCRIBE for a topic we do
+    /// not yet subscribe to. Bounded by `cfg.max_pending_remote_subs`.
+    fn notePendingRemoteSub(self: *Gossipsub, sender: identity.PeerId, topic: []const u8, want: bool) std.mem.Allocator.Error!void {
+        var i: usize = 0;
+        while (i < self.pending_remote_subs.items.len) : (i += 1) {
+            const e = self.pending_remote_subs.items[i];
+            if (e.peer.eql(&sender) and std.mem.eql(u8, e.topic, topic)) {
+                if (!want) {
+                    self.allocator.free(e.topic);
+                    _ = self.pending_remote_subs.swapRemove(i);
+                }
+                return; // already buffered (subscribe) or just removed (unsubscribe)
+            }
+        }
+        if (!want) return; // unsubscribe for an entry we never buffered
+        if (self.pending_remote_subs.items.len >= self.cfg.max_pending_remote_subs) return;
+        const owned = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(owned);
+        try self.pending_remote_subs.append(self.allocator, .{ .peer = sender, .topic = owned });
+    }
+
+    /// Move every buffered remote SUBSCRIBE for `owned_topic` (a key owned by
+    /// `subs`) into remote_interest, freeing the buffered dupes. Called from
+    /// subscribeInner right after the topic's tables are created.
+    fn drainPendingRemoteSubs(self: *Gossipsub, owned_topic: []const u8) std.mem.Allocator.Error!void {
+        var i: usize = 0;
+        while (i < self.pending_remote_subs.items.len) {
+            const e = self.pending_remote_subs.items[i];
+            if (std.mem.eql(u8, e.topic, owned_topic)) {
+                try self.ensureRemoteInterestTable(owned_topic);
+                try self.remote_interest.getPtr(owned_topic).?.peers.put(e.peer, {});
+                self.allocator.free(e.topic);
+                _ = self.pending_remote_subs.swapRemove(i);
+                continue; // swapRemove moved a new item into slot i
+            }
+            i += 1;
         }
     }
 
@@ -1359,6 +1430,10 @@ pub const Gossipsub = struct {
         try self.subs.put(owned, {});
         errdefer _ = self.subs.fetchRemove(owned);
         try self.ensureTopicMesh(owned);
+        // Recover any SUBSCRIBEs that arrived for this topic before we subscribed
+        // (boot-time race) so remote_interest is complete and the graft-everyone
+        // fallback does not fire on a sparse subnet.
+        try self.drainPendingRemoteSubs(owned);
         const w = try rpc.encodeSubscribe(self.allocator, owned, true);
         errdefer self.allocator.free(w);
         try self.appendOut(w, null);
@@ -1484,6 +1559,18 @@ pub const Gossipsub = struct {
         while (fout.next()) |e| {
             _ = e.value_ptr.peers.peers.remove(peer);
         }
+        // Drop any buffered out-of-order SUBSCRIBEs from this peer so a peer that
+        // disconnects before we subscribe doesn't leak its dupes or erode the
+        // pending bound.
+        var pi: usize = 0;
+        while (pi < self.pending_remote_subs.items.len) {
+            if (self.pending_remote_subs.items[pi].peer.eql(&peer)) {
+                self.allocator.free(self.pending_remote_subs.items[pi].topic);
+                _ = self.pending_remote_subs.swapRemove(pi);
+                continue;
+            }
+            pi += 1;
+        }
         self.clearBackoffForPeer(peer);
         if (self.cfg.peer_scoring_enabled) self.score_tracker.removePeer(peer);
         self.syncMeshPeers();
@@ -1560,13 +1647,11 @@ pub const Gossipsub = struct {
                 const ip = interest.?;
                 if (!ip.peers.contains(p)) continue;
             }
-            // libp2p gossipsub v1.1: skip peers currently in PRUNE back-off for this topic.
-            // Direct peers bypass back-off entirely (always-mesh). (The v0.2.46
-            // "critically-short subscriber" back-off bypass was reverted: it
-            // re-grafts intentionally-pruned members on subnets larger than
-            // mesh_n_high -> GRAFT/PRUNE score-flap. The phantom-mesh decay it
-            // targeted is fixed at the root by reliable cross-shard directed
-            // delivery, so members are no longer lost to silently-dropped GRAFTs.)
+            // libp2p gossipsub v1.1: skip peers currently in PRUNE back-off for this
+            // topic. Direct peers bypass entirely (always-mesh). Back-off is bilateral
+            // (a peer that PRUNEs us records back-off for us too), so re-grafting a
+            // backed-off peer just makes it re-PRUNE us -> flap. The fix for sparse-
+            // subnet decay is to stop SPURIOUS prunes, not bypass back-off.
             if (!self.direct_peers.contains(p) and self.isPeerBackedOffInner(p, topic)) continue;
             try self.scratch_peers.append(self.allocator, p);
         }
@@ -2059,7 +2144,10 @@ pub const Gossipsub = struct {
 
             var c = mp.peers.count();
             if (c < self.cfg.mesh_n_low) {
-                const need: usize = self.cfg.mesh_n_low - c;
+                // Graft toward mesh_n (the rust-libp2p target), not the trigger
+                // mesh_n_low. Identical when mesh_n_low == mesh_n, but correct if a
+                // hysteresis band (mesh_n_low < mesh_n) is configured.
+                const need: usize = self.cfg.mesh_n - c;
                 const cand = try self.candidatesOutsideMesh(topic);
                 var i: usize = 0;
                 while (i < need and i < cand.len) : (i += 1) {
@@ -2919,6 +3007,46 @@ test "publish rejects wire over max_transmit_size_bytes" {
 // ---------------------------------------------------------------------------
 // PRUNE back-off (#75 blocker 1)
 // ---------------------------------------------------------------------------
+
+test "remote SUBSCRIBE arriving before our own subscribe is retained and drained (boot-race)" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .mesh_n_low = 8, .mesh_n = 8, .mesh_n_high = 12 });
+    defer g.deinit();
+    g.setClockMs(0);
+
+    const peer = try identity.PeerId.random();
+    g.onPeerConnected(peer);
+
+    // Peer announces interest in "t" BEFORE we subscribe to "t".
+    const sub = try rpc.encodeSubscribe(a, "t", true);
+    defer a.free(sub);
+    try g.handleInboundRpc(peer, sub);
+
+    // Not lost: buffered as pending (remote_interest has no table yet).
+    try std.testing.expectEqual(@as(usize, 1), g.pending_remote_subs.items.len);
+    try std.testing.expect(g.remote_interest.getPtr("t") == null);
+
+    // When WE subscribe, the buffered interest is drained into remote_interest.
+    try g.subscribe("t");
+    while (g.popOutboxDelivery()) |d| a.free(d.wire);
+    const rp = g.remote_interest.getPtr("t");
+    try std.testing.expect(rp != null);
+    try std.testing.expect(rp.?.peers.contains(peer));
+    try std.testing.expectEqual(@as(usize, 0), g.pending_remote_subs.items.len);
+
+    // An out-of-order UNSUBSCRIBE before our subscribe removes the pending entry.
+    const peer2 = try identity.PeerId.random();
+    g.onPeerConnected(peer2);
+    const sub2 = try rpc.encodeSubscribe(a, "u", true);
+    defer a.free(sub2);
+    try g.handleInboundRpc(peer2, sub2);
+    try std.testing.expectEqual(@as(usize, 1), g.pending_remote_subs.items.len);
+    const unsub2 = try rpc.encodeSubscribe(a, "u", false);
+    defer a.free(unsub2);
+    try g.handleInboundRpc(peer2, unsub2);
+    try std.testing.expectEqual(@as(usize, 0), g.pending_remote_subs.items.len);
+}
 
 test "inbound PRUNE records back-off; heartbeat refuses to re-graft inside window" {
     const a = std.testing.allocator;
