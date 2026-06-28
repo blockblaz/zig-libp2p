@@ -1181,7 +1181,24 @@ pub const QuicRuntime = struct {
             _ = sh.inbound_by_peer.remove(peer);
             sh.inbound_by_peer_lock.unlock();
             self.clearOwner(peer, sh.index);
-            self.destroyPersistentGossipStream(sh, peer);
+            // Gate the persistent /meshsub teardown on LAST-leg (transport analog
+            // of the v0.2.45 connection_manager fix). Under sharding a peer holds
+            // up to 2 legs and the stream is bound to ONE (outbound-preferred). A
+            // flap of the OTHER leg must NOT destroy a stream living on the
+            // surviving leg — that silently halts the peer's attestation delivery
+            // (+0/-N coverage decay, never restored → finality stalls 1-2 short of
+            // quorum). Destroy only if the stream was on THIS (closing inbound) leg
+            // OR no other leg survives. If it was on this leg but the peer survives
+            // elsewhere, the next publish lazily reopens on the surviving leg;
+            // replay SUBSCRIBE so the peer re-learns our interest. (inbound_by_peer
+            // was already removed above, so liveLegShardForPeer excludes this leg.)
+            if (sh.persistent_gossip.get(peer)) |g| {
+                const live_leg = self.liveLegShardForPeer(peer) != null;
+                if (g.raw == .inbound or !live_leg) {
+                    self.destroyPersistentGossipStream(sh, peer);
+                    if (live_leg) self.replaySubscribeToPeer(sh, peer);
+                }
+            }
         }
         sh.inbound_conn_notified[slot] = false;
         sh.inbound_conn_peer[slot] = null;
@@ -1282,10 +1299,22 @@ pub const QuicRuntime = struct {
             );
             self.notifyConnClosed(now_ms, cid, peer, .remote_close);
             self.clearOwner(peer, sh.index);
-            self.destroyPersistentGossipStream(sh, peer);
+            // Remove the outbound map entry FIRST so liveLegShardForPeer reflects
+            // this leg closing; the slot/conn stay valid until the destroy() below,
+            // so the gossip stream's raw.release still touches a live conn.
             sh.outbound_by_peer_lock.lock();
             const removed_ob = sh.outbound_by_peer.fetchRemove(peer);
             sh.outbound_by_peer_lock.unlock();
+            // Gate persistent /meshsub teardown on LAST-leg (see the inbound-close
+            // handler for the full rationale): only destroy if the stream was on
+            // THIS (closing outbound) leg or the peer has no surviving leg.
+            if (sh.persistent_gossip.get(peer)) |g| {
+                const live_leg = self.liveLegShardForPeer(peer) != null;
+                if (g.raw == .outbound or !live_leg) {
+                    self.destroyPersistentGossipStream(sh, peer);
+                    if (live_leg) self.replaySubscribeToPeer(sh, peer);
+                }
+            }
             if (removed_ob) |kv| {
                 kv.value.peer_stream_reported.deinit(self.allocator);
                 kv.value.outbound.deinit();
