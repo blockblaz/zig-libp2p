@@ -118,6 +118,15 @@ pub const GossipsubConfig = struct {
     /// message delivers it to ALL subscribed peers (remote_interest), not just
     /// the current mesh — decouples first-hop coverage from mesh convergence.
     flood_publish: bool = true,
+    /// Only flood-publish messages at/below this encoded wire size; larger ones
+    /// (e.g. ~3 MiB blocks) fall back to mesh-forward. flood_publish on a DENSE
+    /// topic (block: ~31 subscribers) multiplies the originator's outbound by the
+    /// subscriber count — for large messages that saturates the single drive loop
+    /// and overflows the bulk outbox (dropping frames), for ZERO coverage benefit:
+    /// coverage is about small attestations, and blocks propagate fine via the
+    /// mesh. So flood only the small (attestation/aggregation) messages where it
+    /// fixes first-hop coverage. Tunable.
+    flood_publish_max_message_bytes: usize = 128 * 1024,
     /// Extra heartbeats a pruned peer stays GRAFT-ineligible past exact backoff
     /// expiry (rust-libp2p backoff_slack). Prevents lockstep re-GRAFT flap. 0 =
     /// exact (no slack).
@@ -1565,7 +1574,7 @@ pub const Gossipsub = struct {
         if (self.subs.contains(topic)) {
             try self.ensureTopicMesh(topic);
             const mp = self.mesh.getPtr(topic).?;
-            const ri: ?*TopicMesh = if (self.cfg.flood_publish) self.remote_interest.getPtr(topic) else null;
+            const ri: ?*TopicMesh = if (self.cfg.flood_publish and inner.len <= self.cfg.flood_publish_max_message_bytes) self.remote_interest.getPtr(topic) else null;
             if (ri) |rip| {
                 // rust-libp2p flood_publish (default on): the ORIGINATOR delivers
                 // its own message to EVERY subscribed peer, not just the current
