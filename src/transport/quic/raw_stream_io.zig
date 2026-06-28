@@ -287,6 +287,21 @@ pub const RawAppBidiServer = struct {
         return ZIo.rawAppStreamFullyReceived(self.conn, self.stream_id);
     }
 
+    /// Send up to `chunk.len` bytes on this stream, returning how many bytes zquic
+    /// accepted (bounded by cwnd / the per-stream pending queue). Tracks
+    /// `send_offset`. Used by the budgeted response-outbox drain to pace a large
+    /// BlocksByRange response across drive laps instead of `writeAll`-ing it whole.
+    pub fn sendChunk(self: *RawAppBidiServer, chunk: []const u8, fin: bool) usize {
+        if (self.client) |c| {
+            const accepted = c.sendRawStreamData(self.stream_id, self.send_offset, chunk, fin);
+            self.send_offset += @intCast(accepted);
+            return accepted;
+        }
+        const accepted = self.server.sendRawStreamData(self.conn, self.stream_id, self.send_offset, chunk, fin);
+        self.send_offset += @intCast(accepted);
+        return accepted;
+    }
+
     /// Release the zquic-side raw_app slot so the per-connection table doesn't fill up.
     pub fn release(self: *RawAppBidiServer, allocator: std.mem.Allocator) bool {
         if (self.client) |c| return c.releaseRawAppStream(self.stream_id);

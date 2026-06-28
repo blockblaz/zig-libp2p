@@ -261,6 +261,8 @@ pub const Shard = struct {
             s.relay_acc.deinit(a);
             s.ms_acc.deinit(a);
             s.ms_tail.deinit(a);
+            for (s.response_outbox.items) |w| a.free(w);
+            s.response_outbox.deinit(a);
             a.destroy(s);
         }
         self.inbound_streams.deinit(a);
@@ -1600,6 +1602,13 @@ pub const QuicRuntime = struct {
     /// a ~3 MiB block ships over ~12 ticks (well within one slot) while
     /// attestations drain every tick. Priority lane is unbudgeted.
     const gossip_bulk_drain_budget_bytes: usize = 256 * 1024;
+
+    /// Max bytes a single inbound req/resp stream's queued response chunks are
+    /// pushed to the transport per drive lap (same rationale as
+    /// gossip_bulk_drain_budget_bytes, applied to BlocksByRange responses). A
+    /// multi-MB response is paced over several laps so it can't fill zquic's
+    /// per-stream pending queue in one lap and stall the inbound socket drain.
+    const response_drain_budget_bytes: usize = 256 * 1024;
 
     /// Re-drain the listener socket + flush server-side conn ACKs if at least
     /// `drive_inbound_pump_interval_ms` has elapsed since the last pump. Cheap
@@ -3676,19 +3685,46 @@ pub const QuicRuntime = struct {
             return;
         };
 
-        // Write response chunk wire-framed.
+        // Enqueue the wire-framed chunk for a BUDGETED per-lap drain
+        // (drainResponseOutbox) — do NOT writeAll synchronously: a multi-MB
+        // BlocksByRange response shoved into zquic in one lap fills the 32 MB
+        // pending queue, makes the drive lap 0.3-1.3s, starves the inbound socket
+        // drain → packet loss → CC collapse. The outbox owns `wire`.
         const wire = snappy_wire.buildResponseWire(self.allocator, 0, chunk) catch |err| {
             log.warn("quic_runtime: buildResponseWire failed: {s}", .{@errorName(err)});
             return;
         };
-        defer self.allocator.free(wire);
-
-        var w = ist.raw.writer();
-        std.Io.Writer.writeAll(&w, wire) catch |err| {
-            log.warn("quic_runtime: write response chunk failed: {s}", .{@errorName(err)});
-            return;
+        ist.response_outbox.append(self.allocator, wire) catch {
+            log.warn("quic_runtime: response_outbox append failed; dropping chunk", .{});
+            self.allocator.free(wire);
         };
-        std.Io.Writer.flush(&w) catch {};
+    }
+
+    /// Drain at most `budget` bytes of queued response chunks onto the stream this
+    /// tick (mirrors the gossip bulk-lane budget). Sends partial chunks across laps
+    /// via `response_outbox_offset`; emits a deferred FIN once fully drained.
+    fn drainResponseOutbox(self: *QuicRuntime, ist: *conn_table.InboundStream, budget: usize) void {
+        var sent_this_call: usize = 0;
+        while (ist.response_outbox.items.len > 0) {
+            if (sent_this_call > 0 and sent_this_call >= budget) break;
+            const head = ist.response_outbox.items[0];
+            const remaining = head[ist.response_outbox_offset..];
+            const accepted = ist.raw.sendChunk(remaining, false);
+            if (accepted == 0) break; // transport backpressure; resume next tick
+            sent_this_call += accepted;
+            ist.response_outbox_offset += accepted;
+            if (ist.response_outbox_offset >= head.len) {
+                _ = ist.response_outbox.orderedRemove(0);
+                self.allocator.free(head);
+                ist.response_outbox_offset = 0;
+            }
+        }
+        // All queued response bytes flushed: send the deferred FIN now (in order).
+        if (ist.response_outbox.items.len == 0 and ist.response_fin_pending) {
+            _ = ist.raw.sendChunk(&[_]u8{}, true);
+            ist.response_fin_pending = false;
+            ist.response_fin_sent = true;
+        }
     }
 
     fn handleEndOfStream(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, request_id: u64) void {
@@ -3708,9 +3744,17 @@ pub const QuicRuntime = struct {
         const ist = found_stream orelse return;
 
         // Half-close the responder write side so rust-libp2p sees the response
-        // stream end (empty chunk sequence is valid for blocks_by_root).
-        ist.raw.writeAllFin(&.{});
-        ist.response_fin_sent = true;
+        // stream end (empty chunk sequence is valid for blocks_by_root). If
+        // response chunks are still queued in the budgeted outbox, DEFER the FIN
+        // until they drain (drainResponseOutbox sends it) so the 0-byte FIN never
+        // races ahead of queued response bytes. Both the FIN and the chunk sends
+        // go through `send_offset`, so they stay in order.
+        if (ist.response_outbox.items.len > 0) {
+            ist.response_fin_pending = true;
+        } else {
+            _ = ist.raw.sendChunk(&[_]u8{}, true);
+            ist.response_fin_sent = true;
+        }
 
         // Drop from channel map; advanceInboundStreams releases the zquic
         // raw-app slot once the peer FINs (see ch4r10t33r/zquic#149).
@@ -3770,6 +3814,8 @@ pub const QuicRuntime = struct {
         ist.relay_acc.deinit(self.allocator);
         ist.ms_acc.deinit(self.allocator);
         ist.ms_tail.deinit(self.allocator);
+        for (ist.response_outbox.items) |w| self.allocator.free(w);
+        ist.response_outbox.deinit(self.allocator);
         self.allocator.destroy(ist);
         _ = sh.inbound_streams.swapRemove(index);
     }
@@ -3790,6 +3836,8 @@ pub const QuicRuntime = struct {
         ist.relay_acc.deinit(self.allocator);
         ist.ms_acc.deinit(self.allocator);
         ist.ms_tail.deinit(self.allocator);
+        for (ist.response_outbox.items) |w| self.allocator.free(w);
+        ist.response_outbox.deinit(self.allocator);
         self.allocator.destroy(ist);
         _ = sh.inbound_streams.swapRemove(index);
     }
@@ -4148,12 +4196,19 @@ pub const QuicRuntime = struct {
                 (p > config.proto_meshsub_last_index and p < config.proto_relay_hop)
             else
                 true; // never finished multistream-select → genuinely stuck
-            if (reapable and !ist.response_fin_sent and ist.created_ms != 0 and
+            if (reapable and ist.response_outbox.items.len == 0 and !ist.response_fin_pending and
+                !ist.response_fin_sent and ist.created_ms != 0 and
                 self.opts.now_ms_fn() - ist.created_ms > conn_table.inbound_request_reap_ms)
             {
                 log.warn("quic_runtime: reaping stale inbound req/resp stream (no response in {d}ms)", .{conn_table.inbound_request_reap_ms});
                 self.removeInboundStreamAt(sh, i);
                 continue;
+            }
+
+            // Drain queued response chunks at a per-lap byte budget (the fix for
+            // a multi-MB BlocksByRange response monopolizing the outbound phase).
+            if (ist.response_outbox.items.len > 0 or ist.response_fin_pending) {
+                self.drainResponseOutbox(ist, response_drain_budget_bytes);
             }
 
             // 1. Multistream handshake: responder side.
