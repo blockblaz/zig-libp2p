@@ -166,6 +166,15 @@ pub const GossipsubConfig = struct {
     max_idontwant_entries: usize = 16384,
     /// TTL applied to IDONTWANT cache entries.
     idontwant_ttl_ms: i64 = gs_cfg.duplicate_cache_ttl_ms,
+    /// Min message size (bytes) to EMIT an outbound IDONTWANT on first receipt
+    /// (libp2p gossipsub v1.2 / rust-libp2p `idontwant_message_size_threshold`,
+    /// default 1 KiB). On first receipt of a message >= this size we tell our
+    /// mesh peers we already have it so they stop relaying the redundant
+    /// full-message copies — without this, an N-degree mesh floods every node
+    /// with ~N copies of each attestation, overflowing the per-peer send outbox
+    /// and dropping attestations (no quorum -> no finality). Below the threshold
+    /// the IDONTWANT control frame isn't worth the saving. Tunable.
+    idontwant_message_size_threshold: usize = 1024,
     /// FIFO cap on the PX dial-suggestion queue (`peer_id` bytes pulled from inbound
     /// PRUNE `peers` lists, #85). Embedders pop via [`popDialSuggestion`] and feed
     /// `connection_manager.registerKnownPeer`.
@@ -1779,6 +1788,26 @@ pub const Gossipsub = struct {
         }
     }
 
+    /// Emit IDONTWANT(mid) to every mesh peer for `topic` except `sender`, on
+    /// FIRST receipt of a large message (libp2p gossipsub v1.2, rust-libp2p
+    /// parity). Tells mesh peers we already have the message so they stop
+    /// relaying the redundant full-message copies to us — the fix for the
+    /// per-peer send-outbox overflow caused by the undeduplicated mesh-degree
+    /// attestation flood. Best-effort per peer.
+    fn broadcastIDontWant(self: *Gossipsub, topic: []const u8, sender: identity.PeerId, mid: [20]u8) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        const mp = self.mesh.getPtr(topic) orelse return;
+        const ctl = try control.encodeIDontWant(self.allocator, &.{mid[0..]});
+        defer self.allocator.free(ctl);
+        var pit = mp.peers.keyIterator();
+        while (pit.next()) |kp| {
+            const dest = kp.*;
+            if (dest.eql(&sender)) continue;
+            const wire = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
+            errdefer self.allocator.free(wire);
+            try self.appendOut(wire, dest);
+        }
+    }
+
     fn pruneMeshDownToN(self: *Gossipsub, topic: []const u8, target: usize) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         const mp = self.mesh.getPtr(topic) orelse return;
         const c = mp.peers.count();
@@ -1887,6 +1916,18 @@ pub const Gossipsub = struct {
                         continue;
                     }
                 }
+            }
+            // IDONTWANT (gossipsub v1.2, rust-libp2p parity): on FIRST receipt of
+            // a message at/above the size threshold, tell our mesh peers we
+            // already have it so they stop relaying the redundant full-message
+            // copies to us. Emitted BEFORE the (possibly slow) validator so the
+            // flood is cut during validation. THE fix for the per-peer priority-
+            // outbox overflow (undeduplicated mesh-degree attestation flood ->
+            // dropped attestations -> no quorum -> no finality).
+            if (self.cfg.idontwant_runtime_enabled and data.len >= self.cfg.idontwant_message_size_threshold) {
+                self.broadcastIDontWant(topic, sender, id) catch |err| {
+                    log.warn("gossipsub: broadcastIDontWant failed: {s}", .{@errorName(err)});
+                };
             }
             // Application-layer validator (#84). Spec maps `reject` to behaviour-score P4
             // penalty; `ignore` drops without scoring.
