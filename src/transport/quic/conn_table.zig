@@ -106,6 +106,18 @@ pub const InboundStream = struct {
     /// Bytes left over after multistream-select succeeded (e.g. ping payload
     /// flushed in the same STREAM frame as the handshake ack).
     ms_tail: std.ArrayList(u8) = .empty,
+    /// Queued, wire-framed response chunks awaiting a BUDGETED per-drive-lap drain
+    /// (`drainResponseOutbox`). The responder enqueues here instead of `writeAll`-ing
+    /// synchronously: a multi-MB BlocksByRange response shoved into zquic in one lap
+    /// fills the 32 MB per-stream pending queue, makes the lap 0.3-1.3s, starves the
+    /// inbound socket drain → packet loss → CC collapse. Drained at
+    /// `response_drain_budget_bytes`/tick like the gossip bulk lane.
+    response_outbox: std.ArrayList([]u8) = .empty,
+    /// Send offset into `response_outbox.items[0]` (a chunk may span several laps).
+    response_outbox_offset: usize = 0,
+    /// FIN requested by handleEndOfStream but deferred until response_outbox drains,
+    /// so the 0-byte FIN never races ahead of queued response bytes.
+    response_fin_pending: bool = false,
 };
 
 /// Hard upper bound on how long an in-flight outbound request may hold its
