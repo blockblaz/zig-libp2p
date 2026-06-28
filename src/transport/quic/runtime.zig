@@ -1319,6 +1319,7 @@ pub const QuicRuntime = struct {
                 .conn = conn,
                 .stream_id = stream_id,
             },
+            .created_ms = self.opts.now_ms_fn(),
         };
         try sh.inbound_streams.append(self.allocator, ist);
     }
@@ -1358,6 +1359,7 @@ pub const QuicRuntime = struct {
                     .client = client,
                 },
                 .known_peer_id = peer_id,
+                .created_ms = self.opts.now_ms_fn(),
             };
             sh.inbound_streams.append(self.allocator, ist) catch {
                 self.allocator.destroy(ist);
@@ -4068,6 +4070,30 @@ pub const QuicRuntime = struct {
             //    catches the close long before the reap.  `removeInboundStreamAt`
             //    releases the (still-valid) raw slot and frees the stream.
             if (ist.conn.draining or ist.conn.phase == .closed) {
+                self.removeInboundStreamAt(sh, i);
+                continue;
+            }
+
+            // 0b. Reap a STALE inbound req/resp stream (R1): one accepted but never
+            //     finished its response within `inbound_request_reap_ms` (peer opened
+            //     the stream, finished multistream-select, then stalled — no request
+            //     body, never FINs). Without this the InboundStream + its zquic
+            //     raw-app slot leak forever → RawAppStreamSlotsFull → the node
+            //     silently stops serving sync.
+            //     ONLY req/resp protocols (status/blocks_by_*, indices
+            //     proto_meshsub_last_index+1 .. proto_relay_hop) and PRE-handshake
+            //     stalls are reapable. Persistent `/meshsub` gossip (0..3), relay
+            //     hop/stop, and dcutr are LONG-LIVED — they never set
+            //     response_fin_sent and must NOT be reaped on age (doing so would
+            //     tear down every gossip stream every 30s).
+            const reapable = if (ist.protocol_index) |p|
+                (p > config.proto_meshsub_last_index and p < config.proto_relay_hop)
+            else
+                true; // never finished multistream-select → genuinely stuck
+            if (reapable and !ist.response_fin_sent and ist.created_ms != 0 and
+                self.opts.now_ms_fn() - ist.created_ms > conn_table.inbound_request_reap_ms)
+            {
+                log.warn("quic_runtime: reaping stale inbound req/resp stream (no response in {d}ms)", .{conn_table.inbound_request_reap_ms});
                 self.removeInboundStreamAt(sh, i);
                 continue;
             }

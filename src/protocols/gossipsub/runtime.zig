@@ -114,6 +114,14 @@ pub const GossipsubConfig = struct {
     mesh_n_low: u8 = gs_cfg.mesh_n_low,
     mesh_n: u8 = gs_cfg.mesh_n,
     mesh_n_high: u8 = gs_cfg.mesh_n_high,
+    /// rust-libp2p flood_publish (default on): the originator of a published
+    /// message delivers it to ALL subscribed peers (remote_interest), not just
+    /// the current mesh — decouples first-hop coverage from mesh convergence.
+    flood_publish: bool = true,
+    /// Extra heartbeats a pruned peer stays GRAFT-ineligible past exact backoff
+    /// expiry (rust-libp2p backoff_slack). Prevents lockstep re-GRAFT flap. 0 =
+    /// exact (no slack).
+    backoff_slack_heartbeats: u32 = 1,
     gossip_lazy: u8 = gs_cfg.gossip_lazy,
     history_length: u8 = gs_cfg.history_length,
     heartbeat_interval_ms: i64 = gs_cfg.heartbeat_interval_ms,
@@ -316,10 +324,23 @@ pub const ValidationResult = enum {
 pub const TopicValidator = *const fn (ctx: ?*anyopaque, topic: []const u8, data: []const u8) ValidationResult;
 
 /// IDONTWANT cache key (#85): the peer that asked us to skip the message id.
-const IDontWantEntry = struct {
+/// Key for the IDONTWANT map (rust-parity O(1) membership). Value = expires_ms.
+const IDontWantKey = struct {
     peer: identity.PeerId,
     id: [20]u8,
-    expires_ms: i64,
+};
+const IDontWantKeyContext = struct {
+    pub fn hash(_: IDontWantKeyContext, k: IDontWantKey) u64 {
+        var buf: [128]u8 = undefined;
+        const pb = k.peer.toBytes(&buf) catch return 0;
+        var h = std.hash.Wyhash.init(0);
+        h.update(pb);
+        h.update(&k.id);
+        return h.final();
+    }
+    pub fn eql(_: IDontWantKeyContext, a: IDontWantKey, b: IDontWantKey) bool {
+        return a.peer.eql(&b.peer) and std.mem.eql(u8, &a.id, &b.id);
+    }
 };
 
 /// Coarse spin-lock guarding all `Gossipsub` public entry points.  This Zig
@@ -475,7 +496,7 @@ pub const Gossipsub = struct {
     /// Inbound publishes dropped because the topic validator returned `ignore` (#84).
     inbound_dropped_validator_ignore: u64,
     /// Per-peer IDONTWANT cache used to suppress redundant outbound publishes / IHAVE (#85).
-    idontwant: std.ArrayList(IDontWantEntry),
+    idontwant: std.HashMap(IDontWantKey, i64, IDontWantKeyContext, std.hash_map.default_max_load_percentage),
     /// Outbound publishes suppressed because the destination had sent IDONTWANT (#85).
     suppressed_outbound_idontwant: u64,
     /// Always-mesh peers (libp2p gossipsub `direct peers`, #85). Never pruned, never backed-off.
@@ -631,7 +652,7 @@ pub const Gossipsub = struct {
             .inbound_dropped_seqno_replay = 0,
             .inbound_dropped_validator_reject = 0,
             .inbound_dropped_validator_ignore = 0,
-            .idontwant = .empty,
+            .idontwant = .init(allocator),
             .suppressed_outbound_idontwant = 0,
             .direct_peers = .init(allocator),
             .px_dial_queue = .empty,
@@ -686,7 +707,7 @@ pub const Gossipsub = struct {
         for (self.backoff.items) |b| self.allocator.free(b.topic);
         self.backoff.deinit(self.allocator);
         self.seqno_dedup.deinit(self.allocator);
-        self.idontwant.deinit(self.allocator);
+        self.idontwant.deinit();
         self.direct_peers.deinit();
         for (self.px_dial_queue.items) |b| self.allocator.free(b);
         self.px_dial_queue.deinit(self.allocator);
@@ -745,9 +766,14 @@ pub const Gossipsub = struct {
 
     /// Drops expired back-off windows. Called from [`heartbeat`] and read paths.
     fn pruneBackoff(self: *Gossipsub) void {
+        // GC only PAST the slack window (expires + slack). Removing at exact
+        // expiry here — before heartbeat graft selection — would defeat the
+        // GRAFT-send slack (the entry would be gone, so isPeerBackedOffForGraft
+        // sees nothing and re-grafts in the same heartbeat the backoff lapses).
+        const slack = self.backoffSlackMs();
         var i: usize = 0;
         while (i < self.backoff.items.len) {
-            if (self.backoff.items[i].expires_ms <= self.clock_ms) {
+            if (self.backoff.items[i].expires_ms + slack <= self.clock_ms) {
                 const e = self.backoff.orderedRemove(i);
                 self.allocator.free(e.topic);
             } else {
@@ -756,13 +782,25 @@ pub const Gossipsub = struct {
         }
     }
 
-    /// Returns the active back-off entry's index for `(peer, topic)` or `null`.
-    /// Side effect: removes the entry on the fly if it has expired.
+    /// Extra time a `(peer,topic)` stays GRAFT-ineligible PAST its exact backoff
+    /// expiry (rust-libp2p `backoff_slack`, default 1 heartbeat). Ensures we never
+    /// re-GRAFT a peer in the same heartbeat its backoff lapses — both ends would
+    /// otherwise re-graft in lockstep, re-collide, and re-prune (a sustained
+    /// synchronized GRAFT/PRUNE flap on dense topics). The slack applies ONLY to
+    /// our GRAFT-SEND eligibility; GRAFT-ACCEPT + reported remaining stay exact.
+    fn backoffSlackMs(self: *const Gossipsub) i64 {
+        return @as(i64, @intCast(self.cfg.backoff_slack_heartbeats)) * self.cfg.heartbeat_interval_ms;
+    }
+
+    /// Returns the back-off entry's index for `(peer, topic)` or `null`. Side
+    /// effect: GCs entries only once they are past expiry + slack, so the slack
+    /// window is observable by the GRAFT-send check.
     fn findActiveBackoff(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) ?usize {
+        const slack = self.backoffSlackMs();
         var i: usize = 0;
         while (i < self.backoff.items.len) {
             const b = self.backoff.items[i];
-            if (b.expires_ms <= self.clock_ms) {
+            if (b.expires_ms + slack <= self.clock_ms) {
                 const removed = self.backoff.orderedRemove(i);
                 self.allocator.free(removed.topic);
                 continue;
@@ -774,13 +812,21 @@ pub const Gossipsub = struct {
     }
 
     /// `true` iff the local node is currently in PRUNE back-off toward `(peer, topic)`,
-    /// i.e. MUST NOT send GRAFT.
+    /// i.e. MUST NOT send GRAFT. EXACT (no slack) — used for accept-side checks
+    /// and the public API; the slack-aware variant is `isPeerBackedOffForGraft`.
     pub fn isPeerBackedOff(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) bool {
         self.lock();
         defer self.unlock();
         return self.isPeerBackedOffInner(peer, topic);
     }
     fn isPeerBackedOffInner(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) bool {
+        const idx = self.findActiveBackoff(peer, topic) orelse return false;
+        return self.backoff.items[idx].expires_ms > self.clock_ms;
+    }
+
+    /// `true` iff we must not GRAFT `(peer,topic)` yet — backed off OR within the
+    /// slack window past expiry (rust `is_backoff_with_slack`).
+    fn isPeerBackedOffForGraft(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) bool {
         return self.findActiveBackoff(peer, topic) != null;
     }
 
@@ -824,7 +870,10 @@ pub const Gossipsub = struct {
     fn remainingBackoffSecondsFor(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) ?u64 {
         const idx = self.findActiveBackoff(peer, topic) orelse return null;
         const remain_ms = self.backoff.items[idx].expires_ms - self.clock_ms;
-        if (remain_ms <= 0) return 0;
+        // Exact: during the slack window (remain <= 0) the peer is no longer
+        // backed off for ACCEPT purposes — return null so an inbound GRAFT is
+        // accepted (only our own GRAFT-send waits out the slack).
+        if (remain_ms <= 0) return null;
         return @intCast(@divTrunc(remain_ms + 999, 1000));
     }
 
@@ -928,37 +977,46 @@ pub const Gossipsub = struct {
     /// Also sweeps expired entries along the way.
     fn peerWantsNotPublish(self: *Gossipsub, peer: identity.PeerId, id: [20]u8) bool {
         if (!self.cfg.idontwant_runtime_enabled) return false;
-        var i: usize = 0;
-        var hit = false;
-        while (i < self.idontwant.items.len) {
-            const e = self.idontwant.items[i];
-            if (e.expires_ms <= self.clock_ms) {
-                _ = self.idontwant.orderedRemove(i);
-                continue;
-            }
-            if (!hit and e.peer.eql(&peer) and std.mem.eql(u8, &e.id, &id)) hit = true;
-            i += 1;
+        // O(1) keyed lookup (was an O(n) scan over up to max_idontwant_entries on
+        // the per-forward × per-mesh-peer hot path — the owner-thread ceiling).
+        // Evict the specific entry if expired (O(1), self-sweeping on lookup).
+        const key = IDontWantKey{ .peer = peer, .id = id };
+        const exp = self.idontwant.get(key) orelse return false;
+        if (exp <= self.clock_ms) {
+            _ = self.idontwant.remove(key);
+            return false;
         }
-        return hit;
+        return true;
     }
 
     fn rememberIDontWant(self: *Gossipsub, peer: identity.PeerId, id: [20]u8) std.mem.Allocator.Error!void {
         if (!self.cfg.idontwant_runtime_enabled) return;
-        // Already present? bump expiry only.
-        for (self.idontwant.items) |*e| {
-            if (e.peer.eql(&peer) and std.mem.eql(u8, &e.id, &id)) {
-                e.expires_ms = self.clock_ms + self.cfg.idontwant_ttl_ms;
-                return;
+        const key = IDontWantKey{ .peer = peer, .id = id };
+        const exp = self.clock_ms + self.cfg.idontwant_ttl_ms;
+        if (self.idontwant.getPtr(key)) |v| {
+            v.* = exp; // bump expiry
+            return;
+        }
+        if (self.idontwant.count() >= self.cfg.max_idontwant_entries) {
+            self.pruneIDontWant();
+            if (self.idontwant.count() >= self.cfg.max_idontwant_entries) {
+                // Still full of live entries — evict one arbitrary to stay bounded.
+                var it = self.idontwant.keyIterator();
+                if (it.next()) |k| _ = self.idontwant.remove(k.*);
             }
         }
-        if (self.idontwant.items.len >= self.cfg.max_idontwant_entries) {
-            _ = self.idontwant.orderedRemove(0);
+        try self.idontwant.put(key, exp);
+    }
+
+    /// Remove expired IDONTWANT entries (called from the heartbeat prune sweep).
+    fn pruneIDontWant(self: *Gossipsub) void {
+        var expired: std.ArrayListUnmanaged(IDontWantKey) = .empty;
+        defer expired.deinit(self.allocator);
+        var it = self.idontwant.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* <= self.clock_ms) expired.append(self.allocator, e.key_ptr.*) catch break;
         }
-        try self.idontwant.append(self.allocator, .{
-            .peer = peer,
-            .id = id,
-            .expires_ms = self.clock_ms + self.cfg.idontwant_ttl_ms,
-        });
+        for (expired.items) |k| _ = self.idontwant.remove(k);
     }
 
     /// Mark `peer` as a direct (always-mesh) peer. Direct peers are never pruned by the
@@ -1507,9 +1565,29 @@ pub const Gossipsub = struct {
         if (self.subs.contains(topic)) {
             try self.ensureTopicMesh(topic);
             const mp = self.mesh.getPtr(topic).?;
-            var pit = mp.peers.keyIterator();
-            while (pit.next()) |kp| {
-                try self.appendPublishWire(wire, kp.*, id);
+            const ri: ?*TopicMesh = if (self.cfg.flood_publish) self.remote_interest.getPtr(topic) else null;
+            if (ri) |rip| {
+                // rust-libp2p flood_publish (default on): the ORIGINATOR delivers
+                // its own message to EVERY subscribed peer, not just the current
+                // mesh — so a validator's own attestation reaches all subnet
+                // members even when the mesh is transiently below mesh_n (mid-
+                // convergence / one slot post-prune). Without this, first-hop
+                // coverage is capped by mesh size → sparse subnets stall below
+                // quorum. Mesh peers not (yet) in remote_interest are still sent.
+                var rit = rip.peers.keyIterator();
+                while (rit.next()) |kp| {
+                    try self.appendPublishWire(wire, kp.*, id);
+                }
+                var pit = mp.peers.keyIterator();
+                while (pit.next()) |kp| {
+                    if (rip.peers.contains(kp.*)) continue;
+                    try self.appendPublishWire(wire, kp.*, id);
+                }
+            } else {
+                var pit = mp.peers.keyIterator();
+                while (pit.next()) |kp| {
+                    try self.appendPublishWire(wire, kp.*, id);
+                }
             }
             self.allocator.free(wire);
         } else {
@@ -1620,6 +1698,15 @@ pub const Gossipsub = struct {
                 const sa = c.gs.peerBehaviourScore(a);
                 const sb = c.gs.peerBehaviourScore(b);
                 if (sa != sb) return sa < sb;
+                // Tie-break: per-node SALTED hash of the peer id (rust shuffles
+                // equal-scored peers before pruning). With scoring off all scores
+                // are 0, so a raw peer-id byte order would make EVERY node prune
+                // the same low-id peer → network-wide synchronized pruning that
+                // feeds the GRAFT/PRUNE flap. Salting with our own peer id
+                // decorrelates victims across nodes. Deterministic (testable).
+                const ha = c.gs.pruneTieBreak(a);
+                const hb = c.gs.pruneTieBreak(b);
+                if (ha != hb) return ha < hb;
                 var ba: [128]u8 = undefined;
                 var bb: [128]u8 = undefined;
                 const ab = a.toBytes(&ba) catch return false;
@@ -1628,6 +1715,19 @@ pub const Gossipsub = struct {
             }
         };
         std.mem.sort(identity.PeerId, peers, ctx, S.less);
+    }
+
+    /// Per-node salted hash of a peer id, used as the prune tie-break so equal-
+    /// scored peers are pruned in a node-specific (decorrelated) order.
+    fn pruneTieBreak(self: *const Gossipsub, p: identity.PeerId) u64 {
+        var pbuf: [128]u8 = undefined;
+        const pb = p.toBytes(&pbuf) catch return 0;
+        var sbuf: [128]u8 = undefined;
+        const sb = self.cfg.local_peer_id.toBytes(&sbuf) catch return 0;
+        var h = std.hash.Wyhash.init(0);
+        h.update(sb);
+        h.update(pb);
+        return h.final();
     }
 
     fn candidatesOutsideMesh(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error![]identity.PeerId {
@@ -1652,7 +1752,7 @@ pub const Gossipsub = struct {
             // (a peer that PRUNEs us records back-off for us too), so re-grafting a
             // backed-off peer just makes it re-PRUNE us -> flap. The fix for sparse-
             // subnet decay is to stop SPURIOUS prunes, not bypass back-off.
-            if (!self.direct_peers.contains(p) and self.isPeerBackedOffInner(p, topic)) continue;
+            if (!self.direct_peers.contains(p) and self.isPeerBackedOffForGraft(p, topic)) continue;
             try self.scratch_peers.append(self.allocator, p);
         }
         // Direct peers always sort to the front; otherwise score-desc, then bytes.
@@ -1666,7 +1766,7 @@ pub const Gossipsub = struct {
         while (cit.next()) |kp| {
             const p = kp.*;
             if (p.eql(&self.cfg.local_peer_id)) continue;
-            if (!self.direct_peers.contains(p) and self.isPeerBackedOffInner(p, topic)) continue;
+            if (!self.direct_peers.contains(p) and self.isPeerBackedOffForGraft(p, topic)) continue;
             try self.scratch_peers.append(self.allocator, p);
         }
         self.sortPeersDirectThenScoreDescThenBytes(self.scratch_peers.items);
@@ -2125,6 +2225,7 @@ pub const Gossipsub = struct {
         self.dup.prune(self.clock_ms);
         self.prunePullCache();
         self.pruneRecentSeen();
+        self.pruneIDontWant();
         self.pruneBackoff();
         self.pruneTopicUnsubscribeCooldown();
         self.pruneFanout();
@@ -2329,7 +2430,7 @@ pub const Gossipsub = struct {
     pub fn idontwantCount(self: *const Gossipsub) usize {
         self.lock();
         defer self.unlock();
-        return self.idontwant.items.len;
+        return self.idontwant.count();
     }
     /// PX dial-suggestion queue depth.
     pub fn dialSuggestionCount(self: *const Gossipsub) usize {
@@ -3046,6 +3147,33 @@ test "remote SUBSCRIBE arriving before our own subscribe is retained and drained
     defer a.free(unsub2);
     try g.handleInboundRpc(peer2, unsub2);
     try std.testing.expectEqual(@as(usize, 0), g.pending_remote_subs.items.len);
+}
+
+test "backoff slack: GRAFT-send stays ineligible through the slack window while ACCEPT is exact" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .heartbeat_interval_ms = 700, .backoff_slack_heartbeats = 1 });
+    defer g.deinit();
+    g.setClockMs(0);
+    const peer = try identity.PeerId.random();
+    // expires at 30000; slack = 1 * 700 -> GRAFT-send ineligible until 30700.
+    try g.recordBackoff(peer, "t", 30_000);
+
+    // Deep inside the window: both exact and graft-send say backed off.
+    g.setClockMs(15_000);
+    try std.testing.expect(g.isPeerBackedOffInner(peer, "t"));
+    try std.testing.expect(g.isPeerBackedOffForGraft(peer, "t"));
+
+    // Past exact expiry but within slack: ACCEPT is exact (clear), GRAFT-send
+    // still ineligible — this is the window the slack protects.
+    g.setClockMs(30_200);
+    try std.testing.expect(!g.isPeerBackedOffInner(peer, "t"));
+    try std.testing.expect(g.isPeerBackedOffForGraft(peer, "t"));
+
+    // Past the slack: both clear.
+    g.setClockMs(30_800);
+    try std.testing.expect(!g.isPeerBackedOffInner(peer, "t"));
+    try std.testing.expect(!g.isPeerBackedOffForGraft(peer, "t"));
 }
 
 test "inbound PRUNE records back-off; heartbeat refuses to re-graft inside window" {
