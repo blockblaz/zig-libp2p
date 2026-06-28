@@ -262,6 +262,7 @@ pub fn decodePublishes(allocator: std.mem.Allocator, rpc_wire: []const u8) (Erro
             try w.nextFieldValue(val_buf, key.wire_type);
         off += nv.total;
         if (key.field_number == 2 and key.wire_type == .length_delimited) {
+            if (out.items.len >= lim.max_publishes_per_rpc) return error.PayloadTooLarge;
             const blob = try allocator.dupe(u8, nv.value);
             errdefer allocator.free(blob);
             try out.append(allocator, blob);

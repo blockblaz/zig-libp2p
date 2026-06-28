@@ -324,10 +324,23 @@ pub const ValidationResult = enum {
 pub const TopicValidator = *const fn (ctx: ?*anyopaque, topic: []const u8, data: []const u8) ValidationResult;
 
 /// IDONTWANT cache key (#85): the peer that asked us to skip the message id.
-const IDontWantEntry = struct {
+/// Key for the IDONTWANT map (rust-parity O(1) membership). Value = expires_ms.
+const IDontWantKey = struct {
     peer: identity.PeerId,
     id: [20]u8,
-    expires_ms: i64,
+};
+const IDontWantKeyContext = struct {
+    pub fn hash(_: IDontWantKeyContext, k: IDontWantKey) u64 {
+        var buf: [128]u8 = undefined;
+        const pb = k.peer.toBytes(&buf) catch return 0;
+        var h = std.hash.Wyhash.init(0);
+        h.update(pb);
+        h.update(&k.id);
+        return h.final();
+    }
+    pub fn eql(_: IDontWantKeyContext, a: IDontWantKey, b: IDontWantKey) bool {
+        return a.peer.eql(&b.peer) and std.mem.eql(u8, &a.id, &b.id);
+    }
 };
 
 /// Coarse spin-lock guarding all `Gossipsub` public entry points.  This Zig
@@ -483,7 +496,7 @@ pub const Gossipsub = struct {
     /// Inbound publishes dropped because the topic validator returned `ignore` (#84).
     inbound_dropped_validator_ignore: u64,
     /// Per-peer IDONTWANT cache used to suppress redundant outbound publishes / IHAVE (#85).
-    idontwant: std.ArrayList(IDontWantEntry),
+    idontwant: std.HashMap(IDontWantKey, i64, IDontWantKeyContext, std.hash_map.default_max_load_percentage),
     /// Outbound publishes suppressed because the destination had sent IDONTWANT (#85).
     suppressed_outbound_idontwant: u64,
     /// Always-mesh peers (libp2p gossipsub `direct peers`, #85). Never pruned, never backed-off.
@@ -639,7 +652,7 @@ pub const Gossipsub = struct {
             .inbound_dropped_seqno_replay = 0,
             .inbound_dropped_validator_reject = 0,
             .inbound_dropped_validator_ignore = 0,
-            .idontwant = .empty,
+            .idontwant = .init(allocator),
             .suppressed_outbound_idontwant = 0,
             .direct_peers = .init(allocator),
             .px_dial_queue = .empty,
@@ -694,7 +707,7 @@ pub const Gossipsub = struct {
         for (self.backoff.items) |b| self.allocator.free(b.topic);
         self.backoff.deinit(self.allocator);
         self.seqno_dedup.deinit(self.allocator);
-        self.idontwant.deinit(self.allocator);
+        self.idontwant.deinit();
         self.direct_peers.deinit();
         for (self.px_dial_queue.items) |b| self.allocator.free(b);
         self.px_dial_queue.deinit(self.allocator);
@@ -959,37 +972,46 @@ pub const Gossipsub = struct {
     /// Also sweeps expired entries along the way.
     fn peerWantsNotPublish(self: *Gossipsub, peer: identity.PeerId, id: [20]u8) bool {
         if (!self.cfg.idontwant_runtime_enabled) return false;
-        var i: usize = 0;
-        var hit = false;
-        while (i < self.idontwant.items.len) {
-            const e = self.idontwant.items[i];
-            if (e.expires_ms <= self.clock_ms) {
-                _ = self.idontwant.orderedRemove(i);
-                continue;
-            }
-            if (!hit and e.peer.eql(&peer) and std.mem.eql(u8, &e.id, &id)) hit = true;
-            i += 1;
+        // O(1) keyed lookup (was an O(n) scan over up to max_idontwant_entries on
+        // the per-forward × per-mesh-peer hot path — the owner-thread ceiling).
+        // Evict the specific entry if expired (O(1), self-sweeping on lookup).
+        const key = IDontWantKey{ .peer = peer, .id = id };
+        const exp = self.idontwant.get(key) orelse return false;
+        if (exp <= self.clock_ms) {
+            _ = self.idontwant.remove(key);
+            return false;
         }
-        return hit;
+        return true;
     }
 
     fn rememberIDontWant(self: *Gossipsub, peer: identity.PeerId, id: [20]u8) std.mem.Allocator.Error!void {
         if (!self.cfg.idontwant_runtime_enabled) return;
-        // Already present? bump expiry only.
-        for (self.idontwant.items) |*e| {
-            if (e.peer.eql(&peer) and std.mem.eql(u8, &e.id, &id)) {
-                e.expires_ms = self.clock_ms + self.cfg.idontwant_ttl_ms;
-                return;
+        const key = IDontWantKey{ .peer = peer, .id = id };
+        const exp = self.clock_ms + self.cfg.idontwant_ttl_ms;
+        if (self.idontwant.getPtr(key)) |v| {
+            v.* = exp; // bump expiry
+            return;
+        }
+        if (self.idontwant.count() >= self.cfg.max_idontwant_entries) {
+            self.pruneIDontWant();
+            if (self.idontwant.count() >= self.cfg.max_idontwant_entries) {
+                // Still full of live entries — evict one arbitrary to stay bounded.
+                var it = self.idontwant.keyIterator();
+                if (it.next()) |k| _ = self.idontwant.remove(k.*);
             }
         }
-        if (self.idontwant.items.len >= self.cfg.max_idontwant_entries) {
-            _ = self.idontwant.orderedRemove(0);
+        try self.idontwant.put(key, exp);
+    }
+
+    /// Remove expired IDONTWANT entries (called from the heartbeat prune sweep).
+    fn pruneIDontWant(self: *Gossipsub) void {
+        var expired: std.ArrayListUnmanaged(IDontWantKey) = .empty;
+        defer expired.deinit(self.allocator);
+        var it = self.idontwant.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* <= self.clock_ms) expired.append(self.allocator, e.key_ptr.*) catch break;
         }
-        try self.idontwant.append(self.allocator, .{
-            .peer = peer,
-            .id = id,
-            .expires_ms = self.clock_ms + self.cfg.idontwant_ttl_ms,
-        });
+        for (expired.items) |k| _ = self.idontwant.remove(k);
     }
 
     /// Mark `peer` as a direct (always-mesh) peer. Direct peers are never pruned by the
@@ -2198,6 +2220,7 @@ pub const Gossipsub = struct {
         self.dup.prune(self.clock_ms);
         self.prunePullCache();
         self.pruneRecentSeen();
+        self.pruneIDontWant();
         self.pruneBackoff();
         self.pruneTopicUnsubscribeCooldown();
         self.pruneFanout();
@@ -2402,7 +2425,7 @@ pub const Gossipsub = struct {
     pub fn idontwantCount(self: *const Gossipsub) usize {
         self.lock();
         defer self.unlock();
-        return self.idontwant.items.len;
+        return self.idontwant.count();
     }
     /// PX dial-suggestion queue depth.
     pub fn dialSuggestionCount(self: *const Gossipsub) usize {

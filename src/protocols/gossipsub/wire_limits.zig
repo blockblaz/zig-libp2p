@@ -21,6 +21,12 @@ pub const max_message_id_bytes: usize = 256;
 /// Repeated message ids inside a single `IHave` / `IWant` / `IDontWant` entry.
 pub const max_message_ids_per_entry: usize = 8192;
 
+/// Max publish messages decoded from a single inbound `RPC` frame. Bounds the
+/// per-frame allocation + owner-thread forward loop against a peer packing a
+/// huge number of tiny messages into one frame (rust caps via
+/// `max_messages_per_rpc`). Generous — honest peers send a handful.
+pub const max_publishes_per_rpc: usize = 8192;
+
 /// Nested `ControlExtensions` message (`ControlMessage.extensions`, field 6).
 pub const max_control_extensions_blob_bytes: usize = 4096;
 
