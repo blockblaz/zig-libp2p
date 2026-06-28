@@ -2696,10 +2696,26 @@ pub const QuicRuntime = struct {
                 coalesce_buf[0..packed_len];
 
             var sent: usize = 0;
-            while (sent < send_slice.len) {
+            // For a SINGLE oversize frame (packed_frames == 0, e.g. a ~3 MiB
+            // block) cap THIS lap's feed to the remaining byte budget. sendChunk
+            // queues into zquic's pending (bounded by pending room, NOT cwnd), so
+            // without this cap the whole block floods pending in one lap → slow
+            // drive lap → priority (attestation) lane can't drain → coverage
+            // decay. The partial suffix is rewritten + the lane LOCKED below, so
+            // the block resumes next tick (per-peer, not global). Coalesced small
+            // frames (packed_frames > 0) are sent whole — the loop-top
+            // frame-boundary budget already paces them.
+            const frame_limit: usize = if (packed_frames == 0 and byte_budget != null)
+                @min(send_slice.len, @max(
+                    byte_budget.? -| sent_this_call,
+                    quic_raw_stream_io.raw_stream_send_chunk_len,
+                ))
+            else
+                send_slice.len;
+            while (sent < frame_limit) {
                 const n = @min(
                     quic_raw_stream_io.raw_stream_send_chunk_len,
-                    send_slice.len - sent,
+                    frame_limit - sent,
                 );
                 const accepted = g.raw.sendChunk(send_slice[sent..][0..n], false);
                 if (accepted == 0) break;
@@ -3728,7 +3744,15 @@ pub const QuicRuntime = struct {
             if (sent_this_call > 0 and sent_this_call >= budget) break;
             const head = ist.response_outbox.items[0];
             const remaining = head[ist.response_outbox_offset..];
-            const accepted = ist.raw.sendChunk(remaining, false);
+            // Cap THIS lap's feed to the remaining byte budget — sendChunk queues
+            // into zquic's 32 MB pending (bounded by pending room, NOT cwnd), so a
+            // single multi-MB block-chunk would otherwise flood pending in one lap
+            // (the budget check at the loop top only fires at a chunk boundary).
+            // budget - sent_this_call is > 0 here (loop-top guard); saturating
+            // so it stays correct even if that guard is ever weakened.
+            const lap_cap = @max(budget -| sent_this_call, 1);
+            const to_send = remaining[0..@min(remaining.len, lap_cap)];
+            const accepted = ist.raw.sendChunk(to_send, false);
             if (accepted == 0) break; // transport backpressure; resume next tick
             sent_this_call += accepted;
             ist.response_outbox_offset += accepted;
