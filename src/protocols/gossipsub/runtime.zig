@@ -114,6 +114,14 @@ pub const GossipsubConfig = struct {
     mesh_n_low: u8 = gs_cfg.mesh_n_low,
     mesh_n: u8 = gs_cfg.mesh_n,
     mesh_n_high: u8 = gs_cfg.mesh_n_high,
+    /// rust-libp2p flood_publish (default on): the originator of a published
+    /// message delivers it to ALL subscribed peers (remote_interest), not just
+    /// the current mesh — decouples first-hop coverage from mesh convergence.
+    flood_publish: bool = true,
+    /// Extra heartbeats a pruned peer stays GRAFT-ineligible past exact backoff
+    /// expiry (rust-libp2p backoff_slack). Prevents lockstep re-GRAFT flap. 0 =
+    /// exact (no slack).
+    backoff_slack_heartbeats: u32 = 1,
     gossip_lazy: u8 = gs_cfg.gossip_lazy,
     history_length: u8 = gs_cfg.history_length,
     heartbeat_interval_ms: i64 = gs_cfg.heartbeat_interval_ms,
@@ -756,13 +764,25 @@ pub const Gossipsub = struct {
         }
     }
 
-    /// Returns the active back-off entry's index for `(peer, topic)` or `null`.
-    /// Side effect: removes the entry on the fly if it has expired.
+    /// Extra time a `(peer,topic)` stays GRAFT-ineligible PAST its exact backoff
+    /// expiry (rust-libp2p `backoff_slack`, default 1 heartbeat). Ensures we never
+    /// re-GRAFT a peer in the same heartbeat its backoff lapses — both ends would
+    /// otherwise re-graft in lockstep, re-collide, and re-prune (a sustained
+    /// synchronized GRAFT/PRUNE flap on dense topics). The slack applies ONLY to
+    /// our GRAFT-SEND eligibility; GRAFT-ACCEPT + reported remaining stay exact.
+    fn backoffSlackMs(self: *const Gossipsub) i64 {
+        return @as(i64, @intCast(self.cfg.backoff_slack_heartbeats)) * self.cfg.heartbeat_interval_ms;
+    }
+
+    /// Returns the back-off entry's index for `(peer, topic)` or `null`. Side
+    /// effect: GCs entries only once they are past expiry + slack, so the slack
+    /// window is observable by the GRAFT-send check.
     fn findActiveBackoff(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) ?usize {
+        const slack = self.backoffSlackMs();
         var i: usize = 0;
         while (i < self.backoff.items.len) {
             const b = self.backoff.items[i];
-            if (b.expires_ms <= self.clock_ms) {
+            if (b.expires_ms + slack <= self.clock_ms) {
                 const removed = self.backoff.orderedRemove(i);
                 self.allocator.free(removed.topic);
                 continue;
@@ -774,13 +794,21 @@ pub const Gossipsub = struct {
     }
 
     /// `true` iff the local node is currently in PRUNE back-off toward `(peer, topic)`,
-    /// i.e. MUST NOT send GRAFT.
+    /// i.e. MUST NOT send GRAFT. EXACT (no slack) — used for accept-side checks
+    /// and the public API; the slack-aware variant is `isPeerBackedOffForGraft`.
     pub fn isPeerBackedOff(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) bool {
         self.lock();
         defer self.unlock();
         return self.isPeerBackedOffInner(peer, topic);
     }
     fn isPeerBackedOffInner(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) bool {
+        const idx = self.findActiveBackoff(peer, topic) orelse return false;
+        return self.backoff.items[idx].expires_ms > self.clock_ms;
+    }
+
+    /// `true` iff we must not GRAFT `(peer,topic)` yet — backed off OR within the
+    /// slack window past expiry (rust `is_backoff_with_slack`).
+    fn isPeerBackedOffForGraft(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) bool {
         return self.findActiveBackoff(peer, topic) != null;
     }
 
@@ -824,7 +852,10 @@ pub const Gossipsub = struct {
     fn remainingBackoffSecondsFor(self: *Gossipsub, peer: identity.PeerId, topic: []const u8) ?u64 {
         const idx = self.findActiveBackoff(peer, topic) orelse return null;
         const remain_ms = self.backoff.items[idx].expires_ms - self.clock_ms;
-        if (remain_ms <= 0) return 0;
+        // Exact: during the slack window (remain <= 0) the peer is no longer
+        // backed off for ACCEPT purposes — return null so an inbound GRAFT is
+        // accepted (only our own GRAFT-send waits out the slack).
+        if (remain_ms <= 0) return null;
         return @intCast(@divTrunc(remain_ms + 999, 1000));
     }
 
@@ -1507,9 +1538,29 @@ pub const Gossipsub = struct {
         if (self.subs.contains(topic)) {
             try self.ensureTopicMesh(topic);
             const mp = self.mesh.getPtr(topic).?;
-            var pit = mp.peers.keyIterator();
-            while (pit.next()) |kp| {
-                try self.appendPublishWire(wire, kp.*, id);
+            const ri: ?*TopicMesh = if (self.cfg.flood_publish) self.remote_interest.getPtr(topic) else null;
+            if (ri) |rip| {
+                // rust-libp2p flood_publish (default on): the ORIGINATOR delivers
+                // its own message to EVERY subscribed peer, not just the current
+                // mesh — so a validator's own attestation reaches all subnet
+                // members even when the mesh is transiently below mesh_n (mid-
+                // convergence / one slot post-prune). Without this, first-hop
+                // coverage is capped by mesh size → sparse subnets stall below
+                // quorum. Mesh peers not (yet) in remote_interest are still sent.
+                var rit = rip.peers.keyIterator();
+                while (rit.next()) |kp| {
+                    try self.appendPublishWire(wire, kp.*, id);
+                }
+                var pit = mp.peers.keyIterator();
+                while (pit.next()) |kp| {
+                    if (rip.peers.contains(kp.*)) continue;
+                    try self.appendPublishWire(wire, kp.*, id);
+                }
+            } else {
+                var pit = mp.peers.keyIterator();
+                while (pit.next()) |kp| {
+                    try self.appendPublishWire(wire, kp.*, id);
+                }
             }
             self.allocator.free(wire);
         } else {
@@ -1620,6 +1671,15 @@ pub const Gossipsub = struct {
                 const sa = c.gs.peerBehaviourScore(a);
                 const sb = c.gs.peerBehaviourScore(b);
                 if (sa != sb) return sa < sb;
+                // Tie-break: per-node SALTED hash of the peer id (rust shuffles
+                // equal-scored peers before pruning). With scoring off all scores
+                // are 0, so a raw peer-id byte order would make EVERY node prune
+                // the same low-id peer → network-wide synchronized pruning that
+                // feeds the GRAFT/PRUNE flap. Salting with our own peer id
+                // decorrelates victims across nodes. Deterministic (testable).
+                const ha = c.gs.pruneTieBreak(a);
+                const hb = c.gs.pruneTieBreak(b);
+                if (ha != hb) return ha < hb;
                 var ba: [128]u8 = undefined;
                 var bb: [128]u8 = undefined;
                 const ab = a.toBytes(&ba) catch return false;
@@ -1628,6 +1688,19 @@ pub const Gossipsub = struct {
             }
         };
         std.mem.sort(identity.PeerId, peers, ctx, S.less);
+    }
+
+    /// Per-node salted hash of a peer id, used as the prune tie-break so equal-
+    /// scored peers are pruned in a node-specific (decorrelated) order.
+    fn pruneTieBreak(self: *const Gossipsub, p: identity.PeerId) u64 {
+        var pbuf: [128]u8 = undefined;
+        const pb = p.toBytes(&pbuf) catch return 0;
+        var sbuf: [128]u8 = undefined;
+        const sb = self.cfg.local_peer_id.toBytes(&sbuf) catch return 0;
+        var h = std.hash.Wyhash.init(0);
+        h.update(sb);
+        h.update(pb);
+        return h.final();
     }
 
     fn candidatesOutsideMesh(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error![]identity.PeerId {
@@ -1652,7 +1725,7 @@ pub const Gossipsub = struct {
             // (a peer that PRUNEs us records back-off for us too), so re-grafting a
             // backed-off peer just makes it re-PRUNE us -> flap. The fix for sparse-
             // subnet decay is to stop SPURIOUS prunes, not bypass back-off.
-            if (!self.direct_peers.contains(p) and self.isPeerBackedOffInner(p, topic)) continue;
+            if (!self.direct_peers.contains(p) and self.isPeerBackedOffForGraft(p, topic)) continue;
             try self.scratch_peers.append(self.allocator, p);
         }
         // Direct peers always sort to the front; otherwise score-desc, then bytes.
@@ -1666,7 +1739,7 @@ pub const Gossipsub = struct {
         while (cit.next()) |kp| {
             const p = kp.*;
             if (p.eql(&self.cfg.local_peer_id)) continue;
-            if (!self.direct_peers.contains(p) and self.isPeerBackedOffInner(p, topic)) continue;
+            if (!self.direct_peers.contains(p) and self.isPeerBackedOffForGraft(p, topic)) continue;
             try self.scratch_peers.append(self.allocator, p);
         }
         self.sortPeersDirectThenScoreDescThenBytes(self.scratch_peers.items);
