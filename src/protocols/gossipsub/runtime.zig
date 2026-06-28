@@ -766,9 +766,14 @@ pub const Gossipsub = struct {
 
     /// Drops expired back-off windows. Called from [`heartbeat`] and read paths.
     fn pruneBackoff(self: *Gossipsub) void {
+        // GC only PAST the slack window (expires + slack). Removing at exact
+        // expiry here — before heartbeat graft selection — would defeat the
+        // GRAFT-send slack (the entry would be gone, so isPeerBackedOffForGraft
+        // sees nothing and re-grafts in the same heartbeat the backoff lapses).
+        const slack = self.backoffSlackMs();
         var i: usize = 0;
         while (i < self.backoff.items.len) {
-            if (self.backoff.items[i].expires_ms <= self.clock_ms) {
+            if (self.backoff.items[i].expires_ms + slack <= self.clock_ms) {
                 const e = self.backoff.orderedRemove(i);
                 self.allocator.free(e.topic);
             } else {
@@ -3142,6 +3147,33 @@ test "remote SUBSCRIBE arriving before our own subscribe is retained and drained
     defer a.free(unsub2);
     try g.handleInboundRpc(peer2, unsub2);
     try std.testing.expectEqual(@as(usize, 0), g.pending_remote_subs.items.len);
+}
+
+test "backoff slack: GRAFT-send stays ineligible through the slack window while ACCEPT is exact" {
+    const a = std.testing.allocator;
+    const me = try identity.PeerId.random();
+    var g = try Gossipsub.init(a, .{ .local_peer_id = me, .heartbeat_interval_ms = 700, .backoff_slack_heartbeats = 1 });
+    defer g.deinit();
+    g.setClockMs(0);
+    const peer = try identity.PeerId.random();
+    // expires at 30000; slack = 1 * 700 -> GRAFT-send ineligible until 30700.
+    try g.recordBackoff(peer, "t", 30_000);
+
+    // Deep inside the window: both exact and graft-send say backed off.
+    g.setClockMs(15_000);
+    try std.testing.expect(g.isPeerBackedOffInner(peer, "t"));
+    try std.testing.expect(g.isPeerBackedOffForGraft(peer, "t"));
+
+    // Past exact expiry but within slack: ACCEPT is exact (clear), GRAFT-send
+    // still ineligible — this is the window the slack protects.
+    g.setClockMs(30_200);
+    try std.testing.expect(!g.isPeerBackedOffInner(peer, "t"));
+    try std.testing.expect(g.isPeerBackedOffForGraft(peer, "t"));
+
+    // Past the slack: both clear.
+    g.setClockMs(30_800);
+    try std.testing.expect(!g.isPeerBackedOffInner(peer, "t"));
+    try std.testing.expect(!g.isPeerBackedOffForGraft(peer, "t"));
 }
 
 test "inbound PRUNE records back-off; heartbeat refuses to re-graft inside window" {
