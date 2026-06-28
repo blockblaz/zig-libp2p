@@ -175,6 +175,14 @@ pub const GossipsubConfig = struct {
     /// and dropping attestations (no quorum -> no finality). Below the threshold
     /// the IDONTWANT control frame isn't worth the saving. Tunable.
     idontwant_message_size_threshold: usize = 1024,
+    /// Max queued-forward CANCELLATIONS scanned per inbound IDONTWANT frame
+    /// (rust-libp2p `remove_data_messages` is bounded by a per-peer queue; our
+    /// outbox is global, so each cancellation is an O(outbox) scan). We emit one
+    /// id per IDONTWANT, so a legitimate inbound frame carries ~1 id; this cap
+    /// only bounds the worst-case lock-hold against a peer that sends a huge
+    /// IDONTWANT id-list (DoS). Remaining ids are still recorded for future
+    /// suppression, just not cancelled in-flight. Tunable.
+    idontwant_max_cancel_per_frame: usize = 256,
     /// FIFO cap on the PX dial-suggestion queue (`peer_id` bytes pulled from inbound
     /// PRUNE `peers` lists, #85). Embedders pop via [`popDialSuggestion`] and feed
     /// `connection_manager.registerKnownPeer`.
@@ -248,6 +256,10 @@ pub const OutDelivery = struct {
     /// `null` means broadcast to all connected peers (subscribe / publish announcements).
     to: ?identity.PeerId,
     kind: OutDeliveryKind = .generic,
+    /// For `.generic` message FORWARDS only: the message id of the queued copy,
+    /// so a later inbound IDONTWANT from `to` can cancel this still-queued
+    /// forward (rust-libp2p `remove_data_messages`). `null` for control frames.
+    msg_id: ?[20]u8 = null,
 };
 
 const TopicMesh = struct {
@@ -1164,7 +1176,7 @@ pub const Gossipsub = struct {
                 defer self.allocator.free(ctl);
                 const rpcw = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
                 errdefer self.allocator.free(rpcw);
-                try self.appendOutKind(rpcw, target, .lazy_ihave);
+                try self.appendOutKind(rpcw, target, .lazy_ihave, null);
                 self.lazy_i_have_tx += 1;
             }
         }
@@ -1233,7 +1245,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn appendOutKind(self: *Gossipsub, wire: []u8, to: ?identity.PeerId, kind: OutDeliveryKind) (errors.GossipsubError || std.mem.Allocator.Error)!void {
+    fn appendOutKind(self: *Gossipsub, wire: []u8, to: ?identity.PeerId, kind: OutDeliveryKind, msg_id: ?[20]u8) (errors.GossipsubError || std.mem.Allocator.Error)!void {
         // Sole outbox writer entry point (owner thread).  The outbox is consumed
         // by the drive thread (`popOutboxDelivery`), so guard the shared
         // ArrayList here and there with `outbox_lock`.  Internal cap helpers
@@ -1244,11 +1256,42 @@ pub const Gossipsub = struct {
             self.enforcePerPeerCap(p);
         }
         try self.enforceGlobalOutboxCap();
-        try self.outbox.append(self.allocator, .{ .wire = wire, .to = to, .kind = kind });
+        try self.outbox.append(self.allocator, .{ .wire = wire, .to = to, .kind = kind, .msg_id = msg_id });
     }
 
     fn appendOut(self: *Gossipsub, wire: []u8, to: ?identity.PeerId) (errors.GossipsubError || std.mem.Allocator.Error)!void {
-        return self.appendOutKind(wire, to, .generic);
+        return self.appendOutKind(wire, to, .generic, null);
+    }
+
+    /// Cancel any still-queued `.generic` message forward of `id` destined for
+    /// `peer` (rust-libp2p `remove_data_messages`). Called when `peer` sends us
+    /// an IDONTWANT(id): it already has the message, so the redundant in-flight
+    /// copy we had queued is wasted bytes — drop it before it overflows the
+    /// per-peer outbox and evicts a fresh attestation. Returns count removed.
+    fn cancelQueuedForwardsTo(self: *Gossipsub, peer: identity.PeerId, id: [20]u8) usize {
+        self.outbox_lock.lock();
+        defer self.outbox_lock.unlock();
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.outbox.items.len) {
+            const d = self.outbox.items[i];
+            const to = d.to orelse {
+                i += 1;
+                continue;
+            };
+            const did = d.msg_id orelse {
+                i += 1;
+                continue;
+            };
+            if (d.kind == .generic and to.eql(&peer) and std.mem.eql(u8, did[0..], id[0..])) {
+                const gone = self.outbox.orderedRemove(i);
+                self.allocator.free(gone.wire);
+                removed += 1;
+                continue; // do not advance i; next item shifted into this slot
+            }
+            i += 1;
+        }
+        return removed;
     }
 
     fn ensureTopicMesh(self: *Gossipsub, topic: []const u8) std.mem.Allocator.Error!void {
@@ -1607,7 +1650,7 @@ pub const Gossipsub = struct {
         }
         const w = try self.allocator.dupe(u8, wire);
         errdefer self.allocator.free(w);
-        try self.appendOut(w, dest);
+        try self.appendOutKind(w, dest, .generic, mid);
     }
 
     fn sortPeersDirectThenScoreDescThenBytes(self: *Gossipsub, peers: []identity.PeerId) void {
@@ -1737,11 +1780,20 @@ pub const Gossipsub = struct {
         if (try control.decodeFirstIDontWant(self.allocator, ctl)) |idw| {
             var owned = idw;
             defer control.deinitIWantOwned(self.allocator, &owned);
+            var cancels: usize = 0;
             for (owned.message_ids) |mid_raw| {
                 if (mid_raw.len != 20) continue;
                 var id: [20]u8 = undefined;
                 @memcpy(id[0..], mid_raw[0..20]);
                 try self.rememberIDontWant(sender, id);
+                // Cancel any still-queued forward of this id to `sender` (rust
+                // remove_data_messages): it already has the message, so the
+                // in-flight copy is wasted bytes that would pressure its outbox.
+                // Bounded per frame to cap worst-case outbox-lock hold (DoS).
+                if (cancels < self.cfg.idontwant_max_cancel_per_frame) {
+                    _ = self.cancelQueuedForwardsTo(sender, id);
+                    cancels += 1;
+                }
             }
         }
         if (try control.decodeFirstIHave(self.allocator, ctl)) |ih| {
@@ -1791,7 +1843,7 @@ pub const Gossipsub = struct {
             defer self.allocator.free(inner);
             const wire = try rpc.encodePublish(self.allocator, inner);
             errdefer self.allocator.free(wire);
-            try self.appendOut(wire, dest);
+            try self.appendOutKind(wire, dest, .generic, mid);
         }
     }
 
@@ -1811,7 +1863,7 @@ pub const Gossipsub = struct {
             if (dest.eql(&sender)) continue;
             const wire = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
             errdefer self.allocator.free(wire);
-            try self.appendOutKind(wire, dest, .idontwant);
+            try self.appendOutKind(wire, dest, .idontwant, null);
         }
     }
 
