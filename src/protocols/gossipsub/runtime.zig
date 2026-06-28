@@ -166,6 +166,15 @@ pub const GossipsubConfig = struct {
     max_idontwant_entries: usize = 16384,
     /// TTL applied to IDONTWANT cache entries.
     idontwant_ttl_ms: i64 = gs_cfg.duplicate_cache_ttl_ms,
+    /// Min message size (bytes) to EMIT an outbound IDONTWANT on first receipt
+    /// (libp2p gossipsub v1.2 / rust-libp2p `idontwant_message_size_threshold`,
+    /// default 1 KiB). On first receipt of a message >= this size we tell our
+    /// mesh peers we already have it so they stop relaying the redundant
+    /// full-message copies — without this, an N-degree mesh floods every node
+    /// with ~N copies of each attestation, overflowing the per-peer send outbox
+    /// and dropping attestations (no quorum -> no finality). Below the threshold
+    /// the IDONTWANT control frame isn't worth the saving. Tunable.
+    idontwant_message_size_threshold: usize = 1024,
     /// FIFO cap on the PX dial-suggestion queue (`peer_id` bytes pulled from inbound
     /// PRUNE `peers` lists, #85). Embedders pop via [`popDialSuggestion`] and feed
     /// `connection_manager.registerKnownPeer`.
@@ -228,6 +237,10 @@ pub const InitConfigError = error{ InvalidMeshKnobs, InvalidOutboxCap, InvalidGo
 pub const OutDeliveryKind = enum {
     generic,
     lazy_ihave,
+    /// Outbound IDONTWANT control frame. Like `lazy_ihave`, it is RECOVERABLE
+    /// (dropping it merely costs one redundant inbound copy), so the per-peer /
+    /// global outbox caps evict it BEFORE `.generic` attestation/block data.
+    idontwant,
 };
 
 pub const OutDelivery = struct {
@@ -1171,10 +1184,12 @@ pub const Gossipsub = struct {
         for (self.outbox.items, 0..) |d, i| {
             const to = d.to orelse continue;
             if (!to.eql(&peer)) continue;
-            if (lazy_only and d.kind != .lazy_ihave) continue;
+            // "lazy_only" = the recoverable tier (lazy_ihave + idontwant): evict
+            // these before .generic attestation/block data.
+            if (lazy_only and d.kind == .generic) continue;
             const removed = self.outbox.orderedRemove(i);
             self.allocator.free(removed.wire);
-            if (removed.kind == .lazy_ihave) self.dropped_lazy_ihave_backpressure += 1;
+            if (removed.kind != .generic) self.dropped_lazy_ihave_backpressure += 1;
             return true;
         }
         return false;
@@ -1190,7 +1205,8 @@ pub const Gossipsub = struct {
 
     fn dropOldestLazyIHaveAny(self: *Gossipsub) bool {
         for (self.outbox.items, 0..) |d, i| {
-            if (d.kind != .lazy_ihave) continue;
+            // Recoverable tier: lazy_ihave + idontwant, evicted before .generic.
+            if (d.kind == .generic) continue;
             const removed = self.outbox.orderedRemove(i);
             self.allocator.free(removed.wire);
             self.dropped_lazy_ihave_backpressure += 1;
@@ -1779,6 +1795,26 @@ pub const Gossipsub = struct {
         }
     }
 
+    /// Emit IDONTWANT(mid) to every mesh peer for `topic` except `sender`, on
+    /// FIRST receipt of a large message (libp2p gossipsub v1.2, rust-libp2p
+    /// parity). Tells mesh peers we already have the message so they stop
+    /// relaying the redundant full-message copies to us — the fix for the
+    /// per-peer send-outbox overflow caused by the undeduplicated mesh-degree
+    /// attestation flood. Best-effort per peer.
+    fn broadcastIDontWant(self: *Gossipsub, topic: []const u8, sender: identity.PeerId, mid: [20]u8) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
+        const mp = self.mesh.getPtr(topic) orelse return;
+        const ctl = try control.encodeIDontWant(self.allocator, &.{mid[0..]});
+        defer self.allocator.free(ctl);
+        var pit = mp.peers.keyIterator();
+        while (pit.next()) |kp| {
+            const dest = kp.*;
+            if (dest.eql(&sender)) continue;
+            const wire = try rpc.encodeControlOnlyRpc(self.allocator, ctl);
+            errdefer self.allocator.free(wire);
+            try self.appendOutKind(wire, dest, .idontwant);
+        }
+    }
+
     fn pruneMeshDownToN(self: *Gossipsub, topic: []const u8, target: usize) (control.Error || rpc.Error || errors.GossipsubError || std.mem.Allocator.Error)!void {
         const mp = self.mesh.getPtr(topic) orelse return;
         const c = mp.peers.count();
@@ -1922,6 +1958,19 @@ pub const Gossipsub = struct {
             if (self.cfg.peer_scoring_enabled) self.score_tracker.recordFirstDelivery(sender, topic);
             try self.recordSeenForLazy(topic, id);
             try self.rememberPullPayload(topic, id, data);
+            // IDONTWANT (gossipsub v1.2, rust-libp2p parity): now that the message
+            // is ACCEPTED and we are forwarding it, tell our mesh peers we have it
+            // so they stop relaying the redundant full-message copies to us. Done
+            // ONLY after .accept (never for a message we reject/ignore — else we
+            // would suppress a valid message mesh-wide and blackhole ourselves for
+            // the cache TTL). Reduces the sustained duplicate load that overflows
+            // the per-peer send outbox and drops attestations. Frames are the
+            // recoverable `.idontwant` kind (evicted before attestation data).
+            if (self.cfg.idontwant_runtime_enabled and data.len >= self.cfg.idontwant_message_size_threshold) {
+                self.broadcastIDontWant(topic, sender, id) catch |err| {
+                    log.warn("gossipsub: broadcastIDontWant failed: {s}", .{@errorName(err)});
+                };
+            }
             try self.forwardPublishWithId(sender, topic, data, id);
         }
     }
