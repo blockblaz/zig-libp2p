@@ -1318,6 +1318,25 @@ pub const QuicRuntime = struct {
                 }
             }
             if (removed_ob) |kv| {
+                // Drop any inbound streams that aliased THIS outbound client
+                // (dispatchOutboundPeerStreams stored `ist.raw.client = &client`
+                // and `ist.conn = &client.conn` into sh.inbound_streams) BEFORE
+                // freeing the client — otherwise those pointers dangle into
+                // recycled memory and a later teardown double-frees / derefs them
+                // (segfault in Client.deinit on a recycled recv_reorder pointer).
+                // Use the non-deref ConnGone variant: the conn is dead, so don't
+                // touch its raw slots.
+                const dying_client = kv.value.outbound.client;
+                var si: usize = 0;
+                while (si < sh.inbound_streams.items.len) {
+                    if (sh.inbound_streams.items[si].raw.client) |c| {
+                        if (c == dying_client) {
+                            self.removeInboundStreamAtConnGone(sh, si);
+                            continue; // swapRemove shifted a new item into `si`
+                        }
+                    }
+                    si += 1;
+                }
                 kv.value.peer_stream_reported.deinit(self.allocator);
                 kv.value.outbound.deinit();
                 self.allocator.destroy(kv.value);
