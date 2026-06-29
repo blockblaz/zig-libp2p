@@ -411,6 +411,10 @@ pub const QuicListener = struct {
     /// batched `recvmmsg` drain keeps the kernel buffer from overflowing under load.
     pub fn drive(self: *QuicListener, rb: *feed_addr.RecvBatch, poll_timeout_ms: u32) DriveError!void {
         self.syncSeenFlags();
+        // Once-per-drive: reset every conn's per-drive STREAM-send budget so the
+        // credit-update re-entrant drains (in feedPacket) + processPendingWork
+        // share one allotment per conn per drive. Must precede the recv loop.
+        self.server.resetDriveSendBudgets();
         var fds = [1]posix.pollfd{.{
             .fd = self.server.sock,
             .events = posix.POLL.IN,
@@ -495,6 +499,9 @@ pub const QuicListener = struct {
     /// analogue of `drive`.
     pub fn driveFromRing(self: *QuicListener, ring: *shard_ring.InboundRing, max: usize) void {
         self.syncSeenFlags();
+        // Once-per-drive: reset every conn's per-drive STREAM-send budget (see
+        // QuicListener.drive). Must precede the feedPacket loop below.
+        self.server.resetDriveSendBudgets();
         var n: usize = 0;
         while (n < max) : (n += 1) {
             const slot = ring.peek() orelse break;
@@ -619,6 +626,13 @@ pub const QuicOutbound = struct {
     /// stay in the (32 MB) socket buffer and drain on the next, fast iteration.
     pub fn drive(self: *QuicOutbound, recv_buf: []u8, poll_timeout_ms: u32, max_drain: usize) DriveError!void {
         _ = recv_buf; // superseded by the per-conn batched receiver
+        // Once-per-drive: reset the conn's STREAM-send budget so all the
+        // credit-update-triggered re-entrant drains (from the feedPacket loop +
+        // processPendingWork below) share ONE per-drive allotment instead of each
+        // restarting a fresh 64-packet slice. This is the single-conn bound that
+        // stops one drive() from emitting thousands of STREAM packets uninterrupted
+        // and starving the inbound socket. Must precede the recv loop.
+        self.client.resetDriveSendBudget();
         const cap = if (max_drain == 0) max_recv_drain_per_call else max_drain;
         var fds = [1]posix.pollfd{.{
             .fd = self.client.sock,
