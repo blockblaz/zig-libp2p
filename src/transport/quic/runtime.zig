@@ -222,6 +222,13 @@ pub const Shard = struct {
     /// always restarting at the map's first entry — so no conn is starved when
     /// the set is larger than one budget allows.
     outbound_rr_start: usize = 0,
+    /// Round-robin cursor into `inbound_streams` for the per-iteration
+    /// `advanceInboundStreams` phase. When the phase's wall-clock budget is
+    /// exhausted mid-scan, the next iteration resumes at the stream we stopped on
+    /// instead of always restarting at index 0 — so streams late in the list
+    /// aren't perpetually served-last (and starved of `drainResponseOutbox`)
+    /// under sustained budget pressure. Taken modulo the CURRENT length each lap.
+    inbound_rr_start: usize = 0,
     /// Reused per-lap snapshot of `outbound_by_peer`'s value pointers. A
     /// `PeerIdMap` has no index access, so we snapshot the conn pointers into this
     /// scratch each lap and index it for round-robin iteration. Re-snapshotted
@@ -1749,6 +1756,17 @@ pub const QuicRuntime = struct {
     /// inbound ACK service aren't starved. Undrained conns' sockets keep their
     /// datagrams in the 32 MB buffer for the next, fast lap.
     const outbound_phase_budget_ms: i64 = 50;
+
+    /// Total wall-clock budget for the inbound-streams phase per iteration. Same
+    /// rationale as `outbound_phase_budget_ms`, applied to `advanceInboundStreams`:
+    /// walking every inbound stream's liveness/reap checks + protocol processing +
+    /// `drainResponseOutbox` (block responses we serve back) can monopolize a lap
+    /// (live: inbound_streams=951ms under heavy backfill), starving the listener +
+    /// gossip-publish + ticks → finality stall. Cap the WORK per lap and resume the
+    /// remaining streams next iteration (round-robin via `Shard.inbound_rr_start`)
+    /// so no stream is perpetually served-last. The liveness/reap SAFETY checks
+    /// still run for every stream the lap visits; only the work is budgeted.
+    const inbound_streams_phase_budget_ms: i64 = 50;
 
     /// Max bytes the BULK (block) gossip lane offers to the transport per drive
     /// tick per stream. Bounds the outbound drive phase so a multi-MB block fed
@@ -4355,8 +4373,37 @@ pub const QuicRuntime = struct {
     //     those protocols under N>1. Tracked in the session report's residual list.
     fn advanceInboundStreams(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
-        var i: usize = 0;
+        // Per-lap wall-clock budget + round-robin resume (mirrors the outbound
+        // phase). Walking every inbound stream's protocol processing +
+        // `drainResponseOutbox` (block responses) can monopolize a lap under
+        // heavy backfill (live: inbound_streams=951ms), starving the listener +
+        // ticks. Start the forward scan at a rotating offset so streams late in
+        // the list aren't perpetually served-last, and break once the phase's
+        // budget is spent — the unserved streams (and any deferred dead-stream
+        // removals) are handled next, now-fast lap.
+        //
+        // SAFE against the mid-loop `swapRemove` in `removeInboundStreamAt*`:
+        // the scan stays a forward `while (i < len)` walk. Starting at `rr_start`
+        // visits `[rr_start, len)` this lap and defers `[0, rr_start)` to next lap;
+        // a swapRemove at index `i` moves the LAST element into `i` (re-processed
+        // in place, no increment), which only ever pulls work FORWARD — no live
+        // stream is skipped, and a deferred stream stays in the list (not
+        // dangling) until the next lap visits it.
+        const phase_t0 = self.opts.now_ms_fn();
+        const len0 = sh.inbound_streams.items.len;
+        const rr_start: usize = if (len0 == 0) 0 else sh.inbound_rr_start % len0;
+        var i: usize = rr_start;
+        var hit_budget = false;
         while (i < sh.inbound_streams.items.len) {
+            // Stop once the phase's wall-clock budget is spent; resume at this
+            // (still-present) stream next lap. Checked at the top of the body so
+            // the previous stream's WORK has completed; the current stream's
+            // liveness/reap simply runs next lap (it stays in the list, never
+            // dangling).
+            if (self.opts.now_ms_fn() - phase_t0 >= inbound_streams_phase_budget_ms) {
+                hit_budget = true;
+                break;
+            }
             // Work budget (#2): flush inbound ACKs while walking many streams.
             // Before the deref below so the draining/closed guard catches any
             // conn the pump reaps; pumpInbound never mutates `inbound_streams`.
@@ -4916,6 +4963,18 @@ pub const QuicRuntime = struct {
                 },
             }
             i += 1;
+        }
+        // Resume cursor for next lap: if we stopped on the budget, resume at the
+        // unserved stream `i` (still present — the break is before its body); if
+        // we ran the scan to the end, wrap to 0 so the skipped prefix `[0, rr_start)`
+        // is served first next lap. Taken modulo the (possibly shrunk) length.
+        const len_now = sh.inbound_streams.items.len;
+        if (len_now == 0) {
+            sh.inbound_rr_start = 0;
+        } else if (hit_budget) {
+            sh.inbound_rr_start = i % len_now;
+        } else {
+            sh.inbound_rr_start = 0;
         }
     }
 
