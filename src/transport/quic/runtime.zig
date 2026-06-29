@@ -517,8 +517,8 @@ pub const QuicRuntime = struct {
         const shard_count: u8 = roundDownPow2(std.math.clamp(requested_shards, @as(u8, 1), @as(u8, 8)));
         const shard_mask: u8 = shard_count - 1;
         if (opts.drive_shards == 0) {
-            log.info("quic_runtime: drive_shards=auto -> {d} (cores={d})", .{
-                shard_count, std.Thread.getCpuCount() catch 0,
+            log.info("quic_runtime: drive_shards=auto -> {d} (effective_cores={d}, affinity={d})", .{
+                shard_count, effectiveCpuCount(), std.Thread.getCpuCount() catch 0,
             });
         }
 
@@ -692,24 +692,31 @@ pub const QuicRuntime = struct {
         return p;
     }
 
-    /// Auto drive-shard count from the host core count, used when
+    /// Auto drive-shard count from the EFFECTIVE core count, used when
     /// `drive_shards == 0`. We target ~1/2 of the cores for QUIC drive threads.
-    /// Raised from ~1/4: at 1/4 a 16-core host got only 4 drive threads, so each
-    /// owned ~8-11 of the 31 peer connections. One peer flooding block data
-    /// (unblocked `blocks_by_range` responses) then saturated that thread —
-    /// serializing gossip + req/resp on all its conns — and the node fell behind
-    /// while 12 cores sat idle. QUIC requires per-connection in-order decrypt, so
-    /// the only parallelism is ACROSS connections (the quinn/rust-libp2p model):
-    /// more drive threads → fewer conns each → one peer's flood no longer starves
-    /// the others. Still leaves ~half the cores for the demux thread, the
-    /// gossip-validation worker, the consensus/STF pool, and the main loop. Result
-    /// clamped to [1,8] and pow2-snapped by the caller. Examples (post-snap):
-    /// 4 cores -> 1, 8 cores -> 4, 16 cores -> 8, 32+ cores -> 8. Falls back to 2.
+    /// QUIC requires per-connection in-order decrypt, so the only parallelism is
+    /// ACROSS connections (the quinn/rust-libp2p model): more drive threads →
+    /// fewer conns each → one peer's flood (block data / gossip / req/resp) no
+    /// longer serializes the others on a saturated thread. A SINGLE drive thread
+    /// for 31 peers is the saturation failure mode (outbox overflow → dropped
+    /// attestations → coverage collapse → no finality), so we floor at 2 shards
+    /// once there are ≥3 effective cores instead of collapsing small hosts to 1.
+    /// ~half is still left for the demux thread, gossip-validation worker,
+    /// consensus/STF pool, and main loop. Result clamped to [1,8] and pow2-snapped
+    /// by the caller. Examples (post-snap): 2 cores -> 1, 4 cores -> 2,
+    /// 8 cores -> 4, 16 cores -> 8, 32+ cores -> 8.
     fn autoDriveShards() u8 {
-        const cores = std.Thread.getCpuCount() catch return 2;
-        if (cores <= 4) return 1;
-        const half = cores / 2; // usize
-        return @intCast(std.math.clamp(half, @as(usize, 1), @as(usize, 8)));
+        const cores = effectiveCpuCount();
+        if (cores <= 2) return 1;
+        const half = cores / 2;
+        return @intCast(std.math.clamp(half, @as(usize, 2), @as(usize, 8)));
+    }
+
+    /// Cores available to this process. `getCpuCount` honours the CPU affinity
+    /// mask (so a cpuset-pinned container reports its real allocation); on a
+    /// dedicated VM it is the machine's core count. Falls back to 2.
+    fn effectiveCpuCount() usize {
+        return std.Thread.getCpuCount() catch 2;
     }
 
     pub fn destroy(self: *QuicRuntime) void {
@@ -1265,6 +1272,107 @@ pub const QuicRuntime = struct {
     ///
     /// Mirrors the listener-side [`QuicListener.syncSeenFlags`] which fires
     /// [`onLifecycleClosed`] for inbound connections.
+    ///
+    /// Drop every outbound req/resp, publish, identify-push and autonat-probe
+    /// entry whose `.raw == .outbound` adapter aliases `dying_client`, BEFORE the
+    /// owning `*ZIo.Client` is freed by [`detectOutboundConnectionClose`].
+    /// `dispatchOutboundPeerStreams`-style adapters stored
+    /// `.raw = .{ .outbound = .{ .client = slot.outbound.client, … } }`, so these
+    /// entries alias the same client by pointer; left behind, the same drive
+    /// iteration's `advanceOutbound*` loops would deref the freed (and under
+    /// dial-churn recycled) client → heap corruption / segfault in
+    /// `Client.deinit`.
+    ///
+    /// ConnGone discipline (same as [`removeInboundStreamAtConnGone`]): the conn
+    /// is already dead, so we must NOT call `entry.raw.release(...)` / `finStream`
+    /// or anything that dereferences the dying client. We free exactly the owned
+    /// fields that `Shard.deinit`'s per-map teardown loops free for each map, and
+    /// clear the `request_id → shard` routing the way `finishOutboundReq` does.
+    fn dropOutboundEntriesForClient(self: *QuicRuntime, sh: *Shard, dying_client: *ZIo.Client) void {
+        const a = self.allocator;
+
+        // outbound_requests: Shard.deinit frees `payload` + `resp_acc`, destroys
+        // the entry. finishOutboundReq additionally clears no shard-routing for
+        // the *request* id, but the inbound-stream-shard table is keyed by the
+        // INBOUND request_id (registered on the responder side), not these
+        // outbound ids, so there is nothing extra to clear here.
+        {
+            var keys: std.ArrayList(u64) = .empty;
+            defer keys.deinit(a);
+            var it = sh.outbound_requests.iterator();
+            while (it.next()) |e| {
+                const req = e.value_ptr.*;
+                if (req.raw == .outbound and req.raw.outbound.client == dying_client) {
+                    keys.append(a, e.key_ptr.*) catch {};
+                }
+            }
+            for (keys.items) |k| {
+                if (sh.outbound_requests.fetchRemove(k)) |kv| {
+                    a.free(kv.value.payload);
+                    kv.value.resp_acc.deinit(a);
+                    a.destroy(kv.value);
+                }
+            }
+        }
+
+        // outbound_publishes: Shard.deinit frees `wire`, destroys the entry.
+        {
+            var keys: std.ArrayList(u64) = .empty;
+            defer keys.deinit(a);
+            var it = sh.outbound_publishes.iterator();
+            while (it.next()) |e| {
+                const op = e.value_ptr.*;
+                if (op.raw == .outbound and op.raw.outbound.client == dying_client) {
+                    keys.append(a, e.key_ptr.*) catch {};
+                }
+            }
+            for (keys.items) |k| {
+                if (sh.outbound_publishes.fetchRemove(k)) |kv| {
+                    a.free(kv.value.wire);
+                    a.destroy(kv.value);
+                }
+            }
+        }
+
+        // outbound_identify_pushes: Shard.deinit frees `wire`, destroys the entry.
+        {
+            var keys: std.ArrayList(u64) = .empty;
+            defer keys.deinit(a);
+            var it = sh.outbound_identify_pushes.iterator();
+            while (it.next()) |e| {
+                const op = e.value_ptr.*;
+                if (op.raw == .outbound and op.raw.outbound.client == dying_client) {
+                    keys.append(a, e.key_ptr.*) catch {};
+                }
+            }
+            for (keys.items) |k| {
+                if (sh.outbound_identify_pushes.fetchRemove(k)) |kv| {
+                    a.free(kv.value.wire);
+                    a.destroy(kv.value);
+                }
+            }
+        }
+
+        // outbound_autonat_probes: Shard.deinit frees `probe_wire`, destroys the entry.
+        {
+            var keys: std.ArrayList(u64) = .empty;
+            defer keys.deinit(a);
+            var it = sh.outbound_autonat_probes.iterator();
+            while (it.next()) |e| {
+                const op = e.value_ptr.*;
+                if (op.raw == .outbound and op.raw.outbound.client == dying_client) {
+                    keys.append(a, e.key_ptr.*) catch {};
+                }
+            }
+            for (keys.items) |k| {
+                if (sh.outbound_autonat_probes.fetchRemove(k)) |kv| {
+                    a.free(kv.value.probe_wire);
+                    a.destroy(kv.value);
+                }
+            }
+        }
+    }
+
     fn detectOutboundConnectionClose(self: *QuicRuntime, sh: *Shard) void {
         // Two-pass: collect peers to evict, then mutate the map. Avoids invalidating
         // the iterator on `fetchRemove` and keeps the close handling identical to
@@ -1327,13 +1435,21 @@ pub const QuicRuntime = struct {
                 // Use the non-deref ConnGone variant: the conn is dead, so don't
                 // touch its raw slots.
                 const dying_client = kv.value.outbound.client;
+                // Drop the four outbound_* maps' entries that alias this client
+                // BEFORE the deinit — those adapters are `.raw == .outbound` and
+                // hold `raw.outbound.client == dying_client`; left behind, this
+                // same iteration's advanceOutbound* loops would deref freed memory.
+                self.dropOutboundEntriesForClient(sh, dying_client);
                 var si: usize = 0;
                 while (si < sh.inbound_streams.items.len) {
-                    if (sh.inbound_streams.items[si].raw.client) |c| {
-                        if (c == dying_client) {
-                            self.removeInboundStreamAtConnGone(sh, si);
-                            continue; // swapRemove shifted a new item into `si`
-                        }
+                    const ist = sh.inbound_streams.items[si];
+                    // Match either the raw-adapter client alias OR a bare
+                    // `ist.conn == &dying_client.conn` (belt-and-suspenders for an
+                    // adapter that set `ist.conn` without `ist.raw.client`).
+                    const alias = if (ist.raw.client) |c| c == dying_client else false;
+                    if (alias or ist.conn == &dying_client.conn) {
+                        self.removeInboundStreamAtConnGone(sh, si);
+                        continue; // swapRemove shifted a new item into `si`
                     }
                     si += 1;
                 }
@@ -4748,6 +4864,26 @@ pub const QuicRuntime = struct {
         }
     }
 
+    /// Structural backstop for the outbound-leg UAF (Part 2): is the outbound
+    /// QUIC leg that `raw` rides still live on this shard?  Only `.raw ==
+    /// .outbound` adapters alias a `*ZIo.Client` that
+    /// [`detectOutboundConnectionClose`] frees; an entry is live iff its peer
+    /// still has an `outbound_by_peer` slot AND that slot's client pointer
+    /// matches the adapter's. `.inbound` (server-initiated leg) adapters never
+    /// alias a freed outbound client, so they are always considered live here
+    /// (their lifetime is governed by the inbound-stream sweep instead).
+    /// Deref-free: compares pointers only, never touches the (possibly dead)
+    /// client.
+    fn outboundLegLive(sh: *Shard, peer: identity.PeerId, raw: *const conn_table.PublishBidiStream) bool {
+        switch (raw.*) {
+            .inbound => return true,
+            .outbound => |*c| {
+                const slot = sh.outbound_by_peer.get(peer) orelse return false;
+                return slot.outbound.client == c.client;
+            },
+        }
+    }
+
     fn advanceOutboundRequests(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
 
@@ -4779,6 +4915,26 @@ pub const QuicRuntime = struct {
                 } }) catch {};
                 // finishOutboundReq releases the raw-app slot and frees the req.
                 self.finishOutboundReq(sh, req);
+            }
+        }
+
+        // Reap entries whose outbound leg has gone (Part 2 backstop): collect
+        // then remove, with ConnGone discipline (no `raw.release` — the client
+        // is freed). Prevents the UAF class even if a Part-1 alias site is missed.
+        {
+            var dead: std.ArrayList(u64) = .empty;
+            defer dead.deinit(a);
+            var dit = sh.outbound_requests.iterator();
+            while (dit.next()) |e| {
+                const req = e.value_ptr.*;
+                if (!outboundLegLive(sh, req.peer, &req.raw)) dead.append(a, req.request_id) catch {};
+            }
+            for (dead.items) |rid| {
+                if (sh.outbound_requests.fetchRemove(rid)) |kv| {
+                    a.free(kv.value.payload);
+                    kv.value.resp_acc.deinit(a);
+                    a.destroy(kv.value);
+                }
             }
         }
 
@@ -4954,6 +5110,23 @@ pub const QuicRuntime = struct {
     /// RPC frame, FIN the stream, then drop the entry.
     fn advanceOutboundPublishes(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
+        // Reap entries whose outbound leg has gone (Part 2 backstop), ConnGone
+        // discipline (no `raw.release`). Free mirrors Shard.deinit: `wire` + entry.
+        {
+            var dead: std.ArrayList(u64) = .empty;
+            defer dead.deinit(a);
+            var dit = sh.outbound_publishes.iterator();
+            while (dit.next()) |e| {
+                const op = e.value_ptr.*;
+                if (!outboundLegLive(sh, op.peer, &op.raw)) dead.append(a, e.key_ptr.*) catch {};
+            }
+            for (dead.items) |id| {
+                if (sh.outbound_publishes.fetchRemove(id)) |kv| {
+                    a.free(kv.value.wire);
+                    a.destroy(kv.value);
+                }
+            }
+        }
         // Collect ids to remove after iteration so we don't mutate the map mid-walk.
         var to_remove: std.ArrayList(u64) = .empty;
         defer to_remove.deinit(a);
@@ -5036,6 +5209,23 @@ pub const QuicRuntime = struct {
 
     fn advanceOutboundIdentifyPushes(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
+        // Reap entries whose outbound leg has gone (Part 2 backstop), ConnGone
+        // discipline (no `raw.release`). Free mirrors Shard.deinit: `wire` + entry.
+        {
+            var dead: std.ArrayList(u64) = .empty;
+            defer dead.deinit(a);
+            var dit = sh.outbound_identify_pushes.iterator();
+            while (dit.next()) |e| {
+                const op = e.value_ptr.*;
+                if (!outboundLegLive(sh, op.peer, &op.raw)) dead.append(a, e.key_ptr.*) catch {};
+            }
+            for (dead.items) |id| {
+                if (sh.outbound_identify_pushes.fetchRemove(id)) |kv| {
+                    a.free(kv.value.wire);
+                    a.destroy(kv.value);
+                }
+            }
+        }
         var to_remove: std.ArrayList(u64) = .empty;
         defer to_remove.deinit(a);
 
@@ -5114,6 +5304,23 @@ pub const QuicRuntime = struct {
 
     fn advanceOutboundAutonatProbes(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
+        // Reap entries whose outbound leg has gone (Part 2 backstop), ConnGone
+        // discipline (no `raw.release`). Free mirrors Shard.deinit: `probe_wire` + entry.
+        {
+            var dead: std.ArrayList(u64) = .empty;
+            defer dead.deinit(a);
+            var dit = sh.outbound_autonat_probes.iterator();
+            while (dit.next()) |e| {
+                const op = e.value_ptr.*;
+                if (!outboundLegLive(sh, op.peer, &op.raw)) dead.append(a, e.key_ptr.*) catch {};
+            }
+            for (dead.items) |id| {
+                if (sh.outbound_autonat_probes.fetchRemove(id)) |kv| {
+                    a.free(kv.value.probe_wire);
+                    a.destroy(kv.value);
+                }
+            }
+        }
         var to_remove: std.ArrayList(u64) = .empty;
         defer to_remove.deinit(a);
 
