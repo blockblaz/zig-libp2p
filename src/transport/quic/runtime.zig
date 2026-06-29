@@ -517,8 +517,8 @@ pub const QuicRuntime = struct {
         const shard_count: u8 = roundDownPow2(std.math.clamp(requested_shards, @as(u8, 1), @as(u8, 8)));
         const shard_mask: u8 = shard_count - 1;
         if (opts.drive_shards == 0) {
-            log.info("quic_runtime: drive_shards=auto -> {d} (cores={d})", .{
-                shard_count, std.Thread.getCpuCount() catch 0,
+            log.info("quic_runtime: drive_shards=auto -> {d} (effective_cores={d}, affinity={d})", .{
+                shard_count, effectiveCpuCount(), std.Thread.getCpuCount() catch 0,
             });
         }
 
@@ -692,24 +692,31 @@ pub const QuicRuntime = struct {
         return p;
     }
 
-    /// Auto drive-shard count from the host core count, used when
+    /// Auto drive-shard count from the EFFECTIVE core count, used when
     /// `drive_shards == 0`. We target ~1/2 of the cores for QUIC drive threads.
-    /// Raised from ~1/4: at 1/4 a 16-core host got only 4 drive threads, so each
-    /// owned ~8-11 of the 31 peer connections. One peer flooding block data
-    /// (unblocked `blocks_by_range` responses) then saturated that thread —
-    /// serializing gossip + req/resp on all its conns — and the node fell behind
-    /// while 12 cores sat idle. QUIC requires per-connection in-order decrypt, so
-    /// the only parallelism is ACROSS connections (the quinn/rust-libp2p model):
-    /// more drive threads → fewer conns each → one peer's flood no longer starves
-    /// the others. Still leaves ~half the cores for the demux thread, the
-    /// gossip-validation worker, the consensus/STF pool, and the main loop. Result
-    /// clamped to [1,8] and pow2-snapped by the caller. Examples (post-snap):
-    /// 4 cores -> 1, 8 cores -> 4, 16 cores -> 8, 32+ cores -> 8. Falls back to 2.
+    /// QUIC requires per-connection in-order decrypt, so the only parallelism is
+    /// ACROSS connections (the quinn/rust-libp2p model): more drive threads →
+    /// fewer conns each → one peer's flood (block data / gossip / req/resp) no
+    /// longer serializes the others on a saturated thread. A SINGLE drive thread
+    /// for 31 peers is the saturation failure mode (outbox overflow → dropped
+    /// attestations → coverage collapse → no finality), so we floor at 2 shards
+    /// once there are ≥3 effective cores instead of collapsing small hosts to 1.
+    /// ~half is still left for the demux thread, gossip-validation worker,
+    /// consensus/STF pool, and main loop. Result clamped to [1,8] and pow2-snapped
+    /// by the caller. Examples (post-snap): 2 cores -> 1, 4 cores -> 2,
+    /// 8 cores -> 4, 16 cores -> 8, 32+ cores -> 8.
     fn autoDriveShards() u8 {
-        const cores = std.Thread.getCpuCount() catch return 2;
-        if (cores <= 4) return 1;
-        const half = cores / 2; // usize
-        return @intCast(std.math.clamp(half, @as(usize, 1), @as(usize, 8)));
+        const cores = effectiveCpuCount();
+        if (cores <= 2) return 1;
+        const half = cores / 2;
+        return @intCast(std.math.clamp(half, @as(usize, 2), @as(usize, 8)));
+    }
+
+    /// Cores available to this process. `getCpuCount` honours the CPU affinity
+    /// mask (so a cpuset-pinned container reports its real allocation); on a
+    /// dedicated VM it is the machine's core count. Falls back to 2.
+    fn effectiveCpuCount() usize {
+        return std.Thread.getCpuCount() catch 2;
     }
 
     pub fn destroy(self: *QuicRuntime) void {
