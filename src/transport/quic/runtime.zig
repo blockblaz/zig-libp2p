@@ -1561,10 +1561,16 @@ pub const QuicRuntime = struct {
         };
     }
 
-    /// Capacity (slots) of the inbound datagram ring. Power of two; 4096 × 2 KiB
-    /// ≈ 8 MiB, matching the listen socket's SO_RCVBUF so a burst the kernel
-    /// accepted can be staged for the drive thread without ring drops.
-    const inbound_ring_capacity: usize = 4096;
+    /// Capacity (slots) of the per-shard inbound datagram ring. Power of two;
+    /// 16384 × 2 KiB ≈ 32 MiB. The demux thread now drains the shared listen
+    /// socket fully each wake (see `endpoint.max_demux_drain_per_call`), so the
+    /// only remaining backpressure source is a drive thread briefly busy on a
+    /// long phase while its ring fills. A deep ring absorbs that transient burst
+    /// (host-independent app memory, ~32 MiB/shard — fine on 32 GiB hosts) so the
+    /// demux never has to drop a routed datagram or stall draining the socket for
+    /// the *other* shards. This is the app-side buffer that replaces relying on a
+    /// large kernel `SO_RCVBUF` / host `net.core.rmem_max` tuning.
+    const inbound_ring_capacity: usize = 16384;
 
     fn demuxTrampoline(self: *QuicRuntime) void {
         self.demuxLoop();
@@ -1588,6 +1594,10 @@ pub const QuicRuntime = struct {
         const rings = ring_ptrs[0..self.shard_count];
         // The shared listen fd is shard 0's listener's Server socket.
         const listener = self.shards[0].listener;
+        // Defense-in-depth: request a 32 MiB kernel recv buffer (RCVBUFFORCE
+        // bypasses rmem_max where permitted). Best-effort; the primary overflow
+        // fix is the full-drain loop below + the deep per-shard rings.
+        listener.tuneListenRecvBuffer(32 * 1024 * 1024);
         // ~134 KiB recvmmsg batch, owned solely by this demux thread.
         const route_batch = self.allocator.create(quic_endpoint.RecvBatch) catch {
             log.err("quic_runtime: demux RecvBatch alloc failed", .{});

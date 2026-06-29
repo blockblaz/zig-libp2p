@@ -48,6 +48,19 @@ pub fn shardForDatagram(bytes: []const u8, src_hash: u64, shard_mask: u8) u8 {
     return bytes[1] & shard_mask;
 }
 
+/// Hot-path wrapper: route a datagram without hashing the source address unless
+/// it is actually needed. Short-header (1-RTT) packets — the overwhelming
+/// majority on an established mesh — route by the tagged DCID byte alone, so the
+/// `Wyhash` is skipped entirely; only long-header Initials hash `addr`. Keeps the
+/// demux drain loop as cheap as possible so it never falls behind the socket.
+pub fn shardForDatagramAddr(bytes: []const u8, addr: *const feed_addr.Address, shard_mask: u8) u8 {
+    if (shard_mask == 0 or bytes.len < 2) return 0;
+    const long_header = (bytes[0] & 0x80) != 0;
+    if (!long_header) return bytes[1] & shard_mask;
+    const src_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&addr.any));
+    return @intCast(src_hash & shard_mask);
+}
+
 pub const InboundRing = struct {
     slots: []DatagramSlot,
     mask: usize, // capacity - 1; capacity is a power of two
@@ -186,4 +199,31 @@ test "shardForDatagram: runt datagram routes to shard 0" {
     const testing = std.testing;
     try testing.expectEqual(@as(u8, 0), shardForDatagram(&[_]u8{0x40}, 7, 0b11));
     try testing.expectEqual(@as(u8, 0), shardForDatagram(&[_]u8{}, 7, 0b11));
+}
+
+test "shardForDatagramAddr: matches shardForDatagram (lazy hash only for long header)" {
+    const testing = std.testing;
+    const mask: u8 = 0b11; // 4 shards
+    const addr = feed_addr.Address.initIp4(.{ 10, 0, 0, 7 }, 4001);
+    const src_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&addr.any));
+
+    // Short header: routes by tagged DCID byte; the source hash is irrelevant
+    // (and is never computed by the wrapper on this path).
+    const short = [_]u8{ 0x40, 0b1001 };
+    try testing.expectEqual(
+        shardForDatagram(&short, src_hash, mask),
+        shardForDatagramAddr(&short, &addr, mask),
+    );
+
+    // Long header: routes by source-address hash — wrapper must match the hash
+    // the explicit form computes from the same address.
+    const long = [_]u8{ 0xC0, 0xFF };
+    try testing.expectEqual(
+        shardForDatagram(&long, src_hash, mask),
+        shardForDatagramAddr(&long, &addr, mask),
+    );
+
+    // Single shard (mask 0) and runt datagrams collapse to shard 0.
+    try testing.expectEqual(@as(u8, 0), shardForDatagramAddr(&short, &addr, 0));
+    try testing.expectEqual(@as(u8, 0), shardForDatagramAddr(&[_]u8{0x40}, &addr, mask));
 }
