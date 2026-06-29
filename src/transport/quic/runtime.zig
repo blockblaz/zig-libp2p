@@ -216,6 +216,17 @@ pub const Shard = struct {
     /// the datagrams the drive loop is still iterating. Only touched by this
     /// shard's own drive thread.
     pump_batch: quic_endpoint.RecvBatch = .{},
+    /// Round-robin cursor into the outbound-conn set for the per-iteration
+    /// outbound drive phase. When the phase's wall-clock budget is exhausted
+    /// mid-set, the next iteration resumes at the next unserved conn instead of
+    /// always restarting at the map's first entry — so no conn is starved when
+    /// the set is larger than one budget allows.
+    outbound_rr_start: usize = 0,
+    /// Reused per-lap snapshot of `outbound_by_peer`'s value pointers. A
+    /// `PeerIdMap` has no index access, so we snapshot the conn pointers into this
+    /// scratch each lap and index it for round-robin iteration. Re-snapshotted
+    /// every lap, so conns added/removed between laps are handled safely.
+    outbound_scratch: std.ArrayList(*conn_table.OutboundConn) = .empty,
 
     pub fn init(a: std.mem.Allocator, listener: *quic_endpoint.QuicListener) Shard {
         return .{
@@ -254,6 +265,7 @@ pub const Shard = struct {
         }
         self.outbound_by_peer.deinit();
         self.inbound_by_peer.deinit();
+        self.outbound_scratch.deinit(a);
 
         for (self.inbound_streams.items) |s| {
             s.req_acc.deinit(a);
@@ -1730,6 +1742,14 @@ pub const QuicRuntime = struct {
     /// matching the inline path's per-call recv bound.
     const inbound_drain_per_call: usize = 1024;
 
+    /// Total wall-clock budget for the outbound drive phase per iteration. Walking
+    /// every outbound conn's `outbound.drive` can exceed a slot under load even
+    /// with the per-conn send bound; cap the whole phase and resume the remaining
+    /// conns next iteration (round-robin) so gossip-publish + periodic ticks +
+    /// inbound ACK service aren't starved. Undrained conns' sockets keep their
+    /// datagrams in the 32 MB buffer for the next, fast lap.
+    const outbound_phase_budget_ms: i64 = 50;
+
     /// Max bytes the BULK (block) gossip lane offers to the transport per drive
     /// tick per stream. Bounds the outbound drive phase so a multi-MB block fed
     /// into zquic's pending queue can't dominate a lap (was SLOW drive iter
@@ -1750,6 +1770,14 @@ pub const QuicRuntime = struct {
     /// when called too soon (a clock read + compare). Called from inside the
     /// heavy per-entity loops so no single phase starves inbound ACK I/O.
     fn maybePumpInbound(self: *QuicRuntime, sh: *Shard) void {
+        // The cheap server-side ACK flush is UNCONDITIONAL: it's just a per-conn
+        // batch flush (no recv, no syscall-per-packet drain), and ACK timeliness
+        // is what keeps peers off the 60s no-ACK teardown during a long phase.
+        // Gating it behind the interval (like the heavier drains below) let ACKs
+        // lag up to a full interval under load. Lower-risk than tripling the whole
+        // pump's frequency: the heavy ring/recv drain + outbound pumpRecv stay
+        // interval-gated (their cost is what we must bound), only the flush is hot.
+        sh.listener.server.flushAppAcks();
         const now = self.opts.now_ms_fn();
         if (now -% sh.last_inbound_pump_ms < drive_inbound_pump_interval_ms) return;
         sh.last_inbound_pump_ms = now;
@@ -1760,10 +1788,9 @@ pub const QuicRuntime = struct {
                 log.warn("quic_runtime: maybePumpInbound: {s}", .{@errorName(err)});
             };
         }
-        // pumpInbound only RECEIVES; flush the ACKs those packets queued so peers
-        // keep getting ACKed through this long phase and don't hit the 60s no-ACK
-        // teardown (which also stalls their gossip outbox into dropping
-        // attestation frames). Non-reaping, so safe to interleave mid-phase.
+        // pumpInbound/pumpFromRing only RECEIVE; flush again so the ACKs those
+        // freshly-drained packets queued go out this pump too (non-reaping, safe
+        // to interleave mid-phase).
         sh.listener.server.flushAppAcks();
         // Also recv-drain the OUTBOUND client sockets: gossip from peers we
         // dialed arrives there, and the full per-conn `outbound.drive` is only
@@ -1843,16 +1870,44 @@ pub const QuicRuntime = struct {
                 // peers' ACKs + requested block responses promptly; a low recv cap
                 // STARVES ACK reading (the opposite of what we want). The SLOW
                 // outbound phase is the SEND, bounded zquic-side.
-                const per_conn_drain: usize = if (n_out == 0) 0 else @max(@as(usize, 64), 1024 / n_out);
-                var it = sh.outbound_by_peer.valueIterator();
-                while (it.next()) |v| {
-                    v.*.outbound.drive(&recv_buf, 0, per_conn_drain) catch |err| {
-                        log.warn("quic_runtime: outbound.drive: {s}", .{@errorName(err)});
-                    };
-                    self.dispatchOutboundPeerStreams(sh, v.*);
-                    // Work budget (#2): keep inbound ACKs flowing while we walk
-                    // every outbound conn.
-                    self.maybePumpInbound(sh);
+                // Floor lowered 64 -> 16 and clamped at 256 so per_conn_drain ×
+                // n_out stays ~≤1024 at high n_out (bounds recv per conn); the
+                // SLOW phase is the SEND, now bounded zquic-side per drive.
+                const per_conn_drain: usize = if (n_out == 0) 0 else @min(@as(usize, 256), @max(@as(usize, 16), 1024 / n_out));
+                if (n_out > 0) {
+                    // Snapshot the conn value-pointers once this lap (PeerIdMap has
+                    // no index access). Re-snapshotting each lap handles conns
+                    // added/removed between laps; the round-robin cursor is taken
+                    // modulo the CURRENT n_out.
+                    sh.outbound_scratch.clearRetainingCapacity();
+                    var it = sh.outbound_by_peer.valueIterator();
+                    while (it.next()) |v| {
+                        sh.outbound_scratch.append(self.allocator, v.*) catch break;
+                    }
+                    const n = sh.outbound_scratch.items.len;
+                    if (n > 0) {
+                        const phase_t0 = self.opts.now_ms_fn();
+                        const rr_start = sh.outbound_rr_start % n;
+                        var served: usize = 0;
+                        while (served < n) : (served += 1) {
+                            const oc = sh.outbound_scratch.items[(rr_start + served) % n];
+                            oc.outbound.drive(&recv_buf, 0, per_conn_drain) catch |err| {
+                                log.warn("quic_runtime: outbound.drive: {s}", .{@errorName(err)});
+                            };
+                            self.dispatchOutboundPeerStreams(sh, oc);
+                            // Work budget (#2): keep inbound ACKs flowing while we
+                            // walk outbound conns.
+                            self.maybePumpInbound(sh);
+                            // Stop when the phase's wall-clock budget is spent;
+                            // resume at the next unserved conn next iteration.
+                            if (self.opts.now_ms_fn() - phase_t0 >= outbound_phase_budget_ms) {
+                                served += 1;
+                                break;
+                            }
+                        }
+                        // Resume the next lap at the first conn we DIDN'T serve.
+                        sh.outbound_rr_start = (rr_start + served) % n;
+                    }
                 }
             }
 
