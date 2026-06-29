@@ -37,16 +37,6 @@ const recv_flags_dontwait: u32 = switch (builtin.target.os.tag) {
 /// next iteration. Well above the steady-state per-conn rate (~550 pkt/s), so it
 /// only bounds bursts, never normal traffic.
 const max_recv_drain_per_call: usize = 1024;
-
-/// Wall-clock bound (ms) on a SINGLE `QuicOutbound.drive` recv drain. The
-/// datagram-count cap (`max_recv_drain_per_call` / the per_conn_drain slice)
-/// does NOT bound time: under block backfill each fed datagram reassembles
-/// large STREAM data, so one drive() can run >1s and the multi-conn drive
-/// loop's between-conn phase budget can't interrupt it. This caps the recv
-/// time per drive() so the outbound phase can't blow past ~2× its budget on a
-/// single heavy conn; the remainder drains next lap from the 32 MB socket
-/// buffer. Only applied to non-blocking drives (poll_timeout_ms == 0).
-const max_drive_recv_ms: i64 = 20;
 const Io = std.Io;
 const shard_ring = @import("shard_ring.zig");
 const multiaddr = @import("multiaddr");
@@ -651,22 +641,12 @@ pub const QuicOutbound = struct {
         }};
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN != 0) {
-            // Wall-clock bound on a SINGLE conn's recv drain. `cap`
-            // (per_conn_drain) bounds the datagram COUNT, but under block
-            // backfill each feedPacket reassembles large STREAM data, so even
-            // ~93-256 datagrams in one drive() can pin this thread for >1s —
-            // and the multi-conn drive loop only checks its phase budget
-            // BETWEEN conns, so it can't interrupt a single heavy conn. Bound
-            // the recv WALL TIME here so no one drive() exceeds ~max_drive_recv_ms;
-            // the kernel buffer holds the remainder for the next, fast lap.
-            // Checked once per recvmmsg batch (≤64 datagrams) to keep the clock
-            // overhead negligible. poll_timeout_ms>0 (handshake waits) skip the
-            // bound — those drives drain a near-empty socket and must not be
-            // clipped.
-            const recv_deadline_ms: i64 = if (poll_timeout_ms == 0)
-                wall_time.milliTimestamp() + max_drive_recv_ms
-            else
-                std.math.maxInt(i64);
+            // NOTE: recv is bounded by datagram COUNT (`cap` = per_conn_drain)
+            // only. A wall-clock recv bound was tried (v0.2.60) and REVERTED: it
+            // left credit-update frames (MAX_DATA/MAX_STREAM_DATA) unprocessed in
+            // the socket buffer under load, so our send window stayed closed and
+            // the priority (attestation) outbox overflowed. The heavy-single-conn
+            // lap needs a control-frame-priority fix, not a blanket time cap.
             var recv_n: usize = 0;
             while (recv_n < cap) {
                 const got = self.recv_batch.recv(self.client.sock);
@@ -675,7 +655,6 @@ pub const QuicOutbound = struct {
                     self.client.feedPacket(self.recv_batch.slot(i).data);
                 }
                 recv_n += got;
-                if (wall_time.milliTimestamp() >= recv_deadline_ms) break;
             }
         }
         self.client.processPendingWork(zquicAddr(self.server_addr));
