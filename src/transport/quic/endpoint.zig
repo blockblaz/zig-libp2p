@@ -37,6 +37,19 @@ const recv_flags_dontwait: u32 = switch (builtin.target.os.tag) {
 /// next iteration. Well above the steady-state per-conn rate (~550 pkt/s), so it
 /// only bounds bursts, never normal traffic.
 const max_recv_drain_per_call: usize = 1024;
+
+/// Drain bound for the dedicated demux/listener thread (`pollAndRouteToRings` /
+/// `pollAndDrainToRing`). Unlike the drive thread, the demux does NO per-conn
+/// work — it only recvmmsg's and routes each datagram into an SPSC ring (a hash
+/// + `@memcpy`), so there is no fairness reason to stop early. Stopping at the
+/// drive thread's 1024 bound left a backlog in the kernel buffer while the demux
+/// went back to `poll()`; under the 32-node devnet's inbound rate that backlog
+/// overflowed `SO_RCVBUF` between wakes (live `node_netstat_Udp_RcvbufErrors` =
+/// ~547 datagrams/s → QUIC loss → cwnd collapse → gossip outbox overflow → no
+/// finality). The demux must instead drain the socket to empty (EWOULDBLOCK)
+/// every wake. This bound is only a runaway safety stop, set high enough that a
+/// healthy mesh never reaches it (the recv loop exits on the first short batch).
+const max_demux_drain_per_call: usize = 1 << 20;
 const Io = std.Io;
 const shard_ring = @import("shard_ring.zig");
 const multiaddr = @import("multiaddr");
@@ -444,6 +457,29 @@ pub const QuicListener = struct {
     // single-threaded on the drive thread. These are the ring-fed analogues of
     // `drive`/`pumpInbound`.
 
+    /// Defense-in-depth: request a large `SO_RCVBUF` on the shared listen socket
+    /// so a momentary stall (e.g. a drive thread finishing a long phase before
+    /// the demux can route its ring) still has kernel headroom and does not drop.
+    /// Tries `SO_RCVBUFFORCE` first (Linux, needs `CAP_NET_ADMIN`) — it bypasses
+    /// `net.core.rmem_max`, so the buffer is what we ask for *without* host
+    /// sysctl tuning. Falls back to `SO_RCVBUF` (capped at `rmem_max`) and, if
+    /// even that is refused, logs and continues — the primary fix is the
+    /// full-drain demux loop + deep app-side rings, not this kernel buffer. Best
+    /// effort: never fails the caller. Linux only (no-op elsewhere).
+    pub fn tuneListenRecvBuffer(self: *QuicListener, bytes: u32) void {
+        if (comptime builtin.target.os.tag == .linux) {
+            const v = std.mem.toBytes(@as(c_int, @intCast(bytes)));
+            // RCVBUFFORCE bypasses rmem_max (privileged); RCVBUF is the
+            // unprivileged fallback. Either failing is non-fatal.
+            if (posix.setsockopt(self.server.sock, posix.SOL.SOCKET, posix.SO.RCVBUFFORCE, &v)) |_| {
+                return;
+            } else |_| {}
+            // Unprivileged fallback (capped at rmem_max); refusal is non-fatal —
+            // the primary fix is the full-drain demux loop + deep app-side rings.
+            posix.setsockopt(self.server.sock, posix.SOL.SOCKET, posix.SO.RCVBUF, &v) catch {};
+        }
+    }
+
     /// Demux-thread side: poll the shared listen socket and copy any waiting
     /// datagrams into `ring` (drop-newest on overflow). `scratch` is a
     /// caller-owned datagram staging buffer (>= shard_ring.max_datagram_bytes).
@@ -451,8 +487,11 @@ pub const QuicListener = struct {
         var fds = [1]posix.pollfd{.{ .fd = self.server.sock, .events = posix.POLL.IN, .revents = 0 }};
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN == 0) return;
+        // Demux thread: drain the socket to empty (EWOULDBLOCK) before returning
+        // to poll — never leave a backlog in the kernel buffer (see
+        // `max_demux_drain_per_call`). `recv` returns 0 at EWOULDBLOCK.
         var recv_n: usize = 0;
-        while (recv_n < max_recv_drain_per_call) {
+        while (recv_n < max_demux_drain_per_call) {
             const got = rb.recv(self.server.sock);
             if (got == 0) break;
             for (0..got) |i| {
@@ -480,14 +519,21 @@ pub const QuicListener = struct {
         var fds = [1]posix.pollfd{.{ .fd = self.server.sock, .events = posix.POLL.IN, .revents = 0 }};
         _ = posix.poll(&fds, @intCast(poll_timeout_ms)) catch return error.PollFailed;
         if (fds[0].revents & posix.POLL.IN == 0) return;
+        // Demux thread: drain the socket to empty (EWOULDBLOCK) before returning
+        // to poll — never leave a backlog in the kernel buffer (see
+        // `max_demux_drain_per_call`). Per-datagram work is only a hash + ring
+        // `@memcpy`, so there is no fairness reason to stop early; stopping at the
+        // drive thread's bound was what let `SO_RCVBUF` overflow between wakes.
         var recv_n: usize = 0;
-        while (recv_n < max_recv_drain_per_call) {
+        while (recv_n < max_demux_drain_per_call) {
             const got = rb.recv(self.server.sock);
             if (got == 0) break;
             for (0..got) |i| {
                 const s = rb.slot(i);
-                const src_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&s.addr.any));
-                const idx = shard_ring.shardForDatagram(s.data, src_hash, mask);
+                // Short-header (1-RTT) — the hot path — routes by the tagged DCID
+                // byte with no hash; only long-header Initials need the source
+                // hash, so compute it lazily inside `shardForDatagram`.
+                const idx = shard_ring.shardForDatagramAddr(s.data, &s.addr, mask);
                 _ = rings[idx].push(s.data, s.addr);
             }
             recv_n += got;
