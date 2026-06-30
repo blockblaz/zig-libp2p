@@ -107,6 +107,14 @@ pub fn createDeps(
     test_options.addOption(bool, "enable_soak_tests", opts.enable_soak_tests);
     mod.addOptions("test_options", test_options);
 
+    // Expose `-Dshadow` to the library source (not just the zquic dep) so the
+    // UDP receive path can skip recvmmsg(2), which the Shadow simulator's
+    // syscall shim does not implement. See `RecvBatch` in
+    // `src/transport/zquic_feed_addr.zig` and issue #291.
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "shadow", opts.shadow);
+    mod.addOptions("build_options", build_options);
+
     return .{
         .mod = mod,
         .multiaddr = multiaddr_dep.module("multiaddr"),

@@ -7,8 +7,17 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const posix = std.posix;
 const system = posix.system;
+
+/// Process-global latch: set once `recvmmsg(2)` is observed unsupported
+/// (`ENOSYS`/`EOPNOTSUPP`), after which every reader uses the per-datagram
+/// `recvfrom` loop for the rest of the run instead of repeating the failing
+/// syscall on every poll. The Shadow simulator's syscall shim does not
+/// implement `recvmmsg`, which otherwise silently yields zero datagrams (no
+/// QUIC handshake ever completes — see issue #291).
+var recvmmsg_unsupported = std.atomic.Value(bool).init(false);
 
 inline fn checkRc(rc: anytype) posix.E {
     return posix.errno(rc);
@@ -91,6 +100,15 @@ pub const RecvBatch = struct {
     }
 
     fn recvLinux(self: *RecvBatch, sock: posix.socket_t) usize {
+        // The Shadow simulator does not implement recvmmsg(2). Under `-Dshadow`
+        // skip it entirely and use the portable per-datagram recvfrom loop, so
+        // the QUIC endpoint actually receives handshake packets (#291).
+        if (comptime build_options.shadow) return self.recvPortable(sock);
+        // Outside a Shadow build the same gap can appear in restricted sandboxes
+        // (seccomp); once we see ENOSYS we latch and fall back for the rest of
+        // the run rather than repeating a syscall that will never succeed.
+        if (recvmmsg_unsupported.load(.monotonic)) return self.recvPortable(sock);
+
         const linux = std.os.linux;
         var iovecs: [recv_batch_size]posix.iovec = undefined;
         var addrs: [recv_batch_size]posix.sockaddr.storage = undefined;
@@ -113,8 +131,27 @@ pub const RecvBatch = struct {
         // MSG_DONTWAIT: read all queued datagrams and return immediately (the
         // tail recvmsg hits EAGAIN, which recvmmsg reports as the count so far).
         const rc = linux.recvmmsg(@intCast(sock), msgs[0..].ptr, recv_batch_size, linux.MSG.DONTWAIT, null);
-        if (@as(isize, @bitCast(rc)) <= 0) return 0;
-        const n: usize = @intCast(rc);
+        // `recvmmsg` here is the raw `std.os.linux` syscall: it returns the
+        // message count on success and `-errno` (wrapped in usize) on error.
+        // Decode it as a signed value rather than via `posix.errno`, which
+        // assumes the libc `-1`-and-read-errno convention (this module links
+        // libc) and would misread a raw `-EAGAIN` as success, then index
+        // `slots` with a garbage count.
+        const signed: isize = @bitCast(rc);
+        if (signed <= 0) {
+            // recvmmsg unavailable (Shadow / restricted seccomp): latch and use
+            // the portable recvfrom loop for the rest of the run so we never
+            // again silently drop queued datagrams. All other non-positive
+            // returns (EAGAIN = no data, EINTR, transient errors) → 0, retry
+            // next poll — matching the original behaviour.
+            const err: isize = -signed; // 0 for rc==0, else the errno
+            if (err == @intFromEnum(linux.E.NOSYS) or err == @intFromEnum(linux.E.OPNOTSUPP)) {
+                recvmmsg_unsupported.store(true, .monotonic);
+                return self.recvPortable(sock);
+            }
+            return 0;
+        }
+        const n: usize = @intCast(signed);
         for (0..n) |i| {
             self.slots[i].len = msgs[i].len;
             self.slots[i].addr = .{ .any = @as(*const posix.sockaddr, @ptrCast(&addrs[i])).* };
