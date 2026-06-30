@@ -178,6 +178,13 @@ pub const RawAppBidiClient = struct {
         return buf.len - self.read_cursor;
     }
 
+    /// Mark this stream PRIORITY in zquic so its pending-send bytes reserve
+    /// headroom in the per-connection budget — a large non-priority req/resp
+    /// response can never starve it. Used for the persistent /meshsub stream.
+    pub fn markPriority(self: *RawAppBidiClient) void {
+        self.client.markStreamPriority(self.stream_id);
+    }
+
     /// Half-close the send direction: emit a STREAM FIN (empty payload) at the
     /// current `send_offset`, leaving the receive side open for the response.
     /// The libp2p req/resp convention is that the requester writes its request
@@ -300,6 +307,18 @@ pub const RawAppBidiServer = struct {
         const accepted = self.server.sendRawStreamData(self.conn, self.stream_id, self.send_offset, chunk, fin);
         self.send_offset += @intCast(accepted);
         return accepted;
+    }
+
+    /// Mark this stream PRIORITY in zquic so its pending-send bytes reserve
+    /// headroom in the per-connection budget — a large non-priority req/resp
+    /// response can never starve it. Routes to the client-side API when this
+    /// adapter wraps a remote-initiated stream on an outbound connection.
+    pub fn markPriority(self: *RawAppBidiServer) void {
+        if (self.client) |c| {
+            c.markStreamPriority(self.stream_id);
+            return;
+        }
+        self.server.markStreamPriority(self.conn, self.stream_id);
     }
 
     /// Release the zquic-side raw_app slot so the per-connection table doesn't fill up.

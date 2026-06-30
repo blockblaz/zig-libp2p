@@ -188,6 +188,17 @@ pub const PublishBidiStream = union(enum) {
         };
     }
 
+    /// Mark the underlying zquic stream PRIORITY so its pending-send bytes
+    /// reserve headroom in the per-connection budget. The persistent /meshsub
+    /// gossip stream uses this so a large req/resp response (e.g. a multi-MB
+    /// `blocks_by_range`) can never monopolize the budget and starve gossip.
+    pub fn markPriority(self: *PublishBidiStream) void {
+        switch (self.*) {
+            .outbound => |*c| c.markPriority(),
+            .inbound => |*s| s.markPriority(),
+        }
+    }
+
     /// Pending receive buffer for this stream (null until the peer sends data).
     /// Lets a response reader work over either an outbound (client) leg or an
     /// inbound (server-initiated) leg — the req/resp-over-inbound fallback,

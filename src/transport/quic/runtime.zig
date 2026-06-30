@@ -2542,6 +2542,13 @@ pub const QuicRuntime = struct {
             a.destroy(g);
             return null;
         };
+        // Mark the persistent /meshsub stream PRIORITY in zquic so a large
+        // non-priority req/resp response (e.g. a multi-MB blocks_by_range) can
+        // never monopolize the per-connection pending-send budget and starve
+        // gossip — the dropped-attestation root cause. zquic reserves headroom
+        // for priority streams; non-priority streams enqueue against a reduced
+        // cap. Must run AFTER `g` is stored so `g.raw` is its final address.
+        g.raw.markPriority();
         log.debug("quic_runtime: opened persistent /meshsub stream peer={s} stream_id={d} leg={s}", .{
             peerBase58(peer, &peer_buf),
             stream_id,
@@ -2761,6 +2768,10 @@ pub const QuicRuntime = struct {
         // Reset the stream to pre-handshake state on the fresh wire stream.
         g.raw = new_raw;
         g.stream_id = new_sid;
+        // Re-mark PRIORITY: the reopen allocated a NEW stream id, so the headroom
+        // reservation must follow it (the old id's marking is stale but harmless —
+        // its slot was released above and is cleared on conn reset).
+        g.raw.markPriority();
         g.handshake_sent = false;
         g.handshake_done = false;
         g.ms_header_done = false;
