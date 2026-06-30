@@ -7,8 +7,17 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const posix = std.posix;
 const system = posix.system;
+
+/// Process-global latch: set once `recvmmsg(2)` is observed unsupported
+/// (`ENOSYS`/`EOPNOTSUPP`), after which every reader uses the per-datagram
+/// `recvfrom` loop for the rest of the run instead of repeating the failing
+/// syscall on every poll. The Shadow simulator's syscall shim does not
+/// implement `recvmmsg`, which otherwise silently yields zero datagrams (no
+/// QUIC handshake ever completes — see issue #291).
+var recvmmsg_unsupported = std.atomic.Value(bool).init(false);
 
 inline fn checkRc(rc: anytype) posix.E {
     return posix.errno(rc);
@@ -91,6 +100,15 @@ pub const RecvBatch = struct {
     }
 
     fn recvLinux(self: *RecvBatch, sock: posix.socket_t) usize {
+        // The Shadow simulator does not implement recvmmsg(2). Under `-Dshadow`
+        // skip it entirely and use the portable per-datagram recvfrom loop, so
+        // the QUIC endpoint actually receives handshake packets (#291).
+        if (comptime build_options.shadow) return self.recvPortable(sock);
+        // Outside a Shadow build the same gap can appear in restricted sandboxes
+        // (seccomp); once we see ENOSYS we latch and fall back for the rest of
+        // the run rather than repeating a syscall that will never succeed.
+        if (recvmmsg_unsupported.load(.monotonic)) return self.recvPortable(sock);
+
         const linux = std.os.linux;
         var iovecs: [recv_batch_size]posix.iovec = undefined;
         var addrs: [recv_batch_size]posix.sockaddr.storage = undefined;
@@ -113,7 +131,20 @@ pub const RecvBatch = struct {
         // MSG_DONTWAIT: read all queued datagrams and return immediately (the
         // tail recvmsg hits EAGAIN, which recvmmsg reports as the count so far).
         const rc = linux.recvmmsg(@intCast(sock), msgs[0..].ptr, recv_batch_size, linux.MSG.DONTWAIT, null);
-        if (@as(isize, @bitCast(rc)) <= 0) return 0;
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            // No datagrams queued, or interrupted — normal, try again next poll.
+            .AGAIN, .INTR => return 0,
+            // recvmmsg unavailable (Shadow / seccomp). Latch and fall back so we
+            // never again silently return zero packets when data is waiting.
+            .NOSYS, .OPNOTSUPP => {
+                recvmmsg_unsupported.store(true, .monotonic);
+                return self.recvPortable(sock);
+            },
+            // Transient errors (e.g. a queued ICMP port-unreachable surfacing as
+            // ECONNREFUSED): drop this batch, the next poll retries.
+            else => return 0,
+        }
         const n: usize = @intCast(rc);
         for (0..n) |i| {
             self.slots[i].len = msgs[i].len;
