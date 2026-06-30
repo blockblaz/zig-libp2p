@@ -131,26 +131,27 @@ pub const RecvBatch = struct {
         // MSG_DONTWAIT: read all queued datagrams and return immediately (the
         // tail recvmsg hits EAGAIN, which recvmmsg reports as the count so far).
         const rc = linux.recvmmsg(@intCast(sock), msgs[0..].ptr, recv_batch_size, linux.MSG.DONTWAIT, null);
-        // `recvmmsg` here is the raw `std.os.linux` syscall, which returns
-        // `-errno` directly. Decode with `linux.E.init` — NOT `posix.errno`,
-        // which assumes the libc `-1`-and-read-errno convention (this module
-        // links libc) and would misread a raw `-EAGAIN` return as `.SUCCESS`,
-        // then index `slots` with a garbage count.
-        switch (linux.E.init(rc)) {
-            .SUCCESS => {},
-            // No datagrams queued, or interrupted — normal, try again next poll.
-            .AGAIN, .INTR => return 0,
-            // recvmmsg unavailable (Shadow / seccomp). Latch and fall back so we
-            // never again silently return zero packets when data is waiting.
-            .NOSYS, .OPNOTSUPP => {
+        // `recvmmsg` here is the raw `std.os.linux` syscall: it returns the
+        // message count on success and `-errno` (wrapped in usize) on error.
+        // Decode it as a signed value rather than via `posix.errno`, which
+        // assumes the libc `-1`-and-read-errno convention (this module links
+        // libc) and would misread a raw `-EAGAIN` as success, then index
+        // `slots` with a garbage count.
+        const signed: isize = @bitCast(rc);
+        if (signed <= 0) {
+            // recvmmsg unavailable (Shadow / restricted seccomp): latch and use
+            // the portable recvfrom loop for the rest of the run so we never
+            // again silently drop queued datagrams. All other non-positive
+            // returns (EAGAIN = no data, EINTR, transient errors) → 0, retry
+            // next poll — matching the original behaviour.
+            const err: isize = -signed; // 0 for rc==0, else the errno
+            if (err == @intFromEnum(linux.E.NOSYS) or err == @intFromEnum(linux.E.OPNOTSUPP)) {
                 recvmmsg_unsupported.store(true, .monotonic);
                 return self.recvPortable(sock);
-            },
-            // Transient errors (e.g. a queued ICMP port-unreachable surfacing as
-            // ECONNREFUSED): drop this batch, the next poll retries.
-            else => return 0,
+            }
+            return 0;
         }
-        const n: usize = @intCast(rc);
+        const n: usize = @intCast(signed);
         for (0..n) |i| {
             self.slots[i].len = msgs[i].len;
             self.slots[i].addr = .{ .any = @as(*const posix.sockaddr, @ptrCast(&addrs[i])).* };
