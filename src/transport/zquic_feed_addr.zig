@@ -131,7 +131,12 @@ pub const RecvBatch = struct {
         // MSG_DONTWAIT: read all queued datagrams and return immediately (the
         // tail recvmsg hits EAGAIN, which recvmmsg reports as the count so far).
         const rc = linux.recvmmsg(@intCast(sock), msgs[0..].ptr, recv_batch_size, linux.MSG.DONTWAIT, null);
-        switch (posix.errno(rc)) {
+        // `recvmmsg` here is the raw `std.os.linux` syscall, which returns
+        // `-errno` directly. Decode with `linux.E.init` — NOT `posix.errno`,
+        // which assumes the libc `-1`-and-read-errno convention (this module
+        // links libc) and would misread a raw `-EAGAIN` return as `.SUCCESS`,
+        // then index `slots` with a garbage count.
+        switch (linux.E.init(rc)) {
             .SUCCESS => {},
             // No datagrams queued, or interrupted — normal, try again next poll.
             .AGAIN, .INTR => return 0,
