@@ -293,6 +293,58 @@ milestones toward a stable release:
 
 Spec-compliance umbrella: [#80](https://github.com/blockblaz/zig-libp2p/issues/80).
 
+## Logging (`DEBUG_QUIC`)
+
+zig-libp2p emits diagnostics through Zig's standard logging under several
+`std.log` scopes. The QUIC transport / runtime scopes —
+**`.quic_runtime`**, **`.quic_dcutr`**, **`.quic_relay`**, and
+**`.connection_manager`** (plus **`.zquic`** from the bundled
+[zquic](https://github.com/ch4r10t33r/zquic) transport) — are *intentionally
+chatty* at `warn` under load: gossip-outbox backpressure/drops, persistent
+`/meshsub` stuck→reopen, `SLOW drive iter`, and dial/connection-lost notices are
+normal operational signal during catch-up or when a peer stops reading a stream.
+
+The library never writes logs itself — the **embedder's `std_options.logFn`**
+decides what is rendered. The recommended convention (mirroring rust-libp2p) is
+to gate these transport scopes behind a **`DEBUG_QUIC`** environment variable —
+**off by default**, with `err` always passing through so genuine failures stay
+visible:
+
+```zig
+pub const std_options: std.Options = .{ .logFn = quicAwareLogFn };
+
+var quic_debug = std.atomic.Value(bool).init(false); // set at startup from env
+
+fn isQuicScope(comptime s: @TypeOf(.enum_literal)) bool {
+    return s == .quic_runtime or s == .quic_dcutr or s == .quic_relay or
+        s == .connection_manager or s == .zquic;
+}
+
+fn quicAwareLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    // Gate warn/info/debug for the QUIC scopes unless DEBUG_QUIC is set;
+    // err always passes through.
+    if (comptime isQuicScope(scope)) {
+        if (@intFromEnum(level) >= @intFromEnum(std.log.Level.warn) and
+            !quic_debug.load(.monotonic)) return;
+    }
+    std.log.defaultLog(level, scope, format, args);
+}
+
+// At startup:
+if (std.posix.getenv("DEBUG_QUIC")) |v| {
+    if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) quic_debug.store(true, .monotonic);
+}
+```
+
+Run with `DEBUG_QUIC=1` (also accepts `true`/`yes`/`on`) to surface the full
+transport log stream when debugging; leave it unset for a quiet main log.
+zeam ships exactly this gate in `pkgs/cli/src/main.zig`.
+
 ## Development
 
 ```sh

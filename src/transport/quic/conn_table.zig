@@ -507,7 +507,7 @@ pub const persistent_gossip_keepalive_interval_ms: i64 = 20_000;
 /// steady state implies the peer has stopped reading the stream, which is
 /// terminal for a `/meshsub/1.1.0` stream that rust-libp2p caps at one
 /// substream per connection (see [`PersistentGossipStream`] doc).
-pub const persistent_gossip_outbox_stuck_timeout_ms: i64 = 20_000;
+pub const persistent_gossip_outbox_stuck_timeout_ms: i64 = 5_000;
 
 /// A queued command from the swarm hook to the drive thread.
 pub const HookWork = union(enum) {
