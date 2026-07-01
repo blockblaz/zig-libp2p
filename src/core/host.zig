@@ -37,6 +37,7 @@ const autonat_mod = @import("../protocols/autonat/root.zig");
 const peer_protocols_mod = @import("peer_protocols.zig");
 const kad_dht_mod = @import("../protocols/kad_dht/root.zig");
 const discovery_mod = @import("../protocols/discovery/root.zig");
+const wall_time = @import("../primitives/wall_time.zig");
 
 pub const AutonatHostConfig = struct {
     enable: bool = false,
@@ -595,7 +596,22 @@ pub const Host = struct {
         payload: []const u8,
         timeout_ms: u32,
     ) (req_resp_runtime.Error || swarm_mod.SubmitError || std.mem.Allocator.Error)!u64 {
-        return self.req_resp.sendRequest(peer, proto, payload, timeout_ms);
+        // Per-call `timeout_ms` is advisory; the effective request timeout is
+        // governed by `cfg.request_timeout_ms` inside the req/resp runtime.
+        _ = timeout_ms;
+        // `req_resp.sendRequest`'s last parameter is the CURRENT wall-clock time
+        // (`now_ms`), from which it derives the request deadline
+        // (`now_ms + cfg.request_timeout_ms`). Passing `timeout_ms` here set the
+        // deadline to ~`timeout_ms` ms after the Unix epoch — decades in the past
+        // — so the very next `req_resp.tick(now_ms)` sweep (driven from the same
+        // wall clock) expired the request instantly with `StreamTimedOut`. That
+        // raced the response round-trip: fast local round-trips won ~90% of the
+        // time, but a slower live round-trip (e.g. a rust peer opening a
+        // server-initiated status stream back to us) lost the race almost every
+        // time, so we appeared to fail the request in a few ms and the peer
+        // closed the connection. Pass the real clock; the per-call `timeout_ms`
+        // is advisory only (the effective timeout is `cfg.request_timeout_ms`).
+        return self.req_resp.sendRequest(peer, proto, payload, wall_time.milliTimestamp());
     }
 
     pub fn registerInboundReqRespChannel(

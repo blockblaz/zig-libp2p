@@ -7066,6 +7066,215 @@ test "QuicRuntime: req/resp rides the inbound leg when no outbound exists (no-ou
     try testing.expect(rtHasNoOutboundTo(rt_a, bundle_b.peer));
 }
 
+test "QuicRuntime: LISTENER-opens-reqresp-to-DIALER single-shot (no retry) — lantern repro" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    // ── Bug topology (from a live devnet, zeam↔lantern) ──────────────────────
+    // A rust peer (lantern) DIALS a zeam node? No — the observed failing case is
+    // the reverse of that: a QUIC DIALER (client) opens the connection, and then
+    // the LISTENER (server) opens its OWN status req/resp stream back to the
+    // dialer (a *server-initiated* bidi stream, id % 4 == 1). The dialer must
+    // serve that inbound request as responder — over its OUTBOUND (client-side)
+    // connection, via the `dispatchOutboundPeerStreams` → `advanceInboundStreams`
+    // (with `ist.raw.client` set) path.
+    //
+    // Mapping to this test: node B DIALS node A (B = client / dialer). Then node
+    // A (the listener) sends a `status` request to B. A's request rides a
+    // server-initiated bidi stream on A's inbound leg; **B must serve it as
+    // responder on its outbound/client leg**. This is exactly the
+    // "listener-opens-reqresp-to-the-dialer" direction.
+    //
+    // Unlike the retry-masked "rides the inbound leg" test above, this issues
+    // SINGLE-SHOT requests (NO retry) in a loop and measures the success rate,
+    // so a persistent failure of this direction shows up as a hard assertion
+    // failure rather than being papered over by a bounded retry.
+
+    const a = testing.allocator;
+
+    var bundle_a = try buildTestBundle(a, "lra", 0xA7);
+    defer bundle_a.deinit(a);
+    var bundle_b = try buildTestBundle(a, "lrb", 0xB8);
+    defer bundle_b.deinit(a);
+
+    var host_a = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_a.peer,
+        .gossipsub = .{ .local_peer_id = bundle_a.peer },
+    });
+    defer host_a.destroy();
+    try host_a.startBackground();
+    try testing.expect(host_a.waitUntilReady(5_000));
+
+    var rt_a = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_a,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_a.cert_pem, .key_pem = bundle_a.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_a.destroy();
+
+    var host_b = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_b.peer,
+        .gossipsub = .{ .local_peer_id = bundle_b.peer },
+    });
+    defer host_b.destroy();
+    try host_b.startBackground();
+    try testing.expect(host_b.waitUntilReady(5_000));
+
+    var rt_b = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_b,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_b.cert_pem, .key_pem = bundle_b.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_b.destroy();
+
+    try rt_a.start();
+    try rt_b.start();
+
+    const a_port = rt_a.boundUdpPortIpv4() orelse return error.NoBoundPort;
+
+    // B dials A — B = dialer/client, A = listener/server.
+    var a_peer_b58_buf: [128]u8 = undefined;
+    const a_peer_b58 = try bundle_a.peer.toBase58(&a_peer_b58_buf);
+    const a_ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ a_port, a_peer_b58 });
+    defer a.free(a_ma_str);
+    var a_ma = try multiaddr.Multiaddr.fromString(a, a_ma_str);
+    defer a_ma.deinit();
+    try rt_b.registerKnownPeer(&a_ma, bundle_a.peer);
+
+    // Responder on B (the DIALER): answer any rpc_request with a fixture chunk + end.
+    const ResponderTask = struct {
+        fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+            const deadline_ms = wall_time.milliTimestamp() + 60_000;
+            while (wall_time.milliTimestamp() < deadline_ms) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(200) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                defer ev.deinit(h.allocator);
+                switch (ev) {
+                    .rpc_request => |r| {
+                        h.sendResponseChunk(r.channel_id, "LISTENER-TO-DIALER-RESP", wall_time.milliTimestamp()) catch {};
+                        h.finishResponseStream(r.channel_id) catch {};
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+    var b_done = std.atomic.Value(bool).init(false);
+    var b_thread = try std.Thread.spawn(.{}, ResponderTask.run, .{ host_b, &b_done });
+    defer {
+        b_done.store(true, .release);
+        b_thread.join();
+    }
+
+    // Wait for B's outbound dial to land (B has outbound to A; A has inbound to B).
+    {
+        var connected = false;
+        const deadline_ms = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
+                connected = true;
+                break;
+            }
+            var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+        try testing.expect(connected);
+    }
+
+    // Bootstrap A's `inbound_by_peer[B]`: B must open a stream to A so A learns
+    // B's peer id (same mechanism the #214 gossip test relies on). Subscribe
+    // both + publish from B, and wait until A has an inbound leg to B and NO
+    // outbound to B (so A's request MUST ride a server-initiated bidi stream).
+    try host_a.subscribe("boot/topic");
+    try host_b.subscribe("boot/topic");
+    try host_b.publish("boot/topic", "BOOT-FROM-B");
+    {
+        var learned = false;
+        const deadline_ms = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            if (host_a.nextEvent(20)) |ev_in| {
+                var e = ev_in;
+                e.deinit(a);
+            } else |_| {}
+            if (rtHasInboundTo(rt_a, bundle_b.peer) and rtHasNoOutboundTo(rt_a, bundle_b.peer)) {
+                learned = true;
+                break;
+            }
+        }
+        try testing.expect(learned);
+    }
+
+    // Drain any queued events on A left over from the bootstrap so the
+    // per-iteration event loop below only observes THIS request's outcome.
+    while (host_a.nextEvent(0)) |ev_in| {
+        var e = ev_in;
+        e.deinit(a);
+    } else |_| {}
+
+    // ── The repro: SINGLE-SHOT requests, NO retry ────────────────────────────
+    // A (LISTENER) sends `status` to B (DIALER). Each request rides a fresh
+    // server-initiated bidi stream on A's inbound leg → B serves it as responder
+    // over its client-side leg. Count successes/failures; NO retry.
+    const iterations: usize = 20;
+    var successes: usize = 0;
+    var failures: usize = 0;
+    var i_it: usize = 0;
+    while (i_it < iterations) : (i_it += 1) {
+        const rid = host_a.sendRequest(bundle_b.peer, .status, "LISTENER-REQ", 8_000) catch {
+            failures += 1;
+            continue;
+        };
+        var saw_chunk = false;
+        var saw_end = false;
+        var got_error = false;
+        const attempt_deadline = wall_time.milliTimestamp() + 8_000;
+        // Correlate STRICTLY by request_id: events for a prior iteration's
+        // request can still be draining, and attributing them to this iteration
+        // would fabricate false failures/successes.
+        while (wall_time.milliTimestamp() < attempt_deadline and !(saw_chunk and saw_end) and !got_error) {
+            var ev = host_a.nextEvent(200) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+            defer ev.deinit(a);
+            switch (ev) {
+                .rpc_response_chunk => |c| {
+                    if (c.request_id == rid and std.mem.eql(u8, c.chunk, "LISTENER-TO-DIALER-RESP")) saw_chunk = true;
+                },
+                .rpc_response_end => |e| {
+                    if (e.request_id == rid) saw_end = true;
+                },
+                .rpc_error_response => |e| {
+                    if (e.request_id == rid) got_error = true;
+                },
+                else => {},
+            }
+        }
+        if (saw_chunk and saw_end) {
+            successes += 1;
+        } else {
+            failures += 1;
+        }
+    }
+
+    // Pre-fix, the FIRST request (and a fast-completing ~10% of the rest) failed
+    // instantly with `StreamTimedOut`: `Host.sendRequest` mis-plumbed its
+    // `timeout_ms` argument into the req/resp `now_ms` slot, so every request's
+    // deadline landed ~decades in the past and the next `req_resp.tick` sweep
+    // expired it before the response round-tripped — near-100% against a slower
+    // (live) peer. With the clock plumbed correctly EVERY single-shot request in
+    // this direction must succeed.
+    try testing.expectEqual(iterations, successes);
+    try testing.expectEqual(@as(usize, 0), failures);
+}
+
 test "QuicRuntime: REPEATED req/resp over inbound leg stays reliable past 256-stream cap (status-RPC timeout fix)" {
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
