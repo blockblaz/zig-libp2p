@@ -364,6 +364,13 @@ pub const QuicRuntime = struct {
     /// responses to the wrong shard → req/resp times out. Collision rate rises
     /// with shard count (1-1/N). Atomic; fetchAdd on every inbound request.
     next_stream_request_id: std.atomic.Value(u64) = .init(1),
+
+    /// TEST ONLY: when set, outbound req/resp streams negotiate multistream-select
+    /// but then send ZERO request-body bytes and never FIN — modeling the
+    /// rust-libp2p (lantern) `/status` behavior that every other client answers.
+    /// Used by the empty-body `/status` interop repro; never set in production.
+    test_suppress_request_body: std.atomic.Value(bool) = .init(false),
+
     autonat_server: autonat_mod.Server,
 
     /// Topics we have subscribed to locally — used to (a) queue SUBSCRIBE
@@ -4934,36 +4941,65 @@ pub const QuicRuntime = struct {
                     // `advanceOutboundRequests`; it's what made req/resp-over-inbound
                     // flake ~15% of runs.
                     const peer_fin = ist.raw.fullyReceived();
-                    if (ist.req_acc.items.len == 0) {
-                        if (peer_fin) {
-                            self.removeInboundStreamAt(sh, i);
-                            continue;
-                        }
-                        i += 1;
-                        continue;
-                    }
 
-                    // Attempt to decode a full unary request from the acc.
-                    const req_ssz = snappy_wire.decodeRequestSsz(a, ist.req_acc.items) catch |err| switch (err) {
-                        error.IncompleteHeader, error.InvalidData => {
+                    // `/status` cross-client interop: rust-libp2p (lantern) and
+                    // other clients open `/status`, complete multistream-select,
+                    // then send ZERO request-body bytes and never FIN — treating an
+                    // empty request as valid (our own status responder ignores the
+                    // body and returns chain.getStatus()). Waiting for a decodable
+                    // body here (like blocks_by_*) means we never answer and reap
+                    // after inbound_request_reap_ms → the peer times out → conn
+                    // flap. Scoped to `.status` ONLY: blocks_by_root / blocks_by_range
+                    // genuinely need the request body and keep decoding as before.
+                    const req_payload: []const u8 = payload_blk: {
+                        // `.status` empty-body dispatch: once ms-select is done and
+                        // a grace window has elapsed with NO body and NO FIN,
+                        // dispatch with an EMPTY payload instead of waiting/reaping
+                        // (the lantern shape — see inbound_status_empty_grace_ms).
+                        // The grace lets a NORMAL peer's in-flight body land + decode
+                        // via the path below first, so this only trips for a
+                        // genuinely empty request. Guarded above on
+                        // `ist.channel_id == null` → dispatched exactly once.
+                        if (proto == .status and ist.req_acc.items.len == 0 and !peer_fin and
+                            ist.created_ms != 0 and
+                            self.opts.now_ms_fn() - ist.created_ms > conn_table.inbound_status_empty_grace_ms)
+                        {
+                            break :payload_blk "";
+                        }
+                        if (ist.req_acc.items.len == 0) {
                             if (peer_fin) {
-                                log.warn("quic_runtime: inbound req/resp decode failed after peer FIN ({d} bytes)", .{
-                                    ist.req_acc.items.len,
-                                });
-                                ist.raw.writeAllFin(&.{});
                                 self.removeInboundStreamAt(sh, i);
                                 continue;
                             }
                             i += 1;
                             continue;
-                        },
-                        else => |e| {
-                            log.warn("quic_runtime: decodeRequestSsz failed: {s}", .{@errorName(e)});
-                            self.removeInboundStreamAt(sh, i);
-                            continue;
-                        },
+                        }
+
+                        // Attempt to decode a full unary request from the acc.
+                        const req_ssz = snappy_wire.decodeRequestSsz(a, ist.req_acc.items) catch |err| switch (err) {
+                            error.IncompleteHeader, error.InvalidData => {
+                                if (peer_fin) {
+                                    log.warn("quic_runtime: inbound req/resp decode failed after peer FIN ({d} bytes)", .{
+                                        ist.req_acc.items.len,
+                                    });
+                                    ist.raw.writeAllFin(&.{});
+                                    self.removeInboundStreamAt(sh, i);
+                                    continue;
+                                }
+                                i += 1;
+                                continue;
+                            },
+                            else => |e| {
+                                log.warn("quic_runtime: decodeRequestSsz failed: {s}", .{@errorName(e)});
+                                self.removeInboundStreamAt(sh, i);
+                                continue;
+                            },
+                        };
+                        break :payload_blk req_ssz;
                     };
-                    defer a.free(req_ssz);
+                    // Free the decoded body on exit; the empty-`/status` literal is
+                    // static and must NOT be freed, so only free when we own it.
+                    defer if (req_payload.len != 0) a.free(req_payload);
 
                     // Synthesize a stream_request_id. MUST be process-globally
                     // unique (NOT the per-conn QUIC stream id): it keys the global
@@ -4986,7 +5022,7 @@ pub const QuicRuntime = struct {
                     self.setInboundStreamShard(stream_rid, sh.index);
 
                     // Hand the request payload to the embedder via swarm.
-                    const payload_dup = a.dupe(u8, req_ssz) catch {
+                    const payload_dup = a.dupe(u8, req_payload) catch {
                         i += 1;
                         continue;
                     };
@@ -5145,13 +5181,20 @@ pub const QuicRuntime = struct {
             //    (a late empty-FIN there previously corrupted the same-stream
             //    read and broke zeam↔zeam + gossip).
             if (!req.request_written) {
-                var w = req.raw.writer();
-                wire_framing.writeUnaryRequestFlush(a, &w, req.payload) catch |err| {
-                    log.warn("quic_runtime: writeUnaryRequestFlush failed: {s}", .{@errorName(err)});
-                    continue;
-                };
-                req.raw.finStream();
-                req.request_written = true;
+                if (builtin.is_test and self.test_suppress_request_body.load(.acquire)) {
+                    // Repro mode: ms-select is done; send NO body and NO FIN
+                    // (the lantern `/status` shape). The responder must still
+                    // answer instead of reaping.
+                    req.request_written = true;
+                } else {
+                    var w = req.raw.writer();
+                    wire_framing.writeUnaryRequestFlush(a, &w, req.payload) catch |err| {
+                        log.warn("quic_runtime: writeUnaryRequestFlush failed: {s}", .{@errorName(err)});
+                        continue;
+                    };
+                    req.raw.finStream();
+                    req.request_written = true;
+                }
             }
 
             // 4. Drain new bytes into the per-request accumulator; decode
@@ -6091,6 +6134,155 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
         switch (ev) {
             .rpc_response_chunk => |c| {
                 try testing.expectEqualStrings("STATUS-RESP-FIXTURE", c.chunk);
+                saw_chunk = true;
+            },
+            .rpc_response_end => saw_end = true,
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_chunk);
+    try testing.expect(saw_end);
+}
+
+test "QuicRuntime: empty-body /status (lantern shape) still gets a response, not reaped" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    // ── Bug (live devnet + cross-client, zeam↔lantern) ────────────────────────
+    // A rust peer (lantern) opens an inbound `/status` req/resp stream, completes
+    // multistream-select, then sends ZERO request-body bytes and NEVER FINs.
+    // Every OTHER client (ethlambda/grandine/gean/ream) answers this (their
+    // status responder ignores the request body). Pre-fix, zeam's inbound
+    // req/resp path waited for a decodable body → never dispatched → reaped the
+    // stream after inbound_request_reap_ms → the peer timed out → conn flap.
+    //
+    // Repro: B dials A, then B sends a `/status` request to A, but with
+    // `test_suppress_request_body` set B negotiates ms-select and then sends NO
+    // body and NO FIN (exactly the lantern shape). A's responder ignores the
+    // request body and answers with a fixture — which it can only do if the
+    // empty-body `/status` is dispatched. Pre-fix this test TIMES OUT (no
+    // response); post-fix A answers.
+
+    const a = testing.allocator;
+
+    var bundle_a = try buildTestBundle(a, "esa", 0xA9);
+    defer bundle_a.deinit(a);
+    var bundle_b = try buildTestBundle(a, "esb", 0xBA);
+    defer bundle_b.deinit(a);
+
+    var host_a = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_a.peer,
+        .gossipsub = .{ .local_peer_id = bundle_a.peer },
+    });
+    defer host_a.destroy();
+    try host_a.startBackground();
+    try testing.expect(host_a.waitUntilReady(5_000));
+
+    var rt_a = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_a,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_a.cert_pem, .key_pem = bundle_a.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_a.destroy();
+
+    var host_b = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_b.peer,
+        .gossipsub = .{ .local_peer_id = bundle_b.peer },
+    });
+    defer host_b.destroy();
+    try host_b.startBackground();
+    try testing.expect(host_b.waitUntilReady(5_000));
+
+    var rt_b = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_b,
+        .tls_pem = .{ .pem_bytes = .{ .cert_pem = bundle_b.cert_pem, .key_pem = bundle_b.key_pem } },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_b.destroy();
+
+    // B sends the request over its outbound leg → advanceOutboundRequests runs on
+    // rt_b, so suppress the body there (models lantern sending zero request bytes).
+    rt_b.test_suppress_request_body.store(true, .release);
+
+    try rt_a.start();
+    try rt_b.start();
+
+    const a_port = rt_a.boundUdpPortIpv4() orelse return error.NoBoundPort;
+
+    var a_peer_b58_buf: [128]u8 = undefined;
+    const a_peer_b58 = try bundle_a.peer.toBase58(&a_peer_b58_buf);
+    const a_ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ a_port, a_peer_b58 });
+    defer a.free(a_ma_str);
+    var a_ma = try multiaddr.Multiaddr.fromString(a, a_ma_str);
+    defer a_ma.deinit();
+    try rt_b.registerKnownPeer(&a_ma, bundle_a.peer);
+
+    // Responder on A: answer any rpc_request WITHOUT reading the request body
+    // (mirrors zeam's status responder returning chain.getStatus()).
+    const ResponderTask = struct {
+        fn run(h: *host_mod.Host, done: *std.atomic.Value(bool)) void {
+            const deadline_ms = wall_time.milliTimestamp() + 25_000;
+            while (wall_time.milliTimestamp() < deadline_ms) {
+                if (done.load(.acquire)) return;
+                var ev = h.nextEvent(200) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return,
+                };
+                defer ev.deinit(h.allocator);
+                switch (ev) {
+                    .rpc_request => |r| {
+                        h.sendResponseChunk(r.channel_id, "EMPTY-STATUS-RESP", wall_time.milliTimestamp()) catch {};
+                        h.finishResponseStream(r.channel_id) catch {};
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+    var a_done = std.atomic.Value(bool).init(false);
+    var a_thread = try std.Thread.spawn(.{}, ResponderTask.run, .{ host_a, &a_done });
+    defer {
+        a_done.store(true, .release);
+        a_thread.join();
+    }
+
+    // Wait for the dial to land.
+    {
+        var connected = false;
+        const deadline_ms = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < deadline_ms) {
+            if (rtHasOutboundTo(rt_b, bundle_a.peer)) {
+                connected = true;
+                break;
+            }
+            var req = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            var rem = std.c.timespec{ .sec = 0, .nsec = 0 };
+            _ = std.c.nanosleep(&req, &rem);
+        }
+        try testing.expect(connected);
+    }
+
+    // B sends a `/status` request. With body-suppression on, B negotiates
+    // ms-select then sends NO body and NO FIN — the lantern shape. A must still
+    // answer (post-fix) instead of reaping the stream (pre-fix → timeout).
+    _ = try host_b.sendRequest(bundle_a.peer, .status, "IGNORED", 15_000);
+
+    var saw_chunk = false;
+    var saw_end = false;
+    const deadline_ms = wall_time.milliTimestamp() + 20_000;
+    while (wall_time.milliTimestamp() < deadline_ms and !(saw_chunk and saw_end)) {
+        var ev = host_b.nextEvent(500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        defer ev.deinit(a);
+        switch (ev) {
+            .rpc_response_chunk => |c| {
+                try testing.expectEqualStrings("EMPTY-STATUS-RESP", c.chunk);
                 saw_chunk = true;
             },
             .rpc_response_end => saw_end = true,

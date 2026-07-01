@@ -138,6 +138,18 @@ pub const outbound_request_reap_ms: i64 = 15_000;
 /// legitimate response is never falsely reaped.
 pub const inbound_request_reap_ms: i64 = 30_000;
 
+/// Grace window before an inbound `/status` stream with NO request body yet is
+/// dispatched to the responder with an EMPTY payload. rust-libp2p (lantern) and
+/// other clients open `/status`, complete multistream-select, then send ZERO
+/// request-body bytes and never FIN — treating an empty request as valid (our
+/// own status responder ignores the body). Without answering, we reap after
+/// `inbound_request_reap_ms` → the peer times out → conn flap. But a NORMAL peer
+/// that DOES send a body may have it still in flight on the first drive tick, so
+/// dispatching an empty payload immediately would race ahead of the body. This
+/// grace lets a real body land + decode first; only a genuinely empty request
+/// (body never arrives) trips the empty-`/status` dispatch. Well under the reap.
+pub const inbound_status_empty_grace_ms: i64 = 500;
+
 pub const OutboundRequest = struct {
     /// The peer this request is destined for.
     peer: identity.PeerId,
