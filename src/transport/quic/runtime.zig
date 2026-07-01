@@ -4482,7 +4482,27 @@ pub const QuicRuntime = struct {
                 !ist.response_fin_sent and ist.created_ms != 0 and
                 self.opts.now_ms_fn() - ist.created_ms > conn_table.inbound_request_reap_ms)
             {
-                log.warn("quic_runtime: reaping stale inbound req/resp stream (no response in {d}ms)", .{conn_table.inbound_request_reap_ms});
+                var reap_peer_buf: [128]u8 = undefined;
+                const reap_peer_str = if (ist.known_peer_id orelse ist.sender_peer) |kp|
+                    peerBase58(kp, &reap_peer_buf)
+                else
+                    "unknown";
+                // Include the stall MODE so a capture pins the cause without
+                // guesswork: proto_index=null / handshake_done=false => peer
+                // opened the stream but never finished multistream-select;
+                // handshake_done=true + req_bytes=0 => negotiated but the peer
+                // never sent a request body; req_bytes>0 + fin=false => partial
+                // request that never FIN'd. Distinguishes a peer-side stall from
+                // a responder that failed to answer a complete request.
+                log.warn("quic_runtime: reaping stale inbound req/resp stream peer={s} stream_id={d} proto_index={?d} handshake_done={} req_bytes={d} fin={} (no response in {d}ms)", .{
+                    reap_peer_str,
+                    ist.stream_id,
+                    ist.protocol_index,
+                    ist.handshake_done,
+                    ist.req_acc.items.len,
+                    ist.raw.finReceived(),
+                    conn_table.inbound_request_reap_ms,
+                });
                 self.removeInboundStreamAt(sh, i);
                 continue;
             }
