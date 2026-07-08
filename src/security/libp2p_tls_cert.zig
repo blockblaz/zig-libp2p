@@ -166,6 +166,17 @@ pub const GenerateOptions = struct {
     cert_key_seed: [32]u8,
 };
 
+/// Canonical libp2p-TLS validity window, matching the reference
+/// implementations: rust-libp2p's `libp2p-tls` (rcgen) mints
+/// `not_before = 1975-01-01`, `not_after = 4096-01-01`; go-libp2p uses an
+/// equivalently unbounded now-1h .. now+100y span. Both are effectively
+/// clock-independent — the libp2p-TLS spec directs verifiers not to reject
+/// on NotBefore/NotAfter, and a fixed wide window is immune to clock skew
+/// between peers. Embedders should prefer these over a narrow now-relative
+/// window so no verifier rejects on validity.
+pub const libp2p_not_before_sec: i64 = 157_766_400; // 1975-01-01T00:00:00Z
+pub const libp2p_not_after_sec: i64 = 67_090_118_400; // 4096-01-01T00:00:00Z
+
 pub const Error = error{
     InvalidValidityWindow,
     InvalidSerial,
@@ -1277,6 +1288,53 @@ test "generate secp256k1 produces cert that verifies and round-trips PeerId" {
 
     const got = try libp2p_tls.peerIdFromVerifiedCertificate(a, gen.cert_der, now);
 
+    var ebuf: [128]u8 = undefined;
+    var gbuf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try expected_id.toBase58(&ebuf),
+        try got.toBase58(&gbuf),
+    );
+}
+
+test "generate secp256k1 with canonical libp2p validity window verifies" {
+    const a = std.testing.allocator;
+
+    var host_seed: [32]u8 = undefined;
+    fillTestSeed(&host_seed, @src().line);
+    const host_kp = try Secp256k1.KeyPair.generateDeterministic(host_seed);
+    var signer = TestSecp256k1Signer{ .kp = host_kp };
+    const host_pub = host_kp.public_key.toCompressedSec1();
+
+    var cert_seed: [32]u8 = undefined;
+    fillTestSeed(&cert_seed, @src().line);
+
+    // Mint with the fixed 1975..4096 window (matches rust-libp2p/rcgen).
+    // notAfter = year 4096 exercises the GeneralizedTime encoding path.
+    var gen = try generate(a, .{
+        .host_identity = .{
+            .secp256k1 = .{
+                .public_key_sec1_compressed = host_pub,
+                .sign = TestSecp256k1Signer.sign,
+                .sign_ctx = &signer,
+            },
+        },
+        .not_before_sec = libp2p_not_before_sec,
+        .not_after_sec = libp2p_not_after_sec,
+        .cert_key_seed = cert_seed,
+    });
+    defer gen.deinit(a);
+
+    // Verifies at any realistic wall clock within the wide window.
+    const now: i64 = 1_700_000_000;
+    const host_pub_proto = try encodeSecp256k1PublicKeyProto(a, host_pub);
+    defer a.free(host_pub_proto);
+    const reader = try peer_id.PublicKeyReader.init(host_pub_proto);
+    const owned = try a.dupe(u8, reader.getData());
+    defer a.free(owned);
+    var expected_pk = peer_id.PublicKey{ .type = .SECP256K1, .data = owned };
+    const expected_id = try peer_id.PeerId.fromPublicKey(a, &expected_pk);
+
+    const got = try libp2p_tls.peerIdFromVerifiedCertificate(a, gen.cert_der, now);
     var ebuf: [128]u8 = undefined;
     var gbuf: [128]u8 = undefined;
     try std.testing.expectEqualStrings(
