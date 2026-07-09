@@ -200,9 +200,6 @@ pub const Host = struct {
         cm.* = connection_manager_mod.ConnectionManager.init(allocator, swarm);
         cm.setLimits(cfg.connection_limits);
         cm.setReqResp(rr);
-        // Enable simultaneous-open connection dedup: the tie-break needs our own
-        // peer id to decide which leg both ends keep (see connection_manager).
-        cm.setLocalPeer(cfg.local_peer);
         for (cfg.protected_peers) |peer| {
             try cm.protect(peer);
         }

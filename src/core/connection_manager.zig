@@ -63,12 +63,6 @@ const KnownState = struct {
     /// Counts failures since the last fully established session; capped by scheduling logic.
     failure_count: u8,
     dial_inflight: bool,
-    /// Set once we observe this peer deduplicating a simultaneous open (it
-    /// graceful-closed our freshly-established leg — see [`onConnectionClosed`]).
-    /// When set AND the tie-break makes the peer the designated dialer, [`tick`]
-    /// stops racing dials against it and waits for its inbound instead, so the
-    /// two ends converge on one connection without churn.
-    dedups: bool = false,
 };
 
 const ConnEntry = struct {
@@ -76,45 +70,7 @@ const ConnEntry = struct {
     direction: peer_events.Direction,
     /// Monotonic insertion order — used to pick the oldest connection during trimming (#90).
     seq: u64,
-    /// Wall-clock ms when this leg established — lets [`onConnectionClosed`]
-    /// recognize a peer's simultaneous-open dedup close (a graceful remote close
-    /// very soon after establishing). See [`dedup_close_window_ms`].
-    established_ms: i64,
 };
-
-/// A peer that closes our freshly-established leg within this window (a graceful
-/// remote close) is deduplicating a duplicate connection (go/rust-libp2p and
-/// lantern all do this). We stop fighting it — see [`onConnectionClosed`] and the
-/// dial gate in [`tick`].
-const dedup_close_window_ms: i64 = 5_000;
-
-/// When a dedup-ing peer is the tie-break's designated dialer we normally wait
-/// for its inbound instead of dialing. This is the slow safety re-arm so a peer
-/// that crashed / never dials us eventually gets retried rather than stranded.
-const dedup_listener_retry_ms: i64 = 60_000;
-
-/// libp2p simultaneous-open tie-break (matches go/rust-libp2p and lantern's
-/// c-lean-libp2p `connection_tie_break_prefers_inbound`): compare the two peer
-/// ids as their canonical binary (multihash) byte strings, shorter-first, with
-/// length as the final tiebreak. The peer with the LARGER id keeps its INBOUND
-/// leg; the peer with the SMALLER id keeps its OUTBOUND leg. Both ends therefore
-/// converge on keeping the single connection dialed by the smaller-id peer.
-///
-/// The byte encoding MUST match the peer's: `PeerId.toBytes` emits the same
-/// CIDv0 multihash bytes lantern compares with `memcmp`, so both sides reach the
-/// identical decision and close the same leg.
-fn keepInboundOnTieBreak(local: identity.PeerId, remote: identity.PeerId) bool {
-    var lbuf: [128]u8 = undefined;
-    var rbuf: [128]u8 = undefined;
-    const lb = local.toBytes(&lbuf) catch return false;
-    const rb = remote.toBytes(&rbuf) catch return false;
-    const min_len = @min(lb.len, rb.len);
-    return switch (std.mem.order(u8, lb[0..min_len], rb[0..min_len])) {
-        .gt => true,
-        .lt => false,
-        .eq => lb.len > rb.len,
-    };
-}
 
 /// Connection-limit knobs (libp2p connection manager profile, #90).
 ///
@@ -168,11 +124,6 @@ pub const ConnectionManager = struct {
     /// Total trim recommendations emitted across both reason codes (#90 observability).
     trim_recommendations_total: u64 = 0,
 
-    /// Our own peer id. Required for the simultaneous-open dedup tie-break
-    /// ([`keepInboundOnTieBreak`]); when null the dial gate is disabled (no
-    /// decision can be made without knowing which side we are).
-    local_peer: ?identity.PeerId = null,
-
     pub fn init(allocator: std.mem.Allocator, s: *swarm_mod.Swarm) ConnectionManager {
         return .{
             .allocator = allocator,
@@ -183,12 +134,6 @@ pub const ConnectionManager = struct {
             .protected_peers = .init(allocator),
             .trim_recommended = .init(allocator),
         };
-    }
-
-    /// Set our own peer id, enabling the simultaneous-open dedup dial gate. Call
-    /// once at setup.
-    pub fn setLocalPeer(self: *ConnectionManager, peer: identity.PeerId) void {
-        self.local_peer = peer;
     }
 
     /// Mark `peer` exempt from trim recommendations until [`unprotect`].
@@ -393,23 +338,6 @@ pub const ConnectionManager = struct {
             // (capped at the slowest bucket via `reconnectDelayMs`).
             if (st.next_dial_deadline_ms > now_ms) continue;
 
-            // Simultaneous-open dedup gate: if this peer deduplicates (it
-            // fast-closed our leg before — see `onConnectionClosed`) AND the
-            // tie-break makes IT the designated dialer (peer id < ours → it keeps
-            // its outbound = our inbound), stop racing dials against it. Dialing
-            // would just recreate the duplicate it closes, churning forever; we
-            // wait for its inbound instead. Both ends run the identical tie-break,
-            // so exactly one side dials → one stable connection. A slow safety
-            // re-arm still retries eventually if the peer never dials us.
-            if (st.dedups) {
-                if (self.local_peer) |lp| {
-                    if (keepInboundOnTieBreak(lp, peer)) {
-                        st.next_dial_deadline_ms = now_ms + dedup_listener_retry_ms;
-                        continue;
-                    }
-                }
-            }
-
             try self.swarm.submit(.{ .dial = .{ .addr = st.dial_str, .expected_peer = peer } });
             st.dial_inflight = true;
             st.next_dial_deadline_ms = std.math.maxInt(i64);
@@ -454,15 +382,9 @@ pub const ConnectionManager = struct {
             st.next_dial_deadline_ms = std.math.maxInt(i64);
         }
 
-        const now_ms = wall_time.milliTimestamp();
         const seq = self.next_seq;
         self.next_seq += 1;
-        try self.conns.put(conn_id, .{
-            .peer = peer,
-            .direction = direction,
-            .seq = seq,
-            .established_ms = now_ms,
-        });
+        try self.conns.put(conn_id, .{ .peer = peer, .direction = direction, .seq = seq });
 
         const gop = try self.peer_active.getOrPut(peer);
         const prev = if (gop.found_existing) gop.value_ptr.* else 0;
@@ -477,6 +399,7 @@ pub const ConnectionManager = struct {
 
         // Per-peer cap: if this connection puts us over `max_per_peer`, recommend
         // closing the oldest connection to that peer (#90).
+        const now_ms = wall_time.milliTimestamp();
         if (self.limits.max_per_peer) |cap| {
             if (gop.value_ptr.* > cap) {
                 try self.recommendOldestForPeer(peer, .over_per_peer_cap, now_ms);
@@ -605,29 +528,6 @@ pub const ConnectionManager = struct {
             "onConnectionClosed: conn_id={d} dir={s} reason={s} peer_active_after={d}",
             .{ conn_id, @tagName(direction), @tagName(reason), count },
         );
-
-        // Simultaneous-open dedup detection: a graceful REMOTE close of a leg we
-        // established only moments ago is the signature of a peer deduplicating a
-        // duplicate connection (go/rust-libp2p and lantern all do this). Mark the
-        // peer so [`tick`] stops racing dials against it and lets the tie-break's
-        // designated dialer own the single surviving connection — otherwise we
-        // redial straight back into the same race and churn forever
-        // (issue_lantern_dedup_simopen_not_cert). zeam↔zeam is unaffected: peers
-        // that keep both legs never fast-close ours, so `dedups` stays false and
-        // the multi-leg behavior is preserved.
-        if (self.local_peer != null and reason == .remote_close and
-            (now_ms - ent.value.established_ms) < dedup_close_window_ms)
-        {
-            if (self.known.getPtr(peer)) |st| {
-                if (!st.dedups) {
-                    st.dedups = true;
-                    log.info(
-                        "onConnectionClosed: peer dedups (remote close {d}ms after establish); dial now tie-break-gated",
-                        .{now_ms - ent.value.established_ms},
-                    );
-                }
-            }
-        }
 
         if (count == 0) {
             _ = self.peer_active.remove(peer);
@@ -1168,80 +1068,4 @@ test "trim entry is cleaned on close" {
 
     _ = try cm.onConnectionClosed(0, 1, .remote_close);
     try std.testing.expectEqual(@as(usize, 0), cm.trim_recommended.count());
-}
-
-test "sim-open tie-break is symmetric — both ends keep the same leg" {
-    // For any two distinct peers, exactly one end "keeps inbound": the larger id
-    // keeps its inbound (= the smaller id's outbound), the smaller id keeps its
-    // outbound. Both therefore preserve the single connection dialed by the
-    // smaller id, matching lantern/go/rust-libp2p. If this symmetry ever breaks,
-    // the two ends close DIFFERENT legs and the connection is lost entirely.
-    var i: usize = 0;
-    while (i < 64) : (i += 1) {
-        const a = try identity.PeerId.random();
-        const b = try identity.PeerId.random();
-        try std.testing.expect(keepInboundOnTieBreak(a, b) != keepInboundOnTieBreak(b, a));
-    }
-}
-
-test "dedup detection gates dial when we are the tie-break listener" {
-    const a = std.testing.allocator;
-    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
-    defer swarm.deinit();
-    var cm = ConnectionManager.init(a, &swarm);
-    defer cm.deinit();
-
-    // Two random ids; assign roles so the tie-break makes US the designated
-    // LISTENER (peer keeps its outbound = dials us), engaging the dial gate.
-    var local = try identity.PeerId.random();
-    var peer = try identity.PeerId.random();
-    if (!keepInboundOnTieBreak(local, peer)) {
-        const tmp = local;
-        local = peer;
-        peer = tmp;
-    }
-    try std.testing.expect(keepInboundOnTieBreak(local, peer));
-    cm.setLocalPeer(local);
-
-    // Bare multiaddr (no /p2p) + explicit peer override → `peer` is the known id.
-    var ma = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/4001/quic-v1");
-    defer ma.deinit();
-    try cm.registerKnownPeer(&ma, peer);
-    // Our outbound leg establishes, then the peer graceful-closes it at once —
-    // the simultaneous-open dedup signature.
-    try cm.onConnectionEstablished(1, peer, .outbound, .{});
-    const t0 = wall_time.milliTimestamp();
-    _ = try cm.onConnectionClosed(t0, 1, .remote_close);
-
-    // Past the reconnect backoff, tick must GATE (not redial): it sets the long
-    // safety deadline instead of submitting a dial, and leaves dial_inflight false.
-    const t_tick = t0 + 20_000;
-    try cm.tick(t_tick);
-    const st = cm.knownPeerStatus(peer).?;
-    try std.testing.expectEqual(t_tick + dedup_listener_retry_ms, st.next_dial_deadline_ms);
-    try std.testing.expect(!st.dial_inflight);
-}
-
-test "non-dedup peer keeps normal multi-leg redial (zeam↔zeam unaffected)" {
-    const a = std.testing.allocator;
-    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
-    defer swarm.deinit();
-    var cm = ConnectionManager.init(a, &swarm);
-    defer cm.deinit();
-
-    var ma = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA");
-    defer ma.deinit();
-    const peer = peerIdFromMultiaddr(&ma).?;
-    cm.setLocalPeer(try identity.PeerId.random());
-    try cm.registerKnownPeer(&ma, null);
-
-    // A leg that lived a LONG time before a remote close is a genuine drop, NOT a
-    // dedup — the peer must stay dialable on the normal reconnect backoff.
-    try cm.onConnectionEstablished(1, peer, .outbound, .{});
-    const t0 = wall_time.milliTimestamp();
-    // Close reported far past the dedup window → not flagged as dedups.
-    _ = try cm.onConnectionClosed(t0 + dedup_close_window_ms + 1_000, 1, .remote_close);
-    const st = cm.knownPeerStatus(peer).?;
-    // Normal backoff re-arm (well under the 60s dedup-listener safety deadline).
-    try std.testing.expect(st.next_dial_deadline_ms < t0 + dedup_close_window_ms + 1_000 + dedup_listener_retry_ms);
 }
