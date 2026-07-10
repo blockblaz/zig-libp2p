@@ -262,6 +262,13 @@ pub const Shard = struct {
 
         for (self.pending_dials.items) |pd| {
             pd.slot.peer_stream_reported.deinit(a);
+            // Tell the peer (CONNECTION_CLOSE) before abandoning: a silently
+            // dropped conn lives on at the peer as a half-open carcass that
+            // its simultaneous-open dedup then prefers over our NEXT dial,
+            // closing every fresh connection as a "duplicate" (the
+            // zeam<->lantern redial churn). Applies to every local-abandon
+            // teardown below, not just shutdown.
+            pd.slot.outbound.closeConnection();
             pd.slot.outbound.deinit();
             a.destroy(pd.slot);
         }
@@ -270,6 +277,7 @@ pub const Shard = struct {
         var it = self.outbound_by_peer.valueIterator();
         while (it.next()) |v| {
             v.*.peer_stream_reported.deinit(a);
+            v.*.outbound.closeConnection();
             v.*.outbound.deinit();
             a.destroy(v.*);
         }
@@ -3711,6 +3719,7 @@ pub const QuicRuntime = struct {
         // (because it never called `pollAccept`) deadlocked two peers dialing
         // each other simultaneously.
         const slot = a.create(conn_table.OutboundConn) catch {
+            outbound.closeConnection();
             outbound.deinit();
             self.failDial(expected_peer);
             return;
@@ -3725,6 +3734,7 @@ pub const QuicRuntime = struct {
             .expected_peer = expected_peer,
             .deadline_ms = self.opts.now_ms_fn() + dial_handshake_timeout_ms,
         }) catch {
+            slot.outbound.closeConnection();
             slot.outbound.deinit();
             a.destroy(slot);
             self.failDial(expected_peer);
@@ -3763,6 +3773,7 @@ pub const QuicRuntime = struct {
             if (shutting_down) {
                 // Quiet teardown: no warn, no failDial event during shutdown.
                 _ = sh.pending_dials.swapRemove(i);
+                pd.slot.outbound.closeConnection();
                 pd.slot.outbound.deinit();
                 self.allocator.destroy(pd.slot);
                 continue;
@@ -3793,6 +3804,7 @@ pub const QuicRuntime = struct {
             now_sec,
         ) catch |err| {
             log.warn("quic_runtime: verify remote peer id failed: {s}", .{@errorName(err)});
+            slot.outbound.closeConnection();
             slot.outbound.deinit();
             a.destroy(slot);
             self.failDial(expected_peer);
@@ -3803,6 +3815,7 @@ pub const QuicRuntime = struct {
         sh.outbound_by_peer_lock.lock();
         sh.outbound_by_peer.put(verified, slot) catch {
             sh.outbound_by_peer_lock.unlock();
+            slot.outbound.closeConnection();
             slot.outbound.deinit();
             a.destroy(slot);
             self.failDial(expected_peer);
@@ -3848,6 +3861,11 @@ pub const QuicRuntime = struct {
             "quic_runtime: dial handshake timed out after {d}ms; peer={s} stalled_phase={s}",
             .{ dial_handshake_timeout_ms, peer_str, @tagName(pd.slot.outbound.client.conn.phase) },
         );
+        // The peer may have COMPLETED its side of this handshake (that is the
+        // common case against lantern under boot load) — abandoning silently
+        // leaves a half-open carcass there that its dedup prefers over every
+        // subsequent dial. Close it on the wire first.
+        pd.slot.outbound.closeConnection();
         pd.slot.outbound.deinit();
         a.destroy(pd.slot);
         if (pd.expected_peer) |ep| {
