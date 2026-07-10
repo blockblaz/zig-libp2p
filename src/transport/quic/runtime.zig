@@ -1539,7 +1539,6 @@ pub const QuicRuntime = struct {
                 &slot.peer_stream_reported,
             );
             const sid = scan.stream_id orelse break;
-            std.debug.print("io: CHURNDBG surfaced server-initiated bidi stream_id={} on CLIENT leg\n", .{sid});
             const ist = self.allocator.create(conn_table.InboundStream) catch break;
             ist.* = .{
                 .slot = inbound_slot_none,

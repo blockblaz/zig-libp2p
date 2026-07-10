@@ -148,7 +148,18 @@ pub const inbound_request_reap_ms: i64 = 30_000;
 /// dispatching an empty payload immediately would race ahead of the body. This
 /// grace lets a real body land + decode first; only a genuinely empty request
 /// (body never arrives) trips the empty-`/status` dispatch. Well under the reap.
-pub const inbound_status_empty_grace_ms: i64 = 500;
+///
+/// 500ms was FAR longer than an in-flight request body ever needs (a body lands
+/// within ~1 RTT + a drive lap — single-digit ms on loopback, low ms on the
+/// devnet). The live zeam<->lantern flap proved lantern's own reqresp deadline
+/// is shorter than 500ms: lantern opens a server-initiated `/status` on the leg
+/// zeam dialed, sends 0 body bytes, and gives up (-1004) + graceful-closes the
+/// leg before the 500ms grace elapses, so zeam never answers → redial churn.
+/// 20ms keeps a real body's decode-first behavior (bodies land far faster than
+/// this) while answering the empty (lantern) shape well within its deadline.
+/// `/status` is body-independent (the responder returns chain.getStatus()), so
+/// even a rare raced body-sender still gets the correct response.
+pub const inbound_status_empty_grace_ms: i64 = 20;
 
 pub const OutboundRequest = struct {
     /// The peer this request is destined for.
