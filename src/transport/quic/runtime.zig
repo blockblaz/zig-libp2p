@@ -169,6 +169,9 @@ pub const Shard = struct {
     inbound_conn_ids: [ZIo.MAX_CONNECTIONS]connection_manager_mod.ConnectionId = .{0} ** ZIo.MAX_CONNECTIONS,
     inbound_conn_notified: [ZIo.MAX_CONNECTIONS]bool = .{false} ** ZIo.MAX_CONNECTIONS,
     inbound_conn_peer: [ZIo.MAX_CONNECTIONS]?identity.PeerId = .{null} ** ZIo.MAX_CONNECTIONS,
+    /// Rate limiter for the unregistered-inbound-conn diagnostics in
+    /// `pollInboundRegistrations` (one line per shard per 10s).
+    last_unregistered_log_ms: i64 = 0,
     /// Outbound dials in-flight on this shard (handshake not yet complete).
     pending_dials: std.ArrayList(PendingDial) = .empty,
     /// Outbound req/resp, publish, identify-push, autonat-probe streams on this
@@ -1273,18 +1276,48 @@ pub const QuicRuntime = struct {
     /// holes and stops the doomed redials. Cheap: a slot scan that only does cert
     /// extraction for connected-but-unregistered inbound slots.
     fn pollInboundRegistrations(self: *QuicRuntime, sh: *Shard) void {
+        const now_ms = self.opts.now_ms_fn();
         var slot: usize = 0;
         while (slot < ZIo.MAX_CONNECTIONS) : (slot += 1) {
             if (sh.inbound_conn_notified[slot]) continue;
             const conn = sh.listener.server.conns[slot] orelse continue;
-            if (conn.phase != .connected or conn.draining) continue;
-            const now_sec = @divTrunc(self.opts.now_ms_fn(), 1000);
+            if (conn.phase != .connected or conn.draining) {
+                // Never skip silently forever: a conn stuck pre-`.connected`
+                // was the app-invisible "zombie" behind the zeam<->lantern
+                // flap (wedged handshake, peer counted it as healthy). zquic
+                // now reaps those after its handshake deadline; this log makes
+                // any recurrence self-reporting. Rate-limited to one line per
+                // shard per 10s, and only for conns stuck > 10s.
+                if (!conn.draining and conn.created_ms > 0 and
+                    now_ms - conn.created_ms > 10_000 and
+                    now_ms - sh.last_unregistered_log_ms > 10_000)
+                {
+                    sh.last_unregistered_log_ms = now_ms;
+                    log.warn("quic_runtime: inbound conn slot={d} unregistered for {d}ms (phase={s}) — wedged handshake?", .{
+                        slot, now_ms - conn.created_ms, @tagName(conn.phase),
+                    });
+                }
+                continue;
+            }
+            const now_sec = @divTrunc(now_ms, 1000);
             const sender = quic_peer_identity.verifiedPeerIdFromLibp2pQuicServerConn(
                 conn,
                 self.allocator,
                 null,
                 now_sec,
-            ) catch continue; // cert not ready yet / not a libp2p peer — retry next tick
+            ) catch |err| {
+                // Transiently normal right after the handshake (cert not yet
+                // extracted); persistently abnormal. Same rate limit as above.
+                if (conn.created_ms > 0 and now_ms - conn.created_ms > 10_000 and
+                    now_ms - sh.last_unregistered_log_ms > 10_000)
+                {
+                    sh.last_unregistered_log_ms = now_ms;
+                    log.warn("quic_runtime: inbound conn slot={d} connected but peer-id extraction failing for {d}ms: {s}", .{
+                        slot, now_ms - conn.created_ms, @errorName(err),
+                    });
+                }
+                continue;
+            };
             self.notifyInboundEstablished(sh, slot, sender, conn);
         }
     }
