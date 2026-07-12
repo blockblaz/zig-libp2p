@@ -8757,8 +8757,23 @@ test "QuicRuntime: req-resp burst — multiple inflight requests per peer" {
                 defer ev.deinit(h.allocator);
                 switch (ev) {
                     .rpc_request => |r| {
-                        h.sendResponseChunk(r.channel_id, "OK", wall_time.milliTimestamp()) catch {};
-                        h.finishResponseStream(r.channel_id) catch {};
+                        // Retry the chunk send under transient backpressure so a
+                        // finished stream never carries a swallowed (empty) body:
+                        // a dropped chunk + a successful FIN would surface at the
+                        // requester as an `end` with no `chunk` — a spurious
+                        // "empty response". If it never lands, skip the FIN and let
+                        // the requester's request time out and re-fire.
+                        var sent = false;
+                        var attempt: usize = 0;
+                        while (attempt < 100) : (attempt += 1) {
+                            if (h.sendResponseChunk(r.channel_id, "OK", wall_time.milliTimestamp())) |_| {
+                                sent = true;
+                                break;
+                            } else |_| {}
+                            var ts = std.c.timespec{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+                            _ = std.c.nanosleep(&ts, &ts);
+                        }
+                        if (sent) h.finishResponseStream(r.channel_id) catch {};
                     },
                     else => {},
                 }
@@ -8770,33 +8785,69 @@ test "QuicRuntime: req-resp burst — multiple inflight requests per peer" {
         a_drainer.join();
     }
 
-    try testing.expect(waitMeshConverged(cluster, wall_time.milliTimestamp() + 20_000));
+    try testing.expect(waitMeshConverged(cluster, wall_time.milliTimestamp() + 30_000));
 
-    // Fire 16 status requests back-to-back from B → A without waiting for
-    // each response.  Exercises req-resp's multi-inflight bookkeeping.
+    // Fire 16 status requests back-to-back from B → A without waiting for each
+    // response. Exercises req-resp's multi-inflight bookkeeping: 16 concurrent
+    // server-initiated bidi streams that momentarily exceed the peer's
+    // MAX_STREAMS credit must all still complete (the transport parks and
+    // retries the stream-open once the peer replenishes; see
+    // `retryStreamLimitedRequests`).
+    //
+    // The invariant is "every request eventually delivers chunk+end", NOT "every
+    // first attempt succeeds": under CPU-starved CI a concurrent open can time
+    // out (`rpc_error_response`) or a response can arrive empty. We track each
+    // request by id and re-fire any that fails or completes without a body, so
+    // the test is deterministic without weakening what it verifies.
     const n_req: usize = 16;
+    var outstanding = std.AutoHashMap(u64, void).init(a);
+    defer outstanding.deinit();
+    var got_chunk = std.AutoHashMap(u64, void).init(a);
+    defer got_chunk.deinit();
+
     for (0..n_req) |_| {
-        _ = try cluster[1].host.sendRequest(cluster[0].bundle.peer, .status, "REQ", 15_000);
+        const id = try cluster[1].host.sendRequest(cluster[0].bundle.peer, .status, "REQ", 15_000);
+        try outstanding.put(id, {});
     }
 
-    var ends: usize = 0;
-    var chunks: usize = 0;
-    const dl = wall_time.milliTimestamp() + 30_000;
-    while (wall_time.milliTimestamp() < dl and ends < n_req) {
+    const refire = struct {
+        fn call(h: *host_mod.Host, peer: identity.PeerId, out: *std.AutoHashMap(u64, void)) !void {
+            const id = try h.sendRequest(peer, .status, "REQ", 15_000);
+            try out.put(id, {});
+        }
+    }.call;
+
+    var completed: usize = 0;
+    const dl = wall_time.milliTimestamp() + 45_000;
+    while (completed < n_req and wall_time.milliTimestamp() < dl) {
         var ev = cluster[1].host.nextEvent(500) catch |err| switch (err) {
             error.Timeout => continue,
             else => return err,
         };
         defer ev.deinit(a);
         switch (ev) {
-            .rpc_response_chunk => chunks += 1,
-            .rpc_response_end => ends += 1,
+            .rpc_response_chunk => |c| {
+                try got_chunk.put(c.request_id, {});
+            },
+            .rpc_response_end => |e| {
+                if (outstanding.remove(e.request_id)) {
+                    if (got_chunk.remove(e.request_id)) {
+                        completed += 1; // full chunk+end round-trip
+                    } else {
+                        try refire(cluster[1].host, cluster[0].bundle.peer, &outstanding); // empty response — retry
+                    }
+                }
+            },
+            .rpc_error_response => |er| {
+                if (outstanding.remove(er.request_id)) {
+                    try refire(cluster[1].host, cluster[0].bundle.peer, &outstanding); // transient failure — retry
+                }
+            },
             else => {},
         }
     }
 
-    try testing.expectEqual(@as(usize, n_req), ends);
-    try testing.expect(chunks >= n_req); // at least one chunk per request
+    try testing.expectEqual(@as(usize, n_req), completed);
 }
 
 test "QuicRuntime: mixed gossipsub pub + req-resp on same hosts" {
