@@ -126,6 +126,21 @@ const IdentifyRecord = struct {
     wire: []u8,
 };
 
+/// An outbound request whose stream-open momentarily hit the peer's MAX_STREAMS
+/// limit (`error.StreamLimitExceeded`). zquic already emitted STREAMS_BLOCKED,
+/// so the peer will extend the limit as its inflight streams close; we retry the
+/// open on subsequent drive ticks instead of dropping the request. Bounded by
+/// `deadline_ms` (same budget as `outbound_request_reap_ms`) after which the
+/// request fails with `StreamTimedOut`. `payload` is heap-owned until the open
+/// succeeds (ownership then moves into `OutboundRequest`) or the deadline frees it.
+const StreamLimitedRetry = struct {
+    peer: identity.PeerId,
+    proto: protocol_mod.LeanSupportedProtocol,
+    request_id: u64,
+    payload: []u8,
+    deadline_ms: i64,
+};
+
 /// Per-shard transport state for the multi-shard drive loop (quinn model).
 ///
 /// Phase 2b incrementally migrates QuicRuntime's per-connection state into this
@@ -178,6 +193,10 @@ pub const Shard = struct {
     /// shard's connections (id-keyed). The monotonic next_* id counters stay
     /// global on QuicRuntime.
     outbound_requests: std.AutoHashMap(u64, *conn_table.OutboundRequest),
+    /// Requests parked awaiting MAX_STREAMS replenishment (see `StreamLimitedRetry`).
+    /// Retried by `retryStreamLimitedRequests`, drained each drive tick from
+    /// `advanceOutboundRequests`.
+    stream_limited_retries: std.ArrayList(StreamLimitedRetry) = .empty,
     outbound_publishes: std.AutoHashMap(u64, *conn_table.OutboundPublish),
     outbound_identify_pushes: std.AutoHashMap(u64, *conn_table.OutboundIdentifyPush),
     outbound_autonat_probes: std.AutoHashMap(u64, *conn_table.OutboundAutonatProbe),
@@ -304,6 +323,9 @@ pub const Shard = struct {
             a.destroy(r.*);
         }
         self.outbound_requests.deinit();
+
+        for (self.stream_limited_retries.items) |e| a.free(e.payload);
+        self.stream_limited_retries.deinit(a);
 
         var pit = self.outbound_publishes.valueIterator();
         while (pit.next()) |p| {
@@ -2157,8 +2179,19 @@ pub const QuicRuntime = struct {
                 self.handleDial(sh, d.addr, d.expected_peer);
             },
             .send_request => |r| {
-                try self.startOutboundRequest(sh, r.peer, r.proto, r.request_id, r.payload);
-                // payload ownership moved into conn_table.OutboundRequest; do NOT free here.
+                // payload ownership moves into conn_table.OutboundRequest on success;
+                // on a transient StreamLimitExceeded the request is parked (payload
+                // retained) and retried by retryStreamLimitedRequests. Either way, do
+                // NOT free here.
+                if (!try self.startOutboundRequest(sh, r.peer, r.proto, r.request_id, r.payload)) {
+                    try sh.stream_limited_retries.append(self.allocator, .{
+                        .peer = r.peer,
+                        .proto = r.proto,
+                        .request_id = r.request_id,
+                        .payload = r.payload,
+                        .deadline_ms = self.opts.now_ms_fn() + conn_table.outbound_request_reap_ms,
+                    });
+                }
             },
             .send_response_chunk => |r| {
                 defer self.allocator.free(r.chunk);
@@ -3884,6 +3917,10 @@ pub const QuicRuntime = struct {
         self.notifyDialFailure(now_ms, cid, expected_peer, .outbound, .{ .err = error.DialFailed });
     }
 
+    /// Returns `true` when the request was started or hard-failed (payload
+    /// consumed either way); returns `false` when the stream-open hit a
+    /// transient `StreamLimitExceeded` — the caller keeps `payload` and parks
+    /// the request in `stream_limited_retries` to retry once MAX_STREAMS grows.
     fn startOutboundRequest(
         self: *QuicRuntime,
         sh: *Shard,
@@ -3891,7 +3928,7 @@ pub const QuicRuntime = struct {
         proto: protocol_mod.LeanSupportedProtocol,
         request_id: u64,
         payload: []u8,
-    ) !void {
+    ) !bool {
         // libp2p req/resp rides whichever single connection to the peer exists.
         // Prefer the outbound (client) leg we dialed; otherwise open a
         // server-initiated bidi stream on the inbound leg the peer dialed to us
@@ -3903,15 +3940,17 @@ pub const QuicRuntime = struct {
         const raw: conn_table.PublishBidiStream = blk: {
             if (sh.outbound_by_peer.get(peer)) |slot| {
                 sid = slot.outbound.nextLocalBidiStream() catch |err| {
+                    if (err == error.StreamLimitExceeded) return false;
                     self.failOutboundRequestStart(peer, request_id, payload, error.IoError, "nextLocalBidiStream", err);
-                    return;
+                    return true;
                 };
                 break :blk .{ .outbound = .{ .client = slot.outbound.client, .stream_id = sid } };
             }
             if (sh.inbound_by_peer.get(peer)) |ic| {
                 sid = sh.listener.server.openRawAppStream(ic.conn) catch |err| {
+                    if (err == error.StreamLimitExceeded) return false;
                     self.failOutboundRequestStart(peer, request_id, payload, error.IoError, "openRawAppStream", err);
-                    return;
+                    return true;
                 };
                 // Quiet diagnostic (status only). On a full-mesh devnet, peers
                 // reject duplicate connections, so ~half of every node's peers
@@ -3931,7 +3970,7 @@ pub const QuicRuntime = struct {
             }
             // Genuinely no connection to this peer in either direction.
             self.failOutboundRequestStart(peer, request_id, payload, error.Disconnected, "no conn to peer", null);
-            return;
+            return true;
         };
 
         const req = try self.allocator.create(conn_table.OutboundRequest);
@@ -3945,6 +3984,35 @@ pub const QuicRuntime = struct {
             .deadline_ms = self.opts.now_ms_fn() + conn_table.outbound_request_reap_ms,
         };
         try sh.outbound_requests.put(request_id, req);
+        return true;
+    }
+
+    /// Retry requests parked in `stream_limited_retries` (see `StreamLimitedRetry`).
+    /// Called each drive tick from `advanceOutboundRequests`. A retry that still
+    /// hits `StreamLimitExceeded` stays parked; one that succeeds (or hard-fails)
+    /// is removed; past `deadline_ms` the request fails with `StreamTimedOut`.
+    fn retryStreamLimitedRequests(self: *QuicRuntime, sh: *Shard) void {
+        if (sh.stream_limited_retries.items.len == 0) return;
+        const now_ms = self.opts.now_ms_fn();
+        var i: usize = 0;
+        while (i < sh.stream_limited_retries.items.len) {
+            const e = sh.stream_limited_retries.items[i];
+            if (now_ms >= e.deadline_ms) {
+                self.failOutboundRequestStart(e.peer, e.request_id, e.payload, error.StreamTimedOut, "stream-limited request timed out", error.StreamLimitExceeded);
+                _ = sh.stream_limited_retries.swapRemove(i);
+                continue;
+            }
+            const handled = self.startOutboundRequest(sh, e.peer, e.proto, e.request_id, e.payload) catch {
+                // Transient allocation failure — leave parked, retry next tick.
+                i += 1;
+                continue;
+            };
+            if (handled) {
+                _ = sh.stream_limited_retries.swapRemove(i);
+            } else {
+                i += 1; // still stream-limited
+            }
+        }
     }
 
     /// Free the request payload and surface an `rpc_error_response` when a
@@ -5128,6 +5196,11 @@ pub const QuicRuntime = struct {
 
     fn advanceOutboundRequests(self: *QuicRuntime, sh: *Shard) !void {
         const a = self.allocator;
+
+        // Retry requests parked on a transient MAX_STREAMS exhaustion first: as
+        // this shard's inflight streams close, the peer extends the limit, so a
+        // parked open now succeeds instead of being dropped.
+        self.retryStreamLimitedRequests(sh);
 
         // Reap requests whose deadline elapsed without a complete response. The
         // embedder has its own (shorter) timeout but never tells us to drop the
