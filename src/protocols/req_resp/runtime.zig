@@ -212,8 +212,12 @@ pub const ReqResp = struct {
         } });
     }
 
-    /// UTF-8 diagnostic is stored via [`errors.setLastErrorMessage`] for this thread (`RawError` + #45).
     pub fn sendErrorResponse(self: *ReqResp, channel_id: u64, message: []const u8) (Error || swarm_mod.SubmitError)!void {
+        return self.sendErrorResponseWithCode(channel_id, 1, message);
+    }
+
+    /// UTF-8 diagnostic is stored via [`errors.setLastErrorMessage`] for this thread (`RawError` + #45).
+    pub fn sendErrorResponseWithCode(self: *ReqResp, channel_id: u64, response_code: u8, message: []const u8) (Error || swarm_mod.SubmitError)!void {
         const ent = blk: {
             self.state_lock.lock();
             defer self.state_lock.unlock();
@@ -224,6 +228,7 @@ pub const ReqResp = struct {
             .peer = ent.value.peer,
             .request_id = ent.value.stream_request_id,
             .kind = error.RawError,
+            .response_code = response_code,
         } });
     }
 

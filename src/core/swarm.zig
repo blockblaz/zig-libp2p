@@ -83,6 +83,7 @@ pub const RpcError = struct {
     peer: identity.PeerId,
     request_id: u64,
     kind: errors.ReqRespError,
+    response_code: u8 = 1,
 };
 
 pub const RpcResponseEnd = struct {
