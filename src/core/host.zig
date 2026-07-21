@@ -636,6 +636,10 @@ pub const Host = struct {
         return self.req_resp.sendErrorResponse(channel_id, message);
     }
 
+    pub fn sendErrorResponseWithCode(self: *Host, channel_id: u64, response_code: u8, message: []const u8) (req_resp_runtime.Error || swarm_mod.SubmitError)!void {
+        return self.req_resp.sendErrorResponseWithCode(channel_id, response_code, message);
+    }
+
     // ── Known peers / dialing ─────────────────────────────────────────────
 
     pub fn registerKnownPeer(

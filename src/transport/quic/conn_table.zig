@@ -556,6 +556,7 @@ pub const HookWork = union(enum) {
     send_error_response: struct {
         peer: identity.PeerId,
         request_id: u64,
+        response_code: u8,
     },
     publish: struct {
         topic: []u8,

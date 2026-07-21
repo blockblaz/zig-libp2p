@@ -996,6 +996,7 @@ pub const QuicRuntime = struct {
                 self.enqueueHookWork(.{ .send_error_response = .{
                     .peer = e.peer,
                     .request_id = e.request_id,
+                    .response_code = e.response_code,
                 } });
                 return .handled;
             },
@@ -2201,7 +2202,7 @@ pub const QuicRuntime = struct {
                 self.handleEndOfStream(sh, e.peer, e.request_id);
             },
             .send_error_response => |e| {
-                self.handleEndOfStream(sh, e.peer, e.request_id);
+                self.handleSendErrorResponse(sh, e.peer, e.request_id, e.response_code);
             },
             .publish => |p| {
                 defer self.allocator.free(p.topic);
@@ -4040,6 +4041,15 @@ pub const QuicRuntime = struct {
     }
 
     fn handleSendResponseChunk(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, request_id: u64, chunk: []const u8) void {
+        self.handleSendResponseChunkWithCode(sh, peer, request_id, 0, chunk);
+    }
+
+    fn handleSendErrorResponse(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, request_id: u64, response_code: u8) void {
+        self.handleSendResponseChunkWithCode(sh, peer, request_id, response_code, &.{});
+        self.handleEndOfStream(sh, peer, request_id);
+    }
+
+    fn handleSendResponseChunkWithCode(self: *QuicRuntime, sh: *Shard, peer: identity.PeerId, request_id: u64, response_code: u8, chunk: []const u8) void {
         // Look up channel via request_id (`stream_request_id` == request_id
         // for inbound channels). Iterate channel_to_inbound to find a match.
         var found: ?*conn_table.InboundStream = null;
@@ -4061,7 +4071,7 @@ pub const QuicRuntime = struct {
         // BlocksByRange response shoved into zquic in one lap fills the 32 MB
         // pending queue, makes the drive lap 0.3-1.3s, starves the inbound socket
         // drain → packet loss → CC collapse. The outbox owns `wire`.
-        const wire = snappy_wire.buildResponseWire(self.allocator, 0, chunk) catch |err| {
+        const wire = snappy_wire.buildResponseWire(self.allocator, response_code, chunk) catch |err| {
             log.warn("quic_runtime: buildResponseWire failed: {s}", .{@errorName(err)});
             return;
         };
